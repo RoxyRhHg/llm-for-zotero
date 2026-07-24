@@ -570,13 +570,25 @@ describe("Mermaid rendering helpers", function () {
     assert.include(normalized, "style A fill:#151515,stroke:#333333");
   });
 
-  it("adds SVG polish rules for the expanded Mermaid viewer", function () {
+  it("scopes SVG polish rules to the expanded Mermaid viewer", function () {
     const svg =
       '<svg viewBox="0 0 10 10"><g class="cluster"><rect /></g></svg>';
 
-    const polished = polishRenderedMermaidSvg(svg, "light");
+    for (const [theme, background] of [
+      ["light", "#ffffff"],
+      ["dark", "#151515"],
+    ] as const) {
+      const polished = polishRenderedMermaidSvg(svg, theme);
 
-    assert.include(polished, 'data-llm-mermaid-polished="true"');
+      assert.include(polished, 'data-llm-mermaid-polished="true"');
+      assert.include(
+        polished,
+        `svg[data-llm-mermaid-polished]{background:${background}`,
+      );
+      assert.notMatch(polished, /<style>\s*svg\s*\{/);
+    }
+
+    const polished = polishRenderedMermaidSvg(svg, "light");
     assert.include(polished, ".cluster rect{fill:#ffffff!important");
     assert.include(polished, ".flowchart-link{stroke:#6b7280!important");
   });
