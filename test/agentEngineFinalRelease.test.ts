@@ -623,4 +623,226 @@ describe("agent engine final UI release", function () {
     assert.equal(assistantMessage.text, "Previous grounded answer.");
     assert.deepEqual(pendingWrites, []);
   });
+
+  it("preserves partial text and flags interruption when the runtime drops mid-stream", async function () {
+    const conversationKey = 555;
+    const statuses: string[] = [];
+    const runtime = {
+      getCapabilities: () => ({
+        streaming: true,
+        toolCalls: true,
+        multimodal: false,
+      }),
+      runTurn: async (params: {
+        onEvent?: (event: any) => Promise<void> | void;
+      }) => {
+        await params.onEvent?.({
+          type: "message_delta",
+          text: "Partial answer that ",
+        });
+        await params.onEvent?.({
+          type: "message_delta",
+          text: "streamed before the drop.",
+        });
+        throw new Error("Error in input stream");
+      },
+    } as unknown as AgentRuntime;
+    const deps = createDeps({
+      runtime,
+      pendingWrites: [],
+      idleRestores: [],
+      statuses,
+    });
+    // Production seeds the conversation history before a turn starts.
+    const history: any[] = [];
+    (deps as any).chatHistory.set(conversationKey, history);
+
+    await sendAgentTurn(
+      {
+        body: {} as Element,
+        item: fakeItem(conversationKey),
+        question: "summarize the methods",
+      },
+      deps,
+    );
+
+    const assistantMessage = history[history.length - 1];
+    assert.strictEqual(
+      assistantMessage.text,
+      "Partial answer that streamed before the drop.",
+    );
+    assert.isTrue(assistantMessage.interrupted);
+    assert.isUndefined(assistantMessage.pendingFinalText);
+    assert.isFalse(Boolean(assistantMessage.streaming));
+    assert.include(statuses.join("\n"), "Error: Error in input stream");
+  });
+
+  it("keeps the bare error text when nothing streamed before the failure", async function () {
+    const conversationKey = 556;
+    const statuses: string[] = [];
+    const runtime = {
+      getCapabilities: () => ({
+        streaming: true,
+        toolCalls: true,
+        multimodal: false,
+      }),
+      runTurn: async () => {
+        throw new Error("boom");
+      },
+    } as unknown as AgentRuntime;
+    const deps = createDeps({
+      runtime,
+      pendingWrites: [],
+      idleRestores: [],
+      statuses,
+    });
+    // Production seeds the conversation history before a turn starts.
+    const history: any[] = [];
+    (deps as any).chatHistory.set(conversationKey, history);
+
+    await sendAgentTurn(
+      {
+        body: {} as Element,
+        item: fakeItem(conversationKey),
+        question: "summarize the methods",
+      },
+      deps,
+    );
+
+    const assistantMessage = history[history.length - 1];
+    assert.strictEqual(assistantMessage.text, "Error: boom");
+    assert.isFalse(Boolean(assistantMessage.interrupted));
+  });
+
+  it("does not resurrect rolled-back text in the preserved partial", async function () {
+    const conversationKey = 557;
+    const retracted = "Thinking about which tool to use. ";
+    // The rollback handler consults a Zotero pref (block-streaming toggle).
+    const zoteroBefore = (globalThis as any).Zotero;
+    (globalThis as any).Zotero = { Prefs: { get: () => true } };
+    try {
+      const runtime = {
+        getCapabilities: () => ({
+          streaming: true,
+          toolCalls: true,
+          multimodal: false,
+        }),
+        runTurn: async (params: {
+          onEvent?: (event: any) => Promise<void> | void;
+        }) => {
+          // Round 1 streams intermediate text the runtime then retracts
+          // (message_rollback), exactly like a tool-call round does.
+          await params.onEvent?.({ type: "message_delta", text: retracted });
+          await params.onEvent?.({
+            type: "message_rollback",
+            length: retracted.length,
+          });
+          // Round 2 streams part of the real answer, then the stream drops.
+          await params.onEvent?.({
+            type: "message_delta",
+            text: "Real partial answer",
+          });
+          throw new Error("Error in input stream");
+        },
+      } as unknown as AgentRuntime;
+      const deps = createDeps({
+        runtime,
+        pendingWrites: [],
+        idleRestores: [],
+        statuses: [],
+      });
+      const history: any[] = [];
+      (deps as any).chatHistory.set(conversationKey, history);
+
+      await sendAgentTurn(
+        {
+          body: {} as Element,
+          item: fakeItem(conversationKey),
+          question: "summarize the methods",
+        },
+        deps,
+      );
+
+      const assistantMessage = history[history.length - 1];
+      assert.strictEqual(assistantMessage.text, "Real partial answer");
+      assert.isTrue(assistantMessage.interrupted);
+    } finally {
+      if (zoteroBefore === undefined) delete (globalThis as any).Zotero;
+      else (globalThis as any).Zotero = zoteroBefore;
+    }
+  });
+
+  it("restores the previous assistant message when a retry fails before streaming", async function () {
+    const conversationKey = 558;
+    const userMessage = {
+      role: "user" as const,
+      text: "summarize",
+      timestamp: 100,
+      runMode: "agent" as const,
+    };
+    const assistantMessage: any = {
+      role: "assistant" as const,
+      text: "Preserved partial answer.",
+      timestamp: 200,
+      runMode: "agent" as const,
+      interrupted: true,
+    };
+    const assistantStoreWrites: unknown[] = [];
+    const runtime = {
+      getCapabilities: () => ({
+        streaming: true,
+        toolCalls: true,
+        multimodal: false,
+      }),
+      runTurn: async () => {
+        throw new Error("NetworkError when attempting to fetch resource.");
+      },
+    } as unknown as AgentRuntime;
+    const deps = createDeps({
+      runtime,
+      pendingWrites: [],
+      idleRestores: [],
+      statuses: [],
+    });
+    deps.chatHistory.set(conversationKey, [userMessage, assistantMessage]);
+    deps.findLatestRetryPair = () => ({
+      userIndex: 0,
+      userMessage,
+      assistantMessage,
+    });
+    deps.reconstructRetryPayload = () => ({
+      question: userMessage.text,
+      screenshotImages: [],
+      paperContexts: [],
+      pdfPaperContexts: [],
+      fullTextPaperContexts: [],
+      selectedCollectionContexts: [],
+      selectedTagContexts: [],
+    });
+    deps.updateStoredLatestAssistantMessage = async (_key, update) => {
+      assistantStoreWrites.push(update);
+    };
+
+    await retryAgentTurn(
+      {} as Element,
+      fakeItem(conversationKey),
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      deps,
+    );
+
+    assert.strictEqual(assistantMessage.text, "Preserved partial answer.");
+    assert.isTrue(assistantMessage.interrupted);
+    assert.isFalse(Boolean(assistantMessage.streaming));
+    // The stored row must keep the partial — no error-text write.
+    assert.lengthOf(assistantStoreWrites, 0);
+  });
 });

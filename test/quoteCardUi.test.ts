@@ -439,13 +439,18 @@ describe("quote card UI contract", function () {
       "src/modules/contextPanel/agentMode/agentEngine.ts",
     );
 
+    // Send and retry share finalizeAgentTurnOutcome, which awaits quote
+    // finalization for the turn's paired user message before persisting.
     assert.include(
       agentSource,
-      "await deps.finalizeAssistantQuoteCitations(\n      assistantMessage,\n      userMessage,\n      runtimeRequest,",
+      "await deps.finalizeAssistantQuoteCitations(\n    assistantMessage,\n    pairedUserMessage,\n    runtimeRequest,",
     );
-    assert.include(
-      agentSource,
-      "await deps.finalizeAssistantQuoteCitations(\n      assistantMessage,\n      retryPair.userMessage,\n      runtimeRequest,",
+    assert.include(agentSource, "pairedUserMessage: userMessage,");
+    assert.include(agentSource, "pairedUserMessage: retryPair.userMessage,");
+    // Both turn paths route through the shared finalizer.
+    assert.equal(
+      agentSource.match(/await finalizeAgentTurnOutcome\(\{/g)?.length,
+      2,
     );
   });
 });

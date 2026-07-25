@@ -2661,6 +2661,201 @@ function restoreRequestUIIdle(
   });
 }
 
+/**
+ * Shared per-turn stream handlers. The send and retry pipelines previously
+ * carried hand-synchronized copies of these; they differ only in the small
+ * hooks threaded through the params.
+ */
+function createStreamReasoningHandler(params: {
+  assistantMessage: Message;
+  flushResponseStream: (reason: BlockStreamFlushReason) => void;
+  queueRefresh: () => void;
+  /** Retry captures the streamed reasoning for its interruption fallback. */
+  onReasoningCaptured?: () => void;
+}): (reasoning: ReasoningEvent) => void {
+  return (reasoning) => {
+    params.flushResponseStream("event");
+    if (reasoning.summary) {
+      params.assistantMessage.reasoningSummary = appendReasoningPart(
+        params.assistantMessage.reasoningSummary,
+        reasoning.summary,
+      );
+    }
+    if (reasoning.details) {
+      params.assistantMessage.reasoningDetails = appendReasoningPart(
+        params.assistantMessage.reasoningDetails,
+        reasoning.details,
+      );
+    }
+    params.onReasoningCaptured?.();
+    params.queueRefresh();
+  };
+}
+
+function createStreamUsageHandler(params: {
+  body: Element;
+  tokenUsageEl: HTMLElement | null;
+  conversationKey: number;
+  contextCache: Parameters<typeof recordContextCacheTelemetry>[0];
+  fallbackContextWindow: number;
+}): (usage: UsageStats) => void {
+  return (usage) => {
+    recordContextCacheTelemetry(params.contextCache, usage);
+    const contextTokens =
+      typeof usage.contextTokens === "number" && usage.contextTokens > 0
+        ? usage.contextTokens
+        : 0;
+    if (contextTokens <= 0) return;
+    const snapshot = setContextUsageSnapshot(params.conversationKey, {
+      contextTokens,
+      contextWindow: usage.contextWindow || params.fallbackContextWindow,
+      estimated: usage.contextWindowIsAuthoritative !== true,
+      source:
+        usage.contextWindowIsAuthoritative === true ? "provider" : "estimated",
+      contextWindowIsAuthoritative: usage.contextWindowIsAuthoritative,
+      cacheReadTokens: usage.cacheReadTokens,
+      cacheWriteTokens: usage.cacheWriteTokens,
+      cacheMissTokens: usage.cacheMissTokens,
+      cacheHitRatio: usage.cacheHitRatio,
+      cacheProvider: usage.cacheProvider,
+    });
+    renderContextUsageSnapshot(params.body, params.tokenUsageEl, snapshot);
+  };
+}
+
+type CodexNativeTurnCallbacks = Pick<
+  Parameters<typeof runCodexAppServerNativeTurn>[0],
+  | "onSkillActivated"
+  | "onDelta"
+  | "onAgentMessageDelta"
+  | "onReasoning"
+  | "onUsage"
+  | "onItemStarted"
+  | "onItemCompleted"
+  | "onMcpToolActivity"
+  | "onMcpConfirmationRequest"
+  | "onMcpSetupWarning"
+  | "onDiagnostics"
+  | "onApprovalRequest"
+>;
+
+/**
+ * The Codex app-server native-turn callback set, previously duplicated
+ * verbatim between the send and retry pipelines.
+ */
+function buildCodexNativeTurnCallbacks(ctx: {
+  body: Element;
+  assistantMessage: Message;
+  codexActivityTrace: ReturnType<
+    typeof createCodexNativeActivityTraceController
+  > | null;
+  flushResponseStream: (reason: BlockStreamFlushReason) => void;
+  setStatusSafely: (
+    text: string,
+    kind: Parameters<typeof setStatus>[2],
+  ) => void;
+  handleDelta: (delta: string) => void;
+  handleReasoning: (reasoning: ReasoningEvent) => void;
+  handleUsage: (usage: UsageStats) => void;
+}): CodexNativeTurnCallbacks {
+  const {
+    body,
+    assistantMessage,
+    codexActivityTrace,
+    flushResponseStream,
+    setStatusSafely,
+    handleDelta,
+    handleReasoning,
+    handleUsage,
+  } = ctx;
+  return {
+    onSkillActivated: (skillId) => {
+      flushResponseStream("event");
+      codexActivityTrace?.noteSkillActivated(skillId);
+      setStatusSafely(`Codex skill activated: ${skillId}`, "sending");
+    },
+    onDelta: handleDelta,
+    onAgentMessageDelta: (event) => {
+      if (!codexActivityTrace?.appendAgentMessageDelta(event)) {
+        handleDelta(event.delta);
+      }
+    },
+    onReasoning: handleReasoning,
+    onUsage: handleUsage,
+    onItemStarted: (event) => {
+      flushResponseStream("event");
+      codexActivityTrace?.appendItemStatus(event, "started");
+      const itemType = sanitizeText(event.type || "");
+      if (itemType && !isCodexNativeAgentMessageItem(event)) {
+        setStatusSafely(`Codex: ${itemType} started`, "sending");
+      }
+    },
+    onItemCompleted: (event) => {
+      flushResponseStream("event");
+      codexActivityTrace?.noteAgentMessageCompleted(event);
+      codexActivityTrace?.appendItemStatus(event, "completed");
+      const itemType = sanitizeText(event.type || "");
+      if (itemType && !isCodexNativeAgentMessageItem(event)) {
+        setStatusSafely(`Codex: ${itemType} completed`, "sending");
+      }
+    },
+    onMcpToolActivity: (event) => {
+      flushResponseStream("event");
+      codexActivityTrace?.noteMcpToolActivity(event);
+      assistantMessage.quoteCitations = mergeQuoteCitations(
+        assistantMessage.quoteCitations,
+        event.quoteCitations,
+      );
+      const label =
+        sanitizeText(event.toolLabel || "").trim() ||
+        sanitizeText(event.toolName || "")
+          .replace(/_/g, " ")
+          .trim();
+      if (label) {
+        setStatusSafely(
+          event.phase === "completed"
+            ? `Codex: used ${label}`
+            : `Codex: using ${label}`,
+          "sending",
+        );
+      }
+    },
+    onMcpConfirmationRequest: async ({ requestId, action }) => {
+      flushResponseStream("event");
+      setStatusSafely(
+        action.mode === "review"
+          ? "Codex is waiting for your Zotero review"
+          : "Codex is waiting for your Zotero approval",
+        "sending",
+      );
+      codexActivityTrace?.noteMcpConfirmationRequired(requestId, action);
+      const resolution = await showNativeMcpActionCard(body, requestId, action);
+      codexActivityTrace?.noteMcpConfirmationResolved(requestId, resolution);
+      return resolution;
+    },
+    onMcpSetupWarning: (message) => {
+      flushResponseStream("event");
+      setStatusSafely(message, "error");
+    },
+    onDiagnostics: (diagnostics) => {
+      flushResponseStream("event");
+      setStatusSafely(
+        formatCodexNativeDiagnosticsStatus(diagnostics),
+        "sending",
+      );
+    },
+    onApprovalRequest: async (request) => {
+      flushResponseStream("event");
+      return resolveCodexNativeApprovalWithOptionalReviewCard({
+        body,
+        request,
+        trace: codexActivityTrace,
+        setStatusSafely,
+      });
+    },
+  };
+}
+
 function createPanelUpdateHelpers(
   body: Element,
   item: Zotero.Item,
@@ -7160,49 +7355,22 @@ export async function retryLatestAssistantResponse(
       if (!chunk) return;
       responseStreamCoalescer?.pushText(chunk);
     };
-    const handleReasoning = (reasoningEvent: ReasoningEvent) => {
-      flushResponseStream("event");
-      if (reasoningEvent.summary) {
-        assistantMessage.reasoningSummary = appendReasoningPart(
-          assistantMessage.reasoningSummary,
-          reasoningEvent.summary,
-        );
+    const handleReasoning = createStreamReasoningHandler({
+      assistantMessage,
+      flushResponseStream,
+      queueRefresh,
+      onReasoningCaptured: () => {
         streamedReasoningSummary = assistantMessage.reasoningSummary;
-      }
-      if (reasoningEvent.details) {
-        assistantMessage.reasoningDetails = appendReasoningPart(
-          assistantMessage.reasoningDetails,
-          reasoningEvent.details,
-        );
         streamedReasoningDetails = assistantMessage.reasoningDetails;
-      }
-      queueRefresh();
-    };
-    const handleUsage = (usage: UsageStats) => {
-      recordContextCacheTelemetry(contextPlan.contextCache, usage);
-      const contextTokens =
-        typeof usage.contextTokens === "number" && usage.contextTokens > 0
-          ? usage.contextTokens
-          : 0;
-      if (contextTokens <= 0) return;
-      const snapshot = setContextUsageSnapshot(conversationKey, {
-        contextTokens,
-        contextWindow:
-          usage.contextWindow || finalPrepared.inputCap.limitTokens,
-        estimated: usage.contextWindowIsAuthoritative !== true,
-        source:
-          usage.contextWindowIsAuthoritative === true
-            ? "provider"
-            : "estimated",
-        contextWindowIsAuthoritative: usage.contextWindowIsAuthoritative,
-        cacheReadTokens: usage.cacheReadTokens,
-        cacheWriteTokens: usage.cacheWriteTokens,
-        cacheMissTokens: usage.cacheMissTokens,
-        cacheHitRatio: usage.cacheHitRatio,
-        cacheProvider: usage.cacheProvider,
-      });
-      renderContextUsageSnapshot(body, ui.tokenUsageEl, snapshot);
-    };
+      },
+    });
+    const handleUsage = createStreamUsageHandler({
+      body,
+      tokenUsageEl: ui.tokenUsageEl,
+      conversationKey,
+      contextCache: contextPlan.contextCache,
+      fallbackContextWindow: finalPrepared.inputCap.limitTokens,
+    });
     const answer = isCodexNativeTurn
       ? (
           await runCodexAppServerNativeTurn({
@@ -7240,100 +7408,16 @@ export async function retryLatestAssistantResponse(
               screenshots: allImages,
               attachments,
             }),
-            onSkillActivated: (skillId) => {
-              flushResponseStream("event");
-              codexActivityTrace?.noteSkillActivated(skillId);
-              setStatusSafely(`Codex skill activated: ${skillId}`, "sending");
-            },
-            onDelta: handleDelta,
-            onAgentMessageDelta: (event) => {
-              if (!codexActivityTrace?.appendAgentMessageDelta(event)) {
-                handleDelta(event.delta);
-              }
-            },
-            onReasoning: handleReasoning,
-            onUsage: handleUsage,
-            onItemStarted: (event) => {
-              flushResponseStream("event");
-              codexActivityTrace?.appendItemStatus(event, "started");
-              const itemType = sanitizeText(event.type || "");
-              if (itemType && !isCodexNativeAgentMessageItem(event)) {
-                setStatusSafely(`Codex: ${itemType} started`, "sending");
-              }
-            },
-            onItemCompleted: (event) => {
-              flushResponseStream("event");
-              codexActivityTrace?.noteAgentMessageCompleted(event);
-              codexActivityTrace?.appendItemStatus(event, "completed");
-              const itemType = sanitizeText(event.type || "");
-              if (itemType && !isCodexNativeAgentMessageItem(event)) {
-                setStatusSafely(`Codex: ${itemType} completed`, "sending");
-              }
-            },
-            onMcpToolActivity: (event) => {
-              flushResponseStream("event");
-              codexActivityTrace?.noteMcpToolActivity(event);
-              assistantMessage.quoteCitations = mergeQuoteCitations(
-                assistantMessage.quoteCitations,
-                event.quoteCitations,
-              );
-              const label =
-                sanitizeText(event.toolLabel || "").trim() ||
-                sanitizeText(event.toolName || "")
-                  .replace(/_/g, " ")
-                  .trim();
-              if (label) {
-                setStatusSafely(
-                  event.phase === "completed"
-                    ? `Codex: used ${label}`
-                    : `Codex: using ${label}`,
-                  "sending",
-                );
-              }
-            },
-            onMcpConfirmationRequest: async ({ requestId, action }) => {
-              flushResponseStream("event");
-              setStatusSafely(
-                action.mode === "review"
-                  ? "Codex is waiting for your Zotero review"
-                  : "Codex is waiting for your Zotero approval",
-                "sending",
-              );
-              codexActivityTrace?.noteMcpConfirmationRequired(
-                requestId,
-                action,
-              );
-              const resolution = await showNativeMcpActionCard(
-                body,
-                requestId,
-                action,
-              );
-              codexActivityTrace?.noteMcpConfirmationResolved(
-                requestId,
-                resolution,
-              );
-              return resolution;
-            },
-            onMcpSetupWarning: (message) => {
-              flushResponseStream("event");
-              setStatusSafely(message, "error");
-            },
-            onDiagnostics: (diagnostics) => {
-              flushResponseStream("event");
-              setStatusSafely(
-                formatCodexNativeDiagnosticsStatus(diagnostics),
-                "sending",
-              );
-            },
-            onApprovalRequest: async (request) => {
-              flushResponseStream("event");
-              return resolveCodexNativeApprovalWithOptionalReviewCard({
-                body,
-                request,
-                trace: codexActivityTrace,
-                setStatusSafely,
-              });
-            },
+            ...buildCodexNativeTurnCallbacks({
+              body,
+              assistantMessage,
+              codexActivityTrace,
+              flushResponseStream,
+              setStatusSafely,
+              handleDelta,
+              handleReasoning,
+              handleUsage,
+            }),
           })
         ).text
       : await callLLMStream(
@@ -7426,13 +7510,20 @@ export async function retryLatestAssistantResponse(
       screenshotImages.length,
     );
     // Preserve whatever streamed during the retry before the drop. Only fall
-    // back to restoring the previous answer when nothing new streamed.
+    // back to restoring the previous answer when nothing new streamed. The
+    // message-text fallback covers content that was flushed out of a
+    // coalescer torn down before the throw (same chain as the send path).
     const partialText = sanitizeText(
-      responseStreamCoalescer?.getFullText() || "",
+      responseStreamCoalescer?.getFullText() || assistantMessage.text || "",
     );
     responseStreamCoalescer?.cancel();
-    if (partialText.trim()) {
-      assistantMessage.text = partialText;
+    const outcome = resolveStreamInterruptionOutcome({
+      partialText,
+      errorMessage: errMsg,
+      retryHint,
+    });
+    if (outcome.interrupted) {
+      assistantMessage.text = outcome.text;
       assistantMessage.interrupted = true;
       assistantMessage.timestamp = Date.now();
       assistantMessage.modelName = effectiveRequestConfig.model;
@@ -9445,47 +9536,18 @@ export async function sendQuestion(
       if (!chunk) return;
       responseStreamCoalescer?.pushText(chunk);
     };
-    const handleReasoning = (reasoning: ReasoningEvent) => {
-      flushResponseStream("event");
-      if (reasoning.summary) {
-        assistantMessage.reasoningSummary = appendReasoningPart(
-          assistantMessage.reasoningSummary,
-          reasoning.summary,
-        );
-      }
-      if (reasoning.details) {
-        assistantMessage.reasoningDetails = appendReasoningPart(
-          assistantMessage.reasoningDetails,
-          reasoning.details,
-        );
-      }
-      queueRefresh();
-    };
-    const handleUsage = (usage: UsageStats) => {
-      recordContextCacheTelemetry(contextPlan.contextCache, usage);
-      const contextTokens =
-        typeof usage.contextTokens === "number" && usage.contextTokens > 0
-          ? usage.contextTokens
-          : 0;
-      if (contextTokens <= 0) return;
-      const snapshot = setContextUsageSnapshot(conversationKey, {
-        contextTokens,
-        contextWindow:
-          usage.contextWindow || finalPrepared.inputCap.limitTokens,
-        estimated: usage.contextWindowIsAuthoritative !== true,
-        source:
-          usage.contextWindowIsAuthoritative === true
-            ? "provider"
-            : "estimated",
-        contextWindowIsAuthoritative: usage.contextWindowIsAuthoritative,
-        cacheReadTokens: usage.cacheReadTokens,
-        cacheWriteTokens: usage.cacheWriteTokens,
-        cacheMissTokens: usage.cacheMissTokens,
-        cacheHitRatio: usage.cacheHitRatio,
-        cacheProvider: usage.cacheProvider,
-      });
-      renderContextUsageSnapshot(body, ui.tokenUsageEl, snapshot);
-    };
+    const handleReasoning = createStreamReasoningHandler({
+      assistantMessage,
+      flushResponseStream,
+      queueRefresh,
+    });
+    const handleUsage = createStreamUsageHandler({
+      body,
+      tokenUsageEl: ui.tokenUsageEl,
+      conversationKey,
+      contextCache: contextPlan.contextCache,
+      fallbackContextWindow: finalPrepared.inputCap.limitTokens,
+    });
     const answer = isCodexNativeTurn
       ? (
           await runCodexAppServerNativeTurn({
@@ -9522,100 +9584,16 @@ export async function sendQuestion(
               screenshots: allSendImages,
               attachments,
             }),
-            onSkillActivated: (skillId) => {
-              flushResponseStream("event");
-              codexActivityTrace?.noteSkillActivated(skillId);
-              setStatusSafely(`Codex skill activated: ${skillId}`, "sending");
-            },
-            onDelta: handleDelta,
-            onAgentMessageDelta: (event) => {
-              if (!codexActivityTrace?.appendAgentMessageDelta(event)) {
-                handleDelta(event.delta);
-              }
-            },
-            onReasoning: handleReasoning,
-            onUsage: handleUsage,
-            onItemStarted: (event) => {
-              flushResponseStream("event");
-              codexActivityTrace?.appendItemStatus(event, "started");
-              const itemType = sanitizeText(event.type || "");
-              if (itemType && !isCodexNativeAgentMessageItem(event)) {
-                setStatusSafely(`Codex: ${itemType} started`, "sending");
-              }
-            },
-            onItemCompleted: (event) => {
-              flushResponseStream("event");
-              codexActivityTrace?.noteAgentMessageCompleted(event);
-              codexActivityTrace?.appendItemStatus(event, "completed");
-              const itemType = sanitizeText(event.type || "");
-              if (itemType && !isCodexNativeAgentMessageItem(event)) {
-                setStatusSafely(`Codex: ${itemType} completed`, "sending");
-              }
-            },
-            onMcpToolActivity: (event) => {
-              flushResponseStream("event");
-              codexActivityTrace?.noteMcpToolActivity(event);
-              assistantMessage.quoteCitations = mergeQuoteCitations(
-                assistantMessage.quoteCitations,
-                event.quoteCitations,
-              );
-              const label =
-                sanitizeText(event.toolLabel || "").trim() ||
-                sanitizeText(event.toolName || "")
-                  .replace(/_/g, " ")
-                  .trim();
-              if (label) {
-                setStatusSafely(
-                  event.phase === "completed"
-                    ? `Codex: used ${label}`
-                    : `Codex: using ${label}`,
-                  "sending",
-                );
-              }
-            },
-            onMcpConfirmationRequest: async ({ requestId, action }) => {
-              flushResponseStream("event");
-              setStatusSafely(
-                action.mode === "review"
-                  ? "Codex is waiting for your Zotero review"
-                  : "Codex is waiting for your Zotero approval",
-                "sending",
-              );
-              codexActivityTrace?.noteMcpConfirmationRequired(
-                requestId,
-                action,
-              );
-              const resolution = await showNativeMcpActionCard(
-                body,
-                requestId,
-                action,
-              );
-              codexActivityTrace?.noteMcpConfirmationResolved(
-                requestId,
-                resolution,
-              );
-              return resolution;
-            },
-            onMcpSetupWarning: (message) => {
-              flushResponseStream("event");
-              setStatusSafely(message, "error");
-            },
-            onDiagnostics: (diagnostics) => {
-              flushResponseStream("event");
-              setStatusSafely(
-                formatCodexNativeDiagnosticsStatus(diagnostics),
-                "sending",
-              );
-            },
-            onApprovalRequest: async (request) => {
-              flushResponseStream("event");
-              return resolveCodexNativeApprovalWithOptionalReviewCard({
-                body,
-                request,
-                trace: codexActivityTrace,
-                setStatusSafely,
-              });
-            },
+            ...buildCodexNativeTurnCallbacks({
+              body,
+              assistantMessage,
+              codexActivityTrace,
+              flushResponseStream,
+              setStatusSafely,
+              handleDelta,
+              handleReasoning,
+              handleUsage,
+            }),
           })
         ).text
       : await callLLMStream(
