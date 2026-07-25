@@ -10,6 +10,12 @@ import {
   sanitizeRenderedMermaidSvgWithReason,
 } from "./mermaidSvg";
 import {
+  buildMermaidSvgCacheKey,
+  cacheMermaidSvg,
+  getCachedMermaidSvg,
+  invalidateMermaidSvg,
+} from "./mermaidSvgCache";
+import {
   openStandaloneMermaidWindow,
   openStandaloneSvgWindow,
 } from "./standaloneMermaidWindow";
@@ -1876,15 +1882,64 @@ async function renderMermaidBlocksNow(
   if (!previews.length) return;
   ensureMermaidThemeWatcher(doc, root);
 
+  // First pass: previews whose (version, theme, source) SVG is already cached
+  // are filled synchronously; chat rebuilds discard element state, so without
+  // this every refresh would re-invoke the Mermaid renderer per diagram. Only
+  // cache misses need the renderer at all.
+  const pendingPreviews: HTMLElement[] = [];
+  for (const preview of previews) {
+    const themeKey = getMermaidThemeKey(doc, preview);
+    if (
+      preview.dataset.mermaidState === "rendered" &&
+      getRenderedMermaidTheme(preview) === themeKey
+    ) {
+      continue;
+    }
+    if (!isStillInRenderedRoot(root, preview)) continue;
+    const source = preview.dataset.llmMermaidSource || "";
+    if (!source.trim()) continue;
+    const cacheKey = buildMermaidSvgCacheKey(
+      MERMAID_RENDER_VERSION,
+      themeKey,
+      source,
+    );
+    const cachedSvg = getCachedMermaidSvg(cacheKey);
+    if (cachedSvg === undefined) {
+      pendingPreviews.push(preview);
+      continue;
+    }
+    try {
+      setMermaidThemeDataset(preview, themeKey);
+      renderMermaidImagePreview(preview, doc, cachedSvg, themeKey, source);
+      preview.dataset.mermaidState = "rendered";
+    } catch (error) {
+      // Per-preview isolation, like the miss path: a cached SVG that throws
+      // on insertion (strict-XML innerHTML) must not stall the rest of the
+      // batch, and its entry must not be replayed on the next rebuild.
+      invalidateMermaidSvg(cacheKey);
+      setMermaidPreviewError(preview, error);
+      continue;
+    }
+    try {
+      options?.onContentRendered?.(preview);
+    } catch {
+      // Async layout hooks should not turn a successful Mermaid render into
+      // an error preview.
+    }
+  }
+  if (!pendingPreviews.length) return;
+
   let mermaid: Mermaid;
   try {
     mermaid = await getMermaidRenderer(doc);
   } catch (error) {
-    for (const preview of previews) setMermaidPreviewError(preview, error);
+    for (const preview of pendingPreviews) {
+      setMermaidPreviewError(preview, error);
+    }
     return;
   }
 
-  for (const preview of previews) {
+  for (const preview of pendingPreviews) {
     const themeKey = getMermaidThemeKey(doc, preview);
     if (
       preview.dataset.mermaidState === "rendered" &&
@@ -1898,6 +1953,11 @@ async function renderMermaidBlocksNow(
 
     preview.dataset.mermaidState = "rendering";
     setMermaidThemeDataset(preview, themeKey);
+    const cacheKey = buildMermaidSvgCacheKey(
+      MERMAID_RENDER_VERSION,
+      themeKey,
+      source,
+    );
     try {
       await initializeMermaidRenderer(mermaid, doc, themeKey);
       const svg = await renderMermaidSvgWithRetry(
@@ -1917,6 +1977,7 @@ async function renderMermaidBlocksNow(
         }
         continue;
       }
+      cacheMermaidSvg(cacheKey, sanitizedSvg.svg);
       if (!isStillInRenderedRoot(root, preview)) continue;
       renderMermaidImagePreview(
         preview,
@@ -1933,6 +1994,11 @@ async function renderMermaidBlocksNow(
         // an error preview.
       }
     } catch (error) {
+      // An entry cached just before a failed insertion is suspect — drop it
+      // so the failure cannot replay from cache on the next rebuild. Reaching
+      // this loop implies the key missed in pass 1, so a render error before
+      // caching makes this a no-op.
+      invalidateMermaidSvg(cacheKey);
       if (isStillInRenderedRoot(root, preview)) {
         setMermaidPreviewError(preview, error);
       }

@@ -82,6 +82,7 @@ function createDeps(params: {
     scheduleQueuedInputDrain: () => undefined,
     createPanelUpdateHelpers: () => ({
       refreshChatSafely: () => undefined,
+      refreshAssistantMessageSafely: () => undefined,
       setStatusSafely: (text) => {
         params.statuses.push(text);
       },

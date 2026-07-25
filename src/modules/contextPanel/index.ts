@@ -48,6 +48,12 @@ import { setupHandlers } from "./setupHandlers";
 import { ensureConversationLoaded, getConversationKey } from "./chat";
 import { renderShortcuts } from "./shortcuts";
 import { refreshChat } from "./chat";
+import {
+  beginChatRenderCycle,
+  claimAsyncChatRender,
+  claimDeferredChatRender,
+  currentChatRenderCycle,
+} from "./chatRenderCycle";
 import { persistPendingChatScrollRestoreFromBody } from "./chatScrollSnapshots";
 import {
   getActiveContextAttachmentFromTabs,
@@ -403,12 +409,16 @@ export function registerReaderContextPanel() {
           setupEmbeddedPanelHandlers(body, item);
           // Flag: onAsyncRender can skip the duplicate buildUI + setupHandlers.
           (body as any).__llmSyncRendered = true;
-          // Defer conversation loading and chat rendering
+          // Defer conversation loading and chat rendering. The render claim is
+          // shared with onAsyncRender so the conversation is only built once
+          // per cycle, and skipped entirely if a newer cycle supersedes this.
+          const chatRenderCycle = beginChatRenderCycle(body);
           void (async () => {
             try {
               if (resolvedState.item)
                 await ensureConversationLoaded(resolvedState.item);
               if (isStandaloneWindowActive()) return;
+              if (!claimDeferredChatRender(body, chatRenderCycle)) return;
               refreshChat(body, resolvedState.item);
             } catch (err) {
               ztoolkit.log("LLM: onRender async setup failed", err);
@@ -467,6 +477,12 @@ export function registerReaderContextPanel() {
       if (syncAlreadyRendered) {
         delete (body as any).__llmSyncRendered;
       }
+      // Captured in the same synchronous block as the flag so it is exactly
+      // the cycle begun by the onRender that set it; claiming is affine to
+      // this cycle so a stale async render cannot steal a newer cycle's claim.
+      const sharedChatRenderCycle = syncAlreadyRendered
+        ? currentChatRenderCycle(body)
+        : null;
       const contextRefreshOnly =
         (body as any).__llmContextRefreshOnly === true &&
         Boolean(body.querySelector("#llm-main"));
@@ -508,7 +524,9 @@ export function registerReaderContextPanel() {
           activeContextPanelStateSync.get(body)?.();
         }
       }
-      refreshChat(body, resolvedItem);
+      if (claimAsyncChatRender(body, sharedChatRenderCycle)) {
+        refreshChat(body, resolvedItem);
+      }
       markCompletedPanelLifecycleSignature(body, lifecycleSignature);
       // Defer content extraction so the panel becomes interactive sooner.
       const activeContextItem = getActiveContextAttachmentFromTabs();

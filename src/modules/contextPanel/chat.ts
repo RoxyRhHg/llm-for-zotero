@@ -112,6 +112,10 @@ import {
   type BlockStreamCoalescer,
   type BlockStreamFlushReason,
 } from "./blockStreamCoalescer";
+import {
+  getStreamInterruptionLabel,
+  resolveStreamInterruptionOutcome,
+} from "./streamInterruption";
 import type {
   ConversationSystem,
   GeneratedChatImage,
@@ -158,6 +162,7 @@ import type {
   ContextAssemblyStrategy,
   ResolvedContextSource,
 } from "./types";
+import { resolveTargetedAssistantRerenders } from "./targetedRerender";
 import {
   chatHistory,
   conversationForkLinks,
@@ -2663,6 +2668,7 @@ function createPanelUpdateHelpers(
   ui: PanelRequestUI,
 ): {
   refreshChatSafely: () => void;
+  refreshAssistantMessageSafely: (message: Message) => void;
   setStatusSafely: (
     text: string,
     kind: Parameters<typeof setStatus>[2],
@@ -2670,6 +2676,11 @@ function createPanelUpdateHelpers(
 } {
   const refreshChatSafely = () => {
     refreshConversationPanels(body, item);
+  };
+  const refreshAssistantMessageSafely = (message: Message) => {
+    refreshConversationPanels(body, item, {
+      chatOptions: { rerenderAssistantMessages: new Set([message]) },
+    });
   };
   const setStatusSafely = (
     text: string,
@@ -2679,6 +2690,7 @@ function createPanelUpdateHelpers(
   };
   return {
     refreshChatSafely,
+    refreshAssistantMessageSafely,
     setStatusSafely,
   };
 }
@@ -4648,6 +4660,7 @@ type AssistantMessageSnapshot = Pick<
   | "reasoningSummary"
   | "reasoningDetails"
   | "reasoningOpen"
+  | "interrupted"
   | "webchatRunState"
   | "webchatCompletionReason"
   | "quoteCitations"
@@ -4688,6 +4701,7 @@ function takeAssistantSnapshot(message: Message): AssistantMessageSnapshot {
     reasoningSummary: message.reasoningSummary,
     reasoningDetails: message.reasoningDetails,
     reasoningOpen: message.reasoningOpen,
+    interrupted: message.interrupted,
     webchatRunState: message.webchatRunState,
     webchatCompletionReason: message.webchatCompletionReason,
     quoteCitations: message.quoteCitations
@@ -4725,6 +4739,7 @@ function restoreAssistantSnapshot(
   message.reasoningSummary = snapshot.reasoningSummary;
   message.reasoningDetails = snapshot.reasoningDetails;
   message.reasoningOpen = snapshot.reasoningOpen;
+  message.interrupted = snapshot.interrupted;
   message.webchatRunState = snapshot.webchatRunState;
   message.webchatCompletionReason = snapshot.webchatCompletionReason;
   message.quoteCitations = snapshot.quoteCitations
@@ -4759,6 +4774,7 @@ function finalizeCancelledAssistantMessage(
     : false;
   message.pendingAgentTraceEvents = undefined;
   message.streaming = false;
+  message.interrupted = undefined;
   message.webchatRunState = undefined;
   message.webchatCompletionReason = null;
 }
@@ -6744,6 +6760,7 @@ export async function retryLatestAssistantResponse(
   const assistantMessage = retryPair.assistantMessage;
   const assistantSnapshot = takeAssistantSnapshot(assistantMessage);
   assistantMessage.text = "";
+  assistantMessage.interrupted = undefined;
   assistantMessage.reasoningSummary = undefined;
   assistantMessage.reasoningDetails = undefined;
   assistantMessage.reasoningOpen = isReasoningExpandedByDefault();
@@ -6793,12 +6810,8 @@ export async function retryLatestAssistantResponse(
     assistantMessage.modelProviderLabel === "Codex"
       ? Date.now()
       : undefined;
-  const { refreshChatSafely, setStatusSafely } = createPanelUpdateHelpers(
-    body,
-    item,
-    conversationKey,
-    ui,
-  );
+  const { refreshChatSafely, refreshAssistantMessageSafely, setStatusSafely } =
+    createPanelUpdateHelpers(body, item, conversationKey, ui);
 
   const historyForLLM = history.slice(0, retryPair.userIndex);
   const retrySelectedTextContexts = synthesizeSelectedTextContexts({
@@ -7073,7 +7086,12 @@ export async function retryLatestAssistantResponse(
       return;
     }
 
-    const queueRefresh = createQueuedRefresh(refreshChatSafely);
+    // Streaming flushes only mutate this assistant message, so re-render just
+    // its bubble; refreshChat falls back to a full rebuild if the wrapper is
+    // not in the DOM yet.
+    const queueRefresh = createQueuedRefresh(() =>
+      refreshAssistantMessageSafely(assistantMessage),
+    );
     const codexActivityTrace = isCodexNativeTurn
       ? createCodexNativeActivityTraceController(assistantMessage, queueRefresh)
       : null;
@@ -7364,6 +7382,7 @@ export async function retryLatestAssistantResponse(
     if (assistantMessage.compactMarker && !assistantMessage.text.trim()) {
       assistantMessage.text = "Conversation compacted";
     }
+    assistantMessage.interrupted = undefined;
     assistantMessage.streaming = false;
     refreshChatSafely();
 
@@ -7401,12 +7420,54 @@ export async function retryLatestAssistantResponse(
       return;
     }
 
-    restoreOriginalAssistant();
     const errMsg = (err as Error).message || "Error";
     const retryHint = resolveMultimodalRetryHint(
       errMsg,
       screenshotImages.length,
     );
+    // Preserve whatever streamed during the retry before the drop. Only fall
+    // back to restoring the previous answer when nothing new streamed.
+    const partialText = sanitizeText(
+      responseStreamCoalescer?.getFullText() || "",
+    );
+    responseStreamCoalescer?.cancel();
+    if (partialText.trim()) {
+      assistantMessage.text = partialText;
+      assistantMessage.interrupted = true;
+      assistantMessage.timestamp = Date.now();
+      assistantMessage.modelName = effectiveRequestConfig.model;
+      assistantMessage.modelEntryId = effectiveRequestConfig.modelEntryId;
+      assistantMessage.modelProviderLabel =
+        effectiveRequestConfig.modelProviderLabel;
+      assistantMessage.reasoningSummary = streamedReasoningSummary;
+      assistantMessage.reasoningDetails = streamedReasoningDetails;
+      assistantMessage.reasoningOpen = isReasoningExpandedByDefault();
+      assistantMessage.streaming = false;
+      refreshChatSafely();
+      const latestContextSnapshot = contextUsageSnapshots.get(conversationKey);
+      await updateStoredLatestAssistantMessageByConversation(
+        conversationKey,
+        {
+          text: assistantMessage.text,
+          timestamp: assistantMessage.timestamp,
+          runMode: assistantMessage.runMode,
+          agentRunId: assistantMessage.agentRunId,
+          modelName: assistantMessage.modelName,
+          modelEntryId: assistantMessage.modelEntryId,
+          modelProviderLabel: assistantMessage.modelProviderLabel,
+          reasoningSummary: assistantMessage.reasoningSummary,
+          reasoningDetails: assistantMessage.reasoningDetails,
+          compactMarker: assistantMessage.compactMarker,
+          contextTokens: latestContextSnapshot?.contextTokens,
+          contextWindow: latestContextSnapshot?.contextWindow,
+          quoteCitations: assistantMessage.quoteCitations,
+          generatedImages: assistantMessage.generatedImages,
+        },
+        effectiveStorageSystem,
+      );
+    } else {
+      restoreOriginalAssistant();
+    }
     setStatusSafely(
       `Retry failed: ${`${errMsg}${retryHint}`.slice(0, 48)}`,
       "error",
@@ -9040,12 +9101,8 @@ export async function sendQuestion(
   if (history.length > PERSISTED_HISTORY_LIMIT) {
     history.splice(0, history.length - PERSISTED_HISTORY_LIMIT);
   }
-  const { refreshChatSafely, setStatusSafely } = createPanelUpdateHelpers(
-    body,
-    item,
-    conversationKey,
-    ui,
-  );
+  const { refreshChatSafely, refreshAssistantMessageSafely, setStatusSafely } =
+    createPanelUpdateHelpers(body, item, conversationKey, ui);
   refreshChatSafely();
 
   let assistantPersisted = false;
@@ -9091,7 +9148,9 @@ export async function sendQuestion(
 
   // [webchat] Dedicated pipeline — bypass context assembly, send raw PDF + question
   if (effectiveRequestConfig.providerProtocol === "web_sync") {
-    const webChatQueueRefresh = createQueuedRefresh(refreshChatSafely);
+    const webChatQueueRefresh = createQueuedRefresh(() =>
+      refreshAssistantMessageSafely(assistantMessage),
+    );
     const reportWebChatSendOutcome = (
       outcome: "success" | "failed" | "cancelled",
     ) => {
@@ -9311,7 +9370,12 @@ export async function sendQuestion(
       return;
     }
 
-    const queueRefresh = createQueuedRefresh(refreshChatSafely);
+    // Streaming flushes only mutate this assistant message, so re-render just
+    // its bubble; refreshChat falls back to a full rebuild if the wrapper is
+    // not in the DOM yet.
+    const queueRefresh = createQueuedRefresh(() =>
+      refreshAssistantMessageSafely(assistantMessage),
+    );
     const codexActivityTrace = isCodexNativeTurn
       ? createCodexNativeActivityTraceController(assistantMessage, queueRefresh)
       : null;
@@ -9596,6 +9660,7 @@ export async function sendQuestion(
     if (assistantMessage.compactMarker && !assistantMessage.text.trim()) {
       assistantMessage.text = "Conversation compacted";
     }
+    assistantMessage.interrupted = undefined;
     assistantMessage.streaming = false;
     refreshChatSafely();
     await persistAssistantOnce();
@@ -9646,8 +9711,19 @@ export async function sendQuestion(
 
     const errMsg = (err as Error).message || "Error";
     const retryHint = resolveMultimodalRetryHint(errMsg, imageCount);
+    // Preserve whatever streamed before the connection dropped instead of
+    // discarding it. getFullText() includes the last, not-yet-flushed chunk.
+    const partialText = sanitizeText(
+      responseStreamCoalescer?.getFullText() || assistantMessage.text || "",
+    );
     responseStreamCoalescer?.cancel();
-    assistantMessage.text = `Error: ${errMsg}${retryHint}`;
+    const outcome = resolveStreamInterruptionOutcome({
+      partialText,
+      errorMessage: errMsg,
+      retryHint,
+    });
+    assistantMessage.text = outcome.text;
+    assistantMessage.interrupted = outcome.interrupted;
     assistantMessage.streaming = false;
     refreshChatSafely();
     await persistAssistantOnce();
@@ -9918,28 +9994,14 @@ export function refreshChat(
         : buildChatScrollSnapshot(chatBox);
   const history = chatHistory.get(conversationKey) || [];
   const requestedRerenders = options.rerenderAssistantMessages;
-  const targetedMessageWrappers = new Map<Message, HTMLElement>();
-  let useTargetedRerender = Boolean(requestedRerenders?.size);
-  if (useTargetedRerender) {
-    const renderedWrappers = Array.from(chatBox.children) as HTMLElement[];
-    for (const message of requestedRerenders || []) {
-      const messageIndex = history.indexOf(message);
-      if (message.role !== "assistant" || messageIndex < 0) {
-        useTargetedRerender = false;
-        break;
-      }
-      const wrapper = renderedWrappers.find(
-        (candidate) =>
-          candidate.dataset.messageRole === "assistant" &&
-          candidate.dataset.messageIndex === `${messageIndex}`,
-      );
-      if (!wrapper) {
-        useTargetedRerender = false;
-        break;
-      }
-      targetedMessageWrappers.set(message, wrapper);
-    }
-  }
+  const { useTargetedRerender, targetedMessageWrappers } =
+    resolveTargetedAssistantRerenders(
+      history,
+      requestedRerenders,
+      requestedRerenders?.size
+        ? (Array.from(chatBox.children) as HTMLElement[])
+        : [],
+    );
   const forkLink = conversationForkLinks.get(conversationKey) || null;
   if (tokenUsageEl && !useTargetedRerender) {
     const snapshot = contextUsageSnapshots.get(conversationKey);
@@ -9953,6 +10015,15 @@ export function refreshChat(
       tokenUsageEl,
       liveSnapshot || recomputedSnapshot || snapshot,
     );
+  } else if (tokenUsageEl) {
+    // Targeted streaming refreshes reach every panel showing the conversation,
+    // but mid-stream usage events render only into the initiating panel's
+    // counter. Sync the others from the live snapshot when one exists — never
+    // the O(history) estimate, which would defeat the targeted render.
+    const snapshot = contextUsageSnapshots.get(conversationKey);
+    if (snapshot && snapshot.source !== "persisted") {
+      renderContextUsageSnapshot(body, tokenUsageEl, snapshot);
+    }
   }
 
   if (history.length === 0) {
@@ -11293,6 +11364,19 @@ export function refreshChat(
       }
     }
 
+    // Interrupted footer — a streamed reply was cut off before completion (e.g.
+    // a connectivity drop); the partial content above is preserved. Distinct
+    // from the webchat status row above.
+    let interruptedRow: HTMLDivElement | null = null;
+    if (!isUser && msg.interrupted) {
+      interruptedRow = doc.createElement("div") as HTMLDivElement;
+      interruptedRow.className = "llm-message-interrupted-row";
+      const note = doc.createElement("span") as HTMLSpanElement;
+      note.className = "llm-message-interrupted-note";
+      note.textContent = `⚠ ${getStreamInterruptionLabel()}`;
+      interruptedRow.appendChild(note);
+    }
+
     if (isUser && inlineEditEl) {
       wrapper.appendChild(inlineEditEl);
     } else {
@@ -11300,6 +11384,7 @@ export function refreshChat(
     }
     wrapper.appendChild(meta);
     if (webchatStatusRow) wrapper.appendChild(webchatStatusRow);
+    if (interruptedRow) wrapper.appendChild(interruptedRow);
     const existingTargetedWrapper = targetedMessageWrappers.get(msg);
     if (useTargetedRerender && existingTargetedWrapper) {
       existingTargetedWrapper.replaceWith(wrapper);
@@ -11353,12 +11438,17 @@ export function refreshConversationPanels(
   options: {
     includeChat?: boolean;
     includePanelState?: boolean;
+    chatOptions?: RefreshChatOptions;
   } = {},
 ): void {
-  const { includeChat = true, includePanelState = false } = options;
+  const {
+    includeChat = true,
+    includePanelState = false,
+    chatOptions,
+  } = options;
   if (!primaryItem) {
     if (includeChat) {
-      refreshChat(primaryBody, primaryItem);
+      refreshChat(primaryBody, primaryItem, chatOptions);
     }
     if (includePanelState) {
       activeContextPanelStateSync.get(primaryBody)?.();
@@ -11385,7 +11475,7 @@ export function refreshConversationPanels(
     const syncPanelState = activeContextPanelStateSync.get(body);
     const updatePanel = () => {
       if (includeChat) {
-        refreshChat(body, item);
+        refreshChat(body, item, chatOptions);
       }
       if (includePanelState) {
         syncPanelState?.();

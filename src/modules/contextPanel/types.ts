@@ -102,6 +102,13 @@ export interface Message {
   reasoningSummary?: string;
   reasoningDetails?: string;
   reasoningOpen?: boolean;
+  /**
+   * Set when a streamed reply was cut off before completion (e.g. a mid-stream
+   * connectivity drop). The partial text stays in `text`; this drives a neutral
+   * "interrupted" footer. Session-only — the preserved text persists via the
+   * normal `text` column, but this flag is not stored across restarts.
+   */
+  interrupted?: boolean;
   webchatRunState?: "done" | "incomplete" | "error";
   webchatCompletionReason?:
     | "settled"

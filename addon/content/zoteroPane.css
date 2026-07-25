@@ -872,6 +872,18 @@
   cursor: default;
 }
 
+/* ---- Interrupted reply footer (streamed reply cut off before completion) ---- */
+.llm-message-interrupted-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 2px 4px 0;
+}
+.llm-message-interrupted-note {
+  font-size: var(--llm-fs-10, 10px);
+  color: #d77757;
+}
+
 .llm-subtitle {
   font-size: var(--llm-fs-11);
   color: var(--fill-secondary);

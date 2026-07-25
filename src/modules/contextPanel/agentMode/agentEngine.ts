@@ -217,6 +217,7 @@ type StatusKind = "ready" | "sending" | "error" | "warning";
 
 type PanelUpdateHelpers = {
   refreshChatSafely: () => void;
+  refreshAssistantMessageSafely: (message: Message) => void;
   setStatusSafely: (text: string, kind: StatusKind) => void;
 };
 
@@ -901,13 +902,14 @@ export async function sendAgentTurn(
       : undefined,
   };
   historyForRun.push(assistantMessage);
-  const { refreshChatSafely, setStatusSafely } = deps.createPanelUpdateHelpers(
-    body,
-    item,
-    conversationKey,
-    ui,
+  const { refreshChatSafely, refreshAssistantMessageSafely, setStatusSafely } =
+    deps.createPanelUpdateHelpers(body, item, conversationKey, ui);
+  // Streaming flushes only mutate this assistant message, so re-render just
+  // its bubble; refreshChat falls back to a full rebuild if the wrapper is
+  // not in the DOM yet.
+  const queueRefresh = deps.createQueuedRefresh(() =>
+    refreshAssistantMessageSafely(assistantMessage),
   );
-  const queueRefresh = deps.createQueuedRefresh(refreshChatSafely);
   const messageDeltaCoalescer = createBlockStreamCoalescer({
     onBlock: (block) => {
       appendPendingFinalText(assistantMessage, block, deps.sanitizeText);
@@ -1663,13 +1665,14 @@ export async function retryAgentTurn(
       ? buildPendingAgentTraceEvents(body)
       : undefined;
 
-  const { refreshChatSafely, setStatusSafely } = deps.createPanelUpdateHelpers(
-    body,
-    item,
-    conversationKey,
-    ui,
+  const { refreshChatSafely, refreshAssistantMessageSafely, setStatusSafely } =
+    deps.createPanelUpdateHelpers(body, item, conversationKey, ui);
+  // Streaming flushes only mutate this assistant message, so re-render just
+  // its bubble; refreshChat falls back to a full rebuild if the wrapper is
+  // not in the DOM yet.
+  const queueRefresh = deps.createQueuedRefresh(() =>
+    refreshAssistantMessageSafely(assistantMessage),
   );
-  const queueRefresh = deps.createQueuedRefresh(refreshChatSafely);
   const messageDeltaCoalescer = createBlockStreamCoalescer({
     onBlock: (block) => {
       appendPendingFinalText(assistantMessage, block, deps.sanitizeText);
