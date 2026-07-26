@@ -16,6 +16,7 @@ import type {
   WorkflowTestAssistantRenderResult,
   WorkflowTestAttachmentFixture,
   WorkflowTestDiagnostics,
+  WorkflowTestDraftRefreshDiagnostics,
   WorkflowTestDuplicatePanelSetupDiagnostics,
   WorkflowTestFixture,
   WorkflowTestHighlightAwareRetrievalDiagnostics,
@@ -653,6 +654,37 @@ async function exerciseDuplicatePanelSetup(
       panelRootAfter?.dataset.handlersInitialized || "",
     panelStateSyncBefore,
     panelStateSyncAfter: activeContextPanelStateSync.has(panel.body),
+  };
+}
+
+async function exercisePanelDraftStateRefresh(
+  panelId: string,
+  text: string,
+): Promise<WorkflowTestDraftRefreshDiagnostics> {
+  assertWorkflowTestEnabled();
+  const panel = getPanel(panelId);
+  const panelRoot = panel.body.querySelector("#llm-main") as HTMLElement | null;
+  const input = panel.body.querySelector(
+    "#llm-input",
+  ) as HTMLTextAreaElement | null;
+  if (!panelRoot || !input) {
+    throw new Error(`Panel ${panelId} has no mounted composer`);
+  }
+  const syncPanelState = activeContextPanelStateSync.get(panel.body);
+  if (!syncPanelState) {
+    throw new Error(`Panel ${panelId} has no state-sync callback`);
+  }
+
+  input.value = text;
+  const eventCtor = panel.body.ownerDocument.defaultView?.Event ?? Event;
+  input.dispatchEvent(new eventCtor("input", { bubbles: true }));
+  const inputBeforeRefresh = input.value;
+  syncPanelState();
+
+  return {
+    webChatMode: panelRoot.dataset.webchatMode === "true",
+    inputBeforeRefresh,
+    inputAfterRefresh: input.value,
   };
 }
 
@@ -2216,6 +2248,7 @@ export function installWorkflowTestHarness(targetAddon: {
     startNewPanelConversation,
     togglePanelConversationMode,
     exerciseDuplicatePanelSetup,
+    exercisePanelDraftStateRefresh,
     seedPanelStoredUserMessage,
     clickPanelSystemToggle,
     clickPanelSystemTogglesRapidly,

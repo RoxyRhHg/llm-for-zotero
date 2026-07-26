@@ -392,6 +392,12 @@ export const draftInputCache = new TTLMap<number, string>(
   24 * 60 * 60 * 1000,
   100,
 );
+// WebChat drafts stay local and isolated from the normal paper-chat composer.
+// They use the same bounded lifetime as other unsent drafts.
+export const webChatDraftInputCache = new TTLMap<number, string>(
+  24 * 60 * 60 * 1000,
+  100,
+);
 export const selectedTextCache = new Map<number, SelectedTextContext[]>();
 export const selectedTextPreviewExpandedCache = new Map<number, number>();
 export const selectedNotePreviewExpandedCache = new Map<number, boolean>();
@@ -511,6 +517,7 @@ export function clearAllState(): void {
   activeGlobalConversationByLibrary.clear();
   activeConversationModeByLibrary.clear();
   draftInputCache.clear();
+  webChatDraftInputCache.clear();
   selectedTextCache.clear();
   selectedTextPreviewExpandedCache.clear();
   selectedNotePreviewExpandedCache.clear();

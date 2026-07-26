@@ -49,6 +49,12 @@ export type WorkflowTestDuplicatePanelSetupDiagnostics = {
   panelStateSyncAfter: boolean;
 };
 
+export type WorkflowTestDraftRefreshDiagnostics = {
+  webChatMode: boolean;
+  inputBeforeRefresh: string;
+  inputAfterRefresh: string;
+};
+
 export type WorkflowTestRuntimeGeometry = {
   containerWidth: number;
   fontScale: number;
@@ -208,6 +214,10 @@ export type WorkflowTestApi = {
   exerciseDuplicatePanelSetup: (
     panelId: string,
   ) => Promise<WorkflowTestDuplicatePanelSetupDiagnostics>;
+  exercisePanelDraftStateRefresh: (
+    panelId: string,
+    text: string,
+  ) => Promise<WorkflowTestDraftRefreshDiagnostics>;
   seedPanelStoredUserMessage: (
     panelId: string,
     text: string,

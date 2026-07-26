@@ -99,6 +99,7 @@ import {
   activeGlobalConversationByLibrary,
   activePaperConversationByPaper,
   draftInputCache,
+  webChatDraftInputCache,
   activeContextPanels,
   activeContextPanelRawItems,
   activeContextPanelStateSync,
@@ -2387,10 +2388,13 @@ export function setupHandlers(
   ) => {
     if (!Number.isFinite(conversationKey) || conversationKey <= 0) return;
     const normalizedKey = Math.floor(conversationKey);
+    const cache = isWebChatModeActive()
+      ? webChatDraftInputCache
+      : draftInputCache;
     if (value) {
-      draftInputCache.set(normalizedKey, value);
+      cache.set(normalizedKey, value);
     } else {
-      draftInputCache.delete(normalizedKey);
+      cache.delete(normalizedKey);
     }
   };
   const persistDraftInputForCurrentConversation = () => {
@@ -2400,7 +2404,6 @@ export function setupHandlers(
     // Don't persist the edit-mode text as a draft; the real draft was saved in
     // inlineEditSavedDraft when edit mode was entered.
     if (!item || !inputBox || inlineEditTarget) return;
-    if (isWebChatModeActive()) return;
     setDraftInputForConversation(getConversationKey(item), inputBox.value);
   };
   const restoreDraftInputForCurrentConversation = () => {
@@ -2409,16 +2412,15 @@ export function setupHandlers(
     // in inlineEditSavedDraft when edit mode was entered and will be restored by
     // inlineEditCleanup when the edit session ends.
     if (inlineEditTarget) return;
-    if (isWebChatModeActive()) {
-      inputBox.value = "";
-      resizeTextareaToContent(inputBox);
-      return;
-    }
-    inputBox.value = draftInputCache.get(getConversationKey(item)) || "";
+    const cache = isWebChatModeActive()
+      ? webChatDraftInputCache
+      : draftInputCache;
+    inputBox.value = cache.get(getConversationKey(item)) || "";
     resizeTextareaToContent(inputBox);
   };
   const clearDraftInputState = (itemId: number) => {
     draftInputCache.delete(itemId);
+    webChatDraftInputCache.delete(itemId);
   };
   const retainPinnedImageState = (itemId: number) =>
     retainPinnedImageState_(pinnedImageKeys, itemId);
@@ -3646,12 +3648,10 @@ export function setupHandlers(
     chip.dataset.fullText = fullText ? "true" : "false";
     chip.classList.toggle("llm-paper-context-chip-full", fullText);
     chip.dataset.contentSource = contentSourceMode;
-    chip.classList.add(
-      getContextSourceModeCssClassName(
-        isWebChatMode() && contentSourceMode === "pdf" && !fullText
-          ? "text"
-          : contentSourceMode,
-      ),
+    chip.classList.add(getContextSourceModeCssClassName(contentSourceMode));
+    chip.classList.toggle(
+      "llm-paper-context-chip-webchat-inactive",
+      isWebChatMode() && contentSourceMode === "pdf" && !fullText,
     );
     chip.classList.add("collapsed");
 
@@ -5371,6 +5371,7 @@ export function setupHandlers(
   const resetCurrentWebChatConversation = () => {
     if (!item) return;
     const key = getConversationKey(item);
+    webChatDraftInputCache.delete(key);
     webChatIsolatedConversationKeys.add(key);
     chatHistory.set(key, []);
     loadedConversationKeys.add(key);
@@ -5393,6 +5394,7 @@ export function setupHandlers(
     }
     loadedConversationKeys.add(key);
     if (!hadWebChatSession) {
+      webChatDraftInputCache.delete(key);
       markNextWebChatSendAsNewChat();
       primeFreshWebChatPaperChipState();
       if (inputBox && !inlineEditTarget) {

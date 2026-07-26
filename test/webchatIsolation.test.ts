@@ -311,6 +311,7 @@ describe("webchat isolation", function () {
     assert.isAbove(resetEnd, resetStart);
     assert.include(resetBlock, "chatHistory.set(key, []);");
     assert.include(resetBlock, "markNextWebChatSendAsNewChat();");
+    assert.include(resetBlock, "webChatDraftInputCache.delete(key);");
 
     const controllerSource = readFileSync(
       resolve(
@@ -412,5 +413,65 @@ describe("webchat isolation", function () {
       "initializeWebChatConversationForCurrentItem();",
     );
     assert.notInclude(webchatBlock, "switchPaperConversation()");
+  });
+
+  it("preserves an unsent webchat draft during panel state refreshes", function () {
+    const source = readFileSync(
+      resolve(here, "../src/modules/contextPanel/setupHandlers.ts"),
+      "utf8",
+    );
+    const setterStart = source.indexOf("const setDraftInputForConversation =");
+    const persistStart = source.indexOf(
+      "const persistDraftInputForCurrentConversation = () => {",
+      setterStart,
+    );
+    const restoreStart = source.indexOf(
+      "const restoreDraftInputForCurrentConversation = () => {",
+      persistStart,
+    );
+    const clearStart = source.indexOf(
+      "const clearDraftInputState =",
+      restoreStart,
+    );
+    const setterBlock = source.slice(setterStart, persistStart);
+    const persistBlock = source.slice(persistStart, restoreStart);
+    const restoreBlock = source.slice(restoreStart, clearStart);
+    const panelSyncStart = source.indexOf(
+      "const syncConversationPanelState = () => {",
+    );
+    const panelSyncEnd = source.indexOf(
+      "activeContextPanelStateSync.set(body, syncConversationPanelState);",
+      panelSyncStart,
+    );
+    const panelSyncBlock = source.slice(panelSyncStart, panelSyncEnd);
+
+    assert.isAtLeast(setterStart, 0);
+    assert.isAbove(persistStart, setterStart);
+    assert.isAbove(restoreStart, persistStart);
+    assert.isAbove(clearStart, restoreStart);
+    assert.notInclude(
+      persistBlock,
+      "if (isWebChatModeActive()) return;",
+      "typed WebChat drafts must be cached",
+    );
+    assert.include(
+      setterBlock,
+      "webChatDraftInputCache",
+      "WebChat drafts must remain isolated from normal paper-chat drafts",
+    );
+    assert.notInclude(
+      restoreBlock,
+      'inputBox.value = "";',
+      "a background refresh must not erase a WebChat draft",
+    );
+    assert.include(
+      restoreBlock,
+      "webChatDraftInputCache",
+      "panel refreshes must restore the isolated WebChat draft",
+    );
+    assert.include(
+      panelSyncBlock,
+      "restoreDraftInputForCurrentConversation();",
+    );
   });
 });
