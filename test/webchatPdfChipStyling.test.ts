@@ -11,7 +11,7 @@ function source(path: string): string {
 }
 
 describe("WebChat PDF chip styling", function () {
-  it("keeps the PDF source class after its one-shot upload is consumed", function () {
+  it("keeps the PDF source class after a successful upload switches to prompt-only mode", function () {
     const setupHandlers = source("src/modules/contextPanel/setupHandlers.ts");
 
     assert.equal(
@@ -39,5 +39,28 @@ describe("WebChat PDF chip styling", function () {
       css,
       /\.llm-paper-context-chip\.llm-paper-context-chip-pdf\.llm-paper-context-chip-webchat-inactive\s+\.llm-paper-context-chip-header\s*\{[\s\S]*?background:\s*transparent;/,
     );
+  });
+
+  it("updates the inactive surface immediately when right-click toggles PDF sending", function () {
+    const controller = source(
+      "src/modules/contextPanel/setupHandlers/controllers/composePreviewInteractionController.ts",
+    );
+
+    assert.match(
+      controller,
+      /paperChip\.classList\.toggle\(\s*"llm-paper-context-chip-webchat-inactive",\s*deps\.isWebChatMode\(\)\s*&&\s*contentSource\s*===\s*"pdf"\s*&&\s*!nextIsFullText,/,
+    );
+    assert.match(controller, /Next query will attach this PDF\./);
+    assert.notMatch(
+      controller,
+      /WebChat only requires uploading PDF once per session/,
+    );
+  });
+
+  it("documents that any later turn can attach the current PDF again", function () {
+    const i18n = source("src/utils/i18n.ts");
+
+    assert.include(i18n, "attach the current PDF again");
+    assert.notInclude(i18n, "uploaded only once per webchat session");
   });
 });

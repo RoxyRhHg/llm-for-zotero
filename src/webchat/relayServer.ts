@@ -115,6 +115,12 @@ export interface RelayTurnDiagnostic {
   streamObserved?: boolean | null;
   userTurnMatched?: boolean | null;
   assistantTurnMatched?: boolean | null;
+  attachmentFilename?: string | null;
+  attachmentMethod?: string | null;
+  attachmentVerificationMs?: number | null;
+  attachmentPreviewVerified?: boolean | null;
+  submittedAttachmentVerified?: boolean | null;
+  completionDetectionMs?: number | null;
 }
 
 export interface RelayState {
@@ -739,6 +745,28 @@ function normalizeTurnDiagnostic(
     streamObserved: readNullableBoolean(raw.streamObserved),
     userTurnMatched: readNullableBoolean(raw.userTurnMatched),
     assistantTurnMatched: readNullableBoolean(raw.assistantTurnMatched),
+    attachmentFilename: readNullableString(raw.attachmentFilename),
+    attachmentMethod: readNullableString(raw.attachmentMethod),
+    attachmentVerificationMs:
+      raw.attachmentVerificationMs == null
+        ? null
+        : Math.max(
+          0,
+          Math.floor(Number(raw.attachmentVerificationMs) || 0),
+        ),
+    attachmentPreviewVerified: readNullableBoolean(
+      raw.attachmentPreviewVerified,
+    ),
+    submittedAttachmentVerified: readNullableBoolean(
+      raw.submittedAttachmentVerified,
+    ),
+    completionDetectionMs:
+      raw.completionDetectionMs == null
+        ? null
+        : Math.max(
+          0,
+          Math.floor(Number(raw.completionDetectionMs) || 0),
+        ),
   };
   const hasValue = Object.values(diagnostic).some(
     (value) => value !== null && value !== undefined,
@@ -884,6 +912,11 @@ const SubmitQueryEndpoint = createEndpoint(["POST"], (opts) => {
   S().query.pdf_filename = (body.pdf_filename as string) || null;
   S().query.images = (body.images as string[]) || null;
   S().query.chatgpt_mode = (body.chatgpt_mode as string) || null;
+  S().query.target =
+    (body.target as string) || S().active_target || null;
+  if (body.target) {
+    S().active_target = body.target as string;
+  }
   S().query.force_new_chat = body.force_new_chat === true;
   S().query.attempt = 0;
   S().query.phase = "pending";

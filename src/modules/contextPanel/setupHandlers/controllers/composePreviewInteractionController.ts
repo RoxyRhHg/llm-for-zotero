@@ -525,18 +525,19 @@ export function attachComposePreviewInteractionController(
       paperChip.dataset.fullText = nextIsFullText ? "true" : "false";
       paperChip.classList.toggle("llm-paper-context-chip-full", nextIsFullText);
       if (contentSource === "pdf") {
-        paperChip.classList.toggle(
-          "llm-paper-context-chip-pdf",
-          nextIsFullText,
-        );
+        paperChip.classList.add("llm-paper-context-chip-pdf");
       }
+      paperChip.classList.toggle(
+        "llm-paper-context-chip-webchat-inactive",
+        deps.isWebChatMode() &&
+          contentSource === "pdf" &&
+          !nextIsFullText,
+      );
       deps.closePaperChipMenu();
       if (deps.isWebChatMode() && contentSource === "pdf") {
         setStatus(
           nextIsFullText
-            ? t(
-                "WebChat only requires uploading PDF once per session. If already uploaded, no need to send again.",
-              )
+            ? t("Next query will attach this PDF.")
             : t("Next query will not attach PDF."),
           "ready",
         );

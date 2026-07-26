@@ -215,13 +215,6 @@ type SendFlowControllerDeps = {
     item: Zotero.Item,
     paperContexts?: PaperContextRef[],
   ) => PaperContextRef[];
-  hasUploadedPdfInCurrentWebChatConversation?: () => boolean;
-  getUploadedWebChatPdfSourceKeys?: () => readonly string[];
-  isWebChatPdfUploadStateUnknown?: () => boolean;
-  markWebChatPdfUploadStateUnknown?: () => void;
-  markWebChatPdfUploadedForCurrentConversation?: (
-    paperContexts: readonly PaperContextRef[],
-  ) => void;
   consumeWebChatForceNewChatIntent?: () => boolean;
   markWebChatForceNewChatIntent?: () => void;
 };
@@ -309,48 +302,9 @@ export function createSendFlowController(deps: SendFlowControllerDeps): {
             ? pdfModePaperContexts
             : []))
         : [];
-      const activeWebChatPdfSourceKeys = activeWebChatPdfPaperContexts.map(
-        (paperContext) =>
-          `zotero-pdf:${paperContext.itemId}:${paperContext.contextItemId}`,
-      );
-      const uploadedWebChatPdfSourceKeys = isWebChat
-        ? deps.getUploadedWebChatPdfSourceKeys?.() || []
-        : [];
-      const isWebChatPdfUploadStateUnknown = isWebChat
-        ? (deps.isWebChatPdfUploadStateUnknown?.() ?? false)
-        : false;
-      const uploadedWebChatPdfMatches =
-        uploadedWebChatPdfSourceKeys.length ===
-          activeWebChatPdfSourceKeys.length &&
-        uploadedWebChatPdfSourceKeys.every(
-          (sourceKey, index) => sourceKey === activeWebChatPdfSourceKeys[index],
-        );
       if (isWebChat && activeWebChatPdfPaperContexts.length > 1) {
         deps.setStatusMessage?.(
           "Web chat supports one PDF attachment at a time. Keep one PDF active or start separate chats.",
-          "error",
-        );
-        return;
-      }
-      if (
-        isWebChat &&
-        activeWebChatPdfPaperContexts.length > 0 &&
-        isWebChatPdfUploadStateUnknown
-      ) {
-        deps.setStatusMessage?.(
-          "This web chat may already contain a different PDF. Start a new web chat before attaching the selected PDF.",
-          "error",
-        );
-        return;
-      }
-      if (
-        isWebChat &&
-        activeWebChatPdfPaperContexts.length > 0 &&
-        uploadedWebChatPdfSourceKeys.length > 0 &&
-        !uploadedWebChatPdfMatches
-      ) {
-        deps.setStatusMessage?.(
-          "The selected PDF differs from the PDF already attached to this web chat. Start a new web chat before sending.",
           "error",
         );
         return;
@@ -726,13 +680,8 @@ export function createSendFlowController(deps: SendFlowControllerDeps): {
       const webchatForceNewChat = isWebChat
         ? (deps.consumeWebChatForceNewChatIntent?.() ?? false)
         : false;
-      const hasUploadedMatchingWebChatPdf =
-        uploadedWebChatPdfSourceKeys.length > 0
-          ? uploadedWebChatPdfMatches
-          : (deps.hasUploadedPdfInCurrentWebChatConversation?.() ?? false);
       const webchatSendPdf = isWebChat
-        ? activeWebChatPdfPaperContexts.length > 0 &&
-          (webchatForceNewChat || !hasUploadedMatchingWebChatPdf)
+        ? activeWebChatPdfPaperContexts.length > 0
         : false;
 
       const consumedForcedSkillIds = deps.consumeForcedSkillIds?.() || [];
@@ -826,9 +775,6 @@ export function createSendFlowController(deps: SendFlowControllerDeps): {
       try {
         await sendTask;
       } catch (err) {
-        if (isWebChat && webchatSendPdf) {
-          deps.markWebChatPdfUploadStateUnknown?.();
-        }
         if (isWebChat && webchatForceNewChat) {
           deps.markWebChatForceNewChatIntent?.();
         }
@@ -840,13 +786,6 @@ export function createSendFlowController(deps: SendFlowControllerDeps): {
           deps.consumePaperModeState(item.id, { webchatGreyOut: true });
           deps.retainPaperState(item.id);
           deps.updatePaperPreviewPreservingScroll();
-        }
-        if (webchatSendPdf && webchatSendSucceeded) {
-          deps.markWebChatPdfUploadedForCurrentConversation?.(
-            activeWebChatPdfPaperContexts,
-          );
-        } else if (webchatSendPdf) {
-          deps.markWebChatPdfUploadStateUnknown?.();
         }
         if (!webchatSendSucceeded && webchatForceNewChat) {
           deps.markWebChatForceNewChatIntent?.();

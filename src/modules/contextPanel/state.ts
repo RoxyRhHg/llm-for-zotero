@@ -28,8 +28,6 @@ export const loadedConversationKeys = new Set<number>();
 export const loadingConversationTasks = new Map<number, Promise<void>>();
 export const webChatIsolatedConversationKeys = new Set<number>();
 const webChatForceNewChatConversationKeys = new Set<number>();
-const webChatPdfUploadedSourceKeys = new Map<number, readonly string[]>();
-const webChatPdfUploadUnknownConversationKeys = new Set<number>();
 export const selectedModelCache = new Map<number, string>();
 export const selectedReasoningCache = new Map<
   number,
@@ -88,8 +86,6 @@ export function markWebChatConversationForceNewChat(
   const key = normalizeConversationKey(conversationKey);
   if (!key) return;
   webChatForceNewChatConversationKeys.add(key);
-  webChatPdfUploadedSourceKeys.delete(key);
-  webChatPdfUploadUnknownConversationKeys.delete(key);
 }
 
 export function clearWebChatConversationForceNewChat(
@@ -110,68 +106,12 @@ export function consumeWebChatConversationForceNewChat(
   return shouldForce;
 }
 
-export function hasWebChatPdfUploadedForConversation(
-  conversationKey: number,
-): boolean {
-  const key = normalizeConversationKey(conversationKey);
-  return key > 0 && webChatPdfUploadedSourceKeys.has(key);
-}
-
-export function markWebChatPdfUploadedForConversation(
-  conversationKey: number,
-  sourceKeys: readonly string[],
-): void {
-  const key = normalizeConversationKey(conversationKey);
-  if (!key) return;
-  const normalizedSourceKeys = sourceKeys
-    .filter((sourceKey): sourceKey is string => typeof sourceKey === "string")
-    .map((sourceKey) => sourceKey.trim())
-    .filter(Boolean);
-  if (!normalizedSourceKeys.length) return;
-  webChatPdfUploadedSourceKeys.set(key, Object.freeze(normalizedSourceKeys));
-  webChatPdfUploadUnknownConversationKeys.delete(key);
-}
-
-export function getWebChatUploadedPdfSourceKeysForConversation(
-  conversationKey: number,
-): readonly string[] {
-  const key = normalizeConversationKey(conversationKey);
-  return key > 0 ? webChatPdfUploadedSourceKeys.get(key) || [] : [];
-}
-
-export function markWebChatPdfUploadStateUnknownForConversation(
-  conversationKey: number,
-): void {
-  const key = normalizeConversationKey(conversationKey);
-  if (!key) return;
-  webChatPdfUploadedSourceKeys.delete(key);
-  webChatPdfUploadUnknownConversationKeys.add(key);
-}
-
-export function isWebChatPdfUploadStateUnknownForConversation(
-  conversationKey: number,
-): boolean {
-  const key = normalizeConversationKey(conversationKey);
-  return key > 0 && webChatPdfUploadUnknownConversationKeys.has(key);
-}
-
-export function resetWebChatPdfUploadedForConversation(
-  conversationKey: number,
-): void {
-  const key = normalizeConversationKey(conversationKey);
-  if (!key) return;
-  webChatPdfUploadedSourceKeys.delete(key);
-  webChatPdfUploadUnknownConversationKeys.delete(key);
-}
-
 export function resetWebChatConversationSessionState(
   conversationKey: number,
 ): void {
   const key = normalizeConversationKey(conversationKey);
   if (!key) return;
   webChatForceNewChatConversationKeys.delete(key);
-  webChatPdfUploadedSourceKeys.delete(key);
-  webChatPdfUploadUnknownConversationKeys.delete(key);
 }
 
 export function getPendingRequestId(conversationKey: number): number {
@@ -492,8 +432,6 @@ export function clearAllState(): void {
   loadedConversationKeys.clear();
   loadingConversationTasks.clear();
   webChatForceNewChatConversationKeys.clear();
-  webChatPdfUploadedSourceKeys.clear();
-  webChatPdfUploadUnknownConversationKeys.clear();
   selectedModelCache.clear();
   selectedReasoningCache.clear();
   selectedReasoningProviderCache.clear();

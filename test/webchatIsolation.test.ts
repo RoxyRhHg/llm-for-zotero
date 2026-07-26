@@ -5,12 +5,7 @@ import { assert } from "chai";
 import {
   clearAllState,
   consumeWebChatConversationForceNewChat,
-  getWebChatUploadedPdfSourceKeysForConversation,
-  hasWebChatPdfUploadedForConversation,
-  isWebChatPdfUploadStateUnknownForConversation,
-  markWebChatPdfUploadStateUnknownForConversation,
   markWebChatConversationForceNewChat,
-  markWebChatPdfUploadedForConversation,
   resetWebChatConversationSessionState,
 } from "../src/modules/contextPanel/state";
 
@@ -340,51 +335,37 @@ describe("webchat isolation", function () {
     assert.include(newChatBlock, "chatHistory.set(key, []);");
   });
 
-  it("shares webchat send flags by conversation key", function () {
+  it("shares the fresh-chat send flag by conversation key", function () {
     const conversationKey = 4242;
 
-    markWebChatPdfUploadedForConversation(conversationKey, [
-      "zotero-pdf:10:101",
-    ]);
-    assert.isTrue(hasWebChatPdfUploadedForConversation(conversationKey));
-    assert.deepEqual(
-      getWebChatUploadedPdfSourceKeysForConversation(conversationKey),
-      ["zotero-pdf:10:101"],
-    );
-
     markWebChatConversationForceNewChat(conversationKey);
-    assert.isFalse(hasWebChatPdfUploadedForConversation(conversationKey));
     assert.isTrue(consumeWebChatConversationForceNewChat(conversationKey));
     assert.isFalse(consumeWebChatConversationForceNewChat(conversationKey));
 
-    markWebChatPdfUploadedForConversation(conversationKey, [
-      "zotero-pdf:10:102",
-    ]);
+    markWebChatConversationForceNewChat(conversationKey);
     resetWebChatConversationSessionState(conversationKey);
-    assert.isFalse(hasWebChatPdfUploadedForConversation(conversationKey));
-    assert.deepEqual(
-      getWebChatUploadedPdfSourceKeysForConversation(conversationKey),
-      [],
-    );
     assert.isFalse(consumeWebChatConversationForceNewChat(conversationKey));
   });
 
-  it("fails closed for restored WebChat sessions until a new chat is requested", function () {
-    const conversationKey = 5252;
+  it("does not block PDF attachment after restoring a WebChat", function () {
+    const sendFlowSource = readFileSync(
+      resolve(
+        here,
+        "../src/modules/contextPanel/setupHandlers/controllers/sendFlowController.ts",
+      ),
+      "utf8",
+    );
+    const historySource = readFileSync(
+      resolve(
+        here,
+        "../src/modules/contextPanel/setupHandlers/controllers/webChatHistoryController.ts",
+      ),
+      "utf8",
+    );
 
-    markWebChatPdfUploadStateUnknownForConversation(conversationKey);
-    assert.isTrue(
-      isWebChatPdfUploadStateUnknownForConversation(conversationKey),
-    );
-    assert.deepEqual(
-      getWebChatUploadedPdfSourceKeysForConversation(conversationKey),
-      [],
-    );
-
-    markWebChatConversationForceNewChat(conversationKey);
-    assert.isFalse(
-      isWebChatPdfUploadStateUnknownForConversation(conversationKey),
-    );
+    assert.notInclude(sendFlowSource, "may already contain a different PDF");
+    assert.notInclude(sendFlowSource, "differs from the PDF already attached");
+    assert.notInclude(historySource, "PdfUploadStateUnknown");
   });
 
   it("does not restore normal paper history on webchat panel startup", function () {

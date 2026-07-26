@@ -900,7 +900,7 @@ export function getWebChatWelcomeHtml(
         <div class="llm-start-page-rec-title llm-webchat-rec-title-spaced">Ask from Zotero</div>
         <ol class="llm-start-page-rec-list">
           <li>Type your question here and press <strong>Send</strong>.</li>
-          <li>For paper chat, a highlighted paper chip means the current PDF will be attached; right-click the chip to switch between send PDF and skip PDF. A PDF is uploaded only once per webchat session.</li>
+          <li>For paper chat, a highlighted paper chip means the current PDF will be attached on the next turn; an unhighlighted chip sends only the prompt. After a successful send, the chip switches to prompt-only mode, and you can right-click it at any time to attach the current PDF again.</li>
           <li>If nothing happens, reload the <strong>${domain}</strong> tab, confirm the extension is enabled, and keep Zotero and the browser on the same monitor.</li>
         </ol>
       </div>

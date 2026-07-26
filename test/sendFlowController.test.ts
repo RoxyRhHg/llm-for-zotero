@@ -289,9 +289,6 @@ describe("sendFlowController", function () {
     let lastSentPdfPaperContexts: PaperContextRef[] | undefined;
     let lastSentWebchatSendPdf = false;
     let lastSentWebchatPdfPaperContexts: PaperContextRef[] | undefined;
-    let lastMarkedWebchatPdfPaperContexts:
-      | readonly PaperContextRef[]
-      | undefined;
     let lastSentLocalDocuments: readonly LocalDocumentResource[] | undefined;
     let lastEditRuntimeMode = "";
     let lastEditDisplayQuestion = "";
@@ -432,11 +429,6 @@ describe("sendFlowController", function () {
       onComposerDraftCleared: () => {
         composerDraftClearedCalls += 1;
       },
-      markWebChatPdfUploadedForCurrentConversation: (
-        paperContexts: readonly PaperContextRef[],
-      ) => {
-        lastMarkedWebchatPdfPaperContexts = paperContexts;
-      },
       ...overrides,
     };
 
@@ -474,7 +466,6 @@ describe("sendFlowController", function () {
         lastSentPdfPaperContexts,
         lastSentWebchatSendPdf,
         lastSentWebchatPdfPaperContexts,
-        lastMarkedWebchatPdfPaperContexts,
         lastSentLocalDocuments,
       }),
       getLastEditRuntimeMode: () => lastEditRuntimeMode,
@@ -1677,7 +1668,6 @@ describe("sendFlowController", function () {
       getActiveWebChatPdfPaperContexts: () => pdfPaperContexts,
       getFullTextPaperContexts: () => [],
       hasActivePdfFullTextPapers: () => true,
-      hasUploadedPdfInCurrentWebChatConversation: () => false,
       getSelectedFiles: () => [],
     });
 
@@ -1688,22 +1678,49 @@ describe("sendFlowController", function () {
       getLastSend().lastSentWebchatPdfPaperContexts,
       pdfPaperContexts,
     );
-    assert.deepEqual(
-      getLastSend().lastMarkedWebchatPdfPaperContexts,
-      pdfPaperContexts,
-    );
     assert.deepEqual(getLastSend().lastSentPdfPaperContexts, pdfPaperContexts);
     assert.equal(getCounts().consumePaperModeStateCalled, 1);
   });
 
-  it("blocks PDF B after PDF A was uploaded in the same WebChat", async function () {
+  it("sends an active WebChat PDF on a later turn", async function () {
+    const pdf: PaperContextRef = {
+      itemId: 10,
+      contextItemId: 102,
+      title: "Persistent PDF",
+      contentSourceMode: "pdf",
+    };
+    const { controller, getLastSend, getCounts } = createBaseDeps({
+      getSelectedProfile: () => ({
+        entryId: "entry-1",
+        model: "chatgpt-web",
+        apiBase: "",
+        apiKey: "",
+        providerLabel: "ChatGPT",
+        authMode: "webchat",
+        providerProtocol: "web_sync",
+      }),
+      getSelectedPaperContexts: () => [pdf],
+      getPdfModePaperContexts: () => [pdf],
+      getActiveWebChatPdfPaperContexts: () => [pdf],
+      getFullTextPaperContexts: () => [],
+      getSelectedFiles: () => [],
+    });
+
+    await controller.doSend();
+
+    assert.equal(getCounts().sendCalled, 1);
+    assert.isTrue(getLastSend().lastSentWebchatSendPdf);
+    assert.deepEqual(getLastSend().lastSentWebchatPdfPaperContexts, [pdf]);
+  });
+
+  it("allows a different PDF on a later turn in the same WebChat", async function () {
     const pdfB: PaperContextRef = {
       itemId: 10,
       contextItemId: 102,
       title: "PDF B",
       contentSourceMode: "pdf",
     };
-    const { controller, inputBox, getCounts, getLastStatus } = createBaseDeps({
+    const { controller, getCounts, getLastSend } = createBaseDeps({
       getSelectedProfile: () => ({
         entryId: "entry-1",
         model: "chatgpt-web",
@@ -1716,20 +1733,15 @@ describe("sendFlowController", function () {
       getSelectedPaperContexts: () => [pdfB],
       getPdfModePaperContexts: () => [pdfB],
       getActiveWebChatPdfPaperContexts: () => [pdfB],
-      getUploadedWebChatPdfSourceKeys: () => ["zotero-pdf:10:101"],
       getFullTextPaperContexts: () => [],
       getSelectedFiles: () => [],
     });
 
     await controller.doSend();
 
-    assert.equal(getCounts().sendCalled, 0);
-    assert.equal(inputBox.value, "ask question");
-    assert.deepEqual(getLastStatus(), {
-      message:
-        "The selected PDF differs from the PDF already attached to this web chat. Start a new web chat before sending.",
-      level: "error",
-    });
+    assert.equal(getCounts().sendCalled, 1);
+    assert.isTrue(getLastSend().lastSentWebchatSendPdf);
+    assert.deepEqual(getLastSend().lastSentWebchatPdfPaperContexts, [pdfB]);
   });
 
   it("blocks multiple active WebChat PDFs before clearing the draft", async function () {
@@ -1775,14 +1787,14 @@ describe("sendFlowController", function () {
     });
   });
 
-  it("blocks PDF upload into a restored WebChat with unknown attachment state", async function () {
+  it("allows a PDF upload after restoring a previous WebChat", async function () {
     const pdf: PaperContextRef = {
       itemId: 10,
       contextItemId: 101,
       title: "Selected PDF",
       contentSourceMode: "pdf",
     };
-    const { controller, inputBox, getCounts, getLastStatus } = createBaseDeps({
+    const { controller, getCounts, getLastSend } = createBaseDeps({
       getSelectedProfile: () => ({
         entryId: "entry-1",
         model: "chatgpt-web",
@@ -1795,20 +1807,15 @@ describe("sendFlowController", function () {
       getSelectedPaperContexts: () => [pdf],
       getPdfModePaperContexts: () => [pdf],
       getActiveWebChatPdfPaperContexts: () => [pdf],
-      isWebChatPdfUploadStateUnknown: () => true,
       getFullTextPaperContexts: () => [],
       getSelectedFiles: () => [],
     });
 
     await controller.doSend();
 
-    assert.equal(getCounts().sendCalled, 0);
-    assert.equal(inputBox.value, "ask question");
-    assert.deepEqual(getLastStatus(), {
-      message:
-        "This web chat may already contain a different PDF. Start a new web chat before attaching the selected PDF.",
-      level: "error",
-    });
+    assert.equal(getCounts().sendCalled, 1);
+    assert.isTrue(getLastSend().lastSentWebchatSendPdf);
+    assert.deepEqual(getLastSend().lastSentWebchatPdfPaperContexts, [pdf]);
   });
 
   it("re-arms a forced-new WebChat PDF send after dispatch failure", async function () {
@@ -1819,7 +1826,6 @@ describe("sendFlowController", function () {
       contentSourceMode: "pdf",
     };
     let forceNewChatIntent = true;
-    let uploadStateUnknown = false;
     let sendAttempts = 0;
     const forceFlags: boolean[] = [];
     const { controller, inputBox } = createBaseDeps({
@@ -1844,11 +1850,6 @@ describe("sendFlowController", function () {
       },
       markWebChatForceNewChatIntent: () => {
         forceNewChatIntent = true;
-        uploadStateUnknown = false;
-      },
-      isWebChatPdfUploadStateUnknown: () => uploadStateUnknown,
-      markWebChatPdfUploadStateUnknown: () => {
-        uploadStateUnknown = true;
       },
       sendQuestion: async (options: {
         webchatForceNewChat?: boolean;
@@ -1871,7 +1872,6 @@ describe("sendFlowController", function () {
     }
     assert.instanceOf(firstError, Error);
     assert.isTrue(forceNewChatIntent);
-    assert.isFalse(uploadStateUnknown);
 
     inputBox.value = "retry question";
     await controller.doSend();
@@ -1880,16 +1880,15 @@ describe("sendFlowController", function () {
     assert.isFalse(forceNewChatIntent);
   });
 
-  it("marks a failed non-forced WebChat PDF upload state unknown", async function () {
+  it("allows a non-forced WebChat PDF retry after dispatch failure", async function () {
     const pdf: PaperContextRef = {
       itemId: 10,
       contextItemId: 101,
       title: "Selected PDF",
       contentSourceMode: "pdf",
     };
-    let uploadStateUnknown = false;
     let sendAttempts = 0;
-    const { controller, inputBox, getLastStatus } = createBaseDeps({
+    const { controller, inputBox, getCounts } = createBaseDeps({
       getSelectedProfile: () => ({
         entryId: "entry-1",
         model: "chatgpt-web",
@@ -1904,30 +1903,25 @@ describe("sendFlowController", function () {
       getActiveWebChatPdfPaperContexts: () => [pdf],
       getFullTextPaperContexts: () => [],
       getSelectedFiles: () => [],
-      isWebChatPdfUploadStateUnknown: () => uploadStateUnknown,
-      markWebChatPdfUploadStateUnknown: () => {
-        uploadStateUnknown = true;
-      },
-      sendQuestion: async () => {
+      sendQuestion: async (options: {
+        onWebChatSendOutcome?: (outcome: "success") => void;
+      }) => {
         sendAttempts += 1;
-        throw new Error("relay outcome unknown");
+        if (sendAttempts === 1) {
+          throw new Error("relay outcome unknown");
+        }
+        options.onWebChatSendOutcome?.("success");
       },
     });
 
     await controller.doSend().catch(() => undefined);
-    assert.isTrue(uploadStateUnknown);
     assert.equal(sendAttempts, 1);
 
     inputBox.value = "retry question";
     await controller.doSend();
 
-    assert.equal(sendAttempts, 1);
-    assert.equal(inputBox.value, "retry question");
-    assert.deepEqual(getLastStatus(), {
-      message:
-        "This web chat may already contain a different PDF. Start a new web chat before attaching the selected PDF.",
-      level: "error",
-    });
+    assert.equal(sendAttempts, 2);
+    assert.equal(getCounts().consumePaperModeStateCalled, 1);
   });
 
   it("honors a swallowed WebChat pipeline failure outcome", async function () {
@@ -1937,8 +1931,6 @@ describe("sendFlowController", function () {
       title: "Selected PDF",
       contentSourceMode: "pdf",
     };
-    let uploadStateUnknown = false;
-    let markedUploaded = false;
     const { controller, getCounts } = createBaseDeps({
       getSelectedProfile: () => ({
         entryId: "entry-1",
@@ -1954,12 +1946,6 @@ describe("sendFlowController", function () {
       getActiveWebChatPdfPaperContexts: () => [pdf],
       getFullTextPaperContexts: () => [],
       getSelectedFiles: () => [],
-      markWebChatPdfUploadStateUnknown: () => {
-        uploadStateUnknown = true;
-      },
-      markWebChatPdfUploadedForCurrentConversation: () => {
-        markedUploaded = true;
-      },
       sendQuestion: async (options: {
         onWebChatSendOutcome?: (outcome: "failed") => void;
       }) => {
@@ -1969,8 +1955,6 @@ describe("sendFlowController", function () {
 
     await controller.doSend();
 
-    assert.isTrue(uploadStateUnknown);
-    assert.isFalse(markedUploaded);
     assert.equal(getCounts().consumePaperModeStateCalled, 0);
   });
 
@@ -2039,7 +2023,6 @@ describe("sendFlowController", function () {
       getPdfModePaperContexts: () => allPdfContexts,
       getActiveWebChatPdfPaperContexts: () => [activePdf],
       getFullTextPaperContexts: () => [],
-      hasUploadedPdfInCurrentWebChatConversation: () => false,
       getSelectedFiles: () => [],
     });
 

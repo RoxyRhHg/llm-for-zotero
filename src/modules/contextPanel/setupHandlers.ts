@@ -87,12 +87,6 @@ import {
   markWebChatConversationForceNewChat,
   clearWebChatConversationForceNewChat,
   consumeWebChatConversationForceNewChat,
-  hasWebChatPdfUploadedForConversation,
-  getWebChatUploadedPdfSourceKeysForConversation,
-  isWebChatPdfUploadStateUnknownForConversation,
-  markWebChatPdfUploadStateUnknownForConversation,
-  markWebChatPdfUploadedForConversation,
-  resetWebChatPdfUploadedForConversation,
   resetWebChatConversationSessionState,
   currentRequestId,
   activeConversationModeByLibrary,
@@ -4860,6 +4854,27 @@ export function setupHandlers(
           setFloatingMenuOpen(modelMenu, MODEL_MENU_OPEN_CLASS, false);
           setFloatingMenuOpen(reasoningMenu, REASONING_MENU_OPEN_CLASS, false);
 
+          // Keep the relay target synchronized when switching between webchat
+          // providers as well as when entering webchat from a local/API model.
+          // Otherwise the model button can show DeepSeek while the extension
+          // continues sending to the previous ChatGPT tab.
+          if (entry.authMode === "webchat") {
+            try {
+              const { getWebChatTargetByModelName } =
+                require("../../webchat/types") as typeof import("../../webchat/types");
+              const { relaySetActiveTarget } =
+                require("../../webchat/relayServer") as typeof import("../../webchat/relayServer");
+              const selectedWebChatTarget = getWebChatTargetByModelName(
+                entry.model || "",
+              );
+              if (selectedWebChatTarget?.id) {
+                relaySetActiveTarget(selectedWebChatTarget.id);
+              }
+            } catch {
+              /* async preload path will retry when entering webchat */
+            }
+          }
+
           // Auto-correct PDF mode for models that don't support native full-PDF
           // input. Downgrade to text/mineru so the user doesn't end up with a
           // broken send.
@@ -4911,18 +4926,6 @@ export function setupHandlers(
             if (item) {
               selectedImageCache.delete(item.id);
               updateImagePreviewPreservingScroll();
-            }
-            // Set active target BEFORE applyWebChatModeUI so the hook's
-            // renderWebChatSidebar() reads the correct target for filtering.
-            try {
-              const { getWebChatTargetByModelName: getEntryTarget } =
-                require("../../webchat/types") as typeof import("../../webchat/types");
-              const { relaySetActiveTarget: setTarget } =
-                require("../../webchat/relayServer") as typeof import("../../webchat/relayServer");
-              const earlyTargetEntry = getEntryTarget(entry.model || "");
-              if (earlyTargetEntry?.id) setTarget(earlyTargetEntry.id);
-            } catch {
-              /* modules not yet loaded — async path below will handle it */
             }
             // Apply webchat UI immediately so model button is disabled during preload
             applyWebChatModeUI();
@@ -5330,44 +5333,6 @@ export function setupHandlers(
     updatePaperPreviewPreservingScroll();
   };
 
-  const hasUploadedPdfInCurrentWebChatConversation = () =>
-    item
-      ? hasWebChatPdfUploadedForConversation(getConversationKey(item))
-      : false;
-
-  const getUploadedWebChatPdfSourceKeysForCurrentConversation = () =>
-    item
-      ? getWebChatUploadedPdfSourceKeysForConversation(getConversationKey(item))
-      : [];
-
-  const isWebChatPdfUploadStateUnknownForCurrentConversation = () =>
-    item
-      ? isWebChatPdfUploadStateUnknownForConversation(getConversationKey(item))
-      : false;
-
-  const markWebChatPdfUploadedForCurrentConversation = (
-    paperContexts: readonly PaperContextRef[],
-  ) => {
-    if (!item) return;
-    markWebChatPdfUploadedForConversation(
-      getConversationKey(item),
-      paperContexts.map(
-        (paperContext) =>
-          `zotero-pdf:${paperContext.itemId}:${paperContext.contextItemId}`,
-      ),
-    );
-  };
-
-  const resetWebChatPdfUploadedForCurrentConversation = () => {
-    if (!item) return;
-    resetWebChatPdfUploadedForConversation(getConversationKey(item));
-  };
-
-  const markWebChatPdfUploadStateUnknownForCurrentConversation = () => {
-    if (!item) return;
-    markWebChatPdfUploadStateUnknownForConversation(getConversationKey(item));
-  };
-
   const resetCurrentWebChatConversation = () => {
     if (!item) return;
     const key = getConversationKey(item);
@@ -5415,7 +5380,6 @@ export function setupHandlers(
   if (hooks) {
     hooks.clearWebChatNewChatIntent = () => {
       clearNextWebChatNewChatIntent();
-      markWebChatPdfUploadStateUnknownForCurrentConversation();
     };
     hooks.getCurrentModelName = () =>
       getSelectedModelInfo().currentModel || null;
@@ -5784,7 +5748,6 @@ export function setupHandlers(
     },
     refreshChatPreservingScroll,
     isWebChatMode,
-    markWebChatPdfUploadStateUnknownForCurrentConversation,
     clearNextWebChatNewChatIntent,
     setSelectedReasoningLevel: (itemId, level) => {
       selectedReasoningCache.set(itemId, level);
@@ -6550,14 +6513,6 @@ export function setupHandlers(
       currentItem: Zotero.Item,
       selectedPaperContexts?: PaperContextRef[],
     ) => getActiveWebChatPdfPaperContexts(currentItem, selectedPaperContexts),
-    hasUploadedPdfInCurrentWebChatConversation,
-    getUploadedWebChatPdfSourceKeys:
-      getUploadedWebChatPdfSourceKeysForCurrentConversation,
-    isWebChatPdfUploadStateUnknown:
-      isWebChatPdfUploadStateUnknownForCurrentConversation,
-    markWebChatPdfUploadStateUnknown:
-      markWebChatPdfUploadStateUnknownForCurrentConversation,
-    markWebChatPdfUploadedForCurrentConversation,
     resolvePdfPaperAttachments: pdfPaperResolver.resolvePdfPaperAttachments,
     resolveLocalPdfResources: localPdfResourceResolver.resolve,
     preflightLocalPdfCapability: async () => {
@@ -7604,7 +7559,6 @@ export function setupHandlers(
         body.querySelector(".llm-webchat-preload")?.remove();
         stopWebChatConnectionCheck();
         clearNextWebChatNewChatIntent();
-        resetWebChatPdfUploadedForCurrentConversation();
         // Restore previous model, or fall back to first non-webchat model
         const restoreId =
           previousNonWebchatModelId ||
