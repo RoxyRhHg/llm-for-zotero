@@ -9,10 +9,26 @@ import {
   getTrackedAssistantNoteForParent,
   rememberAssistantNoteForParent,
 } from "../src/modules/contextPanel/prefHelpers";
-import { resolveSvgFigureRasterSize } from "../src/modules/contextPanel/figureExport";
+import {
+  containsVisualFigureFences,
+  resolveSvgFigureRasterSize,
+} from "../src/modules/contextPanel/figureExport";
 import type { AgentToolContext } from "../src/agent/types";
 
 describe("editCurrentNote create tracking", function () {
+  it("only defers notes that contain supported visual figure fences", function () {
+    assert.isFalse(containsVisualFigureFences("Plain text"));
+    assert.isFalse(
+      containsVisualFigureFences("```ts\nconst svg = '<svg />';\n```"),
+    );
+    assert.isTrue(
+      containsVisualFigureFences('```svg\n<svg viewBox="0 0 10 10" />\n```'),
+    );
+    assert.isTrue(
+      containsVisualFigureFences("```mermaid\ngraph TD\nA-->B\n```"),
+    );
+  });
+
   const baseContext: AgentToolContext = {
     request: {
       conversationKey: 91,
@@ -43,7 +59,12 @@ describe("editCurrentNote create tracking", function () {
         importEmbeddedImage?: (params: {
           blob: Blob;
           parentItemID: number;
+          saveOptions?: { notifierQueue?: unknown };
         }) => Promise<{ key: string } | null>;
+      };
+      Notifier?: {
+        Queue: new () => unknown;
+        commit: (queue: unknown) => Promise<void>;
       };
     };
     IOUtils?: {
@@ -60,6 +81,8 @@ describe("editCurrentNote create tracking", function () {
   const importedImagePaths: string[] = [];
   const importedImageMimeTypes: string[] = [];
   const importedImageByteSizes: number[] = [];
+  const importedImageNotifierQueues: unknown[] = [];
+  const committedNotifierQueues: unknown[] = [];
   let nextNoteId = 100;
   let parentItem: Zotero.Item;
 
@@ -68,6 +91,7 @@ describe("editCurrentNote create tracking", function () {
     libraryID = 0;
     parentID?: number;
     deleted = false;
+    readonly saveOptionsHistory: Array<{ notifierQueue?: unknown }> = [];
     private noteHtml = "";
 
     constructor(itemType: string) {
@@ -90,7 +114,8 @@ describe("editCurrentNote create tracking", function () {
       return "";
     }
 
-    async saveTx() {
+    async saveTx(options: { notifierQueue?: unknown } = {}) {
+      this.saveOptionsHistory.push(options);
       if (!this.id) {
         this.id = nextNoteId++;
       }
@@ -134,6 +159,8 @@ describe("editCurrentNote create tracking", function () {
     importedImagePaths.splice(0);
     importedImageMimeTypes.splice(0);
     importedImageByteSizes.splice(0);
+    importedImageNotifierQueues.splice(0);
+    committedNotifierQueues.splice(0);
     nextNoteId = 100;
     parentItem = {
       id: 9,
@@ -156,11 +183,18 @@ describe("editCurrentNote create tracking", function () {
           savedItems.get(id) || (id === 9 ? parentItem : null),
       },
       Item: MockNoteItem as unknown as new (itemType: string) => Zotero.Item,
+      Notifier: {
+        Queue: class {},
+        commit: async (queue) => {
+          committedNotifierQueues.push(queue);
+        },
+      },
       Attachments: {
-        importEmbeddedImage: async ({ blob, parentItemID }) => {
+        importEmbeddedImage: async ({ blob, parentItemID, saveOptions }) => {
           importedImageParents.push(parentItemID);
           importedImageMimeTypes.push(blob.type);
           importedImageByteSizes.push(blob.size);
+          importedImageNotifierQueues.push(saveOptions?.notifierQueue);
           return { key: `IMG${parentItemID}_${importedImageParents.length}` };
         },
       },
@@ -369,6 +403,18 @@ describe("editCurrentNote create tracking", function () {
     assert.notInclude(note.getNote(), "spine.png</p>");
     assert.deepEqual(importedImageParents, [100]);
     assert.deepEqual(importedImagePaths, ["/tmp/spine.png"]);
+    assert.lengthOf(note.saveOptionsHistory, 2);
+    assert.isOk(note.saveOptionsHistory[0].notifierQueue);
+    assert.strictEqual(
+      note.saveOptionsHistory[0].notifierQueue,
+      note.saveOptionsHistory[1].notifierQueue,
+    );
+    assert.deepEqual(importedImageNotifierQueues, [
+      note.saveOptionsHistory[0].notifierQueue,
+    ]);
+    assert.deepEqual(committedNotifierQueues, [
+      note.saveOptionsHistory[0].notifierQueue,
+    ]);
   });
 
   it("response-menu generated images attach to the newly created item note", async function () {
@@ -519,6 +565,55 @@ describe("editCurrentNote create tracking", function () {
     assert.include(note!.getNote(), "Standalone generated figure.");
     assert.include(note!.getNote(), 'data-attachment-key="IMG100_1"');
     assert.deepEqual(importedImageParents, [100]);
+  });
+
+  it("keeps complete response text and reports a warning when an image cannot be embedded", async function () {
+    globalScope.Zotero!.Attachments!.importEmbeddedImage = async () => null;
+
+    const result = await createAssistantResponseNote({
+      destination: { kind: "item", item: parentItem },
+      queryText: "Generate a figure.",
+      contentText: "The complete answer remains available.",
+      modelName: "Codex",
+      generatedImages: [
+        {
+          id: "img-missing",
+          label: "missing.png",
+          path: "/tmp/missing.png",
+        },
+      ],
+    });
+
+    const note = childNotes(9)[0];
+    assert.include(note.getNote(), "Generate a figure.");
+    assert.include(note.getNote(), "The complete answer remains available.");
+    assert.notInclude(note.getNote(), "Preparing note figures");
+    assert.deepEqual(result.warnings, [
+      "1 generated image(s) could not be embedded",
+    ]);
+  });
+
+  it("chat-history text export persists complete content in one save", async function () {
+    await createNoteFromChatHistory(parentItem, [
+      {
+        role: "user",
+        text: "What is the main result?",
+        timestamp: 1,
+      },
+      {
+        role: "assistant",
+        text: "The complete text-only answer.",
+        timestamp: 2,
+        modelName: "Codex",
+      },
+    ]);
+
+    assert.lengthOf(childNotes(9), 1);
+    const note = childNotes(9)[0];
+    assert.lengthOf(note.saveOptionsHistory, 1);
+    assert.include(note.getNote(), "What is the main result?");
+    assert.include(note.getNote(), "The complete text-only answer.");
+    assert.notInclude(note.getNote(), "Preparing chat history export");
   });
 
   it("chat-history note export embeds assistant generated images and keeps user screenshots", async function () {

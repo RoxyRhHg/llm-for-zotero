@@ -116,6 +116,7 @@ const zhCN: Record<string, string> = {
   "No assistant text selected": "没有选中助手文本",
   "Copied response": "已复制回复",
   "Created a new note": "已创建新笔记",
+  "Created a new note with warnings": "已创建新笔记，但有警告",
   "Failed to create note": "创建笔记失败",
   "No deletable turn found": "没有可删除的对话轮次",
   "No forkable turn found": "没有可分叉的对话轮次",
@@ -137,6 +138,8 @@ const zhCN: Record<string, string> = {
   "No chat history detected.": "未检测到对话历史。",
   "Copied chat as md": "已复制对话为 Markdown",
   "Saved chat history to new note": "已将对话历史保存为新笔记",
+  "Saved chat history to new note with warnings":
+    "已将对话历史保存为新笔记，但有警告",
   "Failed to save chat history": "保存对话历史失败",
   "Could not open plugin settings": "无法打开插件设置",
   "Could not find this paper": "无法找到此论文",

@@ -106,6 +106,7 @@ describe("menu action controller note routing", function () {
     id = 0;
     libraryID = 0;
     parentID?: number;
+    readonly persistedNoteHtml: string[] = [];
     private noteHtml = "";
 
     constructor(itemType: string) {
@@ -125,6 +126,7 @@ describe("menu action controller note routing", function () {
     }
 
     async saveTx() {
+      this.persistedNoteHtml.push(this.noteHtml);
       if (!this.id) {
         this.id = 100 + savedNotes.length;
         savedNotes.push(this);
@@ -296,7 +298,7 @@ describe("menu action controller note routing", function () {
     assert.deepEqual(target?.generatedImages, [generatedImage]);
   });
 
-  it("saves response notes as child item notes in paper chat mode", async function () {
+  it("deduplicates concurrent response-note saves in paper chat mode", async function () {
     const responseMenu = new FakeElement();
     const responseMenuNoteBtn = new FakeElement();
     const status = new FakeElement();
@@ -353,7 +355,10 @@ describe("menu action controller note routing", function () {
       },
     });
 
-    await responseMenuNoteBtn.dispatch("click");
+    await Promise.all([
+      responseMenuNoteBtn.dispatch("click"),
+      responseMenuNoteBtn.dispatch("click"),
+    ]);
 
     assert.lengthOf(savedNotes, 1);
     assert.equal(savedNotes[0].libraryID, 1);
@@ -552,6 +557,13 @@ describe("menu action controller note routing", function () {
     assert.equal(savedNotes[0].parentID, 42);
     assert.include(savedNotes[0].getNote(), "Footer mapped question");
     assert.include(savedNotes[0].getNote(), "Footer mapped answer.");
+    assert.deepEqual(savedNotes[0].persistedNoteHtml, [
+      savedNotes[0].getNote(),
+    ]);
+    assert.notInclude(
+      savedNotes[0].persistedNoteHtml.join("\n"),
+      "Preparing note figures",
+    );
     assert.equal(status.textContent, "Created a new note");
   });
 

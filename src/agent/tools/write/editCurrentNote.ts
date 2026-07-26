@@ -10,6 +10,7 @@ import {
   resolveParentItemForNoteTarget,
 } from "../../../modules/contextPanel/notes";
 import { importLocalImagesIntoNote } from "../../../modules/contextPanel/noteImages";
+import { createFinalizedZoteroNote } from "../../../modules/contextPanel/notePersistence";
 import { escapeNoteHtml } from "../../../modules/contextPanel/textUtils";
 import { ok, fail, validateObject, normalizePositiveInt } from "../shared";
 import { executeAndRecordUndo } from "./mutateLibraryShared";
@@ -786,35 +787,55 @@ export function createEditCurrentNoteTool(
         const libraryID =
           parentItem?.libraryID || context.request.libraryID || 1;
 
-        // Create a blank note first
+        // Persist useful text before importing images that require a note ID.
+        // Notifications remain queued until the final note HTML is verified.
         const note = new Zotero.Item("note");
         note.libraryID = libraryID;
         if (parentId && input.target !== "standalone") {
           note.parentID = parentId;
         }
-        note.setNote("<p>Importing images...</p>");
-        await note.saveTx();
-        const noteId = note.id;
-
-        // Import images into this note
-        let finalContent = input.content;
-        try {
-          finalContent = await importLocalImagesIntoNote(
-            input.content,
-            noteId,
-            zoteroGateway,
+        const initialHtml = input._isHtml
+          ? sanitizeNoteHtml(input.content)
+          : renderRawNoteHtml(input.content);
+        const persisted = await createFinalizedZoteroNote({
+          note,
+          initialHtml,
+          finalize: hasLocalImages
+            ? async ({ noteId, saveOptions }) => {
+                const finalContent = await importLocalImagesIntoNote(
+                  input.content,
+                  noteId,
+                  zoteroGateway,
+                  saveOptions,
+                );
+                const html = input._isHtml
+                  ? sanitizeNoteHtml(finalContent)
+                  : renderRawNoteHtml(finalContent);
+                const warnings =
+                  /(?:src\s*=\s*["']file:|!\[[^\]]*\]\(file:)/i.test(
+                    finalContent,
+                  )
+                    ? ["One or more local images could not be embedded"]
+                    : [];
+                return { html, warnings };
+              }
+            : undefined,
+          log: (message, error) => {
+            Zotero.debug?.(
+              `[llm-for-zotero] ${message}: ${
+                error instanceof Error ? error.message : String(error || "")
+              }`,
+            );
+          },
+        });
+        const noteId = persisted.noteId;
+        if (persisted.warnings.length) {
+          Zotero.debug?.(
+            `[llm-for-zotero] Note ${noteId} created with warnings: ${persisted.warnings.join(
+              "; ",
+            )}`,
           );
-        } catch (e) {
-          Zotero.debug?.(`[llm-for-zotero] Image import failed: ${e}`);
         }
-
-        // Now set the final note HTML with data-attachment-key img tags
-        if (input._isHtml) {
-          note.setNote(sanitizeNoteHtml(finalContent));
-        } else {
-          note.setNote(renderRawNoteHtml(finalContent));
-        }
-        await note.saveTx();
 
         // Register undo
         pushUndoEntry(context.request.conversationKey, {
@@ -834,6 +855,9 @@ export function createEditCurrentNoteTool(
           status: "created",
           noteId,
           title: String(note.getField?.("title") || ""),
+          ...(persisted.warnings.length
+            ? { warnings: persisted.warnings }
+            : {}),
         };
       }
 
