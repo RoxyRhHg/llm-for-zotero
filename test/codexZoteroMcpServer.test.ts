@@ -6,6 +6,7 @@ import {
   getZoteroMcpServerUrl,
   registerScopedZoteroMcpScope,
   registerMcpServer,
+  resolveConversationScopeToken,
   setActiveZoteroMcpScope,
   unregisterMcpServer,
   ZOTERO_MCP_ENDPOINT_PATH,
@@ -2460,6 +2461,53 @@ describe("Zotero MCP server", function () {
       clearHandler();
       scoped.clear();
     }
+  });
+
+  it("keeps a conversation scope token usable across turns and rebinds it to the newest turn", async function () {
+    let seenActiveItemId: number | undefined;
+    const registry = new AgentToolRegistry();
+    registry.register({
+      spec: {
+        name: "library_read",
+        description: "Read an item",
+        inputSchema: { type: "object", additionalProperties: true },
+        mutability: "read",
+        requiresConfirmation: false,
+      },
+      validate: (args) => ({ ok: true, value: args ?? {} }),
+      execute: async (_input, context: AgentToolContext) => {
+        seenActiveItemId = context.request.activeItemId;
+        return { activeItemId: context.request.activeItemId };
+      },
+    });
+    registerMcpServer({ toolRegistry: registry, zoteroGateway: {} as never });
+    const registerTurn = (activeItemId: number) =>
+      registerScopedZoteroMcpScope(
+        {
+          profileSignature: "profile-conv",
+          conversationKey: 501,
+          libraryID: 1,
+          kind: "global",
+          activeItemId,
+        },
+        { token: resolveConversationScopeToken("profile-conv:501") },
+      );
+    const firstTurn = registerTurn(10);
+    const secondTurn = registerTurn(20);
+    assert.equal(secondTurn.token, firstTurn.token);
+
+    const response = await invokeMcpEndpoint({
+      token: getOrCreateZoteroMcpBearerToken(),
+      headers: { [ZOTERO_MCP_SCOPE_HEADER]: firstTurn.token },
+      body: {
+        jsonrpc: "2.0",
+        id: 1,
+        method: "tools/call",
+        params: { name: "library_read", arguments: {} },
+      },
+    });
+    assert.isUndefined(JSON.parse(response[2]).error);
+    assert.equal(seenActiveItemId, 20);
   });
 
   it("rejects stale cached MCP write headers instead of rebinding them", async function () {

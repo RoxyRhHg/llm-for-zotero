@@ -28,6 +28,8 @@ import {
   ZOTERO_MCP_WRITE_TOOL_NAMES,
   getZoteroMcpDirectPdfToolNames,
   registerScopedZoteroMcpScope,
+  resolveConversationScopeToken,
+  clearMcpReadDedupeCacheForScopeToken,
   setActiveZoteroMcpScope,
   type ZoteroMcpActiveScope,
   type ZoteroMcpConfirmationRequest,
@@ -2173,8 +2175,20 @@ export async function runCodexAppServerNativeTurn(params: {
         reasoning: params.reasoning,
         skillContext,
       });
+      // Raw-PDF turns always run on a fresh ephemeral thread, so they keep a
+      // single-turn token. Persistent threads are resumed with the scope header
+      // Codex captured when the thread was created, so they need a token that
+      // stays stable for the whole conversation.
+      const conversationScopeId = currentTurnHasLocalPdfs
+        ? ""
+        : `${profileSignature || ""}:${params.scope.conversationKey}`;
       const scopedMcp = mcpEnabled
-        ? registerScopedZoteroMcpScope(scopedMcpScope)
+        ? registerScopedZoteroMcpScope(
+            scopedMcpScope,
+            conversationScopeId
+              ? { token: resolveConversationScopeToken(conversationScopeId) }
+              : {},
+          )
         : null;
       const mcpThreadConfig = scopedMcp
         ? buildCodexZoteroMcpThreadConfig({
@@ -2646,7 +2660,13 @@ export async function runCodexAppServerNativeTurn(params: {
         return result;
       } finally {
         unregisterGuardianReviews();
-        scopedMcp?.clear();
+        if (scopedMcp) {
+          if (conversationScopeId) {
+            clearMcpReadDedupeCacheForScopeToken(scopedMcp.token);
+          } else {
+            scopedMcp.clear();
+          }
+        }
         clearMcpConfirmationHandler();
         clearMcpScope();
         unregisterApprovalHandlers();

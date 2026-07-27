@@ -179,6 +179,7 @@ const scopedZoteroMcpScopes = new Map<
   string,
   { createdAt: number; expiresAt: number; scope: ZoteroMcpActiveScope }
 >();
+const conversationScopeTokens = new Map<string, string>();
 let activeZoteroMcpScope: ZoteroMcpActiveScope | null = null;
 let registeredMcpDeps: McpServerDeps | null = null;
 const mcpReadDedupeCache = new Map<
@@ -653,6 +654,26 @@ export function registerScopedZoteroMcpScope(
   };
 }
 
+/**
+ * Returns a scope token that stays stable for one conversation.
+ *
+ * Agent runtimes bind the scope header when they create their conversation and
+ * keep reusing it on resume, so a token that only lives for one turn is already
+ * stale by the next turn. A conversation-stable token lets every turn re-register
+ * its own scope under the same header value.
+ */
+export function resolveConversationScopeToken(
+  conversationScopeId: string,
+): string {
+  const key = normalizeText(conversationScopeId, 256);
+  if (!key) return generateToken();
+  const existing = conversationScopeTokens.get(key);
+  if (existing) return existing;
+  const token = generateToken();
+  conversationScopeTokens.set(key, token);
+  return token;
+}
+
 export function setActiveZoteroMcpScope(
   scope: ZoteroMcpActiveScope,
 ): () => void {
@@ -702,7 +723,7 @@ function mcpReadDedupeScopePrefix(scopeToken: string): string {
   return `token:${JSON.stringify(scopeToken)}:`;
 }
 
-function clearMcpReadDedupeCacheForScopeToken(scopeToken: string): void {
+export function clearMcpReadDedupeCacheForScopeToken(scopeToken: string): void {
   const prefix = mcpReadDedupeScopePrefix(scopeToken);
   for (const key of mcpReadDedupeCache.keys()) {
     if (key.startsWith(prefix)) mcpReadDedupeCache.delete(key);
@@ -1195,9 +1216,10 @@ function resolveScopedMcpScope(
   pruneExpiredScopedMcpScopes();
   const entry = scopedZoteroMcpScopes.get(token);
   if (entry) {
-    // A valid token identifies one immutable request scope. The process-wide
-    // active scope may belong to an overlapping turn from the same profile and
-    // must never replace it.
+    // A valid token identifies one conversation, and every turn of that
+    // conversation re-registers its own scope under the token. The process-wide
+    // active scope may belong to an overlapping turn from another conversation
+    // on the same profile and must never replace it.
     return entry.scope;
   }
   throw new Error(
@@ -1833,6 +1855,7 @@ export async function invokeRegisteredZoteroMcpEndpoint(
  */
 export function unregisterMcpServer(): void {
   scopedZoteroMcpScopes.clear();
+  conversationScopeTokens.clear();
   mcpReadDedupeCache.clear();
   zoteroMcpConfirmationHandlers.clear();
   registeredMcpDeps = null;
