@@ -432,21 +432,34 @@ describe("agent engine final UI release", function () {
       storedUpdates.push(update as unknown as Record<string, unknown>);
     };
 
-    await retryAgentTurn(
-      {} as Element,
-      fakeItem(conversationKey),
-      undefined,
-      undefined,
-      undefined,
-      undefined,
-      undefined,
-      undefined,
-      undefined,
-      undefined,
-      undefined,
-      undefined,
-      deps,
-    );
+    // finalizeAgentTurnOutcome resolves the Claude scope from the global
+    // Zotero profile; without this stub the completed turn would fall into
+    // the failure path and this test would assert against the wrong flow.
+    const zoteroBefore = (globalThis as any).Zotero;
+    (globalThis as any).Zotero = {
+      Profile: { dir: "/tmp/zotero-profile" },
+      Prefs: { get: () => undefined },
+    };
+    try {
+      await retryAgentTurn(
+        {} as Element,
+        fakeItem(conversationKey),
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        deps,
+      );
+    } finally {
+      if (zoteroBefore === undefined) delete (globalThis as any).Zotero;
+      else (globalThis as any).Zotero = zoteroBefore;
+    }
 
     assert.lengthOf(storedUpdates, 2);
     for (const update of storedUpdates) {
@@ -772,6 +785,45 @@ describe("agent engine final UI release", function () {
     }
   });
 
+  it("honors the sticky reasoning-expanded preference on a fresh agent send", async function () {
+    const conversationKey = 559;
+    const runtime = {
+      getCapabilities: () => ({
+        streaming: true,
+        toolCalls: true,
+        multimodal: false,
+      }),
+      runTurn: async () =>
+        ({
+          kind: "completed",
+          runId: "run-reasoning-open",
+          text: "Done.",
+          usedFallback: false,
+        }) as AgentRuntimeOutcome,
+    } as unknown as AgentRuntime;
+    const deps = createDeps({
+      runtime,
+      pendingWrites: [],
+      idleRestores: [],
+      statuses: [],
+    });
+    deps.isReasoningExpandedByDefault = () => true;
+    const history: any[] = [];
+    deps.chatHistory.set(conversationKey, history);
+
+    await sendAgentTurn(
+      {
+        body: {} as Element,
+        item: fakeItem(conversationKey),
+        question: "summarize the methods",
+      },
+      deps,
+    );
+
+    const assistantMessage = history[history.length - 1];
+    assert.isTrue(assistantMessage.reasoningOpen);
+  });
+
   it("restores the previous assistant message when a retry fails before streaming", async function () {
     const conversationKey = 558;
     const userMessage = {
@@ -844,5 +896,162 @@ describe("agent engine final UI release", function () {
     assert.isFalse(Boolean(assistantMessage.streaming));
     // The stored row must keep the partial — no error-text write.
     assert.lengthOf(assistantStoreWrites, 0);
+  });
+
+  it("restores the paired user row when a zero-output retry fails after persisting", async function () {
+    const conversationKey = 560;
+    const oldPaperContexts = [{ itemId: 1, title: "Old paper" }];
+    const userMessage: any = {
+      role: "user" as const,
+      text: "summarize",
+      timestamp: 100,
+      runMode: "agent" as const,
+      agentRunId: "run-old",
+      paperContexts: oldPaperContexts,
+      modelName: "model-a",
+      modelEntryId: "entry-a",
+      modelProviderLabel: "Provider A",
+    };
+    const assistantMessage: any = {
+      role: "assistant" as const,
+      text: "Old answer.",
+      timestamp: 200,
+      runMode: "agent" as const,
+      modelName: "model-a",
+    };
+    const userStoreWrites: Array<Record<string, unknown>> = [];
+    const runtime = {
+      getCapabilities: () => ({
+        streaming: true,
+        toolCalls: true,
+        multimodal: false,
+      }),
+      runTurn: async (params: {
+        onStart?: (runId: string) => Promise<void> | void;
+      }) => {
+        // The run registers (persisting the user row with retry metadata)
+        // and then dies without streaming anything.
+        await params.onStart?.("run-new");
+        throw new Error("NetworkError when attempting to fetch resource.");
+      },
+    } as unknown as AgentRuntime;
+    const deps = createDeps({
+      runtime,
+      pendingWrites: [],
+      idleRestores: [],
+      statuses: [],
+    });
+    deps.chatHistory.set(conversationKey, [userMessage, assistantMessage]);
+    deps.findLatestRetryPair = () => ({
+      userIndex: 0,
+      userMessage,
+      assistantMessage,
+    });
+    deps.reconstructRetryPayload = () => ({
+      question: userMessage.text,
+      screenshotImages: [],
+      paperContexts: [{ itemId: 77, title: "Rebuilt during retry" }],
+      pdfPaperContexts: [],
+      fullTextPaperContexts: [],
+      selectedCollectionContexts: [],
+      selectedTagContexts: [],
+    });
+    deps.updateStoredLatestUserMessage = async (_key, update) => {
+      userStoreWrites.push(update as unknown as Record<string, unknown>);
+    };
+
+    await retryAgentTurn(
+      {} as Element,
+      fakeItem(conversationKey),
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      deps,
+    );
+
+    // In-memory user message is back to its pre-retry identity.
+    assert.strictEqual(userMessage.modelName, "model-a");
+    assert.strictEqual(userMessage.modelEntryId, "entry-a");
+    assert.strictEqual(userMessage.modelProviderLabel, "Provider A");
+    assert.strictEqual(userMessage.agentRunId, "run-old");
+    assert.deepEqual(userMessage.paperContexts, oldPaperContexts);
+    // The stored row was rewritten with the restored values after the
+    // onStart persistence stamped the failed retry's metadata onto it.
+    assert.isAtLeast(userStoreWrites.length, 2);
+    const lastWrite = userStoreWrites[userStoreWrites.length - 1];
+    assert.strictEqual(lastWrite.modelName, "model-a");
+    assert.strictEqual(lastWrite.agentRunId, "run-old");
+    assert.deepEqual(lastWrite.paperContexts, oldPaperContexts);
+  });
+
+  it("restores the turn when a retry has nothing to send", async function () {
+    const conversationKey = 561;
+    const userMessage: any = {
+      role: "user" as const,
+      text: "",
+      timestamp: 100,
+      runMode: "agent" as const,
+      modelName: "model-a",
+      paperContexts: [{ itemId: 1, title: "Old paper" }],
+    };
+    const assistantMessage: any = {
+      role: "assistant" as const,
+      text: "Old answer.",
+      timestamp: 200,
+      runMode: "agent" as const,
+    };
+    const deps = createDeps({
+      runtime: createFinalThenHangingRuntime(() => undefined),
+      pendingWrites: [],
+      idleRestores: [],
+      statuses: [],
+    });
+    deps.chatHistory.set(conversationKey, [userMessage, assistantMessage]);
+    deps.findLatestRetryPair = () => ({
+      userIndex: 0,
+      userMessage,
+      assistantMessage,
+    });
+    deps.reconstructRetryPayload = () => ({
+      question: "",
+      screenshotImages: [],
+      paperContexts: [],
+      pdfPaperContexts: [],
+      fullTextPaperContexts: [],
+      selectedCollectionContexts: [],
+      selectedTagContexts: [],
+    });
+
+    await retryAgentTurn(
+      {} as Element,
+      fakeItem(conversationKey),
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      deps,
+    );
+
+    // The bail-out must not leave the turn half-reset: the previous answer
+    // stays visible and the message is not stuck in streaming mode.
+    assert.strictEqual(assistantMessage.text, "Old answer.");
+    assert.isFalse(Boolean(assistantMessage.streaming));
+    assert.strictEqual(userMessage.modelName, "model-a");
+    assert.deepEqual(userMessage.paperContexts, [
+      { itemId: 1, title: "Old paper" },
+    ]);
   });
 });

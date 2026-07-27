@@ -6,7 +6,7 @@ import {
   MERMAID_SVG_CACHE_MAX_ENTRIES,
   buildMermaidSvgCacheKey,
   cacheMermaidSvg,
-  clearMermaidSvgCacheForTests,
+  clearMermaidSvgCache,
   getCachedMermaidSvg,
   getMermaidSvgCacheSizeForTests,
   invalidateMermaidSvg,
@@ -14,7 +14,7 @@ import {
 
 describe("mermaidSvgCache", function () {
   beforeEach(() => {
-    clearMermaidSvgCacheForTests();
+    clearMermaidSvgCache();
   });
 
   it("returns cached SVG for the same version, theme, and source", function () {

@@ -25,6 +25,10 @@ import {
 } from "../portalScope";
 import { mergeCitationPaperContexts } from "../citationContexts";
 import { resolveStreamInterruptionOutcome } from "../streamInterruption";
+import {
+  restoreRetryUserSnapshot,
+  takeRetryUserSnapshot,
+} from "../retryUserSnapshot";
 import { renderPendingActionCard } from "../agentTrace/render";
 import {
   createBlockStreamCoalescer,
@@ -669,6 +673,14 @@ async function handleAgentTurnFailure(ctx: {
    * previous answer) must not be overwritten by bare error text.
    */
   restorePreviousAssistant?: () => void;
+  /**
+   * Retry also passes this: rolls the paired user row (model identity,
+   * rebuilt contexts, run linkage) back to its pre-retry state and rewrites
+   * the stored row that onStart already stamped with the failed retry's
+   * metadata. Runs only alongside restorePreviousAssistant, so the stored
+   * turn stays a consistent pair.
+   */
+  restorePairedUser?: () => Promise<void>;
 }): Promise<void> {
   const {
     err,
@@ -683,6 +695,7 @@ async function handleAgentTurnFailure(ctx: {
     persistAssistantOnce,
     uiRelease,
     restorePreviousAssistant,
+    restorePairedUser,
   } = ctx;
   if (uiRelease.isReleased()) {
     return;
@@ -714,6 +727,7 @@ async function handleAgentTurnFailure(ctx: {
   });
   if (!outcome.interrupted && restorePreviousAssistant) {
     restorePreviousAssistant();
+    await restorePairedUser?.();
     refreshChatSafely();
     setStatusSafely(`Error: ${userFacingError.slice(0, 40)}`, "error");
     return;
@@ -1444,7 +1458,7 @@ export async function sendAgentTurn(
       effectiveRequestConfig.modelProviderLabel === "Codex"
         ? buildPendingAgentTraceEvents(body)
         : undefined,
-    reasoningOpen: false,
+    reasoningOpen: deps.isReasoningExpandedByDefault(),
     quoteCitations: selectedTextQuoteCitationsForMessage.length
       ? selectedTextQuoteCitationsForMessage
       : undefined,
@@ -1636,6 +1650,7 @@ export async function sendAgentTurn(
       modelName: assistantMessage.modelName,
       modelEntryId: assistantMessage.modelEntryId,
       modelProviderLabel: assistantMessage.modelProviderLabel,
+      interrupted: assistantMessage.interrupted,
       contextTokens: snapshot?.contextTokens,
       contextWindow: snapshot?.contextWindow,
       quoteCitations: assistantMessage.quoteCitations,
@@ -1864,6 +1879,19 @@ export async function retryAgentTurn(
     Object.assign(assistantMessage, assistantSnapshot);
     assistantMessage.streaming = false;
   };
+  // The retry rewrites (and, at onStart, persists) the paired user row's
+  // model identity, contexts and run linkage before any output exists. A
+  // failed retry that restores the previous answer must roll the user row
+  // back with it, or the stored turn pairs the old answer with the failed
+  // retry's metadata after a reload.
+  const userSnapshot = takeRetryUserSnapshot(retryPair.userMessage);
+  const restorePairedUser = async () => {
+    restoreRetryUserSnapshot(retryPair.userMessage, userSnapshot);
+    await deps.updateStoredLatestUserMessage(
+      conversationKey,
+      buildStoredUserMessagePatch(retryPair.userMessage),
+    );
+  };
 
   // Clear the previous agent run so the trace and text reset immediately.
   assistantMessage.text = "";
@@ -1942,6 +1970,12 @@ export async function retryAgentTurn(
     ? fullTextPaperContexts
     : undefined;
   if (!question.trim()) {
+    // The assistant bubble was already reset for streaming and the user
+    // contexts rewritten — put the turn back or it stays stuck as an empty
+    // streaming message that blocks every later retry/edit.
+    restorePreviousAssistant();
+    restoreRetryUserSnapshot(retryPair.userMessage, userSnapshot);
+    refreshChatSafely();
     setStatusSafely("Nothing to retry for latest turn", "error");
     deps.setPendingRequestId(conversationKey, 0);
     deps.restoreRequestUIIdle(body, conversationKey, thisRequestId);
@@ -2045,6 +2079,7 @@ export async function retryAgentTurn(
       modelName: assistantMessage.modelName,
       modelEntryId: assistantMessage.modelEntryId,
       modelProviderLabel: assistantMessage.modelProviderLabel,
+      interrupted: assistantMessage.interrupted,
       contextTokens: snapshot?.contextTokens,
       contextWindow: snapshot?.contextWindow,
       quoteCitations: assistantMessage.quoteCitations,
@@ -2143,6 +2178,7 @@ export async function retryAgentTurn(
       persistAssistantOnce,
       uiRelease,
       restorePreviousAssistant,
+      restorePairedUser,
     });
   } finally {
     if (!uiRelease.isReleased()) {

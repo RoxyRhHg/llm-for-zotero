@@ -78,6 +78,7 @@ import {
 } from "./figureExport";
 import {
   createFinalizedZoteroNote,
+  persistVerifiedNoteHtml,
   type NotePersistenceSaveOptions,
 } from "./notePersistence";
 
@@ -1352,8 +1353,10 @@ export async function createNoteFromAssistantText(
           existingNote.getNote() || "",
           html,
         );
-        existingNote.setNote(appendedHtml);
-        await existingNote.saveTx();
+        // Verified write: a silently lost saveTx (the #327 failure class)
+        // throws here, falling through to create a new note instead of
+        // reporting a success that never reached the database.
+        await persistVerifiedNoteHtml(existingNote, appendedHtml);
         ztoolkit.log(
           `LLM: Appended to existing note ${existingNote.id} for parent ${parentId}`,
         );

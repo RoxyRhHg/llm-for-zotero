@@ -7606,6 +7606,10 @@ export function setupHandlers(
   const cleanupSetupHandlers = () => {
     if (setupHandlersCleaned) return;
     setupHandlersCleaned = true;
+    // The connection-check interval and preload token outlive the detached
+    // body otherwise — one leaked 5s timer per abandoned WebChat panel.
+    stopWebChatConnectionCheck();
+    abortWebChatPreload();
     disconnectObserverCleanup?.();
     disconnectObserverCleanup = null;
     cleanupPrefObservers?.();

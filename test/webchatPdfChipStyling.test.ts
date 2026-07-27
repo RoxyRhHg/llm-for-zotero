@@ -63,4 +63,11 @@ describe("WebChat PDF chip styling", function () {
     assert.include(i18n, "attach the current PDF again");
     assert.notInclude(i18n, "uploaded only once per webchat session");
   });
+
+  it("keeps the Chinese welcome text in sync with the reattach behavior", function () {
+    const i18n = source("src/utils/i18n.ts");
+
+    assert.include(i18n, "重新附加当前 PDF");
+    assert.notInclude(i18n, "每个 WebChat 会话通常只上传一次 PDF");
+  });
 });

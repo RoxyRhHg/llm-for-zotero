@@ -26,6 +26,7 @@ import {
 import { resolvePaperContextRefFromAttachment } from "../../modules/contextPanel/paperAttribution";
 import { invalidateCachedContextText } from "../../modules/contextPanel/pdfContext";
 import { ensureMineruCacheDirForAttachment } from "../../modules/contextPanel/mineruSync";
+import { persistVerifiedNoteHtml } from "../../modules/contextPanel/notePersistence";
 import type { AgentRuntimeRequest } from "../types";
 import type {
   GeneratedChatImage,
@@ -1161,12 +1162,10 @@ export class ZoteroGateway {
         ? params.content
         : String(params.content || ""),
     );
-    if (params.preRenderedHtml) {
-      noteItem.setNote(params.preRenderedHtml);
-    } else {
-      noteItem.setNote(renderRawNoteHtml(nextText));
-    }
-    await noteItem.saveTx();
+    await persistVerifiedNoteHtml(
+      noteItem,
+      params.preRenderedHtml || renderRawNoteHtml(nextText),
+    );
     invalidateCachedContextText(snapshot.noteId);
     return {
       noteId: snapshot.noteId,
@@ -1185,8 +1184,10 @@ export class ZoteroGateway {
     if (!noteItem || !(noteItem as any).isNote?.()) {
       throw new Error("Note not found for undo");
     }
-    noteItem.setNote(typeof params.html === "string" ? params.html : "");
-    await noteItem.saveTx();
+    await persistVerifiedNoteHtml(
+      noteItem,
+      typeof params.html === "string" ? params.html : "",
+    );
     invalidateCachedContextText(Math.floor(params.noteId));
   }
 

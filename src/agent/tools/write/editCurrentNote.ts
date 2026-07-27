@@ -10,7 +10,10 @@ import {
   resolveParentItemForNoteTarget,
 } from "../../../modules/contextPanel/notes";
 import { importLocalImagesIntoNote } from "../../../modules/contextPanel/noteImages";
-import { createFinalizedZoteroNote } from "../../../modules/contextPanel/notePersistence";
+import {
+  createFinalizedZoteroNote,
+  persistVerifiedNoteHtml,
+} from "../../../modules/contextPanel/notePersistence";
 import { escapeNoteHtml } from "../../../modules/contextPanel/textUtils";
 import { ok, fail, validateObject, normalizePositiveInt } from "../shared";
 import { executeAndRecordUndo } from "./mutateLibraryShared";
@@ -896,8 +899,7 @@ export function createEditCurrentNoteTool(
           ? sanitizeNoteHtml(contentToAppend)
           : renderRawNoteHtml(contentToAppend);
         const nextHtml = buildAppendedNoteHtml(snapshot.html, appendHtml);
-        targetNote.setNote(nextHtml);
-        await targetNote.saveTx();
+        await persistVerifiedNoteHtml(targetNote, nextHtml);
 
         pushUndoEntry(context.request.conversationKey, {
           id: `undo-edit-current-note-append-${snapshot.noteId}-${Date.now()}`,

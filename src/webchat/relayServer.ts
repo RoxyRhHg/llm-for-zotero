@@ -750,10 +750,7 @@ function normalizeTurnDiagnostic(
     attachmentVerificationMs:
       raw.attachmentVerificationMs == null
         ? null
-        : Math.max(
-          0,
-          Math.floor(Number(raw.attachmentVerificationMs) || 0),
-        ),
+        : Math.max(0, Math.floor(Number(raw.attachmentVerificationMs) || 0)),
     attachmentPreviewVerified: readNullableBoolean(
       raw.attachmentPreviewVerified,
     ),
@@ -763,10 +760,7 @@ function normalizeTurnDiagnostic(
     completionDetectionMs:
       raw.completionDetectionMs == null
         ? null
-        : Math.max(
-          0,
-          Math.floor(Number(raw.completionDetectionMs) || 0),
-        ),
+        : Math.max(0, Math.floor(Number(raw.completionDetectionMs) || 0)),
   };
   const hasValue = Object.values(diagnostic).some(
     (value) => value !== null && value !== undefined,
@@ -912,8 +906,7 @@ const SubmitQueryEndpoint = createEndpoint(["POST"], (opts) => {
   S().query.pdf_filename = (body.pdf_filename as string) || null;
   S().query.images = (body.images as string[]) || null;
   S().query.chatgpt_mode = (body.chatgpt_mode as string) || null;
-  S().query.target =
-    (body.target as string) || S().active_target || null;
+  S().query.target = (body.target as string) || S().active_target || null;
   if (body.target) {
     S().active_target = body.target as string;
   }

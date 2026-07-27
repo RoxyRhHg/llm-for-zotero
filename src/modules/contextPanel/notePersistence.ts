@@ -137,6 +137,20 @@ async function persistAndVerifyNoteHtml(
   throw new Error("Zotero note content did not persist after retry");
 }
 
+/**
+ * Write HTML to an existing note and verify (via a forced reload) that it
+ * actually persisted, retrying once. Zotero's saveTx can silently no-op —
+ * the #327 failure class — so append/replace/undo paths must use this
+ * instead of a bare setNote()+saveTx(), same as note creation does.
+ */
+export async function persistVerifiedNoteHtml(
+  note: Zotero.Item,
+  html: string,
+  saveOptions: NotePersistenceSaveOptions = {},
+): Promise<void> {
+  await persistAndVerifyNoteHtml(note, html, saveOptions);
+}
+
 function resolveCreatedNoteId(
   note: Zotero.Item,
   saveResult: number | boolean | undefined,

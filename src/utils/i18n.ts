@@ -875,7 +875,7 @@ export function getWebChatWelcomeHtml(
           <div class="llm-start-page-rec-title llm-webchat-rec-title-spaced">怎么提问</div>
           <ol class="llm-start-page-rec-list">
             <li>在这里输入问题并点击 <strong>Send</strong>。</li>
-            <li>论文对话中，论文标签高亮表示会附加当前 PDF；右键论文标签可切换发送 PDF 或跳过 PDF。每个 WebChat 会话通常只上传一次 PDF。</li>
+            <li>论文对话中，论文标签高亮表示下一轮会附加当前 PDF；未高亮时只发送提问。发送成功后，标签会自动切换为仅发送提问；之后随时可以右键论文标签重新附加当前 PDF。</li>
             <li>如果没有反应，请刷新 <strong>${domain}</strong> 标签页，确认扩展已启用，并让 Zotero 和浏览器保持在同一个显示器。</li>
           </ol>
         </div>

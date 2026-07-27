@@ -97,10 +97,7 @@ describe("webchat relay/client", function () {
       (polled.query as { target?: string } | undefined)?.target,
       "deepseek",
     );
-    assert.equal(
-      relayServer.relayGetStateSnapshot().active_target,
-      "deepseek",
-    );
+    assert.equal(relayServer.relayGetStateSnapshot().active_target, "deepseek");
   });
 
   it("tracks per-site history freshness without wiping other sites on empty updates", async function () {
@@ -468,30 +465,18 @@ describe("webchat relay/client", function () {
       "deepseek_stream_observed",
     );
     assert.equal(done.responses[0].diagnostic?.clickAttempts, 2);
-    assert.equal(
-      done.responses[0].diagnostic?.attachmentFilename,
-      "paper.pdf",
-    );
-    assert.equal(
-      done.responses[0].diagnostic?.attachmentMethod,
-      "drag_drop",
-    );
+    assert.equal(done.responses[0].diagnostic?.attachmentFilename, "paper.pdf");
+    assert.equal(done.responses[0].diagnostic?.attachmentMethod, "drag_drop");
     assert.equal(
       done.responses[0].diagnostic?.attachmentVerificationMs,
       12_345,
     );
-    assert.equal(
-      done.responses[0].diagnostic?.attachmentPreviewVerified,
-      true,
-    );
+    assert.equal(done.responses[0].diagnostic?.attachmentPreviewVerified, true);
     assert.equal(
       done.responses[0].diagnostic?.submittedAttachmentVerified,
       true,
     );
-    assert.equal(
-      done.responses[0].diagnostic?.completionDetectionMs,
-      875,
-    );
+    assert.equal(done.responses[0].diagnostic?.completionDetectionMs, 875);
   });
 
   it("does not reuse a fresh scraped transcript for the wrong chat", async function () {

@@ -116,6 +116,10 @@ import {
   getStreamInterruptionLabel,
   resolveStreamInterruptionOutcome,
 } from "./streamInterruption";
+import {
+  restoreRetryUserSnapshot,
+  takeRetryUserSnapshot,
+} from "./retryUserSnapshot";
 import type {
   ConversationSystem,
   GeneratedChatImage,
@@ -1829,6 +1833,7 @@ function toPanelMessage(message: StoredChatMessage): Message {
     reasoningDetails: message.reasoningDetails,
     reasoningOpen: isReasoningExpandedByDefault(),
     compactMarker: Boolean((message as StoredChatMessage).compactMarker),
+    interrupted: message.interrupted || undefined,
     webchatRunState: message.webchatRunState,
     webchatCompletionReason: message.webchatCompletionReason,
     quoteCitations: message.quoteCitations,
@@ -6954,6 +6959,11 @@ export async function retryLatestAssistantResponse(
   setRequestUIBusy(body, ui, conversationKey, "Preparing retry...");
   const assistantMessage = retryPair.assistantMessage;
   const assistantSnapshot = takeAssistantSnapshot(assistantMessage);
+  // The retry rewrites (and later persists) the paired user row's model
+  // identity and rebuilt contexts before any output exists. A failed retry
+  // that restores the previous answer must roll the user row back with it,
+  // or the stored turn pairs the old answer with the failed retry's metadata.
+  const userSnapshot = takeRetryUserSnapshot(retryPair.userMessage);
   assistantMessage.text = "";
   assistantMessage.interrupted = undefined;
   assistantMessage.reasoningSummary = undefined;
@@ -7065,6 +7075,12 @@ export async function retryLatestAssistantResponse(
       enrichedFullTextPaperContexts || retryFullTextPaperContexts;
   }
   if (!question.trim()) {
+    // The assistant bubble was already reset for streaming and the user
+    // contexts rewritten — put the turn back or it stays stuck as an empty
+    // streaming message that blocks every later retry/edit.
+    restoreAssistantSnapshot(assistantMessage, assistantSnapshot);
+    restoreRetryUserSnapshot(retryPair.userMessage, userSnapshot);
+    refreshChatSafely();
     setStatusSafely("Nothing to retry for latest turn", "error");
     restoreRequestUIIdle(body, conversationKey, thisRequestId);
     clearPendingRequestIdAndSync(conversationKey, body, item);
@@ -7079,10 +7095,44 @@ export async function retryLatestAssistantResponse(
   let streamedReasoningSummary: string | undefined;
   let streamedReasoningDetails: string | undefined;
 
-  const restoreOriginalAssistant = () => {
+  const restoreOriginalTurn = () => {
     responseStreamCoalescer?.cancel();
     restoreAssistantSnapshot(assistantMessage, assistantSnapshot);
+    restoreRetryUserSnapshot(retryPair.userMessage, userSnapshot);
     refreshChatSafely();
+  };
+  // Writes the user row as it currently stands in memory. Called once before
+  // the request goes out, and again after restoreOriginalTurn on a
+  // zero-output failure so the stored row rolls back with the answer.
+  const persistRetryUserRow = async () => {
+    await updateStoredLatestUserMessageByConversation(
+      conversationKey,
+      {
+        text: retryPair.userMessage.text,
+        timestamp: retryPair.userMessage.timestamp,
+        runMode: retryPair.userMessage.runMode,
+        agentRunId: retryPair.userMessage.agentRunId,
+        selectedText: retryPair.userMessage.selectedText,
+        selectedTextContexts: retryPair.userMessage.selectedTextContexts,
+        selectedTexts: retryPair.userMessage.selectedTexts,
+        selectedTextSources: retryPair.userMessage.selectedTextSources,
+        selectedTextPaperContexts:
+          retryPair.userMessage.selectedTextPaperContexts,
+        screenshotImages: retryPair.userMessage.screenshotImages,
+        paperContexts: retryPair.userMessage.paperContexts,
+        pdfPaperContexts: retryPair.userMessage.pdfPaperContexts,
+        fullTextPaperContexts: retryPair.userMessage.fullTextPaperContexts,
+        citationPaperContexts: retryPair.userMessage.citationPaperContexts,
+        selectedCollectionContexts:
+          retryPair.userMessage.selectedCollectionContexts,
+        attachments: retryPair.userMessage.attachments,
+        modelAttachments: retryPair.userMessage.modelAttachments,
+        modelName: retryPair.userMessage.modelName,
+        modelEntryId: retryPair.userMessage.modelEntryId,
+        modelProviderLabel: retryPair.userMessage.modelProviderLabel,
+      },
+      effectiveStorageSystem,
+    );
   };
   const finalizeCancelledAssistant = async () => {
     flushResponseStream("cancel");
@@ -7096,6 +7146,7 @@ export async function retryLatestAssistantResponse(
         timestamp: assistantMessage.timestamp,
         runMode: assistantMessage.runMode,
         agentRunId: assistantMessage.agentRunId,
+        interrupted: assistantMessage.interrupted,
         modelName: assistantMessage.modelName,
         modelEntryId: assistantMessage.modelEntryId,
         modelProviderLabel: assistantMessage.modelProviderLabel,
@@ -7119,7 +7170,7 @@ export async function retryLatestAssistantResponse(
     const blockedAttachments =
       getBlockedCodexAppServerNativeAttachments(attachments);
     if (blockedAttachments.length) {
-      restoreOriginalAssistant();
+      restoreOriginalTurn();
       restoreRequestUIIdle(body, conversationKey, thisRequestId);
       clearPendingRequestIdAndSync(conversationKey, body, item);
       setStatusSafely(
@@ -7165,7 +7216,7 @@ export async function retryLatestAssistantResponse(
       ...(retryModelInputs.pdfUploadSystemMessages || []),
     ];
   } catch (err) {
-    restoreOriginalAssistant();
+    restoreOriginalTurn();
     restoreRequestUIIdle(body, conversationKey, thisRequestId);
     clearPendingRequestIdAndSync(conversationKey, body, item);
     const message =
@@ -7247,34 +7298,7 @@ export async function retryLatestAssistantResponse(
       selectedCollectionContexts.length
         ? selectedCollectionContexts
         : undefined;
-    await updateStoredLatestUserMessageByConversation(
-      conversationKey,
-      {
-        text: retryPair.userMessage.text,
-        timestamp: retryPair.userMessage.timestamp,
-        runMode: retryPair.userMessage.runMode,
-        agentRunId: retryPair.userMessage.agentRunId,
-        selectedText: retryPair.userMessage.selectedText,
-        selectedTextContexts: retryPair.userMessage.selectedTextContexts,
-        selectedTexts: retryPair.userMessage.selectedTexts,
-        selectedTextSources: retryPair.userMessage.selectedTextSources,
-        selectedTextPaperContexts:
-          retryPair.userMessage.selectedTextPaperContexts,
-        screenshotImages: retryPair.userMessage.screenshotImages,
-        paperContexts: retryPair.userMessage.paperContexts,
-        pdfPaperContexts: retryPair.userMessage.pdfPaperContexts,
-        fullTextPaperContexts: retryPair.userMessage.fullTextPaperContexts,
-        citationPaperContexts: retryPair.userMessage.citationPaperContexts,
-        selectedCollectionContexts:
-          retryPair.userMessage.selectedCollectionContexts,
-        attachments: retryPair.userMessage.attachments,
-        modelAttachments: retryPair.userMessage.modelAttachments,
-        modelName: retryPair.userMessage.modelName,
-        modelEntryId: retryPair.userMessage.modelEntryId,
-        modelProviderLabel: retryPair.userMessage.modelProviderLabel,
-      },
-      effectiveStorageSystem,
-    );
+    await persistRetryUserRow();
     if (getCancelledRequestId(conversationKey) >= thisRequestId) {
       getAbortController(conversationKey)?.abort();
       await finalizeCancelledAssistant();
@@ -7478,6 +7502,7 @@ export async function retryLatestAssistantResponse(
         timestamp: assistantMessage.timestamp,
         runMode: assistantMessage.runMode,
         agentRunId: assistantMessage.agentRunId,
+        interrupted: assistantMessage.interrupted,
         modelName: assistantMessage.modelName,
         modelEntryId: assistantMessage.modelEntryId,
         modelProviderLabel: assistantMessage.modelProviderLabel,
@@ -7543,6 +7568,7 @@ export async function retryLatestAssistantResponse(
           timestamp: assistantMessage.timestamp,
           runMode: assistantMessage.runMode,
           agentRunId: assistantMessage.agentRunId,
+          interrupted: assistantMessage.interrupted,
           modelName: assistantMessage.modelName,
           modelEntryId: assistantMessage.modelEntryId,
           modelProviderLabel: assistantMessage.modelProviderLabel,
@@ -7557,7 +7583,11 @@ export async function retryLatestAssistantResponse(
         effectiveStorageSystem,
       );
     } else {
-      restoreOriginalAssistant();
+      restoreOriginalTurn();
+      // The user row was already persisted with the failed retry's model and
+      // contexts before the request went out — write the restored values back
+      // so the stored turn stays a consistent pair.
+      await persistRetryUserRow();
     }
     setStatusSafely(
       `Retry failed: ${`${errMsg}${retryHint}`.slice(0, 48)}`,
@@ -9212,6 +9242,7 @@ export async function sendQuestion(
         modelName: assistantMessage.modelName,
         modelEntryId: assistantMessage.modelEntryId,
         modelProviderLabel: assistantMessage.modelProviderLabel,
+        interrupted: assistantMessage.interrupted,
         reasoningSummary: assistantMessage.reasoningSummary,
         reasoningDetails: assistantMessage.reasoningDetails,
         webchatRunState: assistantMessage.webchatRunState,

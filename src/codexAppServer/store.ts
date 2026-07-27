@@ -116,6 +116,7 @@ const CODEX_MESSAGE_SELECT_COLUMNS_SQL = `id,
             model_name AS modelName,
             model_entry_id AS modelEntryId,
             model_provider_label AS modelProviderLabel,
+            interrupted,
             webchat_run_state AS webchatRunState,
             webchat_completion_reason AS webchatCompletionReason,
             reasoning_summary AS reasoningSummary,
@@ -498,6 +499,7 @@ const MESSAGE_TRANSFER_COLUMNS = [
   "model_name",
   "model_entry_id",
   "model_provider_label",
+  "interrupted",
   "webchat_run_state",
   "webchat_completion_reason",
   "reasoning_summary",
@@ -531,6 +533,7 @@ const CODEX_MESSAGE_COPY_COLUMNS = [
   "model_name",
   "model_entry_id",
   "model_provider_label",
+  "interrupted",
   "webchat_run_state",
   "webchat_completion_reason",
   "reasoning_summary",
@@ -1100,6 +1103,7 @@ export async function initCodexAppServerStore(): Promise<void> {
         model_name TEXT,
         model_entry_id TEXT,
         model_provider_label TEXT,
+        interrupted INTEGER,
         webchat_run_state TEXT,
         webchat_completion_reason TEXT,
         reasoning_summary TEXT,
@@ -1191,6 +1195,12 @@ export async function initCodexAppServerStore(): Promise<void> {
       columns,
       "generated_images_json",
       "generated_images_json TEXT",
+    );
+    await ensureColumn(
+      CODEX_MESSAGES_TABLE,
+      columns,
+      "interrupted",
+      "interrupted INTEGER",
     );
     await Zotero.DB.queryAsync(
       `CREATE INDEX IF NOT EXISTS ${CODEX_MESSAGES_INDEX}
@@ -1313,8 +1323,8 @@ export async function appendCodexMessage(
   await Zotero.DB.executeTransaction(async () => {
     await Zotero.DB.queryAsync(
       `INSERT INTO ${CODEX_MESSAGES_TABLE}
-        (conversation_id, conversation_key, role, text, timestamp, run_mode, agent_run_id, selected_text, selected_text_contexts_json, selected_texts_json, selected_text_sources_json, selected_text_paper_contexts_json, selected_text_note_contexts_json, forced_skill_ids_json, paper_contexts_json, pdf_paper_contexts_json, full_text_paper_contexts_json, citation_paper_contexts_json, quote_citations_json, screenshot_images, attachments_json, generated_images_json, model_name, model_entry_id, model_provider_label, webchat_run_state, webchat_completion_reason, reasoning_summary, reasoning_details, compact_marker, context_tokens, context_window)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        (conversation_id, conversation_key, role, text, timestamp, run_mode, agent_run_id, selected_text, selected_text_contexts_json, selected_texts_json, selected_text_sources_json, selected_text_paper_contexts_json, selected_text_note_contexts_json, forced_skill_ids_json, paper_contexts_json, pdf_paper_contexts_json, full_text_paper_contexts_json, citation_paper_contexts_json, quote_citations_json, screenshot_images, attachments_json, generated_images_json, model_name, model_entry_id, model_provider_label, interrupted, webchat_run_state, webchat_completion_reason, reasoning_summary, reasoning_details, compact_marker, context_tokens, context_window)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       [
         conversationID,
         normalizedKey,
@@ -1353,6 +1363,7 @@ export async function appendCodexMessage(
         message.modelName || null,
         message.modelEntryId || null,
         message.modelProviderLabel || null,
+        message.interrupted ? 1 : null,
         message.webchatRunState || null,
         message.webchatCompletionReason || null,
         message.reasoningSummary || null,
@@ -1712,6 +1723,7 @@ export async function loadCodexConversation(
         typeof row.modelProviderLabel === "string"
           ? row.modelProviderLabel
           : undefined,
+      interrupted: Number(row.interrupted) === 1 ? true : undefined,
       webchatRunState:
         row.webchatRunState === "done" ||
         row.webchatRunState === "incomplete" ||
@@ -1994,6 +2006,7 @@ export async function updateLatestCodexAssistantMessage(
     | "modelName"
     | "modelEntryId"
     | "modelProviderLabel"
+    | "interrupted"
     | "webchatRunState"
     | "webchatCompletionReason"
     | "reasoningSummary"
@@ -2024,6 +2037,7 @@ export async function updateLatestCodexAssistantMessage(
            model_name = ?,
            model_entry_id = ?,
            model_provider_label = ?,
+           interrupted = ?,
            webchat_run_state = ?,
            webchat_completion_reason = ?,
            reasoning_summary = ?,
@@ -2048,6 +2062,7 @@ export async function updateLatestCodexAssistantMessage(
         message.modelName || null,
         message.modelEntryId || null,
         message.modelProviderLabel || null,
+        message.interrupted ? 1 : null,
         message.webchatRunState || null,
         message.webchatCompletionReason || null,
         message.reasoningSummary || null,

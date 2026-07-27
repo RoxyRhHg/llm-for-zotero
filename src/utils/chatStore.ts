@@ -105,6 +105,8 @@ export type StoredChatMessage = {
   modelName?: string;
   modelEntryId?: string;
   modelProviderLabel?: string;
+  /** Streamed reply was cut off before completion; partial text kept. */
+  interrupted?: boolean;
   webchatRunState?: "done" | "incomplete" | "error";
   webchatCompletionReason?:
     | "settled"
@@ -174,6 +176,7 @@ const CHAT_MESSAGE_SELECT_COLUMNS_SQL = `id,
             model_name AS modelName,
             model_entry_id AS modelEntryId,
             model_provider_label AS modelProviderLabel,
+            interrupted,
             webchat_run_state AS webchatRunState,
             webchat_completion_reason AS webchatCompletionReason,
             reasoning_summary AS reasoningSummary,
@@ -425,6 +428,7 @@ const CHAT_MESSAGE_COPY_COLUMNS = [
   "model_name",
   "model_entry_id",
   "model_provider_label",
+  "interrupted",
   "webchat_run_state",
   "webchat_completion_reason",
   "reasoning_summary",
@@ -1130,6 +1134,7 @@ export async function initChatStore(): Promise<void> {
         model_name TEXT,
         model_entry_id TEXT,
         model_provider_label TEXT,
+        interrupted INTEGER,
         webchat_run_state TEXT,
         webchat_completion_reason TEXT,
         reasoning_summary TEXT,
@@ -1204,6 +1209,12 @@ export async function initChatStore(): Promise<void> {
          ADD COLUMN webchat_completion_reason TEXT`,
       );
     }
+    await ensureColumn(
+      CHAT_MESSAGES_TABLE,
+      messageColumns,
+      "interrupted",
+      "interrupted INTEGER",
+    );
     const hasContextTokensColumn = Boolean(
       columns?.some((column) => column?.name === "context_tokens"),
     );
@@ -1584,6 +1595,7 @@ export async function loadConversation(
         modelName?: unknown;
         modelEntryId?: unknown;
         modelProviderLabel?: unknown;
+        interrupted?: unknown;
         webchatRunState?: unknown;
         webchatCompletionReason?: unknown;
         reasoningSummary?: unknown;
@@ -1896,6 +1908,7 @@ export async function loadConversation(
         typeof row.modelProviderLabel === "string"
           ? row.modelProviderLabel
           : undefined,
+      interrupted: Number(row.interrupted) === 1 ? true : undefined,
       webchatRunState:
         row.webchatRunState === "done" ||
         row.webchatRunState === "incomplete" ||
@@ -2006,8 +2019,8 @@ export async function appendMessage(
   await Zotero.DB.executeTransaction(async () => {
     await Zotero.DB.queryAsync(
       `INSERT INTO ${CHAT_MESSAGES_TABLE}
-        (conversation_id, conversation_key, role, text, timestamp, run_mode, agent_run_id, selected_text, selected_text_contexts_json, selected_texts_json, selected_text_sources_json, selected_text_paper_contexts_json, selected_text_note_contexts_json, forced_skill_ids_json, paper_contexts_json, pdf_paper_contexts_json, full_text_paper_contexts_json, citation_paper_contexts_json, quote_citations_json, collection_contexts_json, tag_contexts_json, screenshot_images, attachments_json, model_attachments_json, generated_images_json, model_name, model_entry_id, model_provider_label, webchat_run_state, webchat_completion_reason, reasoning_summary, reasoning_details, context_tokens, context_window)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        (conversation_id, conversation_key, role, text, timestamp, run_mode, agent_run_id, selected_text, selected_text_contexts_json, selected_texts_json, selected_text_sources_json, selected_text_paper_contexts_json, selected_text_note_contexts_json, forced_skill_ids_json, paper_contexts_json, pdf_paper_contexts_json, full_text_paper_contexts_json, citation_paper_contexts_json, quote_citations_json, collection_contexts_json, tag_contexts_json, screenshot_images, attachments_json, model_attachments_json, generated_images_json, model_name, model_entry_id, model_provider_label, interrupted, webchat_run_state, webchat_completion_reason, reasoning_summary, reasoning_details, context_tokens, context_window)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       [
         conversationID,
         normalizedKey,
@@ -2051,6 +2064,7 @@ export async function appendMessage(
         message.modelName || null,
         message.modelEntryId || null,
         message.modelProviderLabel || null,
+        message.interrupted ? 1 : null,
         message.webchatRunState || null,
         message.webchatCompletionReason || null,
         message.reasoningSummary || null,
@@ -2239,6 +2253,7 @@ export async function updateLatestAssistantMessage(
     | "modelName"
     | "modelEntryId"
     | "modelProviderLabel"
+    | "interrupted"
     | "webchatRunState"
     | "webchatCompletionReason"
     | "reasoningSummary"
@@ -2268,6 +2283,7 @@ export async function updateLatestAssistantMessage(
            model_name = ?,
            model_entry_id = ?,
            model_provider_label = ?,
+           interrupted = ?,
            webchat_run_state = ?,
            webchat_completion_reason = ?,
            reasoning_summary = ?,
@@ -2291,6 +2307,7 @@ export async function updateLatestAssistantMessage(
         message.modelName || null,
         message.modelEntryId || null,
         message.modelProviderLabel || null,
+        message.interrupted ? 1 : null,
         message.webchatRunState || null,
         message.webchatCompletionReason || null,
         message.reasoningSummary || null,

@@ -529,9 +529,7 @@ export function attachComposePreviewInteractionController(
       }
       paperChip.classList.toggle(
         "llm-paper-context-chip-webchat-inactive",
-        deps.isWebChatMode() &&
-          contentSource === "pdf" &&
-          !nextIsFullText,
+        deps.isWebChatMode() && contentSource === "pdf" && !nextIsFullText,
       );
       deps.closePaperChipMenu();
       if (deps.isWebChatMode() && contentSource === "pdf") {

@@ -1,5 +1,8 @@
 import { assert } from "chai";
-import { createFinalizedZoteroNote } from "../src/modules/contextPanel/notePersistence";
+import {
+  createFinalizedZoteroNote,
+  persistVerifiedNoteHtml,
+} from "../src/modules/contextPanel/notePersistence";
 
 describe("finalized Zotero note persistence", function () {
   const globalScope = globalThis as typeof globalThis & {
@@ -146,6 +149,50 @@ describe("finalized Zotero note persistence", function () {
 
     assert.equal(note.saveCalls, 3);
     assert.equal(note.persistedHtml, "<p>Final note with image</p>");
+  });
+
+  it("recovers a silently lost append write by reloading and retrying", async function () {
+    // The #327 failure class: saveTx neither throws nor persists. Appends to
+    // an existing note must verify-and-retry exactly like note creation does.
+    const note = new PersistentNote();
+    note.id = 41;
+    note.noteHtml = "<p>Old</p>";
+    note.persistedHtml = "<p>Old</p>";
+    note.skipPersistOnSaveCall = 1;
+
+    await persistVerifiedNoteHtml(
+      note as unknown as Zotero.Item,
+      "<p>Old</p><p>New answer</p>",
+    );
+
+    assert.equal(note.saveCalls, 2);
+    assert.equal(note.persistedHtml, "<p>Old</p><p>New answer</p>");
+  });
+
+  it("throws instead of reporting success when the write never persists", async function () {
+    class LossyNote extends PersistentNote {
+      async saveTx(): Promise<number | boolean> {
+        this.saveCalls += 1;
+        return true;
+      }
+    }
+    const note = new LossyNote();
+    note.id = 41;
+    note.noteHtml = "<p>Old</p>";
+    note.persistedHtml = "<p>Old</p>";
+
+    let thrown: unknown;
+    try {
+      await persistVerifiedNoteHtml(
+        note as unknown as Zotero.Item,
+        "<p>Old</p><p>New answer</p>",
+      );
+    } catch (error) {
+      thrown = error;
+    }
+
+    assert.instanceOf(thrown, Error);
+    assert.match((thrown as Error).message, /did not persist/);
   });
 
   it("keeps useful text and reports a warning when asset finalization throws", async function () {

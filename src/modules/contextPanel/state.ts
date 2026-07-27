@@ -17,6 +17,7 @@ import type {
   GeneratedChatImage,
 } from "./types";
 import { TTLMap } from "./contexts/ttlMap";
+import { clearMermaidSvgCache } from "./mermaidSvgCache";
 import type { ConversationForkLink } from "../../shared/conversationForkLinks";
 // =============================================================================
 // Module State
@@ -471,4 +472,7 @@ export function clearAllState(): void {
   cancelledRequestIds.clear();
   abortControllers.clear();
   autoLockedGlobalConversationKeys.clear();
+  selectedTagContextCache.clear();
+  webChatIsolatedConversationKeys.clear();
+  clearMermaidSvgCache();
 }

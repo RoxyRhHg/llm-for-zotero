@@ -73,7 +73,8 @@ export function getMermaidSvgCacheSizeForTests(): number {
   return mermaidSvgCache.size;
 }
 
-export function clearMermaidSvgCacheForTests(): void {
+/** Release all cached SVGs; called from clearAllState on plugin shutdown. */
+export function clearMermaidSvgCache(): void {
   mermaidSvgCache.clear();
   mermaidSvgCacheBytes = 0;
 }

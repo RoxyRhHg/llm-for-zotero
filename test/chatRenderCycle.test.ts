@@ -6,6 +6,8 @@ import {
   claimAsyncChatRender,
   claimDeferredChatRender,
   currentChatRenderCycle,
+  setPanelRenderClaim,
+  takePanelRenderClaim,
 } from "../src/modules/contextPanel/chatRenderCycle";
 
 function fakeBody(): Element {
@@ -86,5 +88,151 @@ describe("chatRenderCycle", function () {
     assert.isTrue(claimAsyncChatRender(bodyB, currentChatRenderCycle(bodyB)));
     assert.isFalse(claimAsyncChatRender(bodyA, currentChatRenderCycle(bodyA)));
     assert.isFalse(claimDeferredChatRender(bodyB, cycleB));
+  });
+});
+
+describe("panelRenderClaim", function () {
+  it("a stale async render for a superseded item cannot consume the claim or steal the render", function () {
+    const body = fakeBody();
+    // onRender(item B): full render begins cycle C2 and leaves a claim for B.
+    const cycle2 = beginChatRenderCycle(body);
+    setPanelRenderClaim(body, {
+      kind: "sync-rendered",
+      itemKey: "item-B",
+      cycle: cycle2,
+    });
+    // A stale onAsyncRender(item A) wakes up after B's onRender. It must be
+    // told it is superseded — not handed B's claim and cycle.
+    assert.deepEqual(takePanelRenderClaim(body, "item-A"), {
+      outcome: "stale",
+    });
+    // B's deferred fallback still owns the render.
+    assert.isTrue(claimDeferredChatRender(body, cycle2));
+    // B's own async render still finds its claim intact, then skips the
+    // duplicate render because the deferred path already rendered.
+    const own = takePanelRenderClaim(body, "item-B");
+    assert.equal(own.outcome, "sync-rendered");
+    assert.isFalse(
+      claimAsyncChatRender(
+        body,
+        own.outcome === "sync-rendered" ? own.cycle : null,
+      ),
+    );
+  });
+
+  it("a matching async render consumes the claim exactly once", function () {
+    const body = fakeBody();
+    const cycle = beginChatRenderCycle(body);
+    setPanelRenderClaim(body, {
+      kind: "sync-rendered",
+      itemKey: "item-A",
+      cycle,
+    });
+    const first = takePanelRenderClaim(body, "item-A");
+    assert.equal(first.outcome, "sync-rendered");
+    assert.deepEqual(takePanelRenderClaim(body, "item-A"), {
+      outcome: "none",
+    });
+  });
+
+  it("a sync-rendered claim without a cycle still lets its async render own the chat render", function () {
+    // Standalone-placeholder path: onRender marked the body sync-rendered but
+    // began no cycle of its own.
+    const body = fakeBody();
+    setPanelRenderClaim(body, {
+      kind: "sync-rendered",
+      itemKey: "item-A",
+      cycle: null,
+    });
+    const claim = takePanelRenderClaim(body, "item-A");
+    assert.equal(claim.outcome, "sync-rendered");
+    assert.isTrue(
+      claimAsyncChatRender(
+        body,
+        claim.outcome === "sync-rendered" ? claim.cycle : null,
+      ),
+    );
+  });
+
+  it("a full render's claim replaces a pending context-refresh claim", function () {
+    const body = fakeBody();
+    setPanelRenderClaim(body, { kind: "context-refresh", itemKey: "item-B" });
+    // Item switch: the full render for A overwrites B's pending refresh.
+    const cycle = beginChatRenderCycle(body);
+    setPanelRenderClaim(body, {
+      kind: "sync-rendered",
+      itemKey: "item-A",
+      cycle,
+    });
+    assert.deepEqual(takePanelRenderClaim(body, "item-B"), {
+      outcome: "stale",
+    });
+    assert.equal(takePanelRenderClaim(body, "item-A").outcome, "sync-rendered");
+  });
+
+  it("a context-refresh claim is consumed only by its own item", function () {
+    const body = fakeBody();
+    setPanelRenderClaim(body, { kind: "context-refresh", itemKey: "item-B" });
+    assert.deepEqual(takePanelRenderClaim(body, "item-A"), {
+      outcome: "stale",
+    });
+    assert.deepEqual(takePanelRenderClaim(body, "item-B"), {
+      outcome: "context-refresh",
+    });
+    assert.deepEqual(takePanelRenderClaim(body, "item-B"), {
+      outcome: "none",
+    });
+  });
+
+  it("a stale async render arriving after the owner consumed its claim is still rejected", function () {
+    const body = fakeBody();
+    // onRender(B) leaves its claim; B's own async render consumes it first.
+    const cycleB = beginChatRenderCycle(body);
+    setPanelRenderClaim(body, {
+      kind: "sync-rendered",
+      itemKey: "item-B",
+      cycle: cycleB,
+    });
+    assert.equal(takePanelRenderClaim(body, "item-B").outcome, "sync-rendered");
+    // A stale onAsyncRender(A) arrives late, AFTER the claim is gone. The
+    // body is still owned by B, so A must be rejected — "none" would send it
+    // down the async-only path where it rebuilds A's panel over B's.
+    assert.deepEqual(takePanelRenderClaim(body, "item-A"), {
+      outcome: "stale",
+    });
+    // The rejection must not disturb B: a repeat take for the owner still
+    // reports the claim as already consumed.
+    assert.deepEqual(takePanelRenderClaim(body, "item-B"), {
+      outcome: "none",
+    });
+  });
+
+  it("ownership survives across consumed claims of both kinds", function () {
+    const body = fakeBody();
+    setPanelRenderClaim(body, {
+      kind: "sync-rendered",
+      itemKey: "item-B",
+      cycle: beginChatRenderCycle(body),
+    });
+    assert.equal(takePanelRenderClaim(body, "item-B").outcome, "sync-rendered");
+    // A later same-item context refresh re-marks the body and is consumed.
+    setPanelRenderClaim(body, { kind: "context-refresh", itemKey: "item-B" });
+    assert.equal(
+      takePanelRenderClaim(body, "item-B").outcome,
+      "context-refresh",
+    );
+    // Stale A is still rejected long after both claims were consumed.
+    assert.deepEqual(takePanelRenderClaim(body, "item-A"), {
+      outcome: "stale",
+    });
+  });
+
+  it("a body that never rendered accepts its first async-only render", function () {
+    const body = fakeBody();
+    // No onRender ever ran for this body — there is no owner to defend, so
+    // the async-only render proceeds exactly as before.
+    assert.deepEqual(takePanelRenderClaim(body, "item-A"), {
+      outcome: "none",
+    });
   });
 });
