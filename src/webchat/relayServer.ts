@@ -72,6 +72,7 @@ export type RelayQueryPhase =
   | "pending"
   | "claimed"
   | "prompt_applied"
+  | "submit_started"
   | "submitted"
   | "streaming"
   | "done"
@@ -619,14 +620,16 @@ function phaseOrder(phase: RelayQueryPhase): number {
       return 1;
     case "prompt_applied":
       return 2;
-    case "submitted":
+    case "submit_started":
       return 3;
-    case "streaming":
+    case "submitted":
       return 4;
-    case "done":
+    case "streaming":
       return 5;
-    case "error":
+    case "done":
       return 6;
+    case "error":
+      return 7;
     default:
       return 0;
   }
@@ -982,7 +985,11 @@ const AckQueryPhaseEndpoint = createEndpoint(["POST"], (opts) => {
   if (nextPhase === "claimed" || nextPhase === "prompt_applied") {
     S().running_since = Date.now();
   }
-  if (nextPhase === "submitted" || nextPhase === "streaming") {
+  if (
+    nextPhase === "submit_started" ||
+    nextPhase === "submitted" ||
+    nextPhase === "streaming"
+  ) {
     S().running_since = Date.now();
   }
   if (nextPhase === "submitted" && !S().run_state) {
@@ -1592,6 +1599,7 @@ export function relayAckQueryPhase(
   if (
     phase === "claimed" ||
     phase === "prompt_applied" ||
+    phase === "submit_started" ||
     phase === "submitted" ||
     phase === "streaming"
   ) {

@@ -378,6 +378,68 @@ describe("webchat relay/client", function () {
     assert.isNull(root.remote_chat_id);
   });
 
+  it("prevents query replay once submission is durably starting", async function () {
+    const submit = relayServer.relaySubmitQuery({
+      prompt: "at-most-once delivery",
+    });
+    const firstClaim = relayServer.relayClaimQuery(submit.seq);
+    const firstAttempt = firstClaim.query?.attempt || 1;
+    assert.isTrue(firstClaim.ok);
+
+    const promptApplied = await invokeEndpoint(
+      "/llm-for-zotero/webchat/ack_query_phase",
+      "POST",
+      {
+        seq: submit.seq,
+        attempt: firstAttempt,
+        phase: "prompt_applied",
+      },
+    );
+    assert.equal(promptApplied.ok, true);
+
+    const safeRelease = await invokeEndpoint(
+      "/llm-for-zotero/webchat/release_query",
+      "POST",
+      {
+        seq: submit.seq,
+        attempt: firstAttempt,
+      },
+    );
+    assert.equal(safeRelease.ok, true);
+
+    const secondClaim = relayServer.relayClaimQuery(submit.seq);
+    const secondAttempt = secondClaim.query?.attempt || 2;
+    assert.isTrue(secondClaim.ok);
+    assert.equal(secondAttempt, firstAttempt + 1);
+
+    const submitStarted = await invokeEndpoint(
+      "/llm-for-zotero/webchat/ack_query_phase",
+      "POST",
+      {
+        seq: submit.seq,
+        attempt: secondAttempt,
+        phase: "submit_started",
+      },
+    );
+    assert.equal(submitStarted.ok, true);
+
+    const unsafeRelease = await invokeEndpoint(
+      "/llm-for-zotero/webchat/release_query",
+      "POST",
+      {
+        seq: submit.seq,
+        attempt: secondAttempt,
+      },
+    );
+    assert.equal(unsafeRelease.ok, false);
+    assert.equal(unsafeRelease.reason, "already_submitted");
+    assert.equal(
+      relayServer.relayGetStateSnapshot().query.phase,
+      "submit_started",
+    );
+    assert.equal(relayServer.relayPollQuery().status, "running");
+  });
+
   it("propagates per-turn diagnostics through phase, snapshot, and terminal response", async function () {
     const submit = relayServer.relaySubmitQuery({ prompt: "diagnostic-turn" });
     const claimed = relayServer.relayClaimQuery(submit.seq);

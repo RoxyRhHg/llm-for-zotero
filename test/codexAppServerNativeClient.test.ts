@@ -630,10 +630,10 @@ describe("Codex app-server native client", function () {
     const restorePrefs = installDirectPathTestPrefs("native");
     const expectedCwd = getUserSkillsRuntimeRootDir();
     const writeNoteSkillPath = `${expectedCwd}/.agents/skills/write-note/SKILL.md`;
-    const listedWriteNoteSkillPath = writeNoteSkillPath.replace(
-      /^\/tmp\//,
-      "/private/tmp/",
-    );
+    const listedWriteNoteSkillPath =
+      process.platform === "darwin"
+        ? writeNoteSkillPath.replace(/^\/tmp\//, "/private/tmp/")
+        : writeNoteSkillPath;
     const simplePaperQaSkillPath = `${expectedCwd}/.agents/skills/simple-paper-qa/SKILL.md`;
     const proc = createNativeLifecycleTestProcess({
       newThreadIds: ["thread-pdf-explicit-skill"],
