@@ -661,12 +661,26 @@ export function registerScopedZoteroMcpScope(
  * keep reusing it on resume, so a token that only lives for one turn is already
  * stale by the next turn. A conversation-stable token lets every turn re-register
  * its own scope under the same header value.
+ *
+ * Callers pass the identity rather than a pre-joined key so that the turn runner
+ * and the fork path cannot drift on the key format: two spellings of the same
+ * conversation would yield two tokens and bring the stale-header failure back.
+ *
+ * Entries hold only the token. The scope itself is registered per turn in
+ * `scopedZoteroMcpScopes` and released when the turn ends. They are not expired
+ * on a timer: a token whose conversation is still live in the agent runtime must
+ * keep resolving, because the runtime keeps sending the header it captured when
+ * the conversation was created. The map is cleared in `unregisterMcpServer()`.
  */
-export function resolveConversationScopeToken(
-  conversationScopeId: string,
-): string {
-  const key = normalizeText(conversationScopeId, 256);
-  if (!key) return generateToken();
+export function resolveConversationScopeToken(params: {
+  profileSignature?: string;
+  conversationKey: number;
+}): string {
+  const conversationKey = Math.floor(Number(params.conversationKey));
+  if (!Number.isFinite(conversationKey) || conversationKey <= 0) {
+    return generateToken();
+  }
+  const key = `${normalizeText(params.profileSignature, 256) || ""} ${conversationKey}`;
   const existing = conversationScopeTokens.get(key);
   if (existing) return existing;
   const token = generateToken();
@@ -723,7 +737,7 @@ function mcpReadDedupeScopePrefix(scopeToken: string): string {
   return `token:${JSON.stringify(scopeToken)}:`;
 }
 
-export function clearMcpReadDedupeCacheForScopeToken(scopeToken: string): void {
+function clearMcpReadDedupeCacheForScopeToken(scopeToken: string): void {
   const prefix = mcpReadDedupeScopePrefix(scopeToken);
   for (const key of mcpReadDedupeCache.keys()) {
     if (key.startsWith(prefix)) mcpReadDedupeCache.delete(key);

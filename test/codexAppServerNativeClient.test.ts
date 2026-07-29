@@ -10,6 +10,7 @@ import {
   buildZoteroEnvironmentManifest,
   compactCodexAppServerConversation,
   compactCodexAppServerThread,
+  forkCodexAppServerThread,
   isDeniedTrustedZoteroMcpGuardianReviewForTests,
   listCodexAppServerModels,
   NO_CODEX_APP_SERVER_THREAD_TO_COMPACT_MESSAGE,
@@ -27,6 +28,11 @@ import {
   CodexAppServerProcess,
   destroyCachedCodexAppServerProcess,
 } from "../src/utils/codexAppServerProcess";
+import {
+  resolveConversationScopeToken,
+  ZOTERO_MCP_SCOPE_HEADER,
+} from "../src/agent/mcp/server";
+import { getCodexProfileSignature } from "../src/codexAppServer/constants";
 import { getUserSkillsRuntimeRootDir } from "../src/agent/skills/userSkills";
 import {
   BUILTIN_SKILL_FILES,
@@ -1080,6 +1086,89 @@ describe("Codex app-server native client", function () {
       cursor: "cursor-1",
       limit: 50,
     });
+  });
+
+  it("forks a thread with the target conversation's scope header, not the source's", async function () {
+    const processKey = "native-fork-scope-header";
+    const originalSpawn = CodexAppServerProcess.spawn;
+    const originalZotero = (globalThis as { Zotero?: unknown }).Zotero;
+    const writes: string[] = [];
+    const proc = CodexAppServerProcess.forTest({
+      stdin: {
+        write: (chunk: string) => {
+          writes.push(chunk);
+          const request = JSON.parse(chunk) as { id: number; method: string };
+          if (request.method !== "thread/fork") return;
+          setTimeout(() => {
+            (
+              proc as unknown as {
+                handleMessage: (msg: Record<string, unknown>) => void;
+              }
+            ).handleMessage({
+              id: request.id,
+              result: { thread: { id: "thread-forked" } },
+            });
+          }, 0);
+        },
+      },
+      kill: () => {},
+    });
+    CodexAppServerProcess.spawn = async () => proc;
+    (globalThis as { Zotero?: unknown }).Zotero = {
+      Prefs: { get: () => undefined },
+      Profile: { dir: "/tmp/lfz-fork-scope-profile" },
+      DataDirectory: { dir: "/tmp/lfz-fork-scope-data" },
+    };
+
+    try {
+      const threadId = await forkCodexAppServerThread({
+        threadId: "thread-source",
+        targetConversationKey: 6_000_000_311,
+        processKey,
+        codexPath: "codex",
+      });
+      assert.equal(threadId, "thread-forked");
+
+      const forkRequest = writes
+        .map(
+          (chunk) =>
+            JSON.parse(chunk) as {
+              method: string;
+              params: Record<string, any>;
+            },
+        )
+        .find((entry) => entry.method === "thread/fork");
+      assert.equal(forkRequest?.params.threadId, "thread-source");
+
+      const servers = forkRequest?.params.config?.mcp_servers as Record<
+        string,
+        { http_headers?: Record<string, string> }
+      >;
+      const serverConfig = Object.values(servers || {})[0];
+      const sentScopeToken =
+        serverConfig?.http_headers?.[ZOTERO_MCP_SCOPE_HEADER];
+      const profileSignature = getCodexProfileSignature();
+      assert.equal(
+        sentScopeToken,
+        resolveConversationScopeToken({
+          profileSignature,
+          conversationKey: 6_000_000_311,
+        }),
+      );
+      assert.notEqual(
+        sentScopeToken,
+        resolveConversationScopeToken({
+          profileSignature,
+          conversationKey: 6_000_000_310,
+        }),
+      );
+    } finally {
+      CodexAppServerProcess.spawn = originalSpawn;
+      destroyCachedCodexAppServerProcess(processKey, proc, {
+        codexPath: "codex",
+      });
+      (globalThis as { Zotero?: unknown }).Zotero = originalZotero;
+    }
   });
 
   it("auto-approves trusted Zotero MCP approval prompts except self-confirmation", function () {

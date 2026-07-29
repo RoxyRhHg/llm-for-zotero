@@ -674,18 +674,11 @@ export const conversationRepository = {
     const sourceProviderSessionId =
       normalizeTitle(sourceEntry.providerSessionId) || "";
 
-    let forkedCodexThreadId: string | null = null;
     if (params.system === "codex") {
       const latestCodexForkableAssistantTimestamp =
         await getLatestCodexForkableAssistantTimestamp(sourceConversationKey);
       if (latestCodexForkableAssistantTimestamp !== throughAssistantTimestamp) {
         return null;
-      }
-      if (sourceProviderSessionId) {
-        forkedCodexThreadId = await codexAppServerForkService.forkThread({
-          threadId: sourceProviderSessionId,
-        });
-        if (!forkedCodexThreadId) return null;
       }
     }
 
@@ -695,15 +688,38 @@ export const conversationRepository = {
       libraryID,
       paperItemID,
     });
-    if (!entry) {
-      if (forkedCodexThreadId) {
-        await codexAppServerForkService
-          .archiveThread({ threadId: forkedCodexThreadId })
+    if (!entry) return null;
+
+    // The catalog entry is created first so the fork can be told which
+    // conversation it belongs to. Codex binds the Zotero scope header when it
+    // creates the target conversation, and resume never rebinds it, so a fork
+    // that inherits the source header would stay bound to the source scope.
+    let forkedCodexThreadId: string | null = null;
+    if (params.system === "codex" && sourceProviderSessionId) {
+      const discardForkEntry = async () => {
+        await conversationRepository
+          .deleteCatalogEntry({
+            system: "codex",
+            kind: entry.kind,
+            conversationKey: entry.conversationKey,
+          })
           .catch(() => {});
+      };
+      try {
+        forkedCodexThreadId = await codexAppServerForkService.forkThread({
+          threadId: sourceProviderSessionId,
+          targetConversationKey: entry.conversationKey,
+        });
+      } catch (err) {
+        await discardForkEntry();
+        throw err;
       }
-      return null;
+      if (!forkedCodexThreadId) {
+        await discardForkEntry();
+        return null;
+      }
     }
-    if (entry && params.system === "codex" && forkedCodexThreadId) {
+    if (params.system === "codex" && forkedCodexThreadId) {
       const persistedProviderSession = await upsertCodexConversationSummary({
         conversationKey: entry.conversationKey,
         libraryID,

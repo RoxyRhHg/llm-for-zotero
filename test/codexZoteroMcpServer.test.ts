@@ -2490,24 +2490,35 @@ describe("Zotero MCP server", function () {
           kind: "global",
           activeItemId,
         },
-        { token: resolveConversationScopeToken("profile-conv:501") },
+        {
+          token: resolveConversationScopeToken({
+            profileSignature: "profile-conv",
+            conversationKey: 501,
+          }),
+        },
       );
     const firstTurn = registerTurn(10);
+    // Turn teardown releases the scope; only the token stays registered.
+    firstTurn.clear();
     const secondTurn = registerTurn(20);
-    assert.equal(secondTurn.token, firstTurn.token);
+    try {
+      assert.equal(secondTurn.token, firstTurn.token);
 
-    const response = await invokeMcpEndpoint({
-      token: getOrCreateZoteroMcpBearerToken(),
-      headers: { [ZOTERO_MCP_SCOPE_HEADER]: firstTurn.token },
-      body: {
-        jsonrpc: "2.0",
-        id: 1,
-        method: "tools/call",
-        params: { name: "library_read", arguments: {} },
-      },
-    });
-    assert.isUndefined(JSON.parse(response[2]).error);
-    assert.equal(seenActiveItemId, 20);
+      const response = await invokeMcpEndpoint({
+        token: getOrCreateZoteroMcpBearerToken(),
+        headers: { [ZOTERO_MCP_SCOPE_HEADER]: firstTurn.token },
+        body: {
+          jsonrpc: "2.0",
+          id: 1,
+          method: "tools/call",
+          params: { name: "library_read", arguments: {} },
+        },
+      });
+      assert.isUndefined(JSON.parse(response[2]).error);
+      assert.equal(seenActiveItemId, 20);
+    } finally {
+      secondTurn.clear();
+    }
   });
 
   it("rejects stale cached MCP write headers instead of rebinding them", async function () {
