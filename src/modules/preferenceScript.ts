@@ -153,6 +153,7 @@ import {
   getClaudePermissionModePref,
   getClaudeReasoningModePref,
   getClaudeRuntimeModelPref,
+  getClaudeSettingSourcesByPref,
   isClaudeAutoCompactEnabled,
   isClaudeBlockStreamingEnabled,
   getConversationSystemPref,
@@ -168,6 +169,14 @@ import {
   setClaudeRuntimeModelPref,
   setClaudeBlockStreamingEnabled,
 } from "../claudeCode/prefs";
+import {
+  buildClaudeModelPreferenceOptions,
+  CLAUDE_CUSTOMIZED_MODEL_OPTION_KEY,
+  fetchClaudeModelCatalog,
+  resolveClaudeModelPreferenceSelection,
+  shouldPreserveClaudeCustomModelDraft,
+  type ClaudeModelPreferenceOption,
+} from "../claudeCode/modelCatalog";
 import {
   getCodexAppServerApprovalsReviewerPref,
   getCodexBinaryPathPref,
@@ -2396,6 +2405,18 @@ export async function registerPrefsScripts(_window: Window | undefined | null) {
   const claudeCodeModelSelect = doc.querySelector(
     `#${config.addonRef}-claude-code-model`,
   ) as HTMLSelectElement | null;
+  const claudeCodeCustomModelWrap = doc.querySelector(
+    `#${config.addonRef}-claude-code-custom-model-wrap`,
+  ) as HTMLDivElement | null;
+  const claudeCodeCustomModelInput = doc.querySelector(
+    `#${config.addonRef}-claude-code-custom-model`,
+  ) as HTMLInputElement | null;
+  const claudeCodeModelStatus = doc.querySelector(
+    `#${config.addonRef}-claude-code-model-status`,
+  ) as HTMLSpanElement | null;
+  const claudeCodeModelRefreshButton = doc.querySelector(
+    `#${config.addonRef}-claude-code-model-refresh`,
+  ) as HTMLButtonElement | null;
   const claudeCodeReasoningSelect = doc.querySelector(
     `#${config.addonRef}-claude-code-reasoning`,
   ) as HTMLSelectElement | null;
@@ -2720,6 +2741,143 @@ export async function registerPrefsScripts(_window: Window | undefined | null) {
       });
   }
 
+  let claudeModelCatalogRequestId = 0;
+  let claudeModelPreferenceOptions: ClaudeModelPreferenceOption[] = [];
+  const renderClaudeModelCatalogStatus = (
+    message: string,
+    color = "var(--fill-secondary, #777)",
+  ) => {
+    if (!claudeCodeModelStatus) return;
+    claudeCodeModelStatus.textContent = message;
+    claudeCodeModelStatus.style.color = color;
+  };
+  const setClaudeCustomModelVisible = (visible: boolean) => {
+    if (claudeCodeCustomModelWrap) {
+      claudeCodeCustomModelWrap.hidden = !visible;
+      claudeCodeCustomModelWrap.style.display = visible ? "flex" : "none";
+    }
+    if (claudeCodeCustomModelInput) {
+      claudeCodeCustomModelInput.disabled = !visible;
+    }
+  };
+  const syncClaudeModelPreferenceUi = (preserveCustomDraft = false) => {
+    if (!claudeCodeModelSelect) return;
+    const customDraft = claudeCodeCustomModelInput?.value ?? "";
+    const selection = resolveClaudeModelPreferenceSelection({
+      options: claudeModelPreferenceOptions,
+      selectedModel: getClaudeRuntimeModelPref(),
+    });
+    claudeCodeModelSelect.replaceChildren();
+    for (const model of claudeModelPreferenceOptions) {
+      const option = doc.createElementNS(
+        HTML_NS,
+        "option",
+      ) as HTMLOptionElement;
+      option.value = model.key;
+      option.textContent = model.label;
+      option.title = model.description;
+      claudeCodeModelSelect.appendChild(option);
+    }
+    const customizedOption = doc.createElementNS(
+      HTML_NS,
+      "option",
+    ) as HTMLOptionElement;
+    customizedOption.value = CLAUDE_CUSTOMIZED_MODEL_OPTION_KEY;
+    customizedOption.textContent = t("Customized");
+    claudeCodeModelSelect.appendChild(customizedOption);
+
+    const customized = preserveCustomDraft || selection.customized;
+    claudeCodeModelSelect.value = customized
+      ? CLAUDE_CUSTOMIZED_MODEL_OPTION_KEY
+      : selection.selectedKey;
+    if (claudeCodeCustomModelInput) {
+      claudeCodeCustomModelInput.value = preserveCustomDraft
+        ? customDraft
+        : selection.customValue;
+    }
+    setClaudeCustomModelVisible(customized);
+    const selectedOption = claudeModelPreferenceOptions.find(
+      (option) => option.key === claudeCodeModelSelect.value,
+    );
+    claudeCodeModelSelect.title =
+      selectedOption?.description || selectedOption?.model || "";
+  };
+  const refreshClaudeModelSuggestions = async (
+    forceRefresh = false,
+    clearExisting = false,
+  ) => {
+    if (!claudeCodeModelSelect) return;
+    const requestId = ++claudeModelCatalogRequestId;
+    const preserveCustomDraft = shouldPreserveClaudeCustomModelDraft({
+      customized:
+        claudeCodeModelSelect.value === CLAUDE_CUSTOMIZED_MODEL_OPTION_KEY,
+      draftValue: claudeCodeCustomModelInput?.value ?? "",
+      selectedModel: getClaudeRuntimeModelPref(),
+      focused: doc.activeElement === claudeCodeCustomModelInput,
+    });
+    if (clearExisting) {
+      claudeModelPreferenceOptions = [];
+    }
+    claudeCodeModelSelect.disabled = true;
+    claudeCodeModelSelect.setAttribute("aria-busy", "true");
+    if (claudeCodeModelRefreshButton) {
+      claudeCodeModelRefreshButton.disabled = true;
+    }
+    renderClaudeModelCatalogStatus(t("Loading available models…"));
+    try {
+      const catalog = await fetchClaudeModelCatalog({
+        bridgeUrl: getClaudeBridgeUrl(),
+        settingSources: getClaudeSettingSourcesByPref(),
+        forceRefresh,
+      });
+      if (requestId !== claudeModelCatalogRequestId) return;
+      if (claudeCodeModelStatus) claudeCodeModelStatus.title = "";
+      claudeModelPreferenceOptions = buildClaudeModelPreferenceOptions(
+        catalog.models,
+      );
+      syncClaudeModelPreferenceUi(preserveCustomDraft);
+      if (!catalog.models.length) {
+        renderClaudeModelCatalogStatus(
+          t(
+            "Claude Code did not return any available models. Use Customized to enter one.",
+          ),
+        );
+      } else if (catalog.legacy) {
+        renderClaudeModelCatalogStatus(
+          t(
+            "Using a legacy adapter model list. Update the adapter for model details.",
+          ),
+        );
+      } else {
+        renderClaudeModelCatalogStatus(
+          t("%n models available.").replace(
+            "%n",
+            String(catalog.models.length),
+          ),
+        );
+      }
+    } catch (error) {
+      if (requestId !== claudeModelCatalogRequestId) return;
+      const message = error instanceof Error ? error.message : String(error);
+      if (!claudeModelPreferenceOptions.length) {
+        syncClaudeModelPreferenceUi(preserveCustomDraft);
+      }
+      renderClaudeModelCatalogStatus(
+        t("Could not load models. Use Customized to enter one manually."),
+        "var(--fill-secondary, #777)",
+      );
+      if (claudeCodeModelStatus) claudeCodeModelStatus.title = message;
+    } finally {
+      if (requestId === claudeModelCatalogRequestId) {
+        claudeCodeModelSelect.disabled = false;
+        claudeCodeModelSelect.setAttribute("aria-busy", "false");
+        if (claudeCodeModelRefreshButton) {
+          claudeCodeModelRefreshButton.disabled = false;
+        }
+      }
+    }
+  };
+
   if (agentBackendModeSelect) {
     const applyAgentBackendUi = (enabled: boolean) => {
       agentBackendModeSelect.value = enabled ? "claude_bridge" : "disabled";
@@ -2739,6 +2897,7 @@ export async function registerPrefsScripts(_window: Window | undefined | null) {
       getClaudeBridgeUrl() || DEFAULT_AGENT_BRIDGE_URL;
     const commitBridgeUrl = () => {
       setClaudeBridgeUrl(agentBridgeUrlInput.value);
+      void refreshClaudeModelSuggestions(true, true);
     };
     agentBridgeUrlInput.addEventListener("change", commitBridgeUrl);
     agentBridgeUrlInput.addEventListener("blur", commitBridgeUrl);
@@ -3018,6 +3177,7 @@ export async function registerPrefsScripts(_window: Window | undefined | null) {
         true,
       );
       renderClaudeConfigPaths();
+      void refreshClaudeModelSuggestions(true, true);
     });
   }
   renderClaudeConfigPaths();
@@ -3142,9 +3302,65 @@ export async function registerPrefsScripts(_window: Window | undefined | null) {
   }
 
   if (claudeCodeModelSelect) {
-    claudeCodeModelSelect.value = getClaudeRuntimeModelPref();
     claudeCodeModelSelect.addEventListener("change", () => {
-      setClaudeRuntimeModelPref(claudeCodeModelSelect.value);
+      const selectedKey = claudeCodeModelSelect.value;
+      if (selectedKey === CLAUDE_CUSTOMIZED_MODEL_OPTION_KEY) {
+        setClaudeCustomModelVisible(true);
+        if (
+          claudeCodeCustomModelInput &&
+          !claudeCodeCustomModelInput.value.trim()
+        ) {
+          claudeCodeCustomModelInput.value = getClaudeRuntimeModelPref();
+        }
+        doc.defaultView?.setTimeout(() => {
+          claudeCodeCustomModelInput?.focus();
+          claudeCodeCustomModelInput?.select();
+        }, 0);
+        return;
+      }
+      const selected = claudeModelPreferenceOptions.find(
+        (option) => option.key === selectedKey,
+      );
+      if (!selected) return;
+      setClaudeRuntimeModelPref(selected.model);
+      setClaudeCustomModelVisible(false);
+      claudeCodeModelSelect.title =
+        selected.description || selected.model || "";
+    });
+    void refreshClaudeModelSuggestions(true);
+  }
+
+  if (claudeCodeCustomModelInput) {
+    const commitClaudeCustomModel = () => {
+      const model = claudeCodeCustomModelInput.value.trim();
+      if (!model) {
+        claudeCodeCustomModelInput.value = getClaudeRuntimeModelPref();
+        return;
+      }
+      setClaudeRuntimeModelPref(model);
+      claudeCodeCustomModelInput.value = getClaudeRuntimeModelPref();
+      if (claudeCodeModelSelect) {
+        claudeCodeModelSelect.value = CLAUDE_CUSTOMIZED_MODEL_OPTION_KEY;
+      }
+    };
+    claudeCodeCustomModelInput.addEventListener(
+      "change",
+      commitClaudeCustomModel,
+    );
+    claudeCodeCustomModelInput.addEventListener(
+      "blur",
+      commitClaudeCustomModel,
+    );
+    claudeCodeCustomModelInput.addEventListener("keydown", (event) => {
+      if (event.key !== "Enter") return;
+      event.preventDefault();
+      commitClaudeCustomModel();
+    });
+  }
+
+  if (claudeCodeModelRefreshButton) {
+    claudeCodeModelRefreshButton.addEventListener("click", () => {
+      void refreshClaudeModelSuggestions(true);
     });
   }
 

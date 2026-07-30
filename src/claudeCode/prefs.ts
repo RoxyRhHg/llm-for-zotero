@@ -7,7 +7,7 @@ import {
   type AgentPermissionMode,
 } from "../shared/agentPermissionMode";
 import {
-  CLAUDE_MODEL_OPTIONS,
+  DEFAULT_CLAUDE_RUNTIME_MODEL,
   CLAUDE_REASONING_OPTIONS,
   getClaudeAllocatedConversationKeyRange,
   getClaudeGlobalConversationKeyRange,
@@ -203,15 +203,14 @@ export function setClaudePermissionModePref(mode: AgentPermissionMode): void {
 }
 
 export function getClaudeRuntimeModelPref(): ClaudeRuntimeModel {
-  const raw = getStringPref("claudeCodeModel").trim().toLowerCase();
-  return CLAUDE_MODEL_OPTIONS.includes(raw as ClaudeRuntimeModel)
-    ? (raw as ClaudeRuntimeModel)
-    : "sonnet";
+  return (
+    getStringPref("claudeCodeModel").trim() || DEFAULT_CLAUDE_RUNTIME_MODEL
+  );
 }
 
 export function setClaudeRuntimeModelPref(model: string): void {
-  const normalized = model.trim().toLowerCase();
-  if (!CLAUDE_MODEL_OPTIONS.includes(normalized as ClaudeRuntimeModel)) return;
+  const normalized = model.trim();
+  if (!normalized) return;
   setPref("claudeCodeModel", normalized);
 }
 

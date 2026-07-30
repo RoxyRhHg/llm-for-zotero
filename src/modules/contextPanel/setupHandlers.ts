@@ -451,18 +451,21 @@ import { renderShortcuts } from "./shortcuts";
 import { loadConversationHistoryScope } from "./historyLoader";
 import {
   buildClaudeScope,
-  getClaudeRuntimeModelEntries,
-  getSelectedClaudeRuntimeEntry,
+  getClaudeRuntimeModelEntries as getFallbackClaudeRuntimeModelEntries,
   invalidateAllClaudeHotRuntimes,
   invalidateClaudeConversationSession,
   listClaudeEfforts,
+  listClaudeModels,
   rememberClaudeConversationSelection,
   resolveRememberedClaudeConversationKey,
   refreshClaudeSlashCommands,
   touchClaudeConversation,
 } from "../../claudeCode/runtime";
 import {
+  getClaudeBridgeUrl,
   getClaudeReasoningModePref,
+  getClaudeRuntimeModelPref,
+  getClaudeSettingSourcesCsvByPref,
   getConversationSystemPref,
   getLastUsedClaudeGlobalConversationKey,
   setClaudeCodeModeEnabled,
@@ -474,6 +477,11 @@ import {
   setClaudeRuntimeModelPref,
   setLastUsedClaudeConversationMode,
 } from "../../claudeCode/prefs";
+import {
+  buildClaudeRuntimeModelEntries,
+  type ClaudeModelCatalogEntry,
+  type ClaudeModelCatalogRequestContext,
+} from "../../claudeCode/modelCatalog";
 import {
   getCodexReasoningModePref,
   getCodexRuntimeModelPref,
@@ -881,11 +889,148 @@ export function setupHandlers(
   syncQueuedFollowUpRegistration();
   const isClaudeModeAvailable = () => getClaudeCodeModeEnabled();
   const isCodexModeAvailable = () => isCodexAppServerModeEnabled();
+  let claudeModelCatalogStatus: "idle" | "loading" | "ready" | "error" = "idle";
+  let claudeModelCatalogError = "";
+  let claudeModelCatalogModels: ClaudeModelCatalogEntry[] = [];
+  let claudeModelCatalogLegacy = false;
+  let claudeModelCatalogInFlight: Promise<void> | null = null;
+  let claudeModelCatalogRequestId = 0;
+  let claudeModelCatalogIdentity = "";
+  let claudeModelCatalogLoadedAt = 0;
+  const CLAUDE_MODEL_CATALOG_UI_TTL_MS = 60_000;
   let codexModelCatalogStatus: "idle" | "loading" | "ready" | "error" = "idle";
   let codexModelCatalogError = "";
   let codexModelCatalogModels: CodexAppServerModelCatalogEntry[] = [];
   let codexModelCatalogInFlight: Promise<void> | null = null;
   let codexModelCatalogPath = "";
+  const resolveClaudeModelCatalogContext = ():
+    | ClaudeModelCatalogRequestContext
+    | undefined => {
+    if (!item) return undefined;
+    const conversationKey = getConversationKey(item);
+    const kind = resolveDisplayConversationKind(item);
+    const baseItem = resolveConversationBaseItem(item);
+    const libraryID = Number(item.libraryID || baseItem?.libraryID || 0);
+    if (
+      !Number.isFinite(conversationKey) ||
+      conversationKey <= 0 ||
+      !kind ||
+      !Number.isFinite(libraryID) ||
+      libraryID <= 0
+    ) {
+      return undefined;
+    }
+    const scope = buildClaudeScope({
+      libraryID: Math.floor(libraryID),
+      kind,
+      paperItemID:
+        kind === "paper" ? Number(baseItem?.id || 0) || undefined : undefined,
+      paperTitle:
+        kind === "paper"
+          ? String(baseItem?.getField?.("title") || "").trim() || undefined
+          : undefined,
+    });
+    return {
+      conversationKey,
+      scopeType: scope.scopeType,
+      scopeId: scope.scopeId,
+      scopeLabel: scope.scopeLabel,
+    };
+  };
+  const resolveClaudeModelCatalogIdentity = (
+    context = resolveClaudeModelCatalogContext(),
+  ) =>
+    [
+      getClaudeBridgeUrl().trim().replace(/\/+$/, ""),
+      getClaudeSettingSourcesCsvByPref(),
+      context?.conversationKey || "runtime-root",
+      context?.scopeType || "",
+      context?.scopeId || "",
+    ].join("|");
+  const refreshOpenClaudeModelMenu = () => {
+    updateModelButton();
+    if (!modelMenu || !modelBtn || !isFloatingMenuOpen(modelMenu)) return;
+    rebuildModelMenu();
+    if (!modelMenu.childElementCount) {
+      closeModelMenu();
+      return;
+    }
+    positionFloatingMenu(body, modelMenu, modelBtn);
+  };
+  const ensureClaudeModelCatalogLoaded = (force = false): Promise<void> => {
+    if (!isClaudeConversationSystem()) return Promise.resolve();
+    const context = resolveClaudeModelCatalogContext();
+    const identity = resolveClaudeModelCatalogIdentity(context);
+    const identityChanged = identity !== claudeModelCatalogIdentity;
+    if (
+      !force &&
+      !identityChanged &&
+      claudeModelCatalogStatus === "ready" &&
+      Date.now() - claudeModelCatalogLoadedAt < CLAUDE_MODEL_CATALOG_UI_TTL_MS
+    ) {
+      return Promise.resolve();
+    }
+    if (!force && claudeModelCatalogInFlight && !identityChanged) {
+      return claudeModelCatalogInFlight;
+    }
+    if (identityChanged) {
+      claudeModelCatalogModels = [];
+      claudeModelCatalogLegacy = false;
+      claudeModelCatalogLoadedAt = 0;
+    }
+    claudeModelCatalogStatus = "loading";
+    claudeModelCatalogError = "";
+    claudeModelCatalogIdentity = identity;
+    const requestId = ++claudeModelCatalogRequestId;
+    refreshOpenClaudeModelMenu();
+    claudeModelCatalogInFlight = initAgentSubsystem()
+      .then((coreRuntime) => listClaudeModels(coreRuntime, force, context))
+      .then((catalog) => {
+        if (
+          requestId !== claudeModelCatalogRequestId ||
+          identity !== resolveClaudeModelCatalogIdentity()
+        ) {
+          return;
+        }
+        claudeModelCatalogModels = catalog.models;
+        claudeModelCatalogLegacy = catalog.legacy;
+        claudeModelCatalogStatus = "ready";
+        claudeModelCatalogError = "";
+        claudeModelCatalogLoadedAt = Date.now();
+      })
+      .catch((error: unknown) => {
+        if (
+          requestId !== claudeModelCatalogRequestId ||
+          identity !== resolveClaudeModelCatalogIdentity()
+        ) {
+          return;
+        }
+        claudeModelCatalogStatus = "error";
+        claudeModelCatalogError =
+          error instanceof Error ? error.message : String(error);
+        ztoolkit.log("Claude Code: failed to load model catalog", error);
+      })
+      .finally(() => {
+        if (requestId !== claudeModelCatalogRequestId) return;
+        claudeModelCatalogInFlight = null;
+        refreshOpenClaudeModelMenu();
+      });
+    return claudeModelCatalogInFlight;
+  };
+  const getClaudeRuntimeModelEntries = (): RuntimeModelEntry[] =>
+    buildClaudeRuntimeModelEntries({
+      models: claudeModelCatalogModels,
+      selectedModel: getClaudeRuntimeModelPref(),
+    });
+  const getSelectedClaudeRuntimeEntry = (): RuntimeModelEntry => {
+    const selectedModel = getClaudeRuntimeModelPref();
+    const entries = getClaudeRuntimeModelEntries();
+    return (
+      entries.find((entry) => entry.model === selectedModel) ||
+      entries[0] ||
+      getFallbackClaudeRuntimeModelEntries()[0]!
+    );
+  };
   const resolveCurrentCodexReasoningSelection = () =>
     resolveCodexAppServerReasoningSelection({
       mode: getCodexReasoningModePref(),
@@ -1101,6 +1246,11 @@ export function setupHandlers(
         Promise.allSettled([
           refreshClaudeSlashCommands(coreRuntime, false),
           listClaudeEfforts(coreRuntime, getSelectedClaudeRuntimeEntry().model),
+          listClaudeModels(
+            coreRuntime,
+            false,
+            resolveClaudeModelCatalogContext(),
+          ),
         ]),
       )
       .catch((err: unknown) => {
@@ -4780,6 +4930,73 @@ export function setupHandlers(
     }
   };
 
+  const appendClaudeModelCatalogStatus = (menu: HTMLDivElement) => {
+    if (!isClaudeConversationSystem()) return;
+    if (claudeModelCatalogStatus === "loading") {
+      appendModelMenuEmptyState(
+        menu,
+        claudeModelCatalogModels.length
+          ? t("Refreshing Claude models…")
+          : t("Loading Claude models…"),
+      );
+      return;
+    }
+    if (claudeModelCatalogStatus === "error") {
+      const message = appendModelMenuEmptyState(
+        menu,
+        claudeModelCatalogModels.length
+          ? t("Could not refresh Claude models. Showing the last known list.")
+          : t("Could not load Claude models. Showing the current model only."),
+      );
+      if (claudeModelCatalogError) message.title = claudeModelCatalogError;
+      appendModelMenuAction(menu, t("Retry loading Claude models"), (event) => {
+        if (!isPrimaryPointerEvent(event)) return;
+        event.preventDefault();
+        event.stopPropagation();
+        void ensureClaudeModelCatalogLoaded(true);
+      });
+      return;
+    }
+    if (
+      claudeModelCatalogStatus === "ready" &&
+      !claudeModelCatalogModels.length
+    ) {
+      appendModelMenuEmptyState(
+        menu,
+        t("Claude Code did not return any available models."),
+      );
+      return;
+    }
+    if (claudeModelCatalogStatus === "ready" && claudeModelCatalogLegacy) {
+      appendModelMenuEmptyState(
+        menu,
+        t(
+          "Using a legacy adapter model list. Update the adapter for model details.",
+        ),
+      );
+    }
+  };
+
+  const getModelOptionTitle = (entry: RuntimeModelEntry): string => {
+    if (!isClaudeConversationSystem()) {
+      return `${entry.providerLabel} · ${entry.model}`;
+    }
+    const catalogModel =
+      claudeModelCatalogModels.find((model) => model.value === entry.model) ||
+      claudeModelCatalogModels.find(
+        (model) => model.resolvedModel === entry.model,
+      );
+    return [
+      `${entry.providerLabel} · ${entry.model}`,
+      catalogModel?.resolvedModel && catalogModel.resolvedModel !== entry.model
+        ? `${t("Resolves to")}: ${catalogModel.resolvedModel}`
+        : "",
+      catalogModel?.description || "",
+    ]
+      .filter(Boolean)
+      .join("\n");
+  };
+
   const rebuildModelMenu = () => {
     if (!item || !modelMenu) return;
     const { groupedChoices, selectedEntryId } = getSelectedModelInfo();
@@ -4790,6 +5007,7 @@ export function setupHandlers(
       t("Select model"),
       "llm-model-menu-hint",
     );
+    appendClaudeModelCatalogStatus(modelMenu);
     appendCodexModelCatalogStatus(modelMenu);
     if (!groupedChoices.length) {
       appendModelMenuEmptyState(modelMenu, t("No models configured yet."));
@@ -4809,7 +5027,7 @@ export function setupHandlers(
             textContent: isSelected
               ? `\u2713 ${entry.displayModelLabel || "default"}`
               : entry.displayModelLabel || "default",
-            title: `${entry.providerLabel} · ${entry.model}`,
+            title: getModelOptionTitle(entry),
           },
         );
         const applyModelSelection = (e: Event) => {
@@ -5034,7 +5252,7 @@ export function setupHandlers(
             textContent: isSelected
               ? `\u2713 ${entry.displayModelLabel || "default"}`
               : entry.displayModelLabel || "default",
-            title: `${entry.providerLabel} · ${entry.model}`,
+            title: getModelOptionTitle(entry),
           },
         );
         const runRetry = async (e: Event) => {
@@ -7274,6 +7492,8 @@ export function setupHandlers(
     closeHistoryMenu();
     if (isCodexConversationSystem()) {
       void ensureCodexModelCatalogLoaded();
+    } else if (isClaudeConversationSystem()) {
+      void ensureClaudeModelCatalogLoaded(true);
     }
     updateModelButton();
     flushResponsiveLayoutSyncNow();

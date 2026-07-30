@@ -53,13 +53,17 @@ import {
 } from "./prefs";
 import type { RuntimeModelEntry } from "../utils/modelProviders";
 import {
-  CLAUDE_MODEL_OPTIONS,
   CLAUDE_REASONING_OPTIONS,
   type ClaudeReasoningMode,
   type ClaudeRuntimeModel,
 } from "./constants";
 import { dbg } from "../utils/debugLogger";
 import { getClaudeProfileSignature } from "./projectSkills";
+import {
+  buildClaudeRuntimeModelEntries,
+  type ClaudeModelCatalog,
+  type ClaudeModelCatalogRequestContext,
+} from "./modelCatalog";
 
 export type ClaudeBridgeActionDescriptor = {
   name: string;
@@ -114,22 +118,10 @@ export function getClaudeConversationSystem(): ConversationSystem {
 }
 
 export function getClaudeRuntimeModelEntries(): RuntimeModelEntry[] {
-  return CLAUDE_MODEL_OPTIONS.map((model, index) => ({
-    entryId: `claude_runtime::${model}`,
-    groupId: "claude-runtime",
-    model,
-    apiBase: "",
-    apiKey: "",
-    authMode: "api_key",
-    providerProtocol: "anthropic_messages",
-    providerLabel: "Claude Code",
-    providerOrder: index,
-    displayModelLabel: model,
-    advanced: {
-      temperature: 0.7,
-      maxTokens: 8192,
-    },
-  }));
+  return buildClaudeRuntimeModelEntries({
+    models: [],
+    selectedModel: getClaudeRuntimeModelPref(),
+  });
 }
 
 export function getSelectedClaudeRuntimeEntry(): RuntimeModelEntry {
@@ -237,6 +229,14 @@ export async function listClaudeEfforts(
   model?: string,
 ): Promise<string[]> {
   return getClaudeBridgeRuntime(coreRuntime).listEfforts(model);
+}
+
+export async function listClaudeModels(
+  coreRuntime: AgentRuntime,
+  force = false,
+  context?: ClaudeModelCatalogRequestContext,
+): Promise<ClaudeModelCatalog> {
+  return getClaudeBridgeRuntime(coreRuntime).listModels(force, context);
 }
 
 export async function runClaudeTurn(
@@ -582,7 +582,7 @@ export function resolveClaudeSystemLabel(): string {
 export function isClaudeRuntimeModel(
   model: string,
 ): model is ClaudeRuntimeModel {
-  return CLAUDE_MODEL_OPTIONS.includes(model as ClaudeRuntimeModel);
+  return Boolean(model.trim());
 }
 
 export function isClaudeReasoningMode(

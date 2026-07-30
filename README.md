@@ -530,10 +530,10 @@ Each Claude conversation also gets its own local `.claude` folder under the
 runtime `scopes/` tree, so per-conversation overrides do not leak into other
 chats.
 
-The Zotero UI exposes `opus`, `sonnet`, and `haiku` as capability tiers. If you
-route Claude Code through a compatible provider layer or proxy, configure that
-in Claude Code itself; Zotero only selects the tier and forwards the request to
-the bridge.
+The Zotero UI loads the model catalog advertised by the configured Claude Code bridge and preserves each model value exactly, including aliases, explicit model IDs, context-window variants, custom provider values, and future model families.
+The chat model picker identifies the active conversation so discovery uses the same scoped `.claude/settings.local.json` stack as the turn.
+The model preference remains editable when discovery is unavailable.
+Claude Code is responsible for resolving or rejecting the selected value and for applying provider or proxy configuration.
 
 </details>
 

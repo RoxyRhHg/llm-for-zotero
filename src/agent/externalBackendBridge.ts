@@ -8,6 +8,11 @@ import {
   getClaudeCustomInstructionPref,
   getConversationSystemPref,
 } from "../claudeCode/prefs";
+import {
+  fetchClaudeModelCatalog,
+  type ClaudeModelCatalog,
+  type ClaudeModelCatalogRequestContext,
+} from "../claudeCode/modelCatalog";
 import { getClaudeProfileSignature } from "../claudeCode/projectSkills";
 import { getClaudeConversationSummary } from "../claudeCode/store";
 import { isNativeZoteroMcpToolsEnabled } from "../codexAppServer/prefs";
@@ -126,6 +131,10 @@ export type AgentRuntimeLike = Pick<
   }>;
   refreshSlashCommands(force?: boolean): Promise<void>;
   listEfforts(model?: string): Promise<string[]>;
+  listModels(
+    force?: boolean,
+    context?: ClaudeModelCatalogRequestContext,
+  ): Promise<ClaudeModelCatalog>;
   updateRuntimeRetention(params: {
     conversationKey: number;
     scope?: BridgeScope;
@@ -200,6 +209,7 @@ type ExternalSlashCommandDescriptor = {
 
 type ExternalEffortInfo = {
   efforts: string[];
+  expiresAt?: number;
 };
 
 type RuntimeRetentionResponse = {
@@ -680,6 +690,13 @@ function isClaudeBridgeActive(): boolean {
   );
 }
 
+export function resolveClaudeBridgeModelForMetadata(
+  model: unknown,
+): string | undefined {
+  if (typeof model !== "string") return undefined;
+  return model.trim() || undefined;
+}
+
 function normalizeScopeType(value: unknown): BridgeScopeType | null {
   if (typeof value !== "string") return null;
   const normalized = value.trim().toLowerCase();
@@ -1008,11 +1025,7 @@ async function runExternalBridgeTurn(
       }),
       providerIdentity,
       providerIdentityStack,
-      model:
-        typeof params.request.model === "string" &&
-        params.request.model.trim().toLowerCase() !== "default"
-          ? params.request.model.trim()
-          : undefined,
+      model: resolveClaudeBridgeModelForMetadata(params.request.model),
       effort,
       activeItemId: params.request.activeItemId,
       libraryID: params.request.libraryID,
@@ -2251,7 +2264,15 @@ export function createExternalBackendBridgeRuntime(options: {
   let slashCommandsCacheExpiresAt = 0;
   let slashCommandsRefreshInFlight: Promise<void> | null = null;
   const cachedEffortsByModel = new Map<string, ExternalEffortInfo>();
+  let cachedModelCatalog: ClaudeModelCatalog | null = null;
+  let cachedModelCatalogKey = "";
+  let modelCatalogCacheExpiresAt = 0;
+  let modelCatalogRefreshInFlight: Promise<ClaudeModelCatalog> | null = null;
+  let modelCatalogRefreshKey = "";
+  let modelCatalogRefreshGeneration = 0;
   const SLASH_COMMANDS_CACHE_TTL_MS = 5 * 60_000;
+  const MODEL_CATALOG_CACHE_TTL_MS = 60_000;
+  const EFFORT_CACHE_TTL_MS = 60_000;
   const conversationContextSignature = new Map<number, string>();
   const conversationScopeByKey = new Map<number, BridgeScope>();
   const TOOL_CACHE_TTL_MS = 5 * 60_000;
@@ -2261,7 +2282,14 @@ export function createExternalBackendBridgeRuntime(options: {
     const bridgeUrl = normalizeBaseUrl(getBridgeUrl());
     const source = getClaudeConfigSourcePref();
     const settingSources = getClaudeSettingSourcesCsvByPref();
-    return `${bridgeUrl}|${source}|${settingSources}`;
+    let profileSignature = "";
+    try {
+      profileSignature = getClaudeProfileSignature();
+    } catch {
+      // The profile is always available in Zotero, but keep lightweight test
+      // and bootstrap callers from failing before the application is ready.
+    }
+    return `${bridgeUrl}|${source}|${settingSources}|${profileSignature}`;
   };
 
   const refreshExternalActions = async (force = false): Promise<void> => {
@@ -2272,6 +2300,9 @@ export function createExternalBackendBridgeRuntime(options: {
       cachedSlashCommands = [];
       slashCommandsCacheExpiresAt = 0;
       cachedEffortsByModel.clear();
+      cachedModelCatalog = null;
+      cachedModelCatalogKey = "";
+      modelCatalogCacheExpiresAt = 0;
       lastCapabilityConfigKey = "";
       return;
     }
@@ -2283,6 +2314,9 @@ export function createExternalBackendBridgeRuntime(options: {
       cachedSlashCommands = [];
       slashCommandsCacheExpiresAt = 0;
       cachedEffortsByModel.clear();
+      cachedModelCatalog = null;
+      cachedModelCatalogKey = "";
+      modelCatalogCacheExpiresAt = 0;
       lastCapabilityConfigKey = configKey;
     }
     if (!force && Date.now() < cacheExpiresAt && cachedTools.length > 0) {
@@ -2320,18 +2354,112 @@ export function createExternalBackendBridgeRuntime(options: {
       cachedSlashCommands = [];
       slashCommandsCacheExpiresAt = 0;
       cachedEffortsByModel.clear();
+      cachedModelCatalog = null;
+      cachedModelCatalogKey = "";
+      modelCatalogCacheExpiresAt = 0;
       lastCapabilityConfigKey = configKey;
     }
-    const key = `${configKey}|${(model || "").trim().toLowerCase()}`;
-    if (cachedEffortsByModel.has(key)) {
-      return cachedEffortsByModel.get(key)?.efforts || [];
+    const key = `${configKey}|${(model || "").trim()}`;
+    const cached = cachedEffortsByModel.get(key);
+    if (cached && (cached.expiresAt || 0) > Date.now()) {
+      return cached.efforts;
     }
     const encodedSources = encodeURIComponent(
       getClaudeSettingSourcesByPref().join(","),
     );
     const info = await fetchExternalEfforts(bridgeUrl, encodedSources, model);
-    cachedEffortsByModel.set(key, info);
+    cachedEffortsByModel.set(key, {
+      ...info,
+      expiresAt: Date.now() + EFFORT_CACHE_TTL_MS,
+    });
     return info.efforts;
+  };
+
+  const listModels = async (
+    force = false,
+    context?: ClaudeModelCatalogRequestContext,
+  ): Promise<ClaudeModelCatalog> => {
+    const bridgeUrl = normalizeBaseUrl(getBridgeUrl());
+    if (!bridgeUrl || !isClaudeBridgeActive()) {
+      return { models: [], legacy: true };
+    }
+    const configKey = resolveCapabilityConfigKey();
+    if (configKey !== lastCapabilityConfigKey) {
+      cachedTools = [];
+      cacheExpiresAt = 0;
+      cachedSlashCommands = [];
+      slashCommandsCacheExpiresAt = 0;
+      cachedEffortsByModel.clear();
+      cachedModelCatalog = null;
+      cachedModelCatalogKey = "";
+      modelCatalogCacheExpiresAt = 0;
+      lastCapabilityConfigKey = configKey;
+    }
+    const requestKey = context
+      ? [
+          configKey,
+          String(context.conversationKey).trim(),
+          context.scopeType,
+          context.scopeId.trim(),
+        ].join("|")
+      : `${configKey}|runtime-root`;
+    if (
+      !force &&
+      cachedModelCatalog &&
+      cachedModelCatalogKey === requestKey &&
+      Date.now() < modelCatalogCacheExpiresAt
+    ) {
+      return cachedModelCatalog;
+    }
+    if (
+      !force &&
+      modelCatalogRefreshInFlight &&
+      modelCatalogRefreshKey === requestKey
+    ) {
+      return modelCatalogRefreshInFlight;
+    }
+    if (force) cachedEffortsByModel.clear();
+    const refreshGeneration = ++modelCatalogRefreshGeneration;
+    const refreshPromise = fetchClaudeModelCatalog({
+      bridgeUrl,
+      settingSources: getClaudeSettingSourcesByPref(),
+      context,
+      forceRefresh: force,
+    })
+      .then((catalog) => {
+        if (
+          refreshGeneration === modelCatalogRefreshGeneration &&
+          resolveCapabilityConfigKey() === configKey
+        ) {
+          cachedModelCatalog = catalog;
+          cachedModelCatalogKey = requestKey;
+          modelCatalogCacheExpiresAt = Date.now() + MODEL_CATALOG_CACHE_TTL_MS;
+          cachedEffortsByModel.clear();
+        }
+        return catalog;
+      })
+      .catch((error: unknown) => {
+        const message = formatBridgeUserError(
+          error,
+          bridgeUrl,
+          "Failed to refresh Claude models",
+        );
+        ztoolkit.log(
+          "LLM Agent: Failed to refresh Claude model catalog",
+          message,
+          error,
+        );
+        throw new Error(message);
+      })
+      .finally(() => {
+        if (modelCatalogRefreshInFlight === refreshPromise) {
+          modelCatalogRefreshInFlight = null;
+          modelCatalogRefreshKey = "";
+        }
+      });
+    modelCatalogRefreshInFlight = refreshPromise;
+    modelCatalogRefreshKey = requestKey;
+    return refreshPromise;
   };
 
   const refreshSlashCommands = async (force = false): Promise<void> => {
@@ -2347,6 +2475,9 @@ export function createExternalBackendBridgeRuntime(options: {
       cachedSlashCommands = [];
       slashCommandsCacheExpiresAt = 0;
       cachedEffortsByModel.clear();
+      cachedModelCatalog = null;
+      cachedModelCatalogKey = "";
+      modelCatalogCacheExpiresAt = 0;
       lastCapabilityConfigKey = "";
       return;
     }
@@ -2456,6 +2587,7 @@ export function createExternalBackendBridgeRuntime(options: {
     listSlashCommandsSync,
     refreshSlashCommands,
     listEfforts,
+    listModels,
     updateRuntimeRetention: async ({
       conversationKey,
       scope,
