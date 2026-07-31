@@ -75,6 +75,10 @@ function conversationInput(key: number, overrides: Record<string, unknown> = {})
 }
 
 describe("pendingDeletionStore", function () {
+  beforeEach(function () {
+    resetPendingDeletionStoreForTests();
+  });
+
   afterEach(function () {
     resetPendingDeletionStoreForTests();
     globalScope.Zotero = originalZotero;

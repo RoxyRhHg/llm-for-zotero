@@ -11,7 +11,9 @@ type ClearConversationControllerDeps = {
     conversationKey: number,
     value: AbortController | null,
   ) => void;
-  clearPendingTurnDeletion?: (conversationKey: number) => void;
+  finalizePendingDeletionsForConversation?: (
+    conversationKey: number,
+  ) => Promise<void>;
   validateConversationScope?: (conversationKey: number) => Promise<boolean>;
   clearTransientComposeStateForItem: (itemId: number) => void;
   resetComposePreviewUI: () => void;
@@ -80,7 +82,13 @@ export function createClearConversationController(
       deps.setPendingRequestId?.(normalizedConversationKey, 0);
       deps.setAbortController?.(normalizedConversationKey, null);
     }
-    deps.clearPendingTurnDeletion?.(normalizedConversationKey);
+    try {
+      await deps.finalizePendingDeletionsForConversation?.(
+        normalizedConversationKey,
+      );
+    } catch (err) {
+      deps.logError?.("LLM: Failed to finalize pending deletions", err);
+    }
     deps.clearTransientComposeStateForItem(normalizedItemID);
     deps.resetConversationHistory(normalizedConversationKey);
     deps.markConversationLoaded(normalizedConversationKey);

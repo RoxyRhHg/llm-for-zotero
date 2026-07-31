@@ -17,6 +17,7 @@ import {
   StoredChatMessage,
 } from "../../utils/chatStore";
 import { conversationRepository } from "../../core/conversations/repository";
+import { pendingDeletionStore } from "../../core/conversations/pendingDeletionStore";
 import {
   appendCodexMessage,
   pruneCodexConversation,
@@ -10001,7 +10002,23 @@ export function refreshChat(
       : cachedSnapshot
         ? cachedSnapshot
         : buildChatScrollSnapshot(chatBox);
-  const history = chatHistory.get(conversationKey) || [];
+  const rawHistory = chatHistory.get(conversationKey) || [];
+  // Turns queued for deletion stay in memory and DB until the undo window
+  // closes; they are only hidden from the render.
+  const history = rawHistory.some((message) =>
+    pendingDeletionStore.isMessageInPendingTurn(
+      conversationKey,
+      message.timestamp,
+    ),
+  )
+    ? rawHistory.filter(
+        (message) =>
+          !pendingDeletionStore.isMessageInPendingTurn(
+            conversationKey,
+            message.timestamp,
+          ),
+      )
+    : rawHistory;
   const requestedRerenders = options.rerenderAssistantMessages;
   const { useTargetedRerender, targetedMessageWrappers } =
     resolveTargetedAssistantRerenders(
