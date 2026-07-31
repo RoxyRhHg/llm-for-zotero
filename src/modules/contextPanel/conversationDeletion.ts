@@ -24,7 +24,19 @@ import {
   removeLastUsedPaperConversationKey,
   setLockedGlobalConversationKey,
 } from "./prefHelpers";
-import { clearOwnerAttachmentRefs } from "../../utils/attachmentRefStore";
+import {
+  clearOwnerAttachmentRefs,
+  replaceOwnerAttachmentRefs,
+} from "../../utils/attachmentRefStore";
+import type {
+  PendingConversationDeletionEntry,
+  PendingTurnDeletionEntry,
+} from "../../core/conversations/pendingDeletionStore";
+import type { Message } from "./types";
+import {
+  collectAttachmentHashesFromMessages,
+  findTurnPairByTimestamps,
+} from "./turnMessageUtils";
 import { removeConversationAttachmentFiles } from "./attachmentStorage";
 import {
   buildClaudeScope,
@@ -37,10 +49,12 @@ import {
   buildClaudePaperStateKey,
 } from "../../claudeCode/state";
 import {
+  getConversationSystemPref,
   getLastUsedClaudeGlobalConversationKey,
   getLastUsedClaudePaperConversationKey,
   removeLastUsedClaudeGlobalConversationKey,
   removeLastUsedClaudePaperConversationKey,
+  setConversationSystemPref,
 } from "../../claudeCode/prefs";
 import { archiveCodexAppServerThread } from "../../codexAppServer/nativeClient";
 import {
@@ -655,4 +669,97 @@ export async function finalizeConversationDeletion(
   );
 
   return result;
+}
+
+// ── Headless finalizers for the durable pending-deletion queue ────────────────
+// These run with no live panel (startup sweep, orphaned-window recovery), so
+// they must not touch DOM or per-controller state; live panels react to the
+// store's events instead.
+
+export async function finalizeQueuedConversationDeletion(
+  entry: PendingConversationDeletionEntry,
+  deps: ConversationDeletionDeps = {},
+): Promise<boolean> {
+  let paperItemID = Number(entry.paperItemID || 0) || undefined;
+  if (entry.conversationKind === "paper" && !paperItemID) {
+    const summary = await conversationRepository.getCatalogEntry({
+      system: entry.system,
+      kind: "paper",
+      conversationKey: entry.conversationKey,
+    });
+    paperItemID = Number(summary?.paperItemID || 0) || undefined;
+  }
+  const originalSystem = getConversationSystemPref();
+  if (originalSystem !== entry.system) {
+    setConversationSystemPref(entry.system);
+  }
+  try {
+    const result = await finalizeConversationDeletion(
+      {
+        conversationID: entry.conversationID,
+        conversationKey: entry.conversationKey,
+        kind: entry.conversationKind,
+        conversationSystem: entry.system,
+        libraryID: entry.libraryID,
+        paperItemID,
+        providerSessionId: entry.providerSessionId,
+      },
+      deps,
+    );
+    return result.ok;
+  } finally {
+    if (originalSystem !== entry.system) {
+      setConversationSystemPref(originalSystem);
+    }
+  }
+}
+
+export async function finalizeQueuedTurnDeletion(
+  entry: PendingTurnDeletionEntry,
+  deps: {
+    log?: (message: string, ...args: unknown[]) => void;
+    scheduleAttachmentGc?: () => void;
+  } = {},
+): Promise<boolean> {
+  const log = deps.log || (() => {});
+  try {
+    await conversationRepository.deleteTurnMessages({
+      system: entry.system,
+      conversationKey: entry.conversationKey,
+      userTimestamp: entry.userTimestamp,
+      assistantTimestamp: entry.assistantTimestamp,
+    });
+  } catch (err) {
+    log("LLM: queued turn deletion failed to delete rows", err);
+    return false;
+  }
+  const history = chatHistory.get(entry.conversationKey);
+  if (history) {
+    const pair = findTurnPairByTimestamps(
+      history,
+      entry.userTimestamp,
+      entry.assistantTimestamp,
+    );
+    if (pair) {
+      history.splice(pair.userIndex, 2);
+      chatHistory.set(entry.conversationKey, history);
+    }
+  }
+  try {
+    const remaining =
+      chatHistory.get(entry.conversationKey) ||
+      ((await conversationRepository.loadMessages({
+        system: entry.system,
+        conversationKey: entry.conversationKey,
+      })) as unknown as Message[]);
+    await replaceOwnerAttachmentRefs(
+      "conversation",
+      entry.conversationKey,
+      collectAttachmentHashesFromMessages(remaining),
+    );
+  } catch (err) {
+    log("LLM: queued turn deletion completed with stale attachment refs", err);
+  }
+  deps.scheduleAttachmentGc?.();
+  return true;
 }
