@@ -3,6 +3,7 @@ import {
   finalizeQueuedConversationDeletion,
   finalizeQueuedTurnDeletion,
 } from "./conversationDeletion";
+import { initAgentSubsystem } from "../../agent";
 
 let configured = false;
 
@@ -21,7 +22,10 @@ export function configurePendingDeletionSubsystem(): void {
   configured = true;
   configurePendingDeletionFinalizers({
     finalizeConversation: (entry) =>
-      finalizeQueuedConversationDeletion(entry, { log: safeLog }),
+      finalizeQueuedConversationDeletion(entry, {
+        log: safeLog,
+        getCoreAgentRuntime: initAgentSubsystem,
+      }),
     finalizeTurn: (entry) =>
       finalizeQueuedTurnDeletion(entry, { log: safeLog }),
   });
