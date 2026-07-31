@@ -2363,7 +2363,10 @@ async function getPanelVisibleMessageCount(panelId: string): Promise<number> {
 async function remountPanel(panelId: string): Promise<WorkflowTestPanel> {
   assertWorkflowTestEnabled();
   const panel = getPanel(panelId);
-  const itemId = Math.floor(Number(panel.item.id));
+  // The mounted item may be a synthetic portal item (global conversations);
+  // remount from the original raw Zotero item backing the panel.
+  const rawItem = activeContextPanelRawItems.get(panel.body);
+  const itemId = Math.floor(Number(rawItem?.id || panel.item.id));
   disposeSetupHandlers(panel.body);
   activeContextPanels.delete(panel.body);
   activeContextPanelRawItems.delete(panel.body);
