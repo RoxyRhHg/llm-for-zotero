@@ -191,9 +191,7 @@ type StatusLevel = "ready" | "warning" | "error";
 
 const pendingDeletionSubscriptionsByBody = new WeakMap<Element, () => void>();
 
-export function disposePendingDeletionSubscriptionForBody(
-  body: Element,
-): void {
+export function disposePendingDeletionSubscriptionForBody(body: Element): void {
   const unsubscribe = pendingDeletionSubscriptionsByBody.get(body);
   if (unsubscribe) {
     unsubscribe();
@@ -587,7 +585,6 @@ export function createHistoryLifecycleController(
     }, TOP_TOAST_TIMEOUT_MS);
   };
 
-
   const isHistoryEntryActive = (entry: ConversationHistoryEntry): boolean => {
     if (!item) return false;
     const activeConversationKey = getConversationKey(item);
@@ -871,7 +868,12 @@ export function createHistoryLifecycleController(
     const documents = new Map<number, HistorySearchDocument>();
     const addIndexedMatch = (match: ConversationSearchIndexMatch): void => {
       const entry = createHistorySearchEntryFromIndexMatch(match);
-      if (!entry || pendingDeletionStore.isConversationPendingDeletion(entry.conversationKey)) {
+      if (
+        !entry ||
+        pendingDeletionStore.isConversationPendingDeletion(
+          entry.conversationKey,
+        )
+      ) {
         return;
       }
       entryByKey.set(entry.conversationKey, entry);
@@ -892,7 +894,12 @@ export function createHistoryLifecycleController(
       const truncatedEntries: ConversationHistoryEntry[] = [];
       for (const match of truncatedMatches) {
         const entry = createHistorySearchEntryFromIndexMatch(match);
-        if (!entry || pendingDeletionStore.isConversationPendingDeletion(entry.conversationKey)) {
+        if (
+          !entry ||
+          pendingDeletionStore.isConversationPendingDeletion(
+            entry.conversationKey,
+          )
+        ) {
           continue;
         }
         entryByKey.set(entry.conversationKey, entry);
@@ -925,7 +932,12 @@ export function createHistoryLifecycleController(
   }> => {
     const entries = (
       await loadSearchableConversationHistory(libraryID, { limit: null })
-    ).filter((entry) => !pendingDeletionStore.isConversationPendingDeletion(entry.conversationKey));
+    ).filter(
+      (entry) =>
+        !pendingDeletionStore.isConversationPendingDeletion(
+          entry.conversationKey,
+        ),
+    );
     const documents = new Map<number, HistorySearchDocument>();
     await runHistorySearchDocumentLoads(entries, documents);
     const rawResults = buildHistorySearchResults(
@@ -1577,7 +1589,12 @@ export function createHistoryLifecycleController(
                 continue;
               }
               const normalizedKey = Math.floor(conversationKey);
-              if (pendingDeletionStore.isConversationPendingDeletion(normalizedKey)) continue;
+              if (
+                pendingDeletionStore.isConversationPendingDeletion(
+                  normalizedKey,
+                )
+              )
+                continue;
               if (seenPaperKeys.has(normalizedKey)) continue;
               seenPaperKeys.add(normalizedKey);
               const lastActivity = Number(
@@ -1644,7 +1661,12 @@ export function createHistoryLifecycleController(
                 continue;
               }
               const normalizedKey = Math.floor(conversationKey);
-              if (pendingDeletionStore.isConversationPendingDeletion(normalizedKey)) continue;
+              if (
+                pendingDeletionStore.isConversationPendingDeletion(
+                  normalizedKey,
+                )
+              )
+                continue;
               if (seenPaperKeys.has(normalizedKey)) continue;
               seenPaperKeys.add(normalizedKey);
               const lastActivity = Number(
@@ -1699,7 +1721,12 @@ export function createHistoryLifecycleController(
                 continue;
               }
               const normalizedKey = Math.floor(conversationKey);
-              if (pendingDeletionStore.isConversationPendingDeletion(normalizedKey)) continue;
+              if (
+                pendingDeletionStore.isConversationPendingDeletion(
+                  normalizedKey,
+                )
+              )
+                continue;
               if (seenPaperKeys.has(normalizedKey)) continue;
               seenPaperKeys.add(normalizedKey);
               const lastActivity = Number(
@@ -1807,7 +1834,8 @@ export function createHistoryLifecycleController(
           if (!Number.isFinite(conversationKey) || conversationKey <= 0)
             continue;
           const normalizedKey = Math.floor(conversationKey);
-          if (pendingDeletionStore.isConversationPendingDeletion(normalizedKey)) continue;
+          if (pendingDeletionStore.isConversationPendingDeletion(normalizedKey))
+            continue;
           if (seenGlobalKeys.has(normalizedKey)) continue;
           seenGlobalKeys.add(normalizedKey);
           const lastActivity = Number(
@@ -1887,7 +1915,8 @@ export function createHistoryLifecycleController(
           if (!Number.isFinite(conversationKey) || conversationKey <= 0)
             continue;
           const normalizedKey = Math.floor(conversationKey);
-          if (pendingDeletionStore.isConversationPendingDeletion(normalizedKey)) continue;
+          if (pendingDeletionStore.isConversationPendingDeletion(normalizedKey))
+            continue;
           if (seenGlobalKeys.has(normalizedKey)) continue;
           seenGlobalKeys.add(normalizedKey);
           const lastActivity = Number(
@@ -1969,7 +1998,8 @@ export function createHistoryLifecycleController(
           if (!Number.isFinite(conversationKey) || conversationKey <= 0)
             continue;
           const normalizedKey = Math.floor(conversationKey);
-          if (pendingDeletionStore.isConversationPendingDeletion(normalizedKey)) continue;
+          if (pendingDeletionStore.isConversationPendingDeletion(normalizedKey))
+            continue;
           if (seenGlobalKeys.has(normalizedKey)) continue;
           seenGlobalKeys.add(normalizedKey);
           const lastActivity = Number(
@@ -2028,7 +2058,10 @@ export function createHistoryLifecycleController(
     const allEntries =
       activeHistorySection === "paper" ? paperEntries : globalEntries;
     const visibleEntries = allEntries.filter(
-      (entry) => !pendingDeletionStore.isConversationPendingDeletion(entry.conversationKey),
+      (entry) =>
+        !pendingDeletionStore.isConversationPendingDeletion(
+          entry.conversationKey,
+        ),
     );
     latestConversationHistory = [...visibleEntries].sort((a, b) => {
       if (b.lastActivityAt !== a.lastActivityAt) {
@@ -2735,7 +2768,10 @@ export function createHistoryLifecycleController(
         ? await loadSearchableConversationHistory(libraryID)
         : [];
       return entries.filter(
-        (entry) => !pendingDeletionStore.isConversationPendingDeletion(entry.conversationKey),
+        (entry) =>
+          !pendingDeletionStore.isConversationPendingDeletion(
+            entry.conversationKey,
+          ),
       );
     },
     loadDocument: (entry) => ensureHistorySearchDocument(entry),
@@ -2857,7 +2893,9 @@ export function createHistoryLifecycleController(
       identity: getHistoryEntryRenameIdentity(entry),
       pendingDelete:
         entry.isPendingDelete ||
-        pendingDeletionStore.isConversationPendingDeletion(entry.conversationKey),
+        pendingDeletionStore.isConversationPendingDeletion(
+          entry.conversationKey,
+        ),
       orphan: isOrphanHistoryEntry(entry),
       requestPending: isRequestPending(entry.conversationKey),
     });
@@ -2930,7 +2968,9 @@ export function createHistoryLifecycleController(
             : null,
           pendingDelete:
             Boolean(currentEntry?.isPendingDelete) ||
-            pendingDeletionStore.isConversationPendingDeletion(target.conversationKey),
+            pendingDeletionStore.isConversationPendingDeletion(
+              target.conversationKey,
+            ),
           orphan: currentEntry ? isOrphanHistoryEntry(currentEntry) : false,
           requestPending: isRequestPending(target.conversationKey),
         })
@@ -2949,7 +2989,9 @@ export function createHistoryLifecycleController(
             : null,
           pendingDelete:
             Boolean(currentEntry?.isPendingDelete) ||
-            pendingDeletionStore.isConversationPendingDeletion(target.conversationKey),
+            pendingDeletionStore.isConversationPendingDeletion(
+              target.conversationKey,
+            ),
           orphan: currentEntry ? isOrphanHistoryEntry(currentEntry) : false,
           requestPending: isRequestPending(target.conversationKey),
         })

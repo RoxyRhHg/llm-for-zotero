@@ -1894,7 +1894,10 @@ export function openStandaloneChat(options?: {
             entries: conversations,
             activeConversationKey,
           }).filter(
-            (conv) => !pendingDeletionStore.isConversationPendingDeletion(conv.conversationKey),
+            (conv) =>
+              !pendingDeletionStore.isConversationPendingDeletion(
+                conv.conversationKey,
+              ),
           );
         standaloneSidebarEntriesByKey = new Map(
           conversations.map((conv) => [conv.conversationKey, conv]),
@@ -2193,7 +2196,9 @@ export function openStandaloneChat(options?: {
           .map(toStandaloneHistoryEntry)
           .filter(
             (entry) =>
-              !pendingDeletionStore.isConversationPendingDeletion(entry.conversationKey),
+              !pendingDeletionStore.isConversationPendingDeletion(
+                entry.conversationKey,
+              ),
           );
       };
 

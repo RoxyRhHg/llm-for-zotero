@@ -61,7 +61,10 @@ function installFakeEnv() {
   };
 }
 
-function conversationInput(key: number, overrides: Record<string, unknown> = {}) {
+function conversationInput(
+  key: number,
+  overrides: Record<string, unknown> = {},
+) {
   return {
     conversationKind: "global" as const,
     conversationID: `lfz:test:upstream:global:lib-1:paper-0:legacy-${key}`,

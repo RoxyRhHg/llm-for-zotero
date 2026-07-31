@@ -175,10 +175,13 @@ function armTimer(id: string, delayMs: number): void {
   clearEntryTimer(id);
   timers.set(
     id,
-    env.setTimer(() => {
-      timers.delete(id);
-      void pendingDeletionStore.finalize(id, "timeout");
-    }, Math.max(0, delayMs)),
+    env.setTimer(
+      () => {
+        timers.delete(id);
+        void pendingDeletionStore.finalize(id, "timeout");
+      },
+      Math.max(0, delayMs),
+    ),
   );
 }
 
