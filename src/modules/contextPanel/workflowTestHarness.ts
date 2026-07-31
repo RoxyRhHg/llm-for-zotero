@@ -31,7 +31,14 @@ import type {
   WorkflowTestStandaloneDiagnostics,
   WorkflowTestStandaloneNoteFixture,
   WorkflowTestTargetedQuoteRefreshResult,
+  WorkflowTestPendingDeletionState,
+  WorkflowTestHistoryRow,
+  WorkflowTestSeededTurn,
 } from "./workflowTestTypes";
+import {
+  pendingDeletionStore,
+  PENDING_DELETIONS_TABLE,
+} from "../../core/conversations/pendingDeletionStore";
 import type { Message } from "./types";
 import {
   buildAssistantDisplayMarkdownForRender,
@@ -2206,6 +2213,183 @@ function disposeWorkflowPanels(): void {
   panels.clear();
 }
 
+async function openPanelHistoryMenu(panelId: string): Promise<HTMLElement> {
+  const panel = getPanel(panelId);
+  const menu = panel.body.querySelector(
+    "#llm-history-menu",
+  ) as HTMLElement | null;
+  if (menu && menu.style.display !== "none") return panel.body;
+  dispatchWorkflowClick(panel.body, "#llm-history-toggle", "History toggle");
+  await Zotero.Promise.delay(200);
+  return panel.body;
+}
+
+async function listPanelHistory(
+  panelId: string,
+): Promise<WorkflowTestHistoryRow[]> {
+  assertWorkflowTestEnabled();
+  const body = await openPanelHistoryMenu(panelId);
+  const rows = Array.from(
+    body.querySelectorAll(".llm-history-item[data-conversation-key]"),
+  ) as HTMLElement[];
+  const seen = new Map<number, WorkflowTestHistoryRow>();
+  for (const row of rows) {
+    const conversationKey = Number(row.dataset.conversationKey || 0);
+    if (!conversationKey) continue;
+    seen.set(conversationKey, {
+      conversationKey,
+      title: (row.textContent || "").trim(),
+    });
+  }
+  return Array.from(seen.values());
+}
+
+async function deletePanelHistoryConversation(
+  panelId: string,
+  conversationKey: number,
+): Promise<void> {
+  assertWorkflowTestEnabled();
+  const body = await openPanelHistoryMenu(panelId);
+  const row = body.querySelector(
+    `.llm-history-item[data-conversation-key="${conversationKey}"]`,
+  ) as HTMLElement | null;
+  if (!row) throw new Error(`History row ${conversationKey} not rendered`);
+  const deleteBtn = row.querySelector(
+    ".llm-history-item-delete",
+  ) as HTMLElement | null;
+  if (!deleteBtn) throw new Error(`Row ${conversationKey} is not deletable`);
+  const eventCtor = body.ownerDocument.defaultView?.MouseEvent || MouseEvent;
+  deleteBtn.dispatchEvent(
+    new eventCtor("click", { bubbles: true, cancelable: true }),
+  );
+  await Zotero.Promise.delay(300);
+}
+
+async function seedPanelStoredTurn(
+  panelId: string,
+  userText: string,
+  assistantText: string,
+): Promise<WorkflowTestSeededTurn> {
+  assertWorkflowTestEnabled();
+  const panel = getPanel(panelId);
+  const item = activeContextPanels.get(panel.body)?.() || panel.item;
+  const conversationKey = getConversationKey(item);
+  if (!conversationKey) {
+    throw new Error("Workflow panel has no active conversation key");
+  }
+  const userTimestamp = Date.now();
+  const assistantTimestamp = userTimestamp + 1;
+  const userMessage = {
+    role: "user" as const,
+    text: userText,
+    timestamp: userTimestamp,
+  };
+  const assistantMessage = {
+    role: "assistant" as const,
+    text: assistantText,
+    timestamp: assistantTimestamp,
+  };
+  const conversationSystem =
+    (panel.body.querySelector("#llm-main") as HTMLElement | null)?.dataset
+      .conversationSystem || "upstream";
+  const system =
+    conversationSystem === "codex" || conversationSystem === "claude_code"
+      ? conversationSystem
+      : "upstream";
+  await appendWorkflowStoredMessage(system, conversationKey, userMessage);
+  await appendWorkflowStoredMessage(system, conversationKey, assistantMessage);
+  const existing = chatHistory.get(conversationKey) || [];
+  chatHistory.set(conversationKey, [
+    ...existing,
+    userMessage,
+    assistantMessage,
+  ]);
+  loadedConversationKeys.add(conversationKey);
+  panel.item = item;
+  refreshChat(panel.body, item);
+  await Zotero.Promise.delay(100);
+  return { conversationKey, userTimestamp, assistantTimestamp };
+}
+
+async function deletePanelTurn(
+  panelId: string,
+  userTimestamp: number,
+  assistantTimestamp: number,
+): Promise<void> {
+  assertWorkflowTestEnabled();
+  const panel = getPanel(panelId);
+  const queueTurnDeletion = (
+    panel.body as HTMLElement & {
+      __llmQueueTurnDeletion?: (target: {
+        conversationKey: number;
+        userTimestamp: number;
+        assistantTimestamp: number;
+      }) => Promise<void>;
+    }
+  ).__llmQueueTurnDeletion;
+  if (!queueTurnDeletion) {
+    throw new Error("Turn deletion hook not installed on panel body");
+  }
+  const item = activeContextPanels.get(panel.body)?.() || panel.item;
+  const conversationKey = getConversationKey(item);
+  await queueTurnDeletion({
+    conversationKey,
+    userTimestamp,
+    assistantTimestamp,
+  });
+  await Zotero.Promise.delay(200);
+}
+
+async function clickPanelUndo(panelId: string): Promise<void> {
+  assertWorkflowTestEnabled();
+  const panel = getPanel(panelId);
+  dispatchWorkflowClick(panel.body, "#llm-history-undo-btn", "Undo button");
+  await Zotero.Promise.delay(300);
+}
+
+async function isPanelUndoToastVisible(panelId: string): Promise<boolean> {
+  const panel = getPanel(panelId);
+  const toast = panel.body.querySelector(
+    "#llm-history-undo",
+  ) as HTMLElement | null;
+  return Boolean(toast && toast.style.display !== "none");
+}
+
+async function getPanelVisibleMessageCount(panelId: string): Promise<number> {
+  const panel = getPanel(panelId);
+  return panel.body.querySelectorAll(".llm-message-wrapper").length;
+}
+
+async function remountPanel(panelId: string): Promise<WorkflowTestPanel> {
+  assertWorkflowTestEnabled();
+  const panel = getPanel(panelId);
+  const itemId = Math.floor(Number(panel.item.id));
+  disposeSetupHandlers(panel.body);
+  activeContextPanels.delete(panel.body);
+  activeContextPanelRawItems.delete(panel.body);
+  panel.body.remove();
+  panels.delete(panelId);
+  return renderPanelForItemInternal(itemId);
+}
+
+async function getPendingDeletionState(): Promise<WorkflowTestPendingDeletionState> {
+  const keys = Array.from(
+    pendingDeletionStore.getPendingConversationKeys().values(),
+  );
+  const rows = (await Zotero.DB.queryAsync(
+    `SELECT COUNT(*) AS n FROM ${PENDING_DELETIONS_TABLE}`,
+  )) as Array<{ n: number }>;
+  return {
+    pendingCount: pendingDeletionStore.getLatestPending() ? 1 : 0,
+    pendingConversationKeys: keys,
+    persistedRowCount: Math.floor(Number(rows?.[0]?.n || 0)),
+  };
+}
+
+async function sweepPendingDeletionsAsRestart(): Promise<void> {
+  await pendingDeletionStore.sweepAllPersisted("workflow-test-restart");
+}
+
 async function cleanupFixture(
   fixture:
     | WorkflowTestFixture
@@ -2279,5 +2463,15 @@ export function installWorkflowTestHarness(targetAddon: {
     exerciseReaderPopupStandaloneRouting,
     exerciseHighlightAwareContextRetrieval,
     cleanupFixture,
+    listPanelHistory,
+    deletePanelHistoryConversation,
+    seedPanelStoredTurn,
+    deletePanelTurn,
+    clickPanelUndo,
+    isPanelUndoToastVisible,
+    getPanelVisibleMessageCount,
+    remountPanel,
+    getPendingDeletionState,
+    sweepPendingDeletionsAsRestart,
   };
 }

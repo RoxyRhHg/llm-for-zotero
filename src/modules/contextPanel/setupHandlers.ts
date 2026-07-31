@@ -4554,6 +4554,10 @@ export function setupHandlers(
   createAndSwitchPaperConversation =
     historyLifecycleController.createAndSwitchPaperConversation;
   queueTurnDeletion = historyLifecycleController.queueTurnDeletion;
+  if (__env__ !== "production") {
+    (body as HTMLElement & Record<string, unknown>).__llmQueueTurnDeletion =
+      historyLifecycleController.queueTurnDeletion;
+  }
   forkConversationFromTurn =
     historyLifecycleController.forkConversationFromTurn;
   finalizePendingDeletionsForConversation =
@@ -7632,6 +7636,7 @@ export function setupHandlers(
     delete (body as any)[SCHEDULE_QUEUED_FOLLOW_UP_THREAD_DRAIN_PROPERTY];
     delete (body as any).__llmScheduleClaudeQueueDrain;
     delete (body as any).__llmScheduleClaudeThreadQueueDrain;
+    delete (body as any).__llmQueueTurnDeletion;
     unregisterContextSurfaceActions();
     disposePendingDeletionSubscriptionForBody(body);
     void releaseClaudeRuntimeForBody(body);
