@@ -240,4 +240,128 @@ describe("pendingDeletionStore", function () {
     });
     assert.isTrue(await pendingDeletionStore.finalize("nope", "test"));
   });
+
+  it("failed finalize retries with attempts, then gives up at the cap and restores visibility", async function () {
+    const env = installFakeEnv();
+    let calls = 0;
+    const events: string[] = [];
+    configurePendingDeletionFinalizers({
+      finalizeConversation: async () => {
+        calls += 1;
+        return false;
+      },
+      finalizeTurn: async () => true,
+    });
+    const entry = await pendingDeletionStore.queueConversationDeletion(
+      conversationInput(42),
+    );
+    const stop = pendingDeletionStore.subscribe((e) => events.push(e.type));
+    for (let round = 0; round < MAX_FINALIZE_ATTEMPTS; round++) {
+      env.fireLastTimer();
+      await pendingDeletionStore.finalize("flush-barrier", "noop");
+    }
+    stop();
+    assert.equal(calls, MAX_FINALIZE_ATTEMPTS);
+    assert.isFalse(pendingDeletionStore.isConversationPendingDeletion(42));
+    assert.equal(events[events.length - 1], "gave-up");
+    assert.isTrue(env.queries.some((q) => q.sql.includes("SET attempts = ?")));
+    assert.isOk(entry);
+  });
+
+  it("sweepAllPersisted finalizes leftover rows from a previous session", async function () {
+    const env = installFakeEnv();
+    env.rows.push(
+      {
+        id: "pd-old-1",
+        kind: "conversation",
+        conversation_id: "lfz:x:upstream:global:lib-1:paper-0:legacy-11",
+        conversation_key: 11,
+        system: "upstream",
+        payload: JSON.stringify({
+          conversationKind: "global",
+          libraryID: 1,
+          title: "Leftover chat",
+          wasActive: false,
+        }),
+        queued_at: 1,
+        expires_at: 2,
+        attempts: 0,
+      },
+      {
+        id: "pd-old-2",
+        kind: "turn",
+        conversation_id: null,
+        conversation_key: 12,
+        system: "claude_code",
+        payload: JSON.stringify({
+          userTimestamp: 100,
+          assistantTimestamp: 200,
+        }),
+        queued_at: 1,
+        expires_at: 2,
+        attempts: 0,
+      },
+    );
+    const finalized: string[] = [];
+    configurePendingDeletionFinalizers({
+      finalizeConversation: async (entry) => {
+        finalized.push(`conversation:${entry.conversationKey}`);
+        return true;
+      },
+      finalizeTurn: async (entry) => {
+        finalized.push(`turn:${entry.conversationKey}`);
+        return true;
+      },
+    });
+    await pendingDeletionStore.sweepAllPersisted("startup");
+    assert.deepEqual(finalized, ["conversation:11", "turn:12"]);
+    assert.isNull(pendingDeletionStore.getLatestPending());
+    assert.isTrue(
+      env.queries.filter((q) => q.sql.includes("DELETE FROM")).length >= 2,
+    );
+  });
+
+  it("sweepExpired finalizes only entries past their window", async function () {
+    const env = installFakeEnv();
+    const finalizedKeys: number[] = [];
+    configurePendingDeletionFinalizers({
+      finalizeConversation: async (entry) => {
+        finalizedKeys.push(entry.conversationKey);
+        return true;
+      },
+      finalizeTurn: async () => true,
+    });
+    await pendingDeletionStore.queueConversationDeletion(conversationInput(1));
+    env.advance(DELETION_UNDO_WINDOW_MS + 1);
+    await pendingDeletionStore.sweepExpired("opportunistic");
+    assert.deepEqual(finalizedKeys, [1]);
+    await pendingDeletionStore.queueConversationDeletion(conversationInput(2));
+    await pendingDeletionStore.sweepExpired("opportunistic");
+    assert.deepEqual(finalizedKeys, [1]);
+    assert.isTrue(pendingDeletionStore.isConversationPendingDeletion(2));
+  });
+
+  it("finalizeForConversation finalizes both kinds for that conversation only", async function () {
+    installFakeEnv();
+    const finalized: string[] = [];
+    configurePendingDeletionFinalizers({
+      finalizeConversation: async (entry) => {
+        finalized.push(`conversation:${entry.conversationKey}`);
+        return true;
+      },
+      finalizeTurn: async (entry) => {
+        finalized.push(`turn:${entry.conversationKey}`);
+        return true;
+      },
+    });
+    await pendingDeletionStore.queueTurnDeletion({
+      conversationKey: 5,
+      system: "upstream",
+      userTimestamp: 1,
+      assistantTimestamp: 2,
+    });
+    await pendingDeletionStore.finalizeForConversation(5, "clear-button");
+    await pendingDeletionStore.finalizeForConversation(99, "clear-button");
+    assert.deepEqual(finalized, ["turn:5"]);
+  });
 });
