@@ -3045,7 +3045,12 @@ export function openStandaloneChat(options?: {
         void pendingDeletionStore.undo(latest.id).then((undone) => {
           if (undone) {
             setStandaloneHistoryStatus(t("Conversation restored"), "ready");
+            return;
           }
+          setStandaloneHistoryStatus(
+            t("Failed to restore. Check logs."),
+            "error",
+          );
         });
       });
 

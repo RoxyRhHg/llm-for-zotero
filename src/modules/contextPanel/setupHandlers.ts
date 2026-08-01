@@ -1164,8 +1164,6 @@ export function setupHandlers(
   let finalizePendingDeletionsForConversation: (
     conversationKey: number,
   ) => Promise<void> = async () => {};
-  let hasPendingTurnDeletionForConversation = (_conversationKey: number) =>
-    false;
   let closePaperPicker = () => {};
   let clearForcedSkill = () => {};
   let renderWebChatHistoryMenu: () => Promise<void> = async () => {};
@@ -4563,8 +4561,6 @@ export function setupHandlers(
   finalizePendingDeletionsForConversation =
     historyLifecycleController.finalizePendingDeletionsForConversation;
   resetHistorySearchState = historyLifecycleController.resetHistorySearchState;
-  hasPendingTurnDeletionForConversation =
-    historyLifecycleController.hasPendingTurnDeletionForConversation;
 
   const switchRuntimeSystemFromControl = async (
     clickedSystem: RuntimeConversationSystem,

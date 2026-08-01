@@ -4,6 +4,10 @@ import {
   finalizeQueuedTurnDeletion,
 } from "./conversationDeletion";
 import { initAgentSubsystem } from "../../agent";
+import {
+  ATTACHMENT_GC_MIN_AGE_MS,
+  collectAndDeleteUnreferencedBlobs,
+} from "../../utils/attachmentRefStore";
 
 let configured = false;
 
@@ -20,14 +24,23 @@ function safeLog(message: string, ...args: unknown[]): void {
 export function configurePendingDeletionSubsystem(): void {
   if (configured) return;
   configured = true;
+  const scheduleAttachmentGc = () => {
+    void collectAndDeleteUnreferencedBlobs(ATTACHMENT_GC_MIN_AGE_MS).catch(
+      (err) => safeLog("LLM: attachment GC after queued deletion failed", err),
+    );
+  };
   configurePendingDeletionFinalizers({
     finalizeConversation: (entry) =>
       finalizeQueuedConversationDeletion(entry, {
         log: safeLog,
         getCoreAgentRuntime: initAgentSubsystem,
+        scheduleAttachmentGc,
       }),
     finalizeTurn: (entry) =>
-      finalizeQueuedTurnDeletion(entry, { log: safeLog }),
+      finalizeQueuedTurnDeletion(entry, {
+        log: safeLog,
+        scheduleAttachmentGc,
+      }),
   });
 }
 

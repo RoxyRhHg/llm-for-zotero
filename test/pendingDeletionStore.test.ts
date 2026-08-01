@@ -372,3 +372,110 @@ describe("pendingDeletionStore", function () {
     assert.deepEqual(finalized, ["turn:5"]);
   });
 });
+
+describe("pendingDeletionStore hardening", function () {
+  beforeEach(function () {
+    resetPendingDeletionStoreForTests();
+  });
+
+  afterEach(function () {
+    resetPendingDeletionStoreForTests();
+    globalScope.Zotero = originalZotero;
+  });
+
+  function installEnv() {
+    const env = installFakeEnv();
+    configurePendingDeletionFinalizers({
+      finalizeConversation: async () => true,
+      finalizeTurn: async () => true,
+    });
+    return env;
+  }
+
+  it("undo keeps the entry pending and returns null when the row DELETE fails", async function () {
+    const env = installEnv();
+    const entry = await pendingDeletionStore.queueConversationDeletion(
+      conversationInput(42),
+    );
+    (globalScope.Zotero as { DB: { queryAsync: unknown } }).DB.queryAsync =
+      async (sql: string) => {
+        env.queries.push({ sql });
+        if (sql.includes("DELETE FROM")) throw new Error("disk error");
+        return [];
+      };
+    const undone = await pendingDeletionStore.undo(entry!.id);
+    assert.isNull(undone, "a failed withdraw must not look like a restore");
+    assert.isTrue(
+      pendingDeletionStore.isConversationPendingDeletion(42),
+      "entry must stay pending so state matches the surviving row",
+    );
+    assert.isOk(pendingDeletionStore.getLatestPending());
+  });
+
+  it("finalize without configured finalizers re-arms a retry timer", async function () {
+    // Env configured but finalizers deliberately left unset: the sweep loads
+    // the row into memory, cannot finalize it, and must keep a heartbeat.
+    const env3 = installFakeEnv();
+    env3.rows.push({
+      id: "pd-nofin",
+      kind: "conversation",
+      conversation_id: null,
+      conversation_key: 7,
+      system: "upstream",
+      payload: JSON.stringify({
+        conversationKind: "global",
+        libraryID: 1,
+        title: "x",
+        wasActive: false,
+      }),
+      queued_at: 1,
+      expires_at: 2,
+      attempts: 0,
+    });
+    await pendingDeletionStore.sweepAllPersisted("startup");
+    assert.isTrue(
+      pendingDeletionStore.isConversationPendingDeletion(7),
+      "entry stays pending when no finalizers exist",
+    );
+    assert.isAtLeast(
+      env3.timers.filter((t) => !t.cleared).length,
+      1,
+      "a retry timer must be re-armed so the entry cannot strand",
+    );
+  });
+
+  it("role-aware turn hiding does not hide the other role on a timestamp collision", async function () {
+    installEnv();
+    await pendingDeletionStore.queueTurnDeletion({
+      conversationKey: 5,
+      system: "upstream",
+      userTimestamp: 100,
+      assistantTimestamp: 200,
+    });
+    assert.isTrue(pendingDeletionStore.isMessageInPendingTurn(5, 100, "user"));
+    assert.isFalse(
+      pendingDeletionStore.isMessageInPendingTurn(5, 100, "assistant"),
+      "an assistant message sharing the user timestamp stays visible",
+    );
+    assert.isTrue(
+      pendingDeletionStore.isMessageInPendingTurn(5, 200, "assistant"),
+    );
+    assert.isFalse(pendingDeletionStore.isMessageInPendingTurn(5, 200, "user"));
+    assert.isTrue(
+      pendingDeletionStore.isMessageInPendingTurn(5, 100),
+      "role-less lookup keeps matching either endpoint",
+    );
+  });
+
+  it("getPendingTurnsForConversation returns retained entries for that conversation only", async function () {
+    installEnv();
+    await pendingDeletionStore.queueTurnDeletion({
+      conversationKey: 5,
+      system: "upstream",
+      userTimestamp: 100,
+      assistantTimestamp: 200,
+    });
+    assert.lengthOf(pendingDeletionStore.getPendingTurnsForConversation(5), 1);
+    assert.lengthOf(pendingDeletionStore.getPendingTurnsForConversation(6), 0);
+  });
+});

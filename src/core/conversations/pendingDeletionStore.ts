@@ -76,17 +76,41 @@ function getMainWindow(): Window | null {
   );
 }
 
+// The default timer binds its clearing host at ARM time. Resolving the host
+// again at clear time could target a different window (main window closed and
+// reopened mid-window) and cancel an unrelated timer there while leaking ours.
+type BoundTimerHandle = { cancel: () => void };
+
+function isBoundTimerHandle(handle: unknown): handle is BoundTimerHandle {
+  return (
+    typeof handle === "object" &&
+    handle !== null &&
+    typeof (handle as BoundTimerHandle).cancel === "function"
+  );
+}
+
 function defaultSetTimer(fn: () => void, delayMs: number): unknown {
   const win = getMainWindow();
-  if (win?.setTimeout) return win.setTimeout(fn, delayMs);
-  return setTimeout(fn, delayMs);
+  if (win?.setTimeout) {
+    const id = win.setTimeout(fn, delayMs);
+    return {
+      cancel: () => {
+        try {
+          win.clearTimeout(id);
+        } catch {
+          /* window already gone — its timers died with it */
+        }
+      },
+    } satisfies BoundTimerHandle;
+  }
+  const id = setTimeout(fn, delayMs);
+  return { cancel: () => clearTimeout(id) } satisfies BoundTimerHandle;
 }
 
 function defaultClearTimer(handle: unknown): void {
   if (handle === null || handle === undefined) return;
-  const win = getMainWindow();
-  if (win?.clearTimeout && typeof handle === "number") {
-    win.clearTimeout(handle);
+  if (isBoundTimerHandle(handle)) {
+    handle.cancel();
     return;
   }
   clearTimeout(handle as ReturnType<typeof setTimeout>);
@@ -242,6 +266,16 @@ async function deleteRow(id: string): Promise<void> {
   }
 }
 
+// Undo must never LOOK successful while the write-ahead row survives — the
+// next startup sweep would finalize the row and destroy the "restored" chat.
+async function deleteRowStrict(id: string): Promise<void> {
+  const db = getZoteroDb();
+  if (!db) throw new Error("Zotero DB unavailable");
+  await db.queryAsync(`DELETE FROM ${PENDING_DELETIONS_TABLE} WHERE id = ?`, [
+    id,
+  ]);
+}
+
 async function persistAttempts(entry: PendingDeletionEntry): Promise<void> {
   const db = getZoteroDb();
   if (!db) return;
@@ -271,6 +305,9 @@ async function finalizeInternal(id: string, reason: string): Promise<boolean> {
   clearEntryTimer(id);
   if (!finalizers) {
     env.log("LLM: pending deletion finalizers not configured", { id, reason });
+    // Keep the retry heartbeat alive — without it the entry would sit hidden
+    // forever with a dead undo window until the next sweep.
+    armTimer(id, FINALIZE_RETRY_DELAY_MS);
     return false;
   }
   let ok = false;
@@ -469,8 +506,19 @@ export const pendingDeletionStore = {
     return enqueueOp(async () => {
       const entry = entries.get(id);
       if (!entry) return null;
+      try {
+        await deleteRowStrict(id);
+      } catch (err) {
+        // The durable intent could not be withdrawn; leave the entry (and its
+        // timer) in place so state stays consistent, and let the caller
+        // surface the failure instead of claiming "restored".
+        env.log("LLM: undo failed to withdraw pending-deletion row", {
+          id,
+          err,
+        });
+        return null;
+      }
       removeEntry(id);
-      await deleteRow(id);
       notify({ type: "undone", entry });
       return entry;
     });
@@ -519,19 +567,36 @@ export const pendingDeletionStore = {
     return keys;
   },
 
-  isMessageInPendingTurn(conversationKey: number, timestamp: number): boolean {
+  isMessageInPendingTurn(
+    conversationKey: number,
+    timestamp: number,
+    role?: "user" | "assistant",
+  ): boolean {
     const normalized = Math.floor(timestamp);
     for (const entry of entries.values()) {
       if (entry.kind !== "turn") continue;
       if (entry.conversationKey !== conversationKey) continue;
-      if (
-        entry.userTimestamp === normalized ||
-        entry.assistantTimestamp === normalized
-      ) {
+      const matchesUser =
+        entry.userTimestamp === normalized && role !== "assistant";
+      const matchesAssistant =
+        entry.assistantTimestamp === normalized && role !== "user";
+      if (matchesUser || matchesAssistant) {
         return true;
       }
     }
     return false;
+  },
+
+  getPendingTurnsForConversation(
+    conversationKey: number,
+  ): PendingTurnDeletionEntry[] {
+    const matching: PendingTurnDeletionEntry[] = [];
+    for (const entry of entries.values()) {
+      if (entry.kind === "turn" && entry.conversationKey === conversationKey) {
+        matching.push(entry);
+      }
+    }
+    return matching;
   },
 
   findPendingTurn(

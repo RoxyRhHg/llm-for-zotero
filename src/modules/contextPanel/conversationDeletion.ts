@@ -49,13 +49,12 @@ import {
   buildClaudePaperStateKey,
 } from "../../claudeCode/state";
 import {
-  getConversationSystemPref,
   getLastUsedClaudeGlobalConversationKey,
   getLastUsedClaudePaperConversationKey,
   removeLastUsedClaudeGlobalConversationKey,
   removeLastUsedClaudePaperConversationKey,
-  setConversationSystemPref,
 } from "../../claudeCode/prefs";
+import { getRegisteredConversationScope } from "../../shared/conversationRegistry";
 import { archiveCodexAppServerThread } from "../../codexAppServer/nativeClient";
 import {
   activeCodexGlobalConversationByLibrary,
@@ -676,10 +675,66 @@ export async function finalizeConversationDeletion(
 // they must not touch DOM or per-controller state; live panels react to the
 // store's events instead.
 
+// Conversation keys are reusable (MAX+1 allocation), so a stale queued intent
+// must never be allowed to resolve against whatever conversation owns the key
+// NOW. Returns true when the intent is stale and should simply be dropped.
+async function isStaleQueuedConversationDeletion(
+  entry: PendingConversationDeletionEntry,
+  log?: (message: string, ...args: unknown[]) => void,
+): Promise<boolean> {
+  try {
+    if (entry.conversationID) {
+      const registered = await getRegisteredConversationScope(
+        entry.conversationKey,
+      );
+      if (registered && registered.conversationID !== entry.conversationID) {
+        log?.(
+          "LLM: dropping stale queued deletion — key now owned by another conversation",
+          {
+            conversationKey: entry.conversationKey,
+            queuedConversationID: entry.conversationID,
+            currentConversationID: registered.conversationID,
+          },
+        );
+        return true;
+      }
+      return false;
+    }
+    const summary = await conversationRepository.getCatalogEntry({
+      system: entry.system,
+      kind: entry.conversationKind,
+      conversationKey: entry.conversationKey,
+    });
+    if (
+      summary &&
+      Number(summary.createdAt || 0) > Number(entry.queuedAt || 0)
+    ) {
+      log?.(
+        "LLM: dropping stale queued deletion — conversation was created after the delete was queued",
+        {
+          conversationKey: entry.conversationKey,
+          createdAt: summary.createdAt,
+          queuedAt: entry.queuedAt,
+        },
+      );
+      return true;
+    }
+    return false;
+  } catch (err) {
+    log?.("LLM: stale-deletion check failed; proceeding cautiously", err);
+    return false;
+  }
+}
+
 export async function finalizeQueuedConversationDeletion(
   entry: PendingConversationDeletionEntry,
   deps: ConversationDeletionDeps = {},
 ): Promise<boolean> {
+  if (await isStaleQueuedConversationDeletion(entry, deps.log)) {
+    // Treat as complete: the originally queued conversation is already gone
+    // and the row must not be retried against the key's new owner.
+    return true;
+  }
   let paperItemID = Number(entry.paperItemID || 0) || undefined;
   if (entry.conversationKind === "paper" && !paperItemID) {
     const summary = await conversationRepository.getCatalogEntry({
@@ -689,29 +744,37 @@ export async function finalizeQueuedConversationDeletion(
     });
     paperItemID = Number(summary?.paperItemID || 0) || undefined;
   }
-  const originalSystem = getConversationSystemPref();
-  if (originalSystem !== entry.system) {
-    setConversationSystemPref(entry.system);
-  }
-  try {
-    const result = await finalizeConversationDeletion(
-      {
-        conversationID: entry.conversationID,
-        conversationKey: entry.conversationKey,
-        kind: entry.conversationKind,
-        conversationSystem: entry.system,
-        libraryID: entry.libraryID,
-        paperItemID,
-        providerSessionId: entry.providerSessionId,
-      },
-      deps,
+  const result = await finalizeConversationDeletion(
+    {
+      conversationID: entry.conversationID,
+      conversationKey: entry.conversationKey,
+      kind: entry.conversationKind,
+      conversationSystem: entry.system,
+      libraryID: entry.libraryID,
+      paperItemID,
+      providerSessionId: entry.providerSessionId,
+    },
+    deps,
+  );
+  if (result.ok) return true;
+  // Every failure that aborts BEFORE local rows are deleted early-returns with
+  // one of these markers; retrying those is safe. Any other failure happened
+  // AFTER the destructive delete — report success to the queue so the undo
+  // affordance cannot claim to restore a chat whose rows are already gone.
+  const retrySafe =
+    result.blocked ||
+    result.errors.some(
+      (issue) =>
+        issue.code === "codex_thread_archive" ||
+        issue.code === "message_rows" ||
+        issue.code === "catalog_row",
     );
-    return result.ok;
-  } finally {
-    if (originalSystem !== entry.system) {
-      setConversationSystemPref(originalSystem);
-    }
-  }
+  if (retrySafe) return false;
+  deps.log?.(
+    "LLM: queued conversation deletion completed with cleanup errors",
+    result.errors,
+  );
+  return true;
 }
 
 export async function finalizeQueuedTurnDeletion(

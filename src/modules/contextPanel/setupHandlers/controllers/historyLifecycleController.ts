@@ -111,7 +111,6 @@ import {
 } from "../../portalScope";
 import { replaceOwnerAttachmentRefs } from "../../../../utils/attachmentRefStore";
 import {
-  cloneTurnMessageForUndo,
   collectAttachmentHashesFromMessages,
   findTurnPairByTimestamps,
 } from "../../turnMessageUtils";
@@ -2631,16 +2630,12 @@ export function createHistoryLifecycleController(
       return;
     }
 
-    const latestPendingDeletion = pendingDeletionStore.getLatestPending();
-    const pendingDeletionAffectsFork = Boolean(
-      latestPendingDeletion &&
-      latestPendingDeletion.kind === "turn" &&
-      latestPendingDeletion.conversationKey === sourceConversationKey &&
-      latestPendingDeletion.assistantTimestamp <= assistantTimestamp,
-    );
-    if (pendingDeletionAffectsFork) {
+    const overlappingPendingTurns = pendingDeletionStore
+      .getPendingTurnsForConversation(sourceConversationKey)
+      .filter((pending) => pending.assistantTimestamp <= assistantTimestamp);
+    for (const pending of overlappingPendingTurns) {
       const finalized = await pendingDeletionStore.finalize(
-        latestPendingDeletion!.id,
+        pending.id,
         "fork-overlap",
       );
       if (!finalized) return;
@@ -3450,7 +3445,8 @@ export function createHistoryLifecycleController(
       const latest = pendingDeletionStore.getLatestPending();
       if (!latest) return;
       void pendingDeletionStore.undo(latest.id).then((undone) => {
-        if (undone && status) {
+        if (!status) return;
+        if (undone) {
           setStatus(
             status,
             t(
@@ -3460,7 +3456,9 @@ export function createHistoryLifecycleController(
             ),
             "ready",
           );
+          return;
         }
+        setStatus(status, t("Failed to restore. Check logs."), "error");
       });
     });
   }
@@ -3479,7 +3477,17 @@ export function createHistoryLifecycleController(
   };
 
   const onPendingDeletionEvent = (event: PendingDeletionEvent) => {
-    if (body.isConnected === false) return;
+    // Self-heal: a body whose window is gone can never render again, and its
+    // MutationObserver-based cleanup never fires when the whole window closed.
+    try {
+      if (body.isConnected === false) {
+        disposePendingDeletionSubscriptionForBody(body);
+        return;
+      }
+    } catch {
+      disposePendingDeletionSubscriptionForBody(body);
+      return;
+    }
     renderPendingDeletionToast();
     if (event.entry.kind === "conversation") {
       clearPendingDeletionCaches(event.entry.conversationKey);
@@ -3495,7 +3503,9 @@ export function createHistoryLifecycleController(
     }
     invalidateHistorySearchDocument(event.entry.conversationKey);
     if (
-      (event.type === "undone" || event.type === "finalized") &&
+      (event.type === "undone" ||
+        event.type === "finalized" ||
+        event.type === "gave-up") &&
       item &&
       getConversationKey(item) === event.entry.conversationKey
     ) {
@@ -3842,11 +3852,8 @@ export function createHistoryLifecycleController(
         "clear-conversation",
       ),
     resetHistorySearchState,
-    hasPendingTurnDeletionForConversation: (conversationKey: number) => {
-      const latest = pendingDeletionStore.getLatestPending();
-      return (
-        latest?.kind === "turn" && latest.conversationKey === conversationKey
-      );
-    },
+    hasPendingTurnDeletionForConversation: (conversationKey: number) =>
+      pendingDeletionStore.getPendingTurnsForConversation(conversationKey)
+        .length > 0,
   };
 }
