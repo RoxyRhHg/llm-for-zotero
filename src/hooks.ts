@@ -18,6 +18,8 @@ import { registerZoteroItemContextMenu } from "./modules/contextPanel/zoteroItem
 import { initChatStore } from "./utils/chatStore";
 import { initClaudeCodeStore } from "./claudeCode/store";
 import { initCodexAppServerStore } from "./codexAppServer/store";
+import { pendingDeletionStore } from "./core/conversations/pendingDeletionStore";
+import { configurePendingDeletionSubsystem } from "./modules/contextPanel/pendingDeletionWiring";
 import {
   runDeferredLegacyMigrations,
   runStartupPreferenceMigrations,
@@ -119,6 +121,14 @@ async function initializeConversationStoresForStartup(): Promise<ConversationSto
     readiness.codexStoreReady = true;
   } catch (err) {
     ztoolkit.log("LLM: Failed to initialize Codex App Server store", err);
+  }
+  try {
+    await measureStartupPhase("pending deletion store", async () => {
+      configurePendingDeletionSubsystem();
+      await pendingDeletionStore.init();
+    });
+  } catch (err) {
+    ztoolkit.log("LLM: Failed to initialize pending deletion store", err);
   }
 
   return readiness;
@@ -228,6 +238,9 @@ function scheduleDeferredStartupWork(
     "legacy cache migrations",
     runDeferredLegacyMigrations,
   );
+  runDeferredStartupTask("pending deletion sweep", async () => {
+    await pendingDeletionStore.sweepAllPersisted("startup-sweep");
+  });
   scheduleConversationMaintenance(readiness);
   scheduleConversationIntegrityAudit();
   scheduleClaudeProjectBootstrapIfEnabled();

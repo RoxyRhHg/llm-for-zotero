@@ -13,7 +13,7 @@ describe("clearConversationController", function () {
     const { clearCurrentConversation } = createClearConversationController({
       getConversationKey: () => 7001,
       getCurrentItemID: () => 7001,
-      clearPendingTurnDeletion: (conversationKey) => {
+      finalizePendingDeletionsForConversation: async (conversationKey) => {
         calls.push(`pending:${conversationKey}`);
       },
       clearTransientComposeStateForItem: (itemId) => {

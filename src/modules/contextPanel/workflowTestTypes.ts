@@ -182,6 +182,23 @@ export type WorkflowTestHighlightAwareRetrievalDiagnostics = {
   lastFinalRequest: WorkflowTestFinalRequestSnapshot;
 };
 
+export type WorkflowTestPendingDeletionState = {
+  pendingCount: number;
+  pendingConversationKeys: number[];
+  persistedRowCount: number;
+};
+
+export type WorkflowTestHistoryRow = {
+  conversationKey: number;
+  title: string;
+};
+
+export type WorkflowTestSeededTurn = {
+  conversationKey: number;
+  userTimestamp: number;
+  assistantTimestamp: number;
+};
+
 export type WorkflowTestApi = {
   reset: () => Promise<void>;
   createPaperWithPdfFixture: (input: {
@@ -311,4 +328,25 @@ export type WorkflowTestApi = {
       | WorkflowTestNoteFixture
       | WorkflowTestStandaloneNoteFixture,
   ) => Promise<void>;
+  listPanelHistory: (panelId: string) => Promise<WorkflowTestHistoryRow[]>;
+  deletePanelHistoryConversation: (
+    panelId: string,
+    conversationKey: number,
+  ) => Promise<void>;
+  seedPanelStoredTurn: (
+    panelId: string,
+    userText: string,
+    assistantText: string,
+  ) => Promise<WorkflowTestSeededTurn>;
+  deletePanelTurn: (
+    panelId: string,
+    userTimestamp: number,
+    assistantTimestamp: number,
+  ) => Promise<void>;
+  clickPanelUndo: (panelId: string) => Promise<void>;
+  isPanelUndoToastVisible: (panelId: string) => Promise<boolean>;
+  getPanelVisibleMessageCount: (panelId: string) => Promise<number>;
+  remountPanel: (panelId: string) => Promise<WorkflowTestPanel>;
+  getPendingDeletionState: () => Promise<WorkflowTestPendingDeletionState>;
+  sweepPendingDeletionsAsRestart: () => Promise<void>;
 };

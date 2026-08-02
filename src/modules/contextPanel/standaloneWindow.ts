@@ -73,7 +73,6 @@ import {
 import { loadAllConversationHistory } from "./historyLoader";
 import {
   formatGlobalHistoryTimestamp,
-  GLOBAL_HISTORY_UNDO_WINDOW_MS,
   groupHistoryEntriesByDay,
   isOrphanHistoryEntry,
   maybeSelectPaperHistoryTarget,
@@ -171,14 +170,8 @@ import {
   buildCodexPaperStateKey,
 } from "../../codexAppServer/state";
 import { loadAllCodexConversationHistory } from "../../codexAppServer/historyLoader";
-import {
-  finalizeConversationDeletion,
-  getConversationDeletionFailureMessage,
-} from "./conversationDeletion";
-import {
-  clearActiveConversationForPendingDeletion,
-  shouldRestoreActiveConversationOnDeletionUndo,
-} from "./conversationDeletionActivation";
+import { clearActiveConversationForPendingDeletion } from "./conversationDeletionActivation";
+import { pendingDeletionStore } from "../../core/conversations/pendingDeletionStore";
 import { setStatus } from "./textUtils";
 
 type StandaloneSessionState = {
@@ -422,13 +415,6 @@ type SidebarConv = {
   mode?: "open" | "paper";
 };
 
-type PendingStandaloneHistoryDeletion = {
-  entry: SidebarConv;
-  conversationSystem: ConversationSystem;
-  wasActive: boolean;
-  timeoutId: number | null;
-  expiresAt: number;
-};
 type StandaloneCreateConversationOptions = {
   forceFresh?: boolean;
   excludeConversationKey?: number;
@@ -648,6 +634,7 @@ export function openStandaloneChat(options?: {
   let explicitNewChatInFlight = false;
   let initialRuntimeModeSeeded = false;
   let standaloneAttachmentGcTimer: number | null = null;
+  let unsubscribeStandalonePendingDeletions: (() => void) | null = null;
   let themeObserver: {
     observe(target: Node, options: MutationObserverInit): void;
     disconnect(): void;
@@ -1137,9 +1124,6 @@ export function openStandaloneChat(options?: {
 
       sidebarPanel.append(sidebarHeader, standaloneHistoryUndo, sidebarList);
       sidebar.append(iconStrip, sidebarPanel, sidebarResizeHandle);
-      const pendingStandaloneDeletionKeys = new Set<number>();
-      let pendingStandaloneHistoryDeletion: PendingStandaloneHistoryDeletion | null =
-        null;
       let standaloneSidebarEntriesByKey = new Map<number, SidebarConv>();
 
       // -- Content area --
@@ -1910,7 +1894,10 @@ export function openStandaloneChat(options?: {
             entries: conversations,
             activeConversationKey,
           }).filter(
-            (conv) => !pendingStandaloneDeletionKeys.has(conv.conversationKey),
+            (conv) =>
+              !pendingDeletionStore.isConversationPendingDeletion(
+                conv.conversationKey,
+              ),
           );
         standaloneSidebarEntriesByKey = new Map(
           conversations.map((conv) => [conv.conversationKey, conv]),
@@ -2209,7 +2196,9 @@ export function openStandaloneChat(options?: {
           .map(toStandaloneHistoryEntry)
           .filter(
             (entry) =>
-              !pendingStandaloneDeletionKeys.has(entry.conversationKey),
+              !pendingDeletionStore.isConversationPendingDeletion(
+                entry.conversationKey,
+              ),
           );
       };
 
@@ -2813,25 +2802,24 @@ export function openStandaloneChat(options?: {
         standaloneHistoryUndo.style.display = "flex";
       };
 
-      const clearStandaloneDeletionTimeout = (timeoutId: number | null) => {
-        if (!Number.isFinite(timeoutId)) return;
-        newWin.clearTimeout(timeoutId as number);
+      const renderStandalonePendingDeletionToast = () => {
+        const latest = pendingDeletionStore.getLatestPending();
+        if (!latest || latest.kind !== "conversation") {
+          hideStandaloneHistoryUndoToast();
+          return;
+        }
+        showStandaloneHistoryUndoToast(latest.title);
       };
 
-      const clearPendingStandaloneHistoryDeletion = (
-        restoreRowVisibility: boolean,
-      ): PendingStandaloneHistoryDeletion | null => {
-        if (!pendingStandaloneHistoryDeletion) return null;
-        const pending = pendingStandaloneHistoryDeletion;
-        clearStandaloneDeletionTimeout(pending.timeoutId);
-        pending.timeoutId = null;
-        pendingStandaloneHistoryDeletion = null;
-        if (restoreRowVisibility) {
-          pendingStandaloneDeletionKeys.delete(pending.entry.conversationKey);
-        }
-        hideStandaloneHistoryUndoToast();
-        return pending;
-      };
+      unsubscribeStandalonePendingDeletions?.();
+      unsubscribeStandalonePendingDeletions = pendingDeletionStore.subscribe(
+        () => {
+          if (cancelled || newWin.closed) return;
+          renderStandalonePendingDeletionToast();
+          scheduleStandaloneSidebarRender();
+        },
+      );
+      renderStandalonePendingDeletionToast();
 
       const setStandaloneHistoryStatus = (
         message: string,
@@ -2858,7 +2846,7 @@ export function openStandaloneChat(options?: {
         if (
           !isConversationRenameEligible({
             identity: target,
-            pendingDelete: pendingStandaloneDeletionKeys.has(
+            pendingDelete: pendingDeletionStore.isConversationPendingDeletion(
               target.conversationKey,
             ),
           })
@@ -2888,7 +2876,7 @@ export function openStandaloneChat(options?: {
               current: currentEntry
                 ? getStandaloneRenameIdentity(currentEntry)
                 : null,
-              pendingDelete: pendingStandaloneDeletionKeys.has(
+              pendingDelete: pendingDeletionStore.isConversationPendingDeletion(
                 target.conversationKey,
               ),
             })
@@ -2907,7 +2895,7 @@ export function openStandaloneChat(options?: {
               current: currentEntry
                 ? getStandaloneRenameIdentity(currentEntry)
                 : null,
-              pendingDelete: pendingStandaloneDeletionKeys.has(
+              pendingDelete: pendingDeletionStore.isConversationPendingDeletion(
                 target.conversationKey,
               ),
             })
@@ -3051,68 +3039,19 @@ export function openStandaloneChat(options?: {
         );
       };
 
-      const finalizePendingStandaloneHistoryDeletion = async (
-        reason: "timeout" | "superseded",
-      ) => {
-        const pending = clearPendingStandaloneHistoryDeletion(false);
-        if (!pending) return;
-        const entry = pending.entry;
-        ztoolkit.log("LLM: Finalizing standalone history deletion", {
-          reason,
-          conversationKey: entry.conversationKey,
-          kind: entry.kind,
-          conversationSystem: pending.conversationSystem,
-        });
-        const result = await finalizeConversationDeletion(
-          {
-            conversationID: entry.conversationID,
-            conversationKey: entry.conversationKey,
-            kind:
-              entry.kind || (standaloneMode === "open" ? "global" : "paper"),
-            conversationSystem: pending.conversationSystem,
-            libraryID:
-              Number(entry.libraryID || 0) ||
-              (entry.kind === "paper"
-                ? getCurrentPaperLibraryID()
-                : getCurrentLibraryScopeID()),
-            paperItemID: entry.paperItemID,
-            providerSessionId: entry.providerSessionId,
-          },
-          {
-            resetSessionTokens,
-            scheduleAttachmentGc: scheduleStandaloneAttachmentGc,
-            getCoreAgentRuntime: initAgentSubsystem,
-            log: (message, ...args) => ztoolkit.log(message, ...args),
-          },
-        );
-        pendingStandaloneDeletionKeys.delete(entry.conversationKey);
-        if (!result.ok) {
-          if (pending.wasActive) {
-            await switchStandaloneToConversationEntry(entry);
+      standaloneHistoryUndoBtn.addEventListener("click", () => {
+        const latest = pendingDeletionStore.getLatestPending();
+        if (!latest) return;
+        void pendingDeletionStore.undo(latest.id).then((undone) => {
+          if (undone) {
+            setStandaloneHistoryStatus(t("Conversation restored"), "ready");
+            return;
           }
           setStandaloneHistoryStatus(
-            t(getConversationDeletionFailureMessage(result)),
+            t("Failed to restore. Check logs."),
             "error",
           );
-        }
-        await renderSidebar();
-      };
-
-      const undoPendingStandaloneHistoryDeletion = async () => {
-        const pending = clearPendingStandaloneHistoryDeletion(true);
-        if (!pending) return;
-        if (
-          pending.wasActive &&
-          shouldRestoreActiveConversationOnDeletionUndo()
-        ) {
-          await switchStandaloneToConversationEntry(pending.entry);
-        }
-        await renderSidebar();
-        setStandaloneHistoryStatus(t("Conversation restored"), "ready");
-      };
-
-      standaloneHistoryUndoBtn.addEventListener("click", () => {
-        void undoPendingStandaloneHistoryDeletion();
+        });
       });
 
       const toStandaloneDeletionEntry = (
@@ -3178,11 +3117,8 @@ export function openStandaloneChat(options?: {
         const key = Number(entry.conversationKey || 0);
         if (!key) return;
         const isActive = key === activeConversationKey;
-        if (pendingStandaloneHistoryDeletion) {
-          if (pendingStandaloneHistoryDeletion.entry.conversationKey === key) {
-            return;
-          }
-          await finalizePendingStandaloneHistoryDeletion("superseded");
+        if (pendingDeletionStore.isConversationPendingDeletion(key)) {
+          return;
         }
 
         const deletionConversationSystem =
@@ -3199,18 +3135,32 @@ export function openStandaloneChat(options?: {
               return;
             }
           }
-          pendingStandaloneDeletionKeys.add(key);
-          pendingStandaloneHistoryDeletion = {
-            entry,
-            conversationSystem: deletionConversationSystem,
+          const queued = await pendingDeletionStore.queueConversationDeletion({
+            conversationKind:
+              (entry.kind ||
+                (standaloneMode === "open" ? "global" : "paper")) === "paper"
+                ? "paper"
+                : "global",
+            conversationID: entry.conversationID,
+            conversationKey: key,
+            libraryID:
+              Number(entry.libraryID || 0) ||
+              (entry.kind === "paper"
+                ? getCurrentPaperLibraryID()
+                : getCurrentLibraryScopeID()),
+            system: deletionConversationSystem,
+            paperItemID: entry.paperItemID,
+            providerSessionId: entry.providerSessionId || undefined,
+            title: entry.title || "",
             wasActive: isActive,
-            expiresAt: Date.now() + GLOBAL_HISTORY_UNDO_WINDOW_MS,
-            timeoutId: null,
-          };
-          pendingStandaloneHistoryDeletion.timeoutId = newWin.setTimeout(() => {
-            void finalizePendingStandaloneHistoryDeletion("timeout");
-          }, GLOBAL_HISTORY_UNDO_WINDOW_MS);
-          showStandaloneHistoryUndoToast(entry.title);
+          });
+          if (!queued) {
+            setStandaloneHistoryStatus(
+              t("Failed to queue deletion. Check logs."),
+              "error",
+            );
+            return;
+          }
           await renderSidebar();
           setStandaloneHistoryStatus(
             t("Conversation deleted. Undo available."),
@@ -3218,8 +3168,6 @@ export function openStandaloneChat(options?: {
           );
         } catch (err) {
           ztoolkit.log("LLM: standalone delete conversation failed", err);
-          pendingStandaloneDeletionKeys.delete(key);
-          clearPendingStandaloneHistoryDeletion(true);
           if (isActive) {
             await switchStandaloneToConversationEntry(entry).catch(() => {});
           }
@@ -4183,6 +4131,8 @@ export function openStandaloneChat(options?: {
 
   const cleanupWindow = () => {
     cancelled = true;
+    unsubscribeStandalonePendingDeletions?.();
+    unsubscribeStandalonePendingDeletions = null;
     cleanupStandalonePrefObserver?.();
     cleanupStandaloneVerticalResize?.();
     cleanupStandaloneVerticalResize = null;

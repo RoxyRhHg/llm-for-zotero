@@ -14,6 +14,14 @@ import {
   conversationRepository,
   type ConversationCatalogEntry,
 } from "../src/core/conversations/repository";
+import {
+  configurePendingDeletionStoreEnv,
+  resetPendingDeletionStoreForTests,
+} from "../src/core/conversations/pendingDeletionStore";
+import {
+  configurePendingDeletionSubsystem,
+  resetPendingDeletionSubsystemForTests,
+} from "../src/modules/contextPanel/pendingDeletionWiring";
 import { t } from "../src/utils/i18n";
 
 const LIBRARY_ID = 7;
@@ -373,9 +381,19 @@ describe("historyLifecycleController fork behavior", function () {
     conversationForkLinks.delete(TARGET_CONVERSATION_KEY);
     loadedConversationKeys.delete(SOURCE_CONVERSATION_KEY);
     loadedConversationKeys.delete(TARGET_CONVERSATION_KEY);
+    resetPendingDeletionStoreForTests();
+    configurePendingDeletionStoreEnv({
+      setTimer: () => null,
+      clearTimer: () => {},
+      log: () => {},
+    });
+    resetPendingDeletionSubsystemForTests();
+    configurePendingDeletionSubsystem();
   });
 
   afterEach(function () {
+    resetPendingDeletionStoreForTests();
+    resetPendingDeletionSubsystemForTests();
     conversationRepository.deleteTurnMessages = originalDeleteTurnMessages;
     conversationRepository.ensureCatalogEntry = originalEnsureCatalogEntry;
     conversationRepository.forkConversation = originalForkConversation;
@@ -501,11 +519,12 @@ describe("historyLifecycleController fork behavior", function () {
       historyUndoText.textContent,
       "\u5df2\u5220\u9664\u4e00\u8f6e\u5bf9\u8bdd",
     );
+    // Hide-don't-splice: the queued turn stays in memory until finalize.
     assert.deepEqual(
       (chatHistory.get(SOURCE_CONVERSATION_KEY) || []).map(
         (message) => message.timestamp,
       ),
-      [100, 200, 500, 600],
+      [100, 200, 300, 400, 500, 600],
     );
 
     await controller.forkConversationFromTurn({
@@ -514,6 +533,14 @@ describe("historyLifecycleController fork behavior", function () {
       userTimestamp: 500,
       assistantTimestamp: 600,
     });
+
+    // Finalizing the overlapped pending turn (fork pre-step) splices it.
+    assert.deepEqual(
+      (chatHistory.get(SOURCE_CONVERSATION_KEY) || []).map(
+        (message) => message.timestamp,
+      ),
+      [100, 200, 500, 600],
+    );
 
     assert.deepEqual(events, ["deleteTurnMessages", "forkConversation"]);
     assert.deepEqual(deleteCalls, [

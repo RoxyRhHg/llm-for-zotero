@@ -362,10 +362,8 @@ import {
   getModelPdfSupport,
 } from "./setupHandlers/controllers/modelReasoningController";
 import {
-  GLOBAL_HISTORY_UNDO_WINDOW_MS,
   type ConversationHistoryEntry,
   type HistorySwitchTarget,
-  type PendingHistoryDeletion,
   formatGlobalHistoryTimestamp,
   formatHistoryRowDisplayTitle,
   groupHistoryEntriesByDay,
@@ -422,7 +420,10 @@ import { createLocalPdfResourceResolver } from "./setupHandlers/controllers/loca
 import { isZoteroPdfAttachmentCandidate } from "./setupHandlers/controllers/pdfAttachmentPolicy";
 import { resolvePdfModeModelInputs } from "./setupHandlers/controllers/pdfPaperModelInputController";
 import { createWebChatHistoryController } from "./setupHandlers/controllers/webChatHistoryController";
-import { createHistoryLifecycleController } from "./setupHandlers/controllers/historyLifecycleController";
+import {
+  createHistoryLifecycleController,
+  disposePendingDeletionSubscriptionForBody,
+} from "./setupHandlers/controllers/historyLifecycleController";
 import { attachComposePreviewInteractionController } from "./setupHandlers/controllers/composePreviewInteractionController";
 import { attachFontScaleShortcutController } from "./setupHandlers/controllers/fontScaleShortcutController";
 import { attachComposeCaptureController } from "./setupHandlers/controllers/composeCaptureController";
@@ -1310,9 +1311,9 @@ export function setupHandlers(
     userTimestamp: number;
     assistantTimestamp: number;
   }) => Promise<void> = async () => {};
-  let clearPendingTurnDeletion: () => unknown = () => null;
-  let hasPendingTurnDeletionForConversation = (_conversationKey: number) =>
-    false;
+  let finalizePendingDeletionsForConversation: (
+    conversationKey: number,
+  ) => Promise<void> = async () => {};
   let closePaperPicker = () => {};
   let clearForcedSkill = () => {};
   let renderWebChatHistoryMenu: () => Promise<void> = async () => {};
@@ -4701,13 +4702,15 @@ export function setupHandlers(
   createAndSwitchPaperConversation =
     historyLifecycleController.createAndSwitchPaperConversation;
   queueTurnDeletion = historyLifecycleController.queueTurnDeletion;
+  if (__env__ !== "production") {
+    (body as HTMLElement & Record<string, unknown>).__llmQueueTurnDeletion =
+      historyLifecycleController.queueTurnDeletion;
+  }
   forkConversationFromTurn =
     historyLifecycleController.forkConversationFromTurn;
-  clearPendingTurnDeletion =
-    historyLifecycleController.clearPendingTurnDeletion;
+  finalizePendingDeletionsForConversation =
+    historyLifecycleController.finalizePendingDeletionsForConversation;
   resetHistorySearchState = historyLifecycleController.resetHistorySearchState;
-  hasPendingTurnDeletionForConversation =
-    historyLifecycleController.hasPendingTurnDeletionForConversation;
 
   const switchRuntimeSystemFromControl = async (
     clickedSystem: RuntimeConversationSystem,
@@ -6849,11 +6852,8 @@ export function setupHandlers(
     setCancelledRequestId,
     setPendingRequestId,
     setAbortController,
-    clearPendingTurnDeletion: (conversationKey) => {
-      if (hasPendingTurnDeletionForConversation(conversationKey)) {
-        clearPendingTurnDeletion();
-      }
-    },
+    finalizePendingDeletionsForConversation: (conversationKey) =>
+      finalizePendingDeletionsForConversation(conversationKey),
     validateConversationScope: async (conversationKey) => {
       if (!item) return true;
       const conversationSystem = resolveConversationSystemForItem(item);
@@ -7852,7 +7852,9 @@ export function setupHandlers(
     delete (body as any)[SCHEDULE_QUEUED_FOLLOW_UP_THREAD_DRAIN_PROPERTY];
     delete (body as any).__llmScheduleClaudeQueueDrain;
     delete (body as any).__llmScheduleClaudeThreadQueueDrain;
+    delete (body as any).__llmQueueTurnDeletion;
     unregisterContextSurfaceActions();
+    disposePendingDeletionSubscriptionForBody(body);
     void releaseClaudeRuntimeForBody(body);
     if (setupHandlersCleanupByBody.get(body) === cleanupSetupHandlers) {
       setupHandlersCleanupByBody.delete(body);

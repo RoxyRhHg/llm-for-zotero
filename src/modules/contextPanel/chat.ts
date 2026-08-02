@@ -17,6 +17,7 @@ import {
   StoredChatMessage,
 } from "../../utils/chatStore";
 import { conversationRepository } from "../../core/conversations/repository";
+import { pendingDeletionStore } from "../../core/conversations/pendingDeletionStore";
 import {
   appendCodexMessage,
   pruneCodexConversation,
@@ -6636,6 +6637,9 @@ export async function editLatestUserMessageAndRetry(
   } = opts;
   await ensureConversationLoaded(item);
   const conversationKey = getConversationKey(item);
+  // Retry must act on the state the user SEES: complete any pending turn
+  // deletion first so the hidden turn cannot be the retry target.
+  await pendingDeletionStore.finalizeForConversation(conversationKey, "retry");
   const history = chatHistory.get(conversationKey) || [];
   const retryPair = findLatestRetryPair(history);
   if (!retryPair) return "missing";
@@ -6947,6 +6951,9 @@ export async function retryLatestAssistantResponse(
 
   await ensureConversationLoaded(item);
   const conversationKey = getConversationKey(item);
+  // Retry must act on the state the user SEES: complete any pending turn
+  // deletion first so the hidden turn cannot be the retry target.
+  await pendingDeletionStore.finalizeForConversation(conversationKey, "retry");
   const history = chatHistory.get(conversationKey) || [];
   const retryPair = findLatestRetryPair(history);
   if (!retryPair) {
@@ -8697,6 +8704,14 @@ export async function sendQuestion(
     agentRunId,
     skipAgentDispatch = false,
   } = opts;
+  {
+    // A new send is the user moving on: complete any pending turn deletion so
+    // the hidden turn is neither included in the prompt nor resurrected later.
+    const pendingKey = getConversationKey(item);
+    if (pendingKey) {
+      await pendingDeletionStore.finalizeForConversation(pendingKey, "send");
+    }
+  }
   const effectiveConversationSystem = resolveEffectiveConversationSystem({
     item,
     authMode: opts.authMode,
@@ -10001,7 +10016,19 @@ export function refreshChat(
       : cachedSnapshot
         ? cachedSnapshot
         : buildChatScrollSnapshot(chatBox);
-  const history = chatHistory.get(conversationKey) || [];
+  const rawHistory = chatHistory.get(conversationKey) || [];
+  // Turns queued for deletion stay in memory and DB until the undo window
+  // closes; they are only hidden from the render. Role-aware matching keeps a
+  // same-millisecond timestamp collision on the other role visible.
+  const isPendingTurnMessage = (message: Message) =>
+    pendingDeletionStore.isMessageInPendingTurn(
+      conversationKey,
+      message.timestamp,
+      message.role === "assistant" ? "assistant" : "user",
+    );
+  const history = rawHistory.some(isPendingTurnMessage)
+    ? rawHistory.filter((message) => !isPendingTurnMessage(message))
+    : rawHistory;
   const requestedRerenders = options.rerenderAssistantMessages;
   const { useTargetedRerender, targetedMessageWrappers } =
     resolveTargetedAssistantRerenders(
