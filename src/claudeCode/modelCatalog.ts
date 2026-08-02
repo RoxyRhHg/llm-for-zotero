@@ -250,9 +250,13 @@ export function shouldPreserveClaudeCustomModelDraft(params: {
   selectedModel: string;
   focused: boolean;
 }): boolean {
+  // An empty unfocused draft carries no user input worth preserving; treating
+  // it as preservable would freeze the pre-initialization "Customized" DOM
+  // default before the first catalog sync runs.
+  const draft = params.draftValue.trim();
   return (
     params.customized &&
-    (params.focused || params.draftValue.trim() !== params.selectedModel.trim())
+    (params.focused || (draft !== "" && draft !== params.selectedModel.trim()))
   );
 }
 

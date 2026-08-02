@@ -7493,7 +7493,7 @@ export function setupHandlers(
     if (isCodexConversationSystem()) {
       void ensureCodexModelCatalogLoaded();
     } else if (isClaudeConversationSystem()) {
-      void ensureClaudeModelCatalogLoaded(true);
+      void ensureClaudeModelCatalogLoaded();
     }
     updateModelButton();
     flushResponsiveLayoutSyncNow();

@@ -51,7 +51,6 @@ Documentation:
 - [Roadmap](#roadmap)
 - [FAQ](#faq)
 - [Contributing](#contributing)
-- [Star History](#star-history)
 
 ## At a Glance
 
@@ -757,7 +756,3 @@ Contributions are welcome. Bug reports, feature requests, documentation
 improvements, and pull requests are all useful. Please
 [open an issue](https://github.com/yilewang/llm-for-zotero/issues) or submit a
 PR.
-
-## Star History
-
-[![Star History Chart](https://api.star-history.com/image?repos=yilewang/llm-for-zotero&type=date&legend=top-left)](https://www.star-history.com/?repos=yilewang%2Fllm-for-zotero&type=date&legend=top-left)

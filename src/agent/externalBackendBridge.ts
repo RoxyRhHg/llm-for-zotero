@@ -2292,32 +2292,31 @@ export function createExternalBackendBridgeRuntime(options: {
     return `${bridgeUrl}|${source}|${settingSources}|${profileSignature}`;
   };
 
+  // Every capability cache (tools, slash commands, efforts, model catalog) is
+  // keyed by the same config identity and must be cleared together whenever
+  // that identity changes; keep this the single place that does so.
+  const resetCapabilityCaches = (nextConfigKey: string): void => {
+    cachedTools = [];
+    cacheExpiresAt = 0;
+    cachedSlashCommands = [];
+    slashCommandsCacheExpiresAt = 0;
+    cachedEffortsByModel.clear();
+    cachedModelCatalog = null;
+    cachedModelCatalogKey = "";
+    modelCatalogCacheExpiresAt = 0;
+    lastCapabilityConfigKey = nextConfigKey;
+  };
+
   const refreshExternalActions = async (force = false): Promise<void> => {
     const bridgeUrl = normalizeBaseUrl(getBridgeUrl());
     if (!bridgeUrl) {
-      cachedTools = [];
-      cacheExpiresAt = 0;
-      cachedSlashCommands = [];
-      slashCommandsCacheExpiresAt = 0;
-      cachedEffortsByModel.clear();
-      cachedModelCatalog = null;
-      cachedModelCatalogKey = "";
-      modelCatalogCacheExpiresAt = 0;
-      lastCapabilityConfigKey = "";
+      resetCapabilityCaches("");
       return;
     }
     const configKey = resolveCapabilityConfigKey();
     if (configKey !== lastCapabilityConfigKey) {
       force = true;
-      cachedTools = [];
-      cacheExpiresAt = 0;
-      cachedSlashCommands = [];
-      slashCommandsCacheExpiresAt = 0;
-      cachedEffortsByModel.clear();
-      cachedModelCatalog = null;
-      cachedModelCatalogKey = "";
-      modelCatalogCacheExpiresAt = 0;
-      lastCapabilityConfigKey = configKey;
+      resetCapabilityCaches(configKey);
     }
     if (!force && Date.now() < cacheExpiresAt && cachedTools.length > 0) {
       return;
@@ -2349,15 +2348,7 @@ export function createExternalBackendBridgeRuntime(options: {
     }
     const configKey = resolveCapabilityConfigKey();
     if (configKey !== lastCapabilityConfigKey) {
-      cachedTools = [];
-      cacheExpiresAt = 0;
-      cachedSlashCommands = [];
-      slashCommandsCacheExpiresAt = 0;
-      cachedEffortsByModel.clear();
-      cachedModelCatalog = null;
-      cachedModelCatalogKey = "";
-      modelCatalogCacheExpiresAt = 0;
-      lastCapabilityConfigKey = configKey;
+      resetCapabilityCaches(configKey);
     }
     const key = `${configKey}|${(model || "").trim()}`;
     const cached = cachedEffortsByModel.get(key);
@@ -2385,15 +2376,7 @@ export function createExternalBackendBridgeRuntime(options: {
     }
     const configKey = resolveCapabilityConfigKey();
     if (configKey !== lastCapabilityConfigKey) {
-      cachedTools = [];
-      cacheExpiresAt = 0;
-      cachedSlashCommands = [];
-      slashCommandsCacheExpiresAt = 0;
-      cachedEffortsByModel.clear();
-      cachedModelCatalog = null;
-      cachedModelCatalogKey = "";
-      modelCatalogCacheExpiresAt = 0;
-      lastCapabilityConfigKey = configKey;
+      resetCapabilityCaches(configKey);
     }
     const requestKey = context
       ? [
@@ -2472,13 +2455,7 @@ export function createExternalBackendBridgeRuntime(options: {
     }
     if (!bridgeUrl) {
       dbg("refreshSlashCommands: no bridgeUrl, clearing cache");
-      cachedSlashCommands = [];
-      slashCommandsCacheExpiresAt = 0;
-      cachedEffortsByModel.clear();
-      cachedModelCatalog = null;
-      cachedModelCatalogKey = "";
-      modelCatalogCacheExpiresAt = 0;
-      lastCapabilityConfigKey = "";
+      resetCapabilityCaches("");
       return;
     }
     if (

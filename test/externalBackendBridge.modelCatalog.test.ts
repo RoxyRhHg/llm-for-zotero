@@ -1,4 +1,7 @@
 import { assert } from "chai";
+import { readFileSync } from "node:fs";
+import { dirname, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
 import { afterEach, beforeEach, describe, it } from "mocha";
 import { createExternalBackendBridgeRuntime } from "../src/agent/externalBackendBridge";
 
@@ -202,5 +205,22 @@ describe("external bridge model catalog", function () {
     );
     assert.lengthOf(urls, 2);
     assert.include(urls[1], "refresh=1");
+  });
+
+  it("clears every capability cache through the single shared reset helper", function () {
+    const source = readFileSync(
+      resolve(
+        dirname(fileURLToPath(import.meta.url)),
+        "..",
+        "src/agent/externalBackendBridge.ts",
+      ),
+      "utf8",
+    );
+    assert.include(source, "const resetCapabilityCaches = ");
+    assert.lengthOf(source.match(/cachedModelCatalog = null;/g) ?? [], 1);
+    assert.lengthOf(
+      source.match(/lastCapabilityConfigKey = configKey;/g) ?? [],
+      0,
+    );
   });
 });

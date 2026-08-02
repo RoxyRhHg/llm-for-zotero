@@ -77,9 +77,15 @@ describe("runtime preference UI", function () {
       "listClaudeModels(coreRuntime, force, context)",
     );
     assert.include(setupHandlers, "resolveClaudeModelCatalogContext");
-    assert.match(
-      setupHandlers,
-      /openModelMenu = \(\) => \{[\s\S]*?isClaudeConversationSystem\(\)[\s\S]*?ensureClaudeModelCatalogLoaded\(true\)/,
+    const openModelMenuBlock =
+      setupHandlers.match(
+        /\n {2}openModelMenu = \(\) => \{[\s\S]*?\n {2}\};/,
+      )?.[0] ?? "";
+    assert.include(openModelMenuBlock, "isClaudeConversationSystem()");
+    assert.include(openModelMenuBlock, "ensureClaudeModelCatalogLoaded()");
+    assert.notInclude(
+      openModelMenuBlock,
+      "ensureClaudeModelCatalogLoaded(true)",
     );
     assert.include(
       setupHandlers,

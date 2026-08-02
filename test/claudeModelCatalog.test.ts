@@ -284,6 +284,17 @@ describe("Claude Code model catalog", function () {
     );
   });
 
+  it("does not preserve an empty unfocused draft left by pre-initialization UI state", function () {
+    assert.isFalse(
+      shouldPreserveClaudeCustomModelDraft({
+        customized: true,
+        draftValue: "",
+        selectedModel: "sonnet",
+        focused: false,
+      }),
+    );
+  });
+
   it("marks force-refresh catalog requests explicitly", async function () {
     let requestedUrl = "";
     await fetchClaudeModelCatalog({
