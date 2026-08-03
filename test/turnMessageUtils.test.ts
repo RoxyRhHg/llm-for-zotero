@@ -3,8 +3,15 @@ import {
   findTurnPairByTimestamps,
   cloneTurnMessageForUndo,
   collectAttachmentHashesFromMessages,
+  filterMessagesInPendingTurns,
 } from "../src/modules/contextPanel/turnMessageUtils";
 import type { Message } from "../src/modules/contextPanel/types";
+import {
+  pendingDeletionStore,
+  configurePendingDeletionFinalizers,
+  configurePendingDeletionStoreEnv,
+  resetPendingDeletionStoreForTests,
+} from "../src/core/conversations/pendingDeletionStore";
 
 const HASH_A = "a".repeat(64);
 const HASH_IMG = "b".repeat(64);
@@ -59,5 +66,76 @@ describe("turnMessageUtils", function () {
     ] as unknown as Message[];
     const hashes = collectAttachmentHashesFromMessages(messages);
     assert.deepEqual(hashes, [HASH_A]);
+  });
+});
+
+describe("filterMessagesInPendingTurns", function () {
+  const globalScope = globalThis as typeof globalThis & {
+    Zotero?: Record<string, unknown>;
+  };
+  const originalZotero = globalScope.Zotero;
+
+  beforeEach(async function () {
+    resetPendingDeletionStoreForTests();
+    globalScope.Zotero = {
+      ...(originalZotero || {}),
+      DB: {
+        queryAsync: async (sql: string) => {
+          if (sql.trimStart().toUpperCase().startsWith("SELECT")) return [];
+          return [];
+        },
+      },
+    };
+    configurePendingDeletionStoreEnv({
+      now: () => 1_000_000,
+      setTimer: () => ({}),
+      clearTimer: () => {},
+      log: () => {},
+    });
+    configurePendingDeletionFinalizers({
+      finalizeConversation: async () => true,
+      finalizeTurn: async () => true,
+    });
+  });
+
+  afterEach(function () {
+    resetPendingDeletionStoreForTests();
+    globalScope.Zotero = originalZotero;
+  });
+
+  it("returns the same array when no turn is pending", function () {
+    const messages = [
+      { role: "user", text: "a", timestamp: 1000 },
+      { role: "assistant", text: "b", timestamp: 1001 },
+    ];
+    assert.strictEqual(filterMessagesInPendingTurns(5, messages), messages);
+  });
+
+  it("filters both messages of a queued turn, role-aware", async function () {
+    await pendingDeletionStore.queueTurnDeletion({
+      conversationKey: 5,
+      system: "upstream",
+      userTimestamp: 1000,
+      assistantTimestamp: 1001,
+    });
+    const messages = [
+      { role: "user", text: "a", timestamp: 1000 },
+      { role: "assistant", text: "b", timestamp: 1001 },
+      { role: "user", text: "same-ms", timestamp: 1001 },
+      { role: "user", text: "keep", timestamp: 2000 },
+      { role: "assistant", text: "keep2", timestamp: 2001 },
+      { role: "assistant", text: "no-ts" } as {
+        role: string;
+        text: string;
+        timestamp?: number;
+      },
+    ];
+    const filtered = filterMessagesInPendingTurns(5, messages);
+    assert.deepEqual(
+      filtered.map((message) => message.text),
+      ["same-ms", "keep", "keep2", "no-ts"],
+    );
+    const otherConversation = filterMessagesInPendingTurns(6, messages);
+    assert.strictEqual(otherConversation, messages);
   });
 });

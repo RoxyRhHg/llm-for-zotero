@@ -371,6 +371,41 @@ describe("pendingDeletionStore", function () {
     await pendingDeletionStore.finalizeForConversation(99, "clear-button");
     assert.deepEqual(finalized, ["turn:5"]);
   });
+
+  it("finalizeForConversation propagates failure and success", async function () {
+    installFakeEnv();
+    let fail = true;
+    configurePendingDeletionFinalizers({
+      finalizeConversation: async () => true,
+      finalizeTurn: async () => !fail,
+    });
+    const entry = await pendingDeletionStore.queueTurnDeletion({
+      conversationKey: 7,
+      system: "upstream",
+      userTimestamp: 1,
+      assistantTimestamp: 2,
+    });
+    assert.isOk(entry);
+    assert.isFalse(
+      await pendingDeletionStore.finalizeForConversation(7, "send"),
+      "failed finalize must propagate false",
+    );
+    assert.lengthOf(
+      pendingDeletionStore.getPendingTurnsForConversation(7),
+      1,
+      "failed entry stays pending",
+    );
+    fail = false;
+    assert.isTrue(
+      await pendingDeletionStore.finalizeForConversation(7, "send"),
+      "successful finalize must propagate true",
+    );
+    assert.lengthOf(pendingDeletionStore.getPendingTurnsForConversation(7), 0);
+    assert.isTrue(
+      await pendingDeletionStore.finalizeForConversation(7, "send"),
+      "no matching entries counts as finalized",
+    );
+  });
 });
 
 describe("pendingDeletionStore hardening", function () {

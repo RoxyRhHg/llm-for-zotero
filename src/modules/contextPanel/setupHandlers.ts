@@ -1313,7 +1313,7 @@ export function setupHandlers(
   }) => Promise<void> = async () => {};
   let finalizePendingDeletionsForConversation: (
     conversationKey: number,
-  ) => Promise<void> = async () => {};
+  ) => Promise<boolean> = async () => true;
   let closePaperPicker = () => {};
   let clearForcedSkill = () => {};
   let renderWebChatHistoryMenu: () => Promise<void> = async () => {};
@@ -4705,6 +4705,8 @@ export function setupHandlers(
   if (__env__ !== "production") {
     (body as HTMLElement & Record<string, unknown>).__llmQueueTurnDeletion =
       historyLifecycleController.queueTurnDeletion;
+    (body as HTMLElement & Record<string, unknown>).__llmSearchPanelHistory =
+      historyLifecycleController.searchConversationHistoryForWorkflowTest;
   }
   forkConversationFromTurn =
     historyLifecycleController.forkConversationFromTurn;
@@ -7853,6 +7855,7 @@ export function setupHandlers(
     delete (body as any).__llmScheduleClaudeQueueDrain;
     delete (body as any).__llmScheduleClaudeThreadQueueDrain;
     delete (body as any).__llmQueueTurnDeletion;
+    delete (body as any).__llmSearchPanelHistory;
     unregisterContextSurfaceActions();
     disposePendingDeletionSubscriptionForBody(body);
     void releaseClaudeRuntimeForBody(body);

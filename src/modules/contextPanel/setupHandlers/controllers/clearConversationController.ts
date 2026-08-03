@@ -13,7 +13,7 @@ type ClearConversationControllerDeps = {
   ) => void;
   finalizePendingDeletionsForConversation?: (
     conversationKey: number,
-  ) => Promise<void>;
+  ) => Promise<boolean>;
   validateConversationScope?: (conversationKey: number) => Promise<boolean>;
   clearTransientComposeStateForItem: (itemId: number) => void;
   resetComposePreviewUI: () => void;

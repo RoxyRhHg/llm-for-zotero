@@ -197,4 +197,108 @@ describe("deletion lifecycle", function () {
       }
     });
   });
+
+  it("a turn whose finalize fails stays out of the next send's prompt", async function () {
+    await surfacing(async () => {
+      const api = getWorkflowTestApi();
+      await api.reset();
+      const fixture = await api.createPaperWithPdfFixture({
+        title: "Deletion Prompt Invariant Paper",
+        pdfTitle: "deletion-prompt.pdf",
+      });
+      try {
+        const panel = await api.renderPanelForItem(fixture.parentItemId);
+        await api.seedPanelStoredTurn(
+          panel.panelId,
+          "keep this question",
+          "keep this answer",
+        );
+        const doomed = await api.seedPanelStoredTurn(
+          panel.panelId,
+          "DOOMED-QUESTION-XK9",
+          "DOOMED-ANSWER-XK9",
+        );
+        await api.deletePanelTurn(
+          panel.panelId,
+          doomed.userTimestamp,
+          doomed.assistantTimestamp,
+        );
+        await api.failNextPendingTurnFinalizes(1);
+        const finalRequest = await api.askCapturingFinalRequest(
+          panel.panelId,
+          "and a brand new question",
+        );
+        const historyBlob = (finalRequest.historyTexts || []).join("\n");
+        assert.notInclude(historyBlob, "DOOMED-QUESTION-XK9");
+        assert.notInclude(historyBlob, "DOOMED-ANSWER-XK9");
+        assert.include(historyBlob, "keep this question");
+        const pending = await api.getPendingDeletionState();
+        assert.equal(
+          pending.persistedRowCount,
+          1,
+          "failed finalize keeps the entry queued for retry",
+        );
+      } finally {
+        await api.cleanupFixture(fixture);
+      }
+    });
+  });
+
+  it("history search cannot surface text from a turn queued for deletion", async function () {
+    await surfacing(async () => {
+      const api = getWorkflowTestApi();
+      await api.reset();
+      const fixture = await api.createPaperWithPdfFixture({
+        title: "Deletion Search Invariant Paper",
+        pdfTitle: "deletion-search.pdf",
+      });
+      try {
+        const panel = await api.renderPanelForItem(fixture.parentItemId);
+        await api.seedPanelStoredTurn(
+          panel.panelId,
+          "tell me about zebrafish",
+          "zebrafish are great",
+        );
+        const doomed = await api.seedPanelStoredTurn(
+          panel.panelId,
+          "question about XYLOGRAPH-SECRET",
+          "answer about XYLOGRAPH-SECRET",
+        );
+        const before = await api.searchPanelHistory(panel.panelId, "xylograph");
+        assert.isAtLeast(
+          before.entries.length,
+          1,
+          "sanity: text is searchable before deletion",
+        );
+        await api.deletePanelTurn(
+          panel.panelId,
+          doomed.userTimestamp,
+          doomed.assistantTimestamp,
+        );
+        const during = await api.searchPanelHistory(panel.panelId, "xylograph");
+        assert.lengthOf(
+          during.entries,
+          0,
+          "queued-for-deletion text must not match",
+        );
+        const otherTurn = await api.searchPanelHistory(
+          panel.panelId,
+          "zebrafish",
+        );
+        assert.isAtLeast(otherTurn.entries.length, 1);
+        for (const preview of otherTurn.previews) {
+          assert.notInclude(preview, "XYLOGRAPH-SECRET");
+        }
+        await api.clickPanelUndo(panel.panelId);
+        const after = await api.searchPanelHistory(panel.panelId, "xylograph");
+        assert.isAtLeast(
+          after.entries.length,
+          1,
+          "undo must restore searchability",
+        );
+      } finally {
+        await api.cleanupFixture(fixture);
+      }
+    });
+  });
 });

@@ -112,6 +112,7 @@ import {
 import { replaceOwnerAttachmentRefs } from "../../../../utils/attachmentRefStore";
 import {
   collectAttachmentHashesFromMessages,
+  filterMessagesInPendingTurns,
   findTurnPairByTimestamps,
 } from "../../turnMessageUtils";
 import {
@@ -865,6 +866,7 @@ export function createHistoryLifecycleController(
     }
     const entryByKey = new Map<number, ConversationHistoryEntry>();
     const documents = new Map<number, HistorySearchDocument>();
+    const entriesNeedingVisibleRebuild: ConversationHistoryEntry[] = [];
     const addIndexedMatch = (match: ConversationSearchIndexMatch): void => {
       const entry = createHistorySearchEntryFromIndexMatch(match);
       if (
@@ -876,6 +878,18 @@ export function createHistoryLifecycleController(
         return;
       }
       entryByKey.set(entry.conversationKey, entry);
+      if (
+        pendingDeletionStore.getPendingTurnsForConversation(
+          entry.conversationKey,
+        ).length > 0
+      ) {
+        // The shared index row still contains text from turns queued for
+        // deletion. Rebuild this conversation's document from visible rows
+        // and re-score; a conversation whose only hits were hidden text then
+        // drops out via the matchCount gate.
+        entriesNeedingVisibleRebuild.push(entry);
+        return;
+      }
       const document = createHistorySearchDocument(entry, [
         { text: match.bodyText },
       ]);
@@ -884,6 +898,12 @@ export function createHistoryLifecycleController(
     };
     for (const match of indexed.matches) {
       addIndexedMatch(match);
+    }
+    if (entriesNeedingVisibleRebuild.length) {
+      await runHistorySearchDocumentLoads(
+        entriesNeedingVisibleRebuild,
+        documents,
+      );
     }
     if (indexed.status === "truncated") {
       const truncatedMatches = await loadTruncatedConversationIndexMatches({
@@ -962,7 +982,18 @@ export function createHistoryLifecycleController(
       conversationKey: entry.conversationKey,
       limit: PERSISTED_HISTORY_LIMIT,
     });
-    return createHistorySearchDocument(entry, messages);
+    // Rows from turns queued for deletion are still in the DB during the
+    // undo window; keep them out of the searchable document so search can
+    // never surface text the chat hides.
+    const visibleMessages = filterMessagesInPendingTurns(
+      entry.conversationKey,
+      messages as Array<{
+        role?: unknown;
+        timestamp?: unknown;
+        text?: unknown;
+      }>,
+    );
+    return createHistorySearchDocument(entry, visibleMessages);
   };
 
   const getHistorySearchDocumentFingerprint = (
@@ -3855,5 +3886,33 @@ export function createHistoryLifecycleController(
     hasPendingTurnDeletionForConversation: (conversationKey: number) =>
       pendingDeletionStore.getPendingTurnsForConversation(conversationKey)
         .length > 0,
+    searchConversationHistoryForWorkflowTest: async (query: string) => {
+      syncStateFromDeps();
+      const libraryID = getCurrentLibraryID();
+      if (!libraryID) {
+        return {
+          entries: [] as Array<{ conversationKey: number; title: string }>,
+          previews: [] as string[],
+        };
+      }
+      let result: {
+        entries: ConversationHistoryEntry[];
+        resultsByKey: Map<number, HistorySearchResult>;
+      };
+      try {
+        result = await searchIndexedConversationHistory(libraryID, query);
+      } catch {
+        result = await searchLoadedConversationHistory(libraryID, query);
+      }
+      return {
+        entries: result.entries.map((entry) => ({
+          conversationKey: entry.conversationKey,
+          title: entry.title || "",
+        })),
+        previews: Array.from(result.resultsByKey.values()).map(
+          (searchResult) => searchResult.previewText,
+        ),
+      };
+    },
   };
 }

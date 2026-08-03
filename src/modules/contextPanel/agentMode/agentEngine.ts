@@ -24,6 +24,7 @@ import {
   resolveDisplayConversationKind,
 } from "../portalScope";
 import { mergeCitationPaperContexts } from "../citationContexts";
+import { filterMessagesInPendingTurns } from "../turnMessageUtils";
 import { resolveStreamInterruptionOutcome } from "../streamInterruption";
 import {
   restoreRetryUserSnapshot,
@@ -1503,7 +1504,11 @@ export async function sendAgentTurn(
 
   await deps.ensureConversationLoaded(item);
   const history = deps.chatHistory.get(conversationKey) || [];
-  const llmHistory = deps.buildLLMHistoryMessages(history.slice(0, -2));
+  // A turn queued for deletion is hidden from the user; a failed finalize
+  // must not leak it into the prompt (see filterMessagesInPendingTurns).
+  const llmHistory = deps.buildLLMHistoryMessages(
+    filterMessagesInPendingTurns(conversationKey, history.slice(0, -2)),
+  );
   const normalizedPaperContexts = deps.normalizePaperContexts([
     ...(paperContexts || []),
     ...selectedTextPaperContextsForMessage.filter(
@@ -1799,7 +1804,12 @@ export async function retryAgentTurn(
   const ui = deps.getPanelRequestUI(body);
   await deps.ensureConversationLoaded(item);
   const conversationKey = deps.getConversationKey(item);
-  const history = deps.chatHistory.get(conversationKey) || [];
+  // Select the retry target and slice the prompt from the user-visible view;
+  // turns queued for deletion must stay invisible even if finalize failed.
+  const history = filterMessagesInPendingTurns(
+    conversationKey,
+    deps.chatHistory.get(conversationKey) || [],
+  );
   const retryPair = deps.findLatestRetryPair(history);
   if (!retryPair) {
     if (ui.status) {

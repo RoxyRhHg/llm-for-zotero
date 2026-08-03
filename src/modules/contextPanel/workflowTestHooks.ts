@@ -8,6 +8,7 @@ export type WorkflowTestSendInterceptor = (
 
 export type WorkflowTestFinalRequestSnapshot = {
   prompt: string;
+  historyTexts: string[];
   combinedContext: string;
   strategy: ContextAssemblyStrategy;
   systemMessages: string[];

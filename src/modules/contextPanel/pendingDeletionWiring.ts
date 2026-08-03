@@ -10,6 +10,13 @@ import {
 } from "../../utils/attachmentRefStore";
 
 let configured = false;
+let forcedTurnFinalizeFailures = 0;
+
+// Test-only: make the next N queued-turn finalize attempts fail so workflow
+// tests can drive the failed-finalize path through the real runtime.
+export function forcePendingTurnFinalizeFailuresForTests(count: number): void {
+  forcedTurnFinalizeFailures = Math.max(0, Math.floor(count));
+}
 
 // ztoolkit is an ambient plugin global; outside the plugin runtime (unit
 // tests) it does not exist, so logging stays best-effort.
@@ -36,11 +43,17 @@ export function configurePendingDeletionSubsystem(): void {
         getCoreAgentRuntime: initAgentSubsystem,
         scheduleAttachmentGc,
       }),
-    finalizeTurn: (entry) =>
-      finalizeQueuedTurnDeletion(entry, {
+    finalizeTurn: async (entry) => {
+      if (forcedTurnFinalizeFailures > 0) {
+        forcedTurnFinalizeFailures -= 1;
+        safeLog("LLM: workflow-test forced turn finalize failure", entry.id);
+        return false;
+      }
+      return finalizeQueuedTurnDeletion(entry, {
         log: safeLog,
         scheduleAttachmentGc,
-      }),
+      });
+    },
   });
 }
 

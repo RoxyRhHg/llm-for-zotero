@@ -18,6 +18,7 @@ import {
 } from "../../utils/chatStore";
 import { conversationRepository } from "../../core/conversations/repository";
 import { pendingDeletionStore } from "../../core/conversations/pendingDeletionStore";
+import { filterMessagesInPendingTurns } from "./turnMessageUtils";
 import {
   appendCodexMessage,
   pruneCodexConversation,
@@ -3302,6 +3303,11 @@ async function prepareFinalContextPlanChatRequest(params: {
     workflowTestIntercepted =
       (await workflowTestFinalRequestInterceptor({
         prompt: params.requestParams.prompt,
+        historyTexts: (params.requestParams.history || []).map((message) =>
+          typeof message.content === "string"
+            ? message.content
+            : JSON.stringify(message.content ?? ""),
+        ),
         combinedContext: params.combinedContext,
         strategy: params.contextPlan.strategy,
         systemMessages,
@@ -6638,9 +6644,14 @@ export async function editLatestUserMessageAndRetry(
   await ensureConversationLoaded(item);
   const conversationKey = getConversationKey(item);
   // Retry must act on the state the user SEES: complete any pending turn
-  // deletion first so the hidden turn cannot be the retry target.
+  // deletion first so the hidden turn cannot be the retry target. finalize is
+  // best-effort — on failure the turn stays queued, so select the target from
+  // the filtered (user-visible) view.
   await pendingDeletionStore.finalizeForConversation(conversationKey, "retry");
-  const history = chatHistory.get(conversationKey) || [];
+  const history = filterMessagesInPendingTurns(
+    conversationKey,
+    chatHistory.get(conversationKey) || [],
+  );
   const retryPair = findLatestRetryPair(history);
   if (!retryPair) return "missing";
   if (retryPair.assistantMessage.streaming) return "stale";
@@ -6952,9 +6963,14 @@ export async function retryLatestAssistantResponse(
   await ensureConversationLoaded(item);
   const conversationKey = getConversationKey(item);
   // Retry must act on the state the user SEES: complete any pending turn
-  // deletion first so the hidden turn cannot be the retry target.
+  // deletion first so the hidden turn cannot be the retry target. finalize is
+  // best-effort — on failure the turn stays queued, so select the target and
+  // build the prompt from the filtered (user-visible) view.
   await pendingDeletionStore.finalizeForConversation(conversationKey, "retry");
-  const history = chatHistory.get(conversationKey) || [];
+  const history = filterMessagesInPendingTurns(
+    conversationKey,
+    chatHistory.get(conversationKey) || [],
+  );
   const retryPair = findLatestRetryPair(history);
   if (!retryPair) {
     if (ui.status) setStatus(ui.status, "No retryable response found", "error");
@@ -7692,6 +7708,11 @@ export async function editUserTurnAndRetry(opts: {
   } = opts;
   await ensureConversationLoaded(item);
   const conversationKey = getConversationKey(item);
+  // Edit acts on the state the user SEES: complete any pending turn deletion
+  // first. history stays RAW below on purpose — truncation after the edited
+  // pair must also purge hidden trailing pairs and their rows; a preceding
+  // hidden pair is excluded from the prompt by the delegated retry path.
+  await pendingDeletionStore.finalizeForConversation(conversationKey, "edit");
   const history = chatHistory.get(conversationKey) || [];
 
   const userIndex = history.findIndex(
@@ -8586,6 +8607,15 @@ async function retryLatestAgentResponse(
     providerProtocol,
     modelProviderLabel,
   });
+  // Retry must act on the state the user SEES (see retryLatestAssistantResponse);
+  // callers that already finalized make this a cheap no-op.
+  const agentRetryConversationKey = getConversationKey(item);
+  if (agentRetryConversationKey) {
+    await pendingDeletionStore.finalizeForConversation(
+      agentRetryConversationKey,
+      "retry",
+    );
+  }
   await initAgentSubsystem();
   await retryAgentTurn(
     body,
@@ -8868,9 +8898,12 @@ export async function sendQuestion(
     history.length >= 2 &&
     history[history.length - 2] === optimisticUserMessage &&
     history[history.length - 1] === optimisticAssistantMessage;
-  const historyForLLM = reuseOptimisticPair
-    ? history.slice(0, -2)
-    : history.slice();
+  // finalizeForConversation above is best-effort; when a finalizer fails the
+  // turn is still queued (and hidden), so the prompt must exclude it here.
+  const historyForLLM = filterMessagesInPendingTurns(
+    conversationKey,
+    reuseOptimisticPair ? history.slice(0, -2) : history.slice(),
+  );
   const effectiveRequestConfig = resolveEffectiveRequestConfig({
     item,
     model,
@@ -10018,17 +10051,8 @@ export function refreshChat(
         : buildChatScrollSnapshot(chatBox);
   const rawHistory = chatHistory.get(conversationKey) || [];
   // Turns queued for deletion stay in memory and DB until the undo window
-  // closes; they are only hidden from the render. Role-aware matching keeps a
-  // same-millisecond timestamp collision on the other role visible.
-  const isPendingTurnMessage = (message: Message) =>
-    pendingDeletionStore.isMessageInPendingTurn(
-      conversationKey,
-      message.timestamp,
-      message.role === "assistant" ? "assistant" : "user",
-    );
-  const history = rawHistory.some(isPendingTurnMessage)
-    ? rawHistory.filter((message) => !isPendingTurnMessage(message))
-    : rawHistory;
+  // closes; they are only hidden from the render.
+  const history = filterMessagesInPendingTurns(conversationKey, rawHistory);
   const requestedRerenders = options.rerenderAssistantMessages;
   const { useTargetedRerender, targetedMessageWrappers } =
     resolveTargetedAssistantRerenders(

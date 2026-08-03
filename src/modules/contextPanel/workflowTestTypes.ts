@@ -199,6 +199,11 @@ export type WorkflowTestSeededTurn = {
   assistantTimestamp: number;
 };
 
+export type WorkflowTestHistorySearchResult = {
+  entries: WorkflowTestHistoryRow[];
+  previews: string[];
+};
+
 export type WorkflowTestApi = {
   reset: () => Promise<void>;
   createPaperWithPdfFixture: (input: {
@@ -349,4 +354,13 @@ export type WorkflowTestApi = {
   remountPanel: (panelId: string) => Promise<WorkflowTestPanel>;
   getPendingDeletionState: () => Promise<WorkflowTestPendingDeletionState>;
   sweepPendingDeletionsAsRestart: () => Promise<void>;
+  searchPanelHistory: (
+    panelId: string,
+    query: string,
+  ) => Promise<WorkflowTestHistorySearchResult>;
+  failNextPendingTurnFinalizes: (count: number) => Promise<void>;
+  askCapturingFinalRequest: (
+    panelId: string,
+    text: string,
+  ) => Promise<WorkflowTestFinalRequestSnapshot>;
 };

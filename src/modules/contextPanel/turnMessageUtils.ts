@@ -1,6 +1,34 @@
 import type { Message } from "./types";
 import { normalizeAttachmentContentHash } from "./normalizers";
 import { extractManagedBlobHash } from "./attachmentStorage";
+import { pendingDeletionStore } from "../../core/conversations/pendingDeletionStore";
+
+// Turns queued for deletion stay in memory and the DB until the undo window
+// closes; only their visibility changes. Every consumer of user-visible
+// history — the render, provider prompts, retry-target selection, and search
+// documents — must share this one filter so a pending or failed finalize can
+// never leak a hidden turn back into model input or search results.
+// Role-aware matching keeps a same-millisecond timestamp collision on the
+// other role visible. Returns the input array unchanged when nothing matches.
+export const filterMessagesInPendingTurns = <
+  T extends { role?: unknown; timestamp?: unknown },
+>(
+  conversationKey: number,
+  messages: T[],
+): T[] => {
+  const isHiddenPendingMessage = (message: T): boolean => {
+    const timestamp = Number(message.timestamp);
+    if (!Number.isFinite(timestamp)) return false;
+    return pendingDeletionStore.isMessageInPendingTurn(
+      conversationKey,
+      timestamp,
+      message.role === "assistant" ? "assistant" : "user",
+    );
+  };
+  return messages.some(isHiddenPendingMessage)
+    ? messages.filter((message) => !isHiddenPendingMessage(message))
+    : messages;
+};
 
 export const cloneTurnMessageForUndo = (message: Message): Message => ({
   ...message,

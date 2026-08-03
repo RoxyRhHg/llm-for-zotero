@@ -531,14 +531,18 @@ export const pendingDeletionStore = {
   finalizeForConversation(
     conversationKey: number,
     reason: string,
-  ): Promise<void> {
+  ): Promise<boolean> {
     return enqueueOp(async () => {
       const matching = Array.from(entries.values()).filter(
         (entry) => entry.conversationKey === conversationKey,
       );
+      let allFinalized = true;
       for (const entry of matching) {
-        await finalizeInternal(entry.id, reason);
+        if (!(await finalizeInternal(entry.id, reason))) {
+          allFinalized = false;
+        }
       }
+      return allFinalized;
     });
   },
 

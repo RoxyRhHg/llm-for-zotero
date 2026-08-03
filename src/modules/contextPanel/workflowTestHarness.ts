@@ -33,8 +33,10 @@ import type {
   WorkflowTestTargetedQuoteRefreshResult,
   WorkflowTestPendingDeletionState,
   WorkflowTestHistoryRow,
+  WorkflowTestHistorySearchResult,
   WorkflowTestSeededTurn,
 } from "./workflowTestTypes";
+import { forcePendingTurnFinalizeFailuresForTests } from "./pendingDeletionWiring";
 import {
   pendingDeletionStore,
   PENDING_DELETIONS_TABLE,
@@ -2201,6 +2203,7 @@ async function reset(): Promise<void> {
   setWorkflowTestFinalRequestInterceptor((snapshot) => {
     lastFinalRequest = snapshot;
   });
+  forcePendingTurnFinalizeFailuresForTests(0);
 }
 
 function disposeWorkflowPanels(): void {
@@ -2393,6 +2396,63 @@ async function sweepPendingDeletionsAsRestart(): Promise<void> {
   await pendingDeletionStore.sweepAllPersisted("workflow-test-restart");
 }
 
+async function searchPanelHistory(
+  panelId: string,
+  query: string,
+): Promise<WorkflowTestHistorySearchResult> {
+  assertWorkflowTestEnabled();
+  const panel = getPanel(panelId);
+  const search = (
+    panel.body as HTMLElement & {
+      __llmSearchPanelHistory?: (
+        query: string,
+      ) => Promise<WorkflowTestHistorySearchResult>;
+    }
+  ).__llmSearchPanelHistory;
+  if (!search) {
+    throw new Error("History search hook not installed on panel body");
+  }
+  return search(query);
+}
+
+async function failNextPendingTurnFinalizes(count: number): Promise<void> {
+  assertWorkflowTestEnabled();
+  forcePendingTurnFinalizeFailuresForTests(count);
+}
+
+// Drive a real send through the full request pipeline with intercepting
+// hooks (no network), and return the captured final provider request.
+async function askCapturingFinalRequest(
+  panelId: string,
+  text: string,
+): Promise<WorkflowTestFinalRequestSnapshot> {
+  assertWorkflowTestEnabled();
+  const panel = getPanel(panelId);
+  lastFinalRequest = null;
+  setWorkflowTestSendInterceptor((opts) => {
+    opts.apiBase = "http://127.0.0.1:9/v1";
+    opts.apiKey = "workflow-test-key";
+    opts.authMode = "api_key";
+    lastSend = opts;
+    return true;
+  });
+  setWorkflowTestFinalRequestInterceptor((snapshot) => {
+    lastFinalRequest = snapshot;
+    return true;
+  });
+  try {
+    await ask(panelId, text);
+    return await waitForFinalRequest(panel.body);
+  } finally {
+    setWorkflowTestSendInterceptor((opts) => {
+      lastSend = opts;
+    });
+    setWorkflowTestFinalRequestInterceptor((snapshot) => {
+      lastFinalRequest = snapshot;
+    });
+  }
+}
+
 async function cleanupFixture(
   fixture:
     | WorkflowTestFixture
@@ -2476,5 +2536,8 @@ export function installWorkflowTestHarness(targetAddon: {
     remountPanel,
     getPendingDeletionState,
     sweepPendingDeletionsAsRestart,
+    searchPanelHistory,
+    failNextPendingTurnFinalizes,
+    askCapturingFinalRequest,
   };
 }
