@@ -479,6 +479,56 @@ describe("pendingDeletionStore hardening", function () {
     );
   });
 
+  it("gave-up withdraws the row strictly; a failed withdraw keeps the entry hidden and retries", async function () {
+    const env = installFakeEnv();
+    const events: string[] = [];
+    configurePendingDeletionFinalizers({
+      finalizeConversation: async () => false,
+      finalizeTurn: async () => true,
+    });
+    const entry = await pendingDeletionStore.queueConversationDeletion(
+      conversationInput(42),
+    );
+    assert.isOk(entry);
+    let deleteFails = true;
+    (globalScope.Zotero as { DB: { queryAsync: unknown } }).DB.queryAsync =
+      async (sql: string) => {
+        env.queries.push({ sql });
+        if (deleteFails && sql.includes("DELETE FROM"))
+          throw new Error("disk error");
+        return [];
+      };
+    const stop = pendingDeletionStore.subscribe((e) => events.push(e.type));
+    for (let round = 0; round < MAX_FINALIZE_ATTEMPTS; round++) {
+      env.fireLastTimer();
+      await pendingDeletionStore.finalize("flush-barrier", "noop");
+    }
+    assert.notInclude(
+      events,
+      "gave-up",
+      "give-up must not restore visibility while the write-ahead row survives",
+    );
+    assert.isTrue(
+      pendingDeletionStore.isConversationPendingDeletion(42),
+      "conversation must stay hidden while its write-ahead row survives",
+    );
+    assert.isAtLeast(
+      env.timers.filter((t) => !t.cleared).length,
+      1,
+      "a retry timer must stay armed so the entry cannot strand",
+    );
+    deleteFails = false;
+    env.fireLastTimer();
+    await pendingDeletionStore.finalize("flush-barrier", "noop");
+    stop();
+    assert.include(
+      events,
+      "gave-up",
+      "give-up completes once the row is withdrawn",
+    );
+    assert.isFalse(pendingDeletionStore.isConversationPendingDeletion(42));
+  });
+
   it("role-aware turn hiding does not hide the other role on a timestamp collision", async function () {
     installEnv();
     await pendingDeletionStore.queueTurnDeletion({

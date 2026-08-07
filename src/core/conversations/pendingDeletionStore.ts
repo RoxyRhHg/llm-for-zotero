@@ -328,12 +328,27 @@ async function finalizeInternal(id: string, reason: string): Promise<boolean> {
   }
   entry.attempts += 1;
   if (entry.attempts >= MAX_FINALIZE_ATTEMPTS) {
+    // Giving up restores the conversation's visibility, so the durable intent
+    // must be withdrawn first — a surviving row would let the next startup
+    // sweep destroy the chat the user believes was restored (same invariant
+    // as undo). If the withdraw fails, stay hidden and keep retrying.
+    try {
+      await deleteRowStrict(id);
+    } catch (err) {
+      env.log(
+        "LLM: failed to withdraw pending-deletion row while giving up; retrying",
+        { id, reason, attempts: entry.attempts, err },
+      );
+      await persistAttempts(entry);
+      armTimer(id, FINALIZE_RETRY_DELAY_MS);
+      notify({ type: "finalize-failed", entry });
+      return false;
+    }
     env.log(
       "LLM: giving up on pending deletion after repeated failures; restoring visibility",
       { id, reason, attempts: entry.attempts },
     );
     removeEntry(id);
-    await deleteRow(id);
     notify({ type: "gave-up", entry });
     return false;
   }
