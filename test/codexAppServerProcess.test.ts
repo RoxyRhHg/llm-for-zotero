@@ -2304,6 +2304,73 @@ describe("codexAppServerProcess", function () {
     );
   });
 
+  it("finds codex from the user-scope WinGet Links directory without relying on PATH", async function () {
+    await withRuntimeStubs(
+      {
+        env: {
+          CODEX_PATH: "",
+          LOCALAPPDATA: "C:\\Users\\alice\\AppData\\Local",
+        },
+        inheritEnv: false,
+        ioExists: async (path) =>
+          path ===
+          "C:\\Users\\alice\\AppData\\Local\\Microsoft\\WinGet\\Links\\codex.exe",
+        platform: "windows",
+        subprocessUnavailable: true,
+      },
+      async () => {
+        const binary = await resolveCodexBinary();
+        assert.equal(
+          binary,
+          "C:\\Users\\alice\\AppData\\Local\\Microsoft\\WinGet\\Links\\codex.exe",
+        );
+      },
+    );
+  });
+
+  it("derives the user-scope WinGet Links candidate from USERPROFILE when LOCALAPPDATA is missing", async function () {
+    await withRuntimeStubs(
+      {
+        env: {
+          CODEX_PATH: "",
+          USERPROFILE: "C:\\Users\\alice",
+          APPDATA: "",
+          LOCALAPPDATA: "",
+        },
+        inheritEnv: false,
+        ioExists: async (path) =>
+          path ===
+          "C:\\Users\\alice\\AppData\\Local\\Microsoft\\WinGet\\Links\\codex.exe",
+        platform: "windows",
+        subprocessUnavailable: true,
+      },
+      async () => {
+        const binary = await resolveCodexBinary();
+        assert.equal(
+          binary,
+          "C:\\Users\\alice\\AppData\\Local\\Microsoft\\WinGet\\Links\\codex.exe",
+        );
+      },
+    );
+  });
+
+  it("finds codex from the machine-scope WinGet Links directory without relying on PATH", async function () {
+    await withRuntimeStubs(
+      {
+        env: { CODEX_PATH: "" },
+        inheritEnv: false,
+        ioExists: async (path) =>
+          path === "C:\\Program Files\\WinGet\\Links\\codex.exe",
+        platform: "windows",
+        subprocessUnavailable: true,
+      },
+      async () => {
+        const binary = await resolveCodexBinary();
+        assert.equal(binary, "C:\\Program Files\\WinGet\\Links\\codex.exe");
+      },
+    );
+  });
+
   it("rejects explicit wsl.exe launchers on Windows", async function () {
     await withRuntimeStubs(
       {

@@ -2035,6 +2035,14 @@ function buildWindowsCodexCandidates(
     candidates.push(
       joinRuntimePath("\\", localAppData, "Volta", "bin", "codex.cmd"),
       joinRuntimePath("\\", localAppData, "Volta", "bin", "codex.exe"),
+      joinRuntimePath(
+        "\\",
+        localAppData,
+        "Microsoft",
+        "WinGet",
+        "Links",
+        "codex.exe",
+      ),
     );
   }
   for (const nvmRoot of [nvmSymlink, nvmHome]) {
@@ -2046,6 +2054,7 @@ function buildWindowsCodexCandidates(
     );
   }
   candidates.push("C:\\Program Files\\codex\\codex.exe");
+  candidates.push("C:\\Program Files\\WinGet\\Links\\codex.exe");
   return uniquePaths(candidates);
 }
 
