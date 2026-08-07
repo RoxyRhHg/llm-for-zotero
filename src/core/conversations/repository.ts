@@ -76,6 +76,8 @@ import {
   type StoredChatMessage,
 } from "../../utils/chatStore";
 import { codexAppServerForkService } from "../../codexAppServer/forkService";
+import { getCodexProfileSignature } from "../../codexAppServer/constants";
+import { releaseConversationScopeToken } from "../../agent/mcp/server";
 import {
   deleteConversationForkLink,
   recordConversationForkLink,
@@ -1023,6 +1025,10 @@ export const conversationRepository = {
     }
     if (target.system === "codex") {
       await deleteCodexConversation(conversationKey);
+      releaseConversationScopeToken({
+        profileSignature: getCodexProfileSignature(),
+        conversationKey,
+      });
       await cleanupForkLink();
       return;
     }
@@ -1049,6 +1055,10 @@ export const conversationRepository = {
     }
     if (target.system === "codex") {
       await deleteCodexConversationLocalRows(conversationKey);
+      releaseConversationScopeToken({
+        profileSignature: getCodexProfileSignature(),
+        conversationKey,
+      });
       return;
     }
     await deleteUpstreamConversationLocalRows(conversationKey, target.kind);

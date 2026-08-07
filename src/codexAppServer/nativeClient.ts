@@ -1914,8 +1914,10 @@ export async function listCodexAppServerModels(
  *
  * `thread/fork` creates the target conversation from the source thread, so
  * without an override it inherits the source conversation's scope header. Resume
- * does not rebind headers, so that header would keep resolving to the source
- * scope for the whole life of the fork.
+ * does not reliably rebind headers on a loaded thread, so that header would keep
+ * resolving to the source scope for the whole life of the fork. The override is
+ * also required while tools are disabled so the fork cannot retain an enabled
+ * source MCP server behind the preference.
  */
 export function buildForkedCodexThreadMcpConfig(
   targetConversationKey?: number,
@@ -1924,7 +1926,7 @@ export function buildForkedCodexThreadMcpConfig(
   if (!Number.isFinite(conversationKey) || conversationKey <= 0) {
     return undefined;
   }
-  if (!isCodexZoteroMcpToolsEnabled()) return undefined;
+  const mcpEnabled = isCodexZoteroMcpToolsEnabled();
   const profileSignature = getCodexProfileSignature();
   return buildCodexZoteroMcpThreadConfig({
     profileSignature,
@@ -1932,7 +1934,8 @@ export function buildForkedCodexThreadMcpConfig(
       profileSignature,
       conversationKey,
     }),
-    required: true,
+    required: mcpEnabled,
+    enabled: mcpEnabled,
   }).config;
 }
 
@@ -1952,10 +1955,41 @@ export async function forkCodexAppServerThread(params: {
   };
   const config = buildForkedCodexThreadMcpConfig(params.targetConversationKey);
   if (config) requestParams.config = config;
-  const result = await proc.sendRequest("thread/fork", requestParams);
-  const threadId = extractCodexAppServerThreadId(result);
-  if (!threadId) throw new Error("Codex app-server did not return a thread ID");
-  return threadId;
+  const targetConversationKey = Math.floor(
+    Number(params.targetConversationKey),
+  );
+  const profileSignature = getCodexProfileSignature();
+  const provisionalMcpScope =
+    config &&
+    isCodexZoteroMcpToolsEnabled() &&
+    Number.isFinite(targetConversationKey) &&
+    targetConversationKey > 0
+      ? registerScopedZoteroMcpScope(
+          {
+            profileSignature,
+            conversationKey: targetConversationKey,
+          },
+          {
+            token: resolveConversationScopeToken({
+              profileSignature,
+              conversationKey: targetConversationKey,
+            }),
+          },
+        )
+      : null;
+  try {
+    // A required MCP server performs tools/list while the fork is being
+    // created. Keep the target token resolvable for that handshake; the first
+    // target turn will register the complete conversation scope under it.
+    const result = await proc.sendRequest("thread/fork", requestParams);
+    const threadId = extractCodexAppServerThreadId(result);
+    if (!threadId) {
+      throw new Error("Codex app-server did not return a thread ID");
+    }
+    return threadId;
+  } finally {
+    provisionalMcpScope?.clear();
+  }
 }
 
 export async function archiveCodexAppServerThread(params: {

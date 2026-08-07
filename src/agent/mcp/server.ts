@@ -386,16 +386,19 @@ export function buildZoteroMcpConfigValue(
     scopeToken?: string;
     required?: boolean;
     rawPdfMode?: boolean;
+    enabled?: boolean;
   } = {},
 ): Record<string, unknown> {
   const token = getOrCreateZoteroMcpBearerToken();
   const scopeToken = normalizeText(params.scopeToken, 256);
+  const enabled = params.enabled !== false;
   const enabledToolNames = params.rawPdfMode
     ? getZoteroMcpDirectPdfToolNames()
     : getZoteroMcpAllowedToolNames();
   return {
     url: getZoteroMcpServerUrl(),
-    ...(params.required ? { required: true } : {}),
+    ...(!enabled ? { enabled: false } : {}),
+    ...(enabled && params.required ? { required: true } : {}),
     default_tools_approval_mode: CODEX_MCP_TOOL_APPROVAL_MODE,
     tools: getZoteroMcpToolApprovalOverrides(enabledToolNames),
     http_headers: {
@@ -670,7 +673,8 @@ export function registerScopedZoteroMcpScope(
  * `scopedZoteroMcpScopes` and released when the turn ends. They are not expired
  * on a timer: a token whose conversation is still live in the agent runtime must
  * keep resolving, because the runtime keeps sending the header it captured when
- * the conversation was created. The map is cleared in `unregisterMcpServer()`.
+ * the conversation was created. Endpoint restarts preserve the map; durable
+ * conversation deletion releases its exact entry.
  */
 export function resolveConversationScopeToken(params: {
   profileSignature?: string;
@@ -686,6 +690,25 @@ export function resolveConversationScopeToken(params: {
   const token = generateToken();
   conversationScopeTokens.set(key, token);
   return token;
+}
+
+/**
+ * Releases the stable token after its conversation has been durably deleted.
+ * This is deliberately identity-specific: another Zotero profile can use the
+ * same numeric conversation key and must keep its own live runtime binding.
+ */
+export function releaseConversationScopeToken(params: {
+  profileSignature?: string;
+  conversationKey: number;
+}): void {
+  const conversationKey = Math.floor(Number(params.conversationKey));
+  if (!Number.isFinite(conversationKey) || conversationKey <= 0) return;
+  const key = `${normalizeText(params.profileSignature, 256) || ""} ${conversationKey}`;
+  const token = conversationScopeTokens.get(key);
+  if (!token) return;
+  conversationScopeTokens.delete(key);
+  scopedZoteroMcpScopes.delete(token);
+  clearMcpReadDedupeCacheForScopeToken(token);
 }
 
 export function setActiveZoteroMcpScope(
@@ -1869,7 +1892,6 @@ export async function invokeRegisteredZoteroMcpEndpoint(
  */
 export function unregisterMcpServer(): void {
   scopedZoteroMcpScopes.clear();
-  conversationScopeTokens.clear();
   mcpReadDedupeCache.clear();
   zoteroMcpConfirmationHandlers.clear();
   registeredMcpDeps = null;
