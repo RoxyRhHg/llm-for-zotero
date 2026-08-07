@@ -2242,6 +2242,7 @@ describe("codexAppServerProcess", function () {
           const message =
             error instanceof Error ? error.message : String(error);
           assert.include(message, "codex binary not found");
+          assert.include(message, "Codex CLI Path");
           assert.include(message, "only native Windows Codex is supported");
           assert.include(message, "WSL Codex is not supported");
         }

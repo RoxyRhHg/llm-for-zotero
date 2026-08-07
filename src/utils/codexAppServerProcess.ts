@@ -2128,7 +2128,8 @@ function createCodexBinaryNotFoundError(
       : "";
   return new Error(
     "codex binary not found. Install Codex CLI (https://github.com/openai/codex) and ensure it is on your PATH, " +
-      "or set the CODEX_PATH environment variable to the absolute path of the codex executable." +
+      "set the Codex CLI Path in the plugin's Agent settings to the absolute path of the codex executable, " +
+      "or set the CODEX_PATH environment variable." +
       windowsHint,
   );
 }
