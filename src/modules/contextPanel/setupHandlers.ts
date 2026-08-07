@@ -895,6 +895,7 @@ export function setupHandlers(
   let claudeModelCatalogModels: ClaudeModelCatalogEntry[] = [];
   let claudeModelCatalogLegacy = false;
   let claudeModelCatalogInFlight: Promise<void> | null = null;
+  let claudeModelCatalogInFlightForced = false;
   let claudeModelCatalogRequestId = 0;
   let claudeModelCatalogIdentity = "";
   let claudeModelCatalogLoadedAt = 0;
@@ -971,7 +972,14 @@ export function setupHandlers(
     ) {
       return Promise.resolve();
     }
-    if (!force && claudeModelCatalogInFlight && !identityChanged) {
+    if (
+      claudeModelCatalogInFlight &&
+      !identityChanged &&
+      (!force || claudeModelCatalogInFlightForced)
+    ) {
+      // Rapid re-opens piggyback on the running FORCED fetch instead of
+      // launching a parallel one; an unforced in-flight load never satisfies
+      // a forced request (its data may come from the bridge cache).
       return claudeModelCatalogInFlight;
     }
     if (identityChanged) {
@@ -982,6 +990,7 @@ export function setupHandlers(
     claudeModelCatalogStatus = "loading";
     claudeModelCatalogError = "";
     claudeModelCatalogIdentity = identity;
+    claudeModelCatalogInFlightForced = force;
     const requestId = ++claudeModelCatalogRequestId;
     refreshOpenClaudeModelMenu();
     claudeModelCatalogInFlight = initAgentSubsystem()
@@ -1014,6 +1023,7 @@ export function setupHandlers(
       .finally(() => {
         if (requestId !== claudeModelCatalogRequestId) return;
         claudeModelCatalogInFlight = null;
+        claudeModelCatalogInFlightForced = false;
         refreshOpenClaudeModelMenu();
       });
     return claudeModelCatalogInFlight;
@@ -7495,7 +7505,11 @@ export function setupHandlers(
     if (isCodexConversationSystem()) {
       void ensureCodexModelCatalogLoaded();
     } else if (isClaudeConversationSystem()) {
-      void ensureClaudeModelCatalogLoaded();
+      // Force: the catalog cache identity (bridge URL, prefs, profile-dir
+      // hash, scope) cannot see in-place ~/.claude/settings.json profile
+      // changes, so a user-initiated open must revalidate. Non-blocking — the
+      // menu opens on the cached list and live-updates when the fetch lands.
+      void ensureClaudeModelCatalogLoaded(true);
     }
     updateModelButton();
     flushResponsiveLayoutSyncNow();

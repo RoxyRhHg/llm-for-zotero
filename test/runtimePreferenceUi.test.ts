@@ -82,14 +82,19 @@ describe("runtime preference UI", function () {
         /\n {2}openModelMenu = \(\) => \{[\s\S]*?\n {2}\};/,
       )?.[0] ?? "";
     assert.include(openModelMenuBlock, "isClaudeConversationSystem()");
-    assert.include(openModelMenuBlock, "ensureClaudeModelCatalogLoaded()");
-    assert.notInclude(
-      openModelMenuBlock,
-      "ensureClaudeModelCatalogLoaded(true)",
-    );
+    // Force-refresh on user-initiated open: the catalog cache identity cannot
+    // see in-place ~/.claude/settings.json profile changes (issue #335), and
+    // the call is non-blocking — the menu opens on the cached list and
+    // live-updates. (This deliberately reverses an earlier review round that
+    // leaned on the 60s TTL alone; see test/claudeModelMenuRefresh.test.ts.)
+    assert.include(openModelMenuBlock, "ensureClaudeModelCatalogLoaded(true)");
+    // In-flight dedupe must engage for forced opens too: rapid re-opens
+    // piggyback on the running forced fetch instead of launching another,
+    // while an unforced in-flight load never satisfies a forced request.
+    assert.include(setupHandlers, "claudeModelCatalogInFlight &&");
     assert.include(
       setupHandlers,
-      "if (!force && claudeModelCatalogInFlight && !identityChanged)",
+      "(!force || claudeModelCatalogInFlightForced)",
     );
     assert.include(embeddedPanel, "setupHandlers(body, rawItem)");
     assert.include(standalonePanel, "setupHandlers(contentArea, mountedItem");

@@ -2269,6 +2269,7 @@ export function createExternalBackendBridgeRuntime(options: {
   let modelCatalogCacheExpiresAt = 0;
   let modelCatalogRefreshInFlight: Promise<ClaudeModelCatalog> | null = null;
   let modelCatalogRefreshKey = "";
+  let modelCatalogRefreshForced = false;
   let modelCatalogRefreshGeneration = 0;
   const SLASH_COMMANDS_CACHE_TTL_MS = 5 * 60_000;
   const MODEL_CATALOG_CACHE_TTL_MS = 60_000;
@@ -2395,10 +2396,13 @@ export function createExternalBackendBridgeRuntime(options: {
       return cachedModelCatalog;
     }
     if (
-      !force &&
       modelCatalogRefreshInFlight &&
-      modelCatalogRefreshKey === requestKey
+      modelCatalogRefreshKey === requestKey &&
+      (!force || modelCatalogRefreshForced)
     ) {
+      // A forced request may piggyback on an in-flight FORCED refresh — that
+      // one is already bypassing every cache. An unforced in-flight fetch
+      // cannot satisfy it: its response may come from the bridge cache.
       return modelCatalogRefreshInFlight;
     }
     if (force) cachedEffortsByModel.clear();
@@ -2438,10 +2442,12 @@ export function createExternalBackendBridgeRuntime(options: {
         if (modelCatalogRefreshInFlight === refreshPromise) {
           modelCatalogRefreshInFlight = null;
           modelCatalogRefreshKey = "";
+          modelCatalogRefreshForced = false;
         }
       });
     modelCatalogRefreshInFlight = refreshPromise;
     modelCatalogRefreshKey = requestKey;
+    modelCatalogRefreshForced = force;
     return refreshPromise;
   };
 

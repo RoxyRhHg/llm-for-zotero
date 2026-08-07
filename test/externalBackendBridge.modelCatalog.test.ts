@@ -207,6 +207,82 @@ describe("external bridge model catalog", function () {
     assert.include(urls[1], "refresh=1");
   });
 
+  it("reuses an in-flight forced refresh for a concurrent forced request", async function () {
+    const urls: string[] = [];
+    let resolveFetch!: (response: Response) => void;
+    const pending = new Promise<Response>((resolve) => {
+      resolveFetch = resolve;
+    });
+    globalThis.fetch = (async (input: RequestInfo | URL) => {
+      urls.push(String(input));
+      return pending.then((response) => response.clone());
+    }) as typeof fetch;
+    const runtime = createRuntime();
+
+    const first = runtime.listModels(true);
+    const second = runtime.listModels(true);
+    resolveFetch(
+      new Response(
+        JSON.stringify({
+          models: ["FreshModel"],
+          modelInfos: [{ value: "FreshModel" }],
+        }),
+        { status: 200, headers: { "Content-Type": "application/json" } },
+      ),
+    );
+
+    assert.deepEqual(
+      (await first).models.map((model) => model.value),
+      ["FreshModel"],
+    );
+    assert.deepEqual(
+      (await second).models.map((model) => model.value),
+      ["FreshModel"],
+    );
+    assert.lengthOf(
+      urls,
+      1,
+      "concurrent forced requests must share one bridge fetch",
+    );
+    assert.include(urls[0], "refresh=1");
+  });
+
+  it("does not satisfy a forced refresh with an in-flight unforced fetch", async function () {
+    const urls: string[] = [];
+    const resolvers: Array<(response: Response) => void> = [];
+    globalThis.fetch = (async (input: RequestInfo | URL) => {
+      urls.push(String(input));
+      return new Promise<Response>((resolve) => {
+        resolvers.push(resolve);
+      });
+    }) as typeof fetch;
+    const runtime = createRuntime();
+
+    const unforced = runtime.listModels();
+    const forced = runtime.listModels(true);
+    for (const [index, resolve] of resolvers.entries()) {
+      resolve(
+        new Response(
+          JSON.stringify({
+            models: [index === 0 ? "CachedModel" : "FreshModel"],
+            modelInfos: [{ value: index === 0 ? "CachedModel" : "FreshModel" }],
+          }),
+          { status: 200, headers: { "Content-Type": "application/json" } },
+        ),
+      );
+    }
+    await unforced;
+
+    assert.deepEqual(
+      (await forced).models.map((model) => model.value),
+      ["FreshModel"],
+      "the forced caller must get bridge-cache-busting data",
+    );
+    assert.lengthOf(urls, 2);
+    assert.notInclude(urls[0], "refresh=1");
+    assert.include(urls[1], "refresh=1");
+  });
+
   it("clears every capability cache through the single shared reset helper", function () {
     const source = readFileSync(
       resolve(
