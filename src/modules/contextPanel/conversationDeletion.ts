@@ -677,11 +677,12 @@ export async function finalizeConversationDeletion(
 
 // Conversation keys are reusable (MAX+1 allocation), so a stale queued intent
 // must never be allowed to resolve against whatever conversation owns the key
-// NOW. Returns true when the intent is stale and should simply be dropped.
-async function isStaleQueuedConversationDeletion(
+// NOW. "stale" intents are simply dropped; "unknown" means ownership could not
+// be verified, so nothing destructive may run until a later retry can verify.
+async function classifyQueuedConversationDeletionStaleness(
   entry: PendingConversationDeletionEntry,
   log?: (message: string, ...args: unknown[]) => void,
-): Promise<boolean> {
+): Promise<"stale" | "fresh" | "unknown"> {
   try {
     if (entry.conversationID) {
       const registered = await getRegisteredConversationScope(
@@ -696,9 +697,9 @@ async function isStaleQueuedConversationDeletion(
             currentConversationID: registered.conversationID,
           },
         );
-        return true;
+        return "stale";
       }
-      return false;
+      return "fresh";
     }
     const summary = await conversationRepository.getCatalogEntry({
       system: entry.system,
@@ -717,12 +718,12 @@ async function isStaleQueuedConversationDeletion(
           queuedAt: entry.queuedAt,
         },
       );
-      return true;
+      return "stale";
     }
-    return false;
+    return "fresh";
   } catch (err) {
-    log?.("LLM: stale-deletion check failed; proceeding cautiously", err);
-    return false;
+    log?.("LLM: stale-deletion check failed; deferring for retry", err);
+    return "unknown";
   }
 }
 
@@ -730,10 +731,19 @@ export async function finalizeQueuedConversationDeletion(
   entry: PendingConversationDeletionEntry,
   deps: ConversationDeletionDeps = {},
 ): Promise<boolean> {
-  if (await isStaleQueuedConversationDeletion(entry, deps.log)) {
+  const staleness = await classifyQueuedConversationDeletionStaleness(
+    entry,
+    deps.log,
+  );
+  if (staleness === "stale") {
     // Treat as complete: the originally queued conversation is already gone
     // and the row must not be retried against the key's new owner.
     return true;
+  }
+  if (staleness === "unknown") {
+    // Ownership could not be verified; nothing destructive has run yet, so
+    // report a retry-safe failure instead of risking the key's new owner.
+    return false;
   }
   let paperItemID = Number(entry.paperItemID || 0) || undefined;
   if (entry.conversationKind === "paper" && !paperItemID) {

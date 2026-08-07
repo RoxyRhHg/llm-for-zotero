@@ -148,6 +148,55 @@ describe("finalizeQueuedConversationDeletion stale-intent guards", function () {
     assert.lengthOf(destructive, 0, "the key's new owner must not be touched");
   });
 
+  it("treats a failed stale-check as retryable instead of proceeding destructively", async function () {
+    const destructive: string[] = [];
+    let registrySelects = 0;
+    globalScope.Zotero = {
+      ...(originalZotero || {}),
+      DB: {
+        queryAsync: async (sql: string) => {
+          if (sql.includes("llm_for_zotero_conversation_registry")) {
+            if (sql.trimStart().toUpperCase().startsWith("SELECT")) {
+              registrySelects += 1;
+              // The stale-check read fails transiently; every later read
+              // succeeds and reports the key's NEW owner.
+              if (registrySelects === 1) throw new Error("db locked");
+              return [
+                {
+                  conversationID: "lfz:new:owner",
+                  conversationKey: 2_000_000_777,
+                  system: "upstream",
+                  kind: "global",
+                  profileSignature: "profile-default",
+                  libraryID: 1,
+                  paperItemID: null,
+                  valid: 1,
+                  invalidReason: null,
+                },
+              ];
+            }
+            return [];
+          }
+          if (sql.includes("DELETE")) destructive.push(sql);
+          return [];
+        },
+        executeTransaction: async (fn: () => Promise<unknown>) => fn(),
+      },
+    };
+    const ok = await finalizeQueuedConversationDeletion(
+      baseEntry({ conversationID: "lfz:original:owner" }) as never,
+    );
+    assert.isFalse(
+      ok,
+      "unverified ownership must defer the deletion for retry",
+    );
+    assert.lengthOf(
+      destructive,
+      0,
+      "no destructive statement may run while ownership is unverified",
+    );
+  });
+
   it("drops a stale ID-less intent when the catalog row was created after queueing", async function () {
     const destructive: string[] = [];
     globalScope.Zotero = {
