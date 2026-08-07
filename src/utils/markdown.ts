@@ -122,6 +122,19 @@ function escapeAttribute(text: string): string {
 
 type MarkdownRenderTarget = "chat" | "zotero-note";
 
+function getCurrentMarkdownRenderTarget(): MarkdownRenderTarget {
+  return zoteroNoteMode ? "zotero-note" : "chat";
+}
+
+function headingLevelForTarget(
+  depth: number,
+  target: MarkdownRenderTarget,
+): number {
+  const normalizedDepth = Math.min(6, Math.max(1, Math.trunc(depth)));
+  if (target === "zotero-note") return normalizedDepth;
+  return Math.min(5, Math.max(2, normalizedDepth + 1));
+}
+
 type MarkdownMathToken = Tokens.Generic & {
   type: "llmMathBlock" | "llmInlineMath";
   raw: string;
@@ -261,13 +274,18 @@ function renderSafeRawHtmlAttributes(
 function renderSafeRawHtmlTag(
   rawTag: string,
   state: RawHtmlRenderState,
+  target: MarkdownRenderTarget = getCurrentMarkdownRenderTarget(),
 ): string | null {
   const tagMatch = rawTag.match(
     /^<\s*(\/?)\s*([a-z][a-z0-9-]*)([\s\S]*?)(\/?)\s*>$/i,
   );
   if (!tagMatch) return null;
 
-  const tagName = SAFE_RAW_HTML_TAG_ALIASES[tagMatch[2].toLowerCase()] || null;
+  const rawTagName = tagMatch[2].toLowerCase();
+  const tagName =
+    target === "zotero-note" && /^h[1-6]$/.test(rawTagName)
+      ? rawTagName
+      : SAFE_RAW_HTML_TAG_ALIASES[rawTagName] || null;
   if (!tagName) return null;
 
   if (tagMatch[1]) {
@@ -291,7 +309,10 @@ function renderSafeRawHtmlTag(
   return `<${tagName}${attrs}>`;
 }
 
-function renderSafeRawHtmlFragment(rawHtml: string): string {
+function renderSafeRawHtmlFragment(
+  rawHtml: string,
+  target: MarkdownRenderTarget = getCurrentMarkdownRenderTarget(),
+): string {
   const state: RawHtmlRenderState = { stack: [] };
   const tagPattern = /<(?:"[^"]*"|'[^']*'|[^'">])*>/g;
   let result = "";
@@ -303,7 +324,7 @@ function renderSafeRawHtmlFragment(rawHtml: string): string {
       result += escapeHtml(rawHtml.slice(lastEnd, match.index));
     }
 
-    const safeTag = renderSafeRawHtmlTag(match[0], state);
+    const safeTag = renderSafeRawHtmlTag(match[0], state, target);
     result += safeTag === null ? escapeHtml(match[0]) : safeTag;
     lastEnd = match.index + match[0].length;
   }
@@ -322,17 +343,18 @@ function renderSafeRawHtmlFragment(rawHtml: string): string {
 function renderSafeRawHtml(
   rawHtml: string,
   rawHtmlState?: RawHtmlRenderState,
+  target: MarkdownRenderTarget = getCurrentMarkdownRenderTarget(),
 ): string {
   const html = rawHtml.trim();
 
   if (RAW_HTML_SINGLE_TAG_PATTERN.test(html)) {
     const state = rawHtmlState || { stack: [] };
-    const safeTag = renderSafeRawHtmlTag(html, state);
+    const safeTag = renderSafeRawHtmlTag(html, state, target);
     if (safeTag !== null) return safeTag;
   }
 
   if (/<[^>]*>/.test(rawHtml)) {
-    return renderSafeRawHtmlFragment(rawHtml);
+    return renderSafeRawHtmlFragment(rawHtml, target);
   }
 
   return escapeHtml(rawHtml);
@@ -344,7 +366,10 @@ function decodeEscapedRawHtmlTagEntities(text: string): string {
     .replace(/&(apos|#39|#x27);/gi, "'");
 }
 
-function restoreEscapedSafeRawHtmlTagsInSegment(text: string): string {
+function restoreEscapedSafeRawHtmlTagsInSegment(
+  text: string,
+  target: MarkdownRenderTarget = getCurrentMarkdownRenderTarget(),
+): string {
   const state: RawHtmlRenderState = { stack: [] };
   return text.replace(
     ESCAPED_RAW_HTML_TAG_PATTERN,
@@ -357,18 +382,21 @@ function restoreEscapedSafeRawHtmlTagsInSegment(text: string): string {
     ) => {
       const decodedAttrs = decodeEscapedRawHtmlTagEntities(rawAttrs || "");
       const rawTag = `<${closingSlash}${tagName}${decodedAttrs}${selfClosingSlash}>`;
-      return renderSafeRawHtmlTag(rawTag, state) ?? match;
+      return renderSafeRawHtmlTag(rawTag, state, target) ?? match;
     },
   );
 }
 
-function restoreEscapedSafeRawHtmlTags(text: string): string {
+function restoreEscapedSafeRawHtmlTags(
+  text: string,
+  target: MarkdownRenderTarget = getCurrentMarkdownRenderTarget(),
+): string {
   if (!/&lt;\s*\/?\s*[a-z][a-z0-9-]*[\s\S]*?&gt;/i.test(text)) {
     return text;
   }
 
   if (!hasBalancedCodeBlocks(text)) {
-    return restoreEscapedSafeRawHtmlTagsInSegment(text);
+    return restoreEscapedSafeRawHtmlTagsInSegment(text, target);
   }
 
   const codeBlockRegex = /```[ \t]*([^\s`]*)[^\n`]*\n?([\s\S]*?)```/g;
@@ -380,6 +408,7 @@ function restoreEscapedSafeRawHtmlTags(text: string): string {
     if (match.index > lastEnd) {
       result += restoreEscapedSafeRawHtmlTagsInSegment(
         text.slice(lastEnd, match.index),
+        target,
       );
     }
     result += match[0];
@@ -387,7 +416,10 @@ function restoreEscapedSafeRawHtmlTags(text: string): string {
   }
 
   if (lastEnd < text.length) {
-    result += restoreEscapedSafeRawHtmlTagsInSegment(text.slice(lastEnd));
+    result += restoreEscapedSafeRawHtmlTagsInSegment(
+      text.slice(lastEnd),
+      target,
+    );
   }
 
   return result;
@@ -1329,7 +1361,7 @@ function collectTableBlock(
     if (!trimmed) break;
     if (
       !currentRow &&
-      (/^#{1,4}\s+/.test(trimmed) ||
+      (/^#{1,6}\s+/.test(trimmed) ||
         /^>/.test(trimmed) ||
         /^---+$/.test(trimmed) ||
         /^\$\$/.test(trimmed) ||
@@ -1365,7 +1397,7 @@ function collectTableBlock(
 function isStructuralBlockStart(lines: string[], index: number): boolean {
   const trimmed = lines[index]?.trim() || "";
   return (
-    /^#{1,4}\s+/.test(trimmed) ||
+    /^#{1,6}\s+/.test(trimmed) ||
     /^>/.test(trimmed) ||
     /^---+$/.test(trimmed) ||
     /^\$\$/.test(trimmed) ||
@@ -1485,7 +1517,7 @@ function splitTextBlocks(text: string): TextBlock[] {
     }
 
     // Header
-    if (/^#{1,4}\s+/.test(trimmed)) {
+    if (/^#{1,6}\s+/.test(trimmed)) {
       blocks.push({ type: "header", content: trimmed, raw: line });
       i++;
       continue;
@@ -1533,7 +1565,7 @@ function splitTextBlocks(text: string): TextBlock[] {
     while (
       i < lines.length &&
       lines[i].trim() &&
-      !/^#{1,4}\s+/.test(lines[i].trim()) &&
+      !/^#{1,6}\s+/.test(lines[i].trim()) &&
       !isUnorderedListLine(lines[i].trim()) &&
       !isOrderedListLine(lines[i].trim()) &&
       !/^>/.test(lines[i].trim()) &&
@@ -1697,17 +1729,13 @@ function renderMathBlock(content: string): string {
 /** Render header */
 function renderHeader(content: string): string {
   const trimmed = content.trim();
-  if (trimmed.startsWith("#### ")) {
-    return `<h5>${renderInline(trimmed.slice(5))}</h5>`;
-  }
-  if (trimmed.startsWith("### ")) {
-    return `<h4>${renderInline(trimmed.slice(4))}</h4>`;
-  }
-  if (trimmed.startsWith("## ")) {
-    return `<h3>${renderInline(trimmed.slice(3))}</h3>`;
-  }
-  if (trimmed.startsWith("# ")) {
-    return `<h2>${renderInline(trimmed.slice(2))}</h2>`;
+  const match = trimmed.match(/^(#{1,6})\s+([\s\S]*)$/);
+  if (match) {
+    const level = headingLevelForTarget(
+      match[1].length,
+      getCurrentMarkdownRenderTarget(),
+    );
+    return `<h${level}>${renderInline(match[2])}</h${level}>`;
   }
   return `<p>${renderInline(trimmed)}</p>`;
 }
@@ -2083,7 +2111,7 @@ function createMarkedRenderer(
   };
 
   renderer.html = function (token: Tokens.HTML | Tokens.Tag): string {
-    return renderSafeRawHtml(token.text, rawHtmlRenderState);
+    return renderSafeRawHtml(token.text, rawHtmlRenderState, target);
   };
 
   renderer.heading = function (token: Tokens.Heading): string {
@@ -2093,7 +2121,7 @@ function createMarkedRenderer(
     ) {
       return `<p>${parseInlineTokens(this.parser, token.tokens)}</p><hr/>`;
     }
-    const level = Math.min(5, Math.max(2, token.depth + 1));
+    const level = headingLevelForTarget(token.depth, target);
     return `<h${level}>${parseInlineTokens(this.parser, token.tokens)}</h${level}>`;
   };
 
@@ -2275,6 +2303,8 @@ export function renderMarkdown(
     return "";
   }
 
+  const target: MarkdownRenderTarget = getCurrentMarkdownRenderTarget();
+
   const prevResolver = activeImageResolver;
   if (options?.resolveImage) activeImageResolver = options.resolveImage;
 
@@ -2284,11 +2314,8 @@ export function renderMarkdown(
     }
 
     const normalized = normalizeMarkdownForMarked(
-      restoreEscapedSafeRawHtmlTags(text),
+      restoreEscapedSafeRawHtmlTags(text, target),
     );
-    const target: MarkdownRenderTarget = zoteroNoteMode
-      ? "zotero-note"
-      : "chat";
     const rendered = createMarkedMarkdownRenderer(target).parse(normalized);
     if (typeof rendered === "string") {
       return rendered.trim();

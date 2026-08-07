@@ -121,6 +121,22 @@ describe("chat retry model inputs", function () {
     assert.notInclude(payload!.renderedHtml, "[[quote:");
   });
 
+  it("preserves Markdown heading levels in rendered clipboard payloads", function () {
+    const payload = buildRenderedMarkdownClipboardPayload(
+      ["# Paper Title", "## Summary", "### Details"].join("\n\n"),
+    );
+
+    assert.isNotNull(payload);
+    assert.equal(
+      payload!.plainText,
+      "# Paper Title\n\n## Summary\n\n### Details",
+    );
+    assert.equal(
+      payload!.renderedHtml,
+      "<h1>Paper Title</h1><h2>Summary</h2><h3>Details</h3>",
+    );
+  });
+
   it("expands legacy markdown-only quote blocks in rendered clipboard payloads", function () {
     const payload = buildRenderedMarkdownClipboardPayload(
       [

@@ -244,6 +244,77 @@ describe("normalizeBlockBoundaries", function () {
   });
 });
 
+describe("heading level rendering", function () {
+  const markdown = [
+    "# One",
+    "## Two",
+    "### Three",
+    "#### Four",
+    "##### Five",
+    "###### Six",
+  ].join("\n\n");
+
+  it("preserves all Markdown heading levels for Zotero notes", function () {
+    const html = renderMarkdownForNote(markdown);
+
+    assert.equal(
+      html,
+      "<h1>One</h1><h2>Two</h2><h3>Three</h3><h4>Four</h4><h5>Five</h5><h6>Six</h6>",
+    );
+  });
+
+  it("retains the chat renderer heading offset and cap", function () {
+    const html = renderMarkdown(markdown);
+
+    assert.equal(
+      html,
+      "<h2>One</h2><h3>Two</h3><h4>Three</h4><h5>Four</h5><h5>Five</h5><h5>Six</h5>",
+    );
+  });
+
+  it("preserves all heading levels when the legacy parser renders a note", function () {
+    __setMarkdownParserDisabledForTest(true);
+    try {
+      const html = renderMarkdownForNote(markdown);
+      const levels = Array.from(
+        html.matchAll(/<h([1-6])>/g),
+        (match) => match[1],
+      );
+      assert.deepEqual(levels, ["1", "2", "3", "4", "5", "6"]);
+    } finally {
+      __setMarkdownParserDisabledForTest(false);
+    }
+  });
+
+  it("retains the chat heading offset when the legacy parser is used", function () {
+    __setMarkdownParserDisabledForTest(true);
+    try {
+      const html = renderMarkdown(markdown);
+      const levels = Array.from(
+        html.matchAll(/<h([1-6])>/g),
+        (match) => match[1],
+      );
+      assert.deepEqual(levels, ["2", "3", "4", "5", "5", "5"]);
+    } finally {
+      __setMarkdownParserDisabledForTest(false);
+    }
+  });
+
+  it("preserves safe raw and escaped headings for notes", function () {
+    const raw = renderMarkdownForNote(
+      "<h1>Raw One</h1><h6>Raw Six</h6>\n\n&lt;h1&gt;Escaped One&lt;/h1&gt;&lt;h6&gt;Escaped Six&lt;/h6&gt;",
+    );
+    assert.include(raw, "<h1>Raw One</h1>");
+    assert.include(raw, "<h6>Raw Six</h6>");
+    assert.include(raw, "<h1>Escaped One</h1>");
+    assert.include(raw, "<h6>Escaped Six</h6>");
+
+    const chat = renderMarkdown("<h1>Raw One</h1><h6>Raw Six</h6>");
+    assert.include(chat, "<h2>Raw One</h2>");
+    assert.include(chat, "<h5>Raw Six</h5>");
+  });
+});
+
 describe("renderMarkdown with inline block tokens", function () {
   it("renders inline ### as a proper header element", function () {
     const input = "intro. (Author, 2024) ### Key Finding";
