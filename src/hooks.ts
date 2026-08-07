@@ -369,7 +369,7 @@ function registerPrefsPane() {
     id: PREFERENCES_PANE_ID,
     src: `chrome://${addon.data.config.addonRef}/content/preferences.xhtml`,
     label: "llm-for-zotero",
-    image: `chrome://${addon.data.config.addonRef}/content/icons/icon-20.png`,
+    image: `chrome://${addon.data.config.addonRef}/content/icons/icon.svg`,
   });
 }
 

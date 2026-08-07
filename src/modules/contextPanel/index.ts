@@ -258,11 +258,11 @@ export function registerReaderContextPanel() {
     pluginID: config.addonID,
     header: {
       l10nID: getLocaleID("llm-panel-head"),
-      icon: `chrome://${config.addonRef}/content/icons/icon-20.png`,
+      icon: `chrome://${config.addonRef}/content/icons/icon-sidebar.svg`,
     },
     sidenav: {
       l10nID: getLocaleID("llm-panel-sidenav-tooltip"),
-      icon: `chrome://${config.addonRef}/content/icons/icon-20.png`,
+      icon: `chrome://${config.addonRef}/content/icons/icon-sidebar.svg`,
     },
     onInit: ({ setEnabled, tabType }) => {
       setEnabled(true);
