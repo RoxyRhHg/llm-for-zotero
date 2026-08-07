@@ -2035,6 +2035,14 @@ function buildWindowsCodexCandidates(
     candidates.push(
       joinRuntimePath("\\", localAppData, "Volta", "bin", "codex.cmd"),
       joinRuntimePath("\\", localAppData, "Volta", "bin", "codex.exe"),
+      joinRuntimePath(
+        "\\",
+        localAppData,
+        "Microsoft",
+        "WinGet",
+        "Links",
+        "codex.exe",
+      ),
     );
   }
   for (const nvmRoot of [nvmSymlink, nvmHome]) {
@@ -2046,6 +2054,7 @@ function buildWindowsCodexCandidates(
     );
   }
   candidates.push("C:\\Program Files\\codex\\codex.exe");
+  candidates.push("C:\\Program Files\\WinGet\\Links\\codex.exe");
   return uniquePaths(candidates);
 }
 
@@ -2119,7 +2128,8 @@ function createCodexBinaryNotFoundError(
       : "";
   return new Error(
     "codex binary not found. Install Codex CLI (https://github.com/openai/codex) and ensure it is on your PATH, " +
-      "or set the CODEX_PATH environment variable to the absolute path of the codex executable." +
+      "set the Codex CLI Path in the plugin's Agent settings to the absolute path of the codex executable, " +
+      "or set the CODEX_PATH environment variable." +
       windowsHint,
   );
 }

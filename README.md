@@ -367,9 +367,8 @@ planned for future deprecation after app-server validation.
    npm install -g @openai/codex
    ```
 
-   On macOS, you can also use `brew install --cask codex`. On Windows, install
-   Codex from PowerShell or Command Prompt rather than WSL, so Zotero MCP can
-   use the Windows-local loopback connection.
+   On macOS, you can also use `brew install --cask codex`.
+   On Windows, you can also use `winget install OpenAI.Codex`; install Codex from PowerShell or Command Prompt rather than WSL, so Zotero MCP can use the Windows-local loopback connection.
 
 2. Log in:
 
