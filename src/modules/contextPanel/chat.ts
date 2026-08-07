@@ -6647,7 +6647,20 @@ export async function editLatestUserMessageAndRetry(
   // deletion first so the hidden turn cannot be the retry target. finalize is
   // best-effort — on failure the turn stays queued, so select the target from
   // the filtered (user-visible) view.
-  await pendingDeletionStore.finalizeForConversation(conversationKey, "retry");
+  await pendingDeletionStore.finalizeTurnsForConversation(
+    conversationKey,
+    "retry",
+  );
+  // Editing a turn means the user wants this chat alive: restore a pending
+  // conversation deletion instead of letting it commit underneath the edit.
+  // An unwithdrawable intent means the visible state cannot be trusted.
+  if (
+    !(await pendingDeletionStore.restoreConversationDeletionsFor(
+      conversationKey,
+    ))
+  ) {
+    return "stale";
+  }
   const history = filterMessagesInPendingTurns(
     conversationKey,
     chatHistory.get(conversationKey) || [],
@@ -6966,7 +6979,22 @@ export async function retryLatestAssistantResponse(
   // deletion first so the hidden turn cannot be the retry target. finalize is
   // best-effort — on failure the turn stays queued, so select the target and
   // build the prompt from the filtered (user-visible) view.
-  await pendingDeletionStore.finalizeForConversation(conversationKey, "retry");
+  await pendingDeletionStore.finalizeTurnsForConversation(
+    conversationKey,
+    "retry",
+  );
+  // A retry means the user wants this chat alive: restore a pending
+  // conversation deletion instead of letting it commit underneath the retry.
+  if (
+    !(await pendingDeletionStore.restoreConversationDeletionsFor(
+      conversationKey,
+    ))
+  ) {
+    if (ui.status) {
+      setStatus(ui.status, t("Failed to restore. Check logs."), "error");
+    }
+    return;
+  }
   const history = filterMessagesInPendingTurns(
     conversationKey,
     chatHistory.get(conversationKey) || [],
@@ -7712,7 +7740,22 @@ export async function editUserTurnAndRetry(opts: {
   // first. history stays RAW below on purpose — truncation after the edited
   // pair must also purge hidden trailing pairs and their rows; a preceding
   // hidden pair is excluded from the prompt by the delegated retry path.
-  await pendingDeletionStore.finalizeForConversation(conversationKey, "edit");
+  await pendingDeletionStore.finalizeTurnsForConversation(
+    conversationKey,
+    "edit",
+  );
+  // An edit means the user wants this chat alive: restore a pending
+  // conversation deletion instead of letting it commit underneath the edit.
+  if (
+    !(await pendingDeletionStore.restoreConversationDeletionsFor(
+      conversationKey,
+    ))
+  ) {
+    ztoolkit.log(
+      "LLM: editUserTurnAndRetry — pending conversation deletion could not be restored",
+    );
+    return false;
+  }
   const history = chatHistory.get(conversationKey) || [];
 
   const userIndex = history.findIndex(
@@ -8608,10 +8651,11 @@ async function retryLatestAgentResponse(
     modelProviderLabel,
   });
   // Retry must act on the state the user SEES (see retryLatestAssistantResponse);
-  // callers that already finalized make this a cheap no-op.
+  // callers that already finalized and restored make this a cheap no-op. Turn
+  // entries only — a pending conversation deletion is the callers' concern.
   const agentRetryConversationKey = getConversationKey(item);
   if (agentRetryConversationKey) {
-    await pendingDeletionStore.finalizeForConversation(
+    await pendingDeletionStore.finalizeTurnsForConversation(
       agentRetryConversationKey,
       "retry",
     );
@@ -8739,7 +8783,26 @@ export async function sendQuestion(
     // the hidden turn is neither included in the prompt nor resurrected later.
     const pendingKey = getConversationKey(item);
     if (pendingKey) {
-      await pendingDeletionStore.finalizeForConversation(pendingKey, "send");
+      await pendingDeletionStore.finalizeTurnsForConversation(
+        pendingKey,
+        "send",
+      );
+      // A send also means the user is actively continuing THIS chat: a still-
+      // undoable conversation deletion (queued from another mount of the same
+      // chat) is restored, never committed as a side effect. If its durable
+      // intent cannot be withdrawn, abort rather than write into a chat whose
+      // deletion row survives.
+      if (
+        !(await pendingDeletionStore.restoreConversationDeletionsFor(
+          pendingKey,
+        ))
+      ) {
+        const ui = getPanelRequestUI(body);
+        if (ui.status) {
+          setStatus(ui.status, t("Failed to restore. Check logs."), "error");
+        }
+        return;
+      }
     }
   }
   const effectiveConversationSystem = resolveEffectiveConversationSystem({
@@ -8898,8 +8961,8 @@ export async function sendQuestion(
     history.length >= 2 &&
     history[history.length - 2] === optimisticUserMessage &&
     history[history.length - 1] === optimisticAssistantMessage;
-  // finalizeForConversation above is best-effort; when a finalizer fails the
-  // turn is still queued (and hidden), so the prompt must exclude it here.
+  // finalizeTurnsForConversation above is best-effort; when a finalizer fails
+  // the turn is still queued (and hidden), so the prompt must exclude it here.
   const historyForLLM = filterMessagesInPendingTurns(
     conversationKey,
     reuseOptimisticPair ? history.slice(0, -2) : history.slice(),

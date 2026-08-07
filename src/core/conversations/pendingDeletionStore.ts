@@ -299,6 +299,26 @@ async function supersedeOthers(keepId: string | null): Promise<void> {
   }
 }
 
+async function undoInternal(id: string): Promise<PendingDeletionEntry | null> {
+  const entry = entries.get(id);
+  if (!entry) return null;
+  try {
+    await deleteRowStrict(id);
+  } catch (err) {
+    // The durable intent could not be withdrawn; leave the entry (and its
+    // timer) in place so state stays consistent, and let the caller
+    // surface the failure instead of claiming "restored".
+    env.log("LLM: undo failed to withdraw pending-deletion row", {
+      id,
+      err,
+    });
+    return null;
+  }
+  removeEntry(id);
+  notify({ type: "undone", entry });
+  return entry;
+}
+
 async function finalizeInternal(id: string, reason: string): Promise<boolean> {
   const entry = entries.get(id);
   if (!entry) return true;
@@ -518,25 +538,7 @@ export const pendingDeletionStore = {
   },
 
   undo(id: string): Promise<PendingDeletionEntry | null> {
-    return enqueueOp(async () => {
-      const entry = entries.get(id);
-      if (!entry) return null;
-      try {
-        await deleteRowStrict(id);
-      } catch (err) {
-        // The durable intent could not be withdrawn; leave the entry (and its
-        // timer) in place so state stays consistent, and let the caller
-        // surface the failure instead of claiming "restored".
-        env.log("LLM: undo failed to withdraw pending-deletion row", {
-          id,
-          err,
-        });
-        return null;
-      }
-      removeEntry(id);
-      notify({ type: "undone", entry });
-      return entry;
-    });
+    return enqueueOp(() => undoInternal(id));
   },
 
   finalize(id: string, reason: string): Promise<boolean> {
@@ -558,6 +560,51 @@ export const pendingDeletionStore = {
         }
       }
       return allFinalized;
+    });
+  },
+
+  // Turn-only variant for user-action paths (send/retry/edit). Those actions
+  // commit hidden-turn removals, but must never commit a pending CONVERSATION
+  // deletion: the same chat can still be mounted elsewhere while its deletion
+  // is undoable, and the action would otherwise destroy it as a side effect.
+  finalizeTurnsForConversation(
+    conversationKey: number,
+    reason: string,
+  ): Promise<boolean> {
+    return enqueueOp(async () => {
+      const matching = Array.from(entries.values()).filter(
+        (entry) =>
+          entry.kind === "turn" && entry.conversationKey === conversationKey,
+      );
+      let allFinalized = true;
+      for (const entry of matching) {
+        if (!(await finalizeInternal(entry.id, reason))) {
+          allFinalized = false;
+        }
+      }
+      return allFinalized;
+    });
+  },
+
+  // A user action inside a conversation whose deletion is still undoable means
+  // the user wants the chat alive: withdraw the queued deletion instead of
+  // letting it commit underneath them. Returns false when a durable intent
+  // could not be withdrawn — callers must abort rather than write into a chat
+  // whose write-ahead deletion row survives.
+  restoreConversationDeletionsFor(conversationKey: number): Promise<boolean> {
+    return enqueueOp(async () => {
+      const matching = Array.from(entries.values()).filter(
+        (entry) =>
+          entry.kind === "conversation" &&
+          entry.conversationKey === conversationKey,
+      );
+      let allRestored = true;
+      for (const entry of matching) {
+        if (!(await undoInternal(entry.id))) {
+          allRestored = false;
+        }
+      }
+      return allRestored;
     });
   },
 

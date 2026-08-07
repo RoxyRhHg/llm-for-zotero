@@ -372,6 +372,115 @@ describe("pendingDeletionStore", function () {
     assert.deepEqual(finalized, ["turn:5"]);
   });
 
+  it("finalizeTurnsForConversation never touches a pending conversation deletion", async function () {
+    installFakeEnv();
+    const finalized: string[] = [];
+    configurePendingDeletionFinalizers({
+      finalizeConversation: async (entry) => {
+        finalized.push(`conversation:${entry.conversationKey}`);
+        return true;
+      },
+      finalizeTurn: async (entry) => {
+        finalized.push(`turn:${entry.conversationKey}`);
+        return true;
+      },
+    });
+    await pendingDeletionStore.queueConversationDeletion(conversationInput(5));
+    assert.isTrue(
+      await pendingDeletionStore.finalizeTurnsForConversation(5, "send"),
+    );
+    assert.deepEqual(finalized, [], "no finalizer may run for a send");
+    assert.isTrue(
+      pendingDeletionStore.isConversationPendingDeletion(5),
+      "the conversation deletion must stay pending (undoable)",
+    );
+  });
+
+  it("finalizeTurnsForConversation finalizes pending turns for that conversation only", async function () {
+    installFakeEnv();
+    const finalized: string[] = [];
+    configurePendingDeletionFinalizers({
+      finalizeConversation: async () => true,
+      finalizeTurn: async (entry) => {
+        finalized.push(`turn:${entry.conversationKey}`);
+        return true;
+      },
+    });
+    await pendingDeletionStore.queueTurnDeletion({
+      conversationKey: 5,
+      system: "upstream",
+      userTimestamp: 1,
+      assistantTimestamp: 2,
+    });
+    assert.isTrue(
+      await pendingDeletionStore.finalizeTurnsForConversation(99, "send"),
+    );
+    assert.lengthOf(pendingDeletionStore.getPendingTurnsForConversation(5), 1);
+    assert.isTrue(
+      await pendingDeletionStore.finalizeTurnsForConversation(5, "send"),
+    );
+    assert.deepEqual(finalized, ["turn:5"]);
+    assert.lengthOf(pendingDeletionStore.getPendingTurnsForConversation(5), 0);
+  });
+
+  it("restoreConversationDeletionsFor withdraws the row and restores visibility without finalizing", async function () {
+    const env = installFakeEnv();
+    let finalized = 0;
+    configurePendingDeletionFinalizers({
+      finalizeConversation: async () => {
+        finalized += 1;
+        return true;
+      },
+      finalizeTurn: async () => true,
+    });
+    await pendingDeletionStore.queueConversationDeletion(conversationInput(42));
+    const events: string[] = [];
+    const stop = pendingDeletionStore.subscribe((e) => events.push(e.type));
+    assert.isTrue(
+      await pendingDeletionStore.restoreConversationDeletionsFor(42),
+    );
+    stop();
+    assert.deepEqual(events, ["undone"]);
+    assert.equal(finalized, 0, "restore must never run the finalizer");
+    assert.isFalse(pendingDeletionStore.isConversationPendingDeletion(42));
+    assert.isTrue(
+      env.queries.some((q) =>
+        q.sql.includes(`DELETE FROM ${PENDING_DELETIONS_TABLE}`),
+      ),
+    );
+    assert.lengthOf(
+      env.timers.filter((t) => !t.cleared),
+      0,
+    );
+    assert.isTrue(
+      await pendingDeletionStore.restoreConversationDeletionsFor(42),
+      "no matching entries counts as restored",
+    );
+  });
+
+  it("restoreConversationDeletionsFor keeps the entry pending when the withdraw fails", async function () {
+    const env = installFakeEnv();
+    configurePendingDeletionFinalizers({
+      finalizeConversation: async () => true,
+      finalizeTurn: async () => true,
+    });
+    await pendingDeletionStore.queueConversationDeletion(conversationInput(42));
+    (globalScope.Zotero as { DB: { queryAsync: unknown } }).DB.queryAsync =
+      async (sql: string) => {
+        env.queries.push({ sql });
+        if (sql.includes("DELETE FROM")) throw new Error("disk error");
+        return [];
+      };
+    assert.isFalse(
+      await pendingDeletionStore.restoreConversationDeletionsFor(42),
+      "a failed withdraw must not look like a restore",
+    );
+    assert.isTrue(
+      pendingDeletionStore.isConversationPendingDeletion(42),
+      "entry must stay pending so state matches the surviving row",
+    );
+  });
+
   it("finalizeForConversation propagates failure and success", async function () {
     installFakeEnv();
     let fail = true;
