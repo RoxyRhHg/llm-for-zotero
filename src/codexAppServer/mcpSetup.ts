@@ -572,6 +572,7 @@ export function buildCodexZoteroMcpThreadConfig(params: {
   required?: boolean;
   enableShellTool?: boolean;
   rawPdfMode?: boolean;
+  enabled?: boolean;
 }): { serverName: string; config: Record<string, unknown> } {
   const serverName = getZoteroMcpServerName(params.profileSignature);
   return {
@@ -585,6 +586,7 @@ export function buildCodexZoteroMcpThreadConfig(params: {
           scopeToken: params.scopeToken,
           required: params.required,
           rawPdfMode: params.rawPdfMode,
+          enabled: params.enabled,
         }),
       },
     },
