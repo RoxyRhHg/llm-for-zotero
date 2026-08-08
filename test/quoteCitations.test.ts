@@ -4128,6 +4128,47 @@ describe("quoteCitations", function () {
     );
   });
 
+  it("finalizes a quote anchor followed by a citation line as one quote", function () {
+    const visibleQuote =
+      "The role of internally-generated network dynamics in rapid temporal sequence coding, updating, and parallel recalling of alternate spatial and mental navigation contexts has remained unclear.";
+    const sourceChunk = `1038/s41467-025-63346-w Generative emergence of non-local representations in the hippocampus Yuchen Zhou 1, Jeremie Sibille1 & George Dragoi 1,2,3 ${visibleQuote}`;
+    const citation = buildQuoteCitation({
+      id: "Q_reopen_separate_citation_line",
+      quoteText: sourceChunk,
+      citationLabel: "(Zhou et al., 2025)",
+      sourceMatchText: sourceChunk,
+      sourceMatchKind: "exact",
+      sourceMatchSource: "context-text",
+      contextItemId: 3823,
+      itemId: 3822,
+    });
+    assert.isDefined(citation);
+
+    const finalized = finalizeAssistantQuoteCitations({
+      markdown: [
+        `> “${visibleQuote}”`,
+        `> [[quote:${citation!.id}]]`,
+        "> (Zhou et al., 2025)",
+        "",
+        "### What problem are they addressing?",
+      ].join("\n"),
+      quoteCitations: [citation!],
+      sourceIndex: buildQuoteSourceIndex({
+        quoteCitations: [citation!],
+      }),
+    });
+
+    assert.equal((finalized.markdown.match(/\[\[quote:/g) || []).length, 1);
+    assert.notInclude(finalized.markdown, "> (Zhou et al., 2025)");
+    assert.include(finalized.markdown, "### What problem are they addressing?");
+    const rendered = replaceQuoteCitationPlaceholdersForMarkdown(
+      finalized.markdown,
+      finalized.quoteCitations,
+    );
+    assert.include(rendered, `> “${visibleQuote}”`);
+    assert.notInclude(rendered, sourceChunk);
+  });
+
   it("omits unresolved placeholders on external text surfaces", function () {
     const preserved = replaceQuoteCitationPlaceholdersForMarkdown(
       "Evidence: [[quote:Q_missing]]",

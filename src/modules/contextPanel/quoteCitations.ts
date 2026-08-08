@@ -446,6 +446,30 @@ function isBlockquoteWrappedQuoteCitationLine(line: string): boolean {
   return BLOCKQUOTE_WRAPPED_QUOTE_CITATION_LINE_PATTERN.test(line);
 }
 
+function shouldIncludeStructuredAnchorInBlockquote(params: {
+  lines: string[];
+  index: number;
+  hasQuoteLines: boolean;
+}): boolean {
+  if (
+    !params.hasQuoteLines ||
+    !isBlockquoteWrappedQuoteCitationLine(params.lines[params.index] || "")
+  ) {
+    return false;
+  }
+  let nextIndex = params.index + 1;
+  while (
+    nextIndex < params.lines.length &&
+    /^[ \t]*>[ \t]*$/.test(params.lines[nextIndex] || "")
+  ) {
+    nextIndex += 1;
+  }
+  if (nextIndex >= params.lines.length) return false;
+  const nextLine = params.lines[nextIndex] || "";
+  if (!/^[ \t]*>/.test(nextLine)) return false;
+  return Boolean(parseCitationOnlyLine(stripBlockquoteMarker(nextLine)));
+}
+
 function findAdjacentStandaloneQuoteCitation(params: {
   markdownLines: string[];
   followingLineStartIndex: number;
@@ -498,19 +522,36 @@ export function parseStructuredBlockquoteQuoteBinding(
 
   const visibleLines: string[] = [];
   let citationLabel = "";
+  let anchorSeen = false;
+  let canConsumeFollowingCitation = false;
   for (const line of quoteLines) {
     QUOTE_CITATION_PATTERN.lastIndex = 0;
     const containsAnchor = QUOTE_CITATION_PATTERN.test(line);
     QUOTE_CITATION_PATTERN.lastIndex = 0;
     if (!containsAnchor) {
+      const parsedFollowingLabel =
+        anchorSeen &&
+        canConsumeFollowingCitation &&
+        parseStandaloneCitationLabel(line);
+      if (parsedFollowingLabel) {
+        citationLabel = parsedFollowingLabel;
+        canConsumeFollowingCitation = false;
+        continue;
+      }
+      if (anchorSeen && line.trim()) {
+        canConsumeFollowingCitation = false;
+      }
       visibleLines.push(line);
       continue;
     }
+    anchorSeen = true;
+    canConsumeFollowingCitation = true;
     const remainder = normalizeMultilineText(
       line.replace(QUOTE_CITATION_PATTERN, ""),
     );
     QUOTE_CITATION_PATTERN.lastIndex = 0;
     if (!remainder) continue;
+    canConsumeFollowingCitation = false;
     const parsedLabel = parseStandaloneCitationLabel(remainder);
     if (parsedLabel) {
       citationLabel = parsedLabel;
@@ -819,7 +860,12 @@ export function sanitizeUntrustedSourceBackedQuoteBlocks(
     while (
       index < lines.length &&
       /^[ \t]*>/.test(lines[index]) &&
-      !isBlockquoteWrappedQuoteCitationLine(lines[index])
+      (!isBlockquoteWrappedQuoteCitationLine(lines[index]) ||
+        shouldIncludeStructuredAnchorInBlockquote({
+          lines,
+          index,
+          hasQuoteLines: quoteLines.length > 0,
+        }))
     ) {
       quoteLines.push(stripBlockquoteMarker(lines[index]));
       index += 1;
@@ -3182,7 +3228,12 @@ function* finalizeAssistantQuoteCitationSteps(
     while (
       index < lines.length &&
       /^[ \t]*>/.test(lines[index]) &&
-      !isBlockquoteWrappedQuoteCitationLine(lines[index])
+      (!isBlockquoteWrappedQuoteCitationLine(lines[index]) ||
+        shouldIncludeStructuredAnchorInBlockquote({
+          lines,
+          index,
+          hasQuoteLines: quoteLines.length > 0,
+        }))
     ) {
       quoteLines.push(stripBlockquoteMarker(lines[index]));
       index += 1;
