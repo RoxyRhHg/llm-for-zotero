@@ -6,6 +6,8 @@ import {
   getZoteroMcpServerUrl,
   registerScopedZoteroMcpScope,
   registerMcpServer,
+  releaseConversationScopeToken,
+  resolveConversationScopeToken,
   setActiveZoteroMcpScope,
   unregisterMcpServer,
   ZOTERO_MCP_ENDPOINT_PATH,
@@ -2460,6 +2462,140 @@ describe("Zotero MCP server", function () {
       clearHandler();
       scoped.clear();
     }
+  });
+
+  it("keeps a conversation scope token usable across turns and rebinds it to the newest turn", async function () {
+    let seenActiveItemId: number | undefined;
+    const registry = new AgentToolRegistry();
+    registry.register({
+      spec: {
+        name: "library_read",
+        description: "Read an item",
+        inputSchema: { type: "object", additionalProperties: true },
+        mutability: "read",
+        requiresConfirmation: false,
+      },
+      validate: (args) => ({ ok: true, value: args ?? {} }),
+      execute: async (_input, context: AgentToolContext) => {
+        seenActiveItemId = context.request.activeItemId;
+        return { activeItemId: context.request.activeItemId };
+      },
+    });
+    registerMcpServer({ toolRegistry: registry, zoteroGateway: {} as never });
+    const registerTurn = (activeItemId: number) =>
+      registerScopedZoteroMcpScope(
+        {
+          profileSignature: "profile-conv",
+          conversationKey: 501,
+          libraryID: 1,
+          kind: "global",
+          activeItemId,
+        },
+        {
+          token: resolveConversationScopeToken({
+            profileSignature: "profile-conv",
+            conversationKey: 501,
+          }),
+        },
+      );
+    const firstTurn = registerTurn(10);
+    // Turn teardown releases the scope; only the token stays registered.
+    firstTurn.clear();
+    const secondTurn = registerTurn(20);
+    try {
+      assert.equal(secondTurn.token, firstTurn.token);
+
+      const response = await invokeMcpEndpoint({
+        token: getOrCreateZoteroMcpBearerToken(),
+        headers: { [ZOTERO_MCP_SCOPE_HEADER]: firstTurn.token },
+        body: {
+          jsonrpc: "2.0",
+          id: 1,
+          method: "tools/call",
+          params: { name: "library_read", arguments: {} },
+        },
+      });
+      assert.isUndefined(JSON.parse(response[2]).error);
+      assert.equal(seenActiveItemId, 20);
+    } finally {
+      secondTurn.clear();
+    }
+  });
+
+  it("keeps a conversation scope token stable across MCP endpoint restarts", function () {
+    const firstToken = resolveConversationScopeToken({
+      profileSignature: "profile-restart",
+      conversationKey: 503,
+    });
+
+    unregisterMcpServer();
+
+    assert.equal(
+      resolveConversationScopeToken({
+        profileSignature: "profile-restart",
+        conversationKey: 503,
+      }),
+      firstToken,
+    );
+  });
+
+  it("releases only the deleted conversation's stable scope token", async function () {
+    registerMcpServer({
+      toolRegistry: new AgentToolRegistry(),
+      zoteroGateway: {} as never,
+    });
+    const firstToken = resolveConversationScopeToken({
+      profileSignature: "profile-cleanup-a",
+      conversationKey: 502,
+    });
+    const otherProfileToken = resolveConversationScopeToken({
+      profileSignature: "profile-cleanup-b",
+      conversationKey: 502,
+    });
+    const activeScope = registerScopedZoteroMcpScope(
+      {
+        profileSignature: "profile-cleanup-a",
+        conversationKey: 502,
+        libraryID: 1,
+        kind: "global",
+      },
+      { token: firstToken },
+    );
+
+    releaseConversationScopeToken({
+      profileSignature: "profile-cleanup-a",
+      conversationKey: 502,
+    });
+
+    assert.notEqual(
+      resolveConversationScopeToken({
+        profileSignature: "profile-cleanup-a",
+        conversationKey: 502,
+      }),
+      firstToken,
+    );
+    assert.equal(
+      resolveConversationScopeToken({
+        profileSignature: "profile-cleanup-b",
+        conversationKey: 502,
+      }),
+      otherProfileToken,
+    );
+    const staleResponse = await invokeMcpEndpoint({
+      token: getOrCreateZoteroMcpBearerToken(),
+      headers: { [ZOTERO_MCP_SCOPE_HEADER]: firstToken },
+      body: {
+        jsonrpc: "2.0",
+        id: 1,
+        method: "tools/list",
+        params: {},
+      },
+    });
+    assert.match(
+      JSON.parse(staleResponse[2]).error.message,
+      /scope token is invalid or expired/i,
+    );
+    activeScope.clear();
   });
 
   it("rejects stale cached MCP write headers instead of rebinding them", async function () {
