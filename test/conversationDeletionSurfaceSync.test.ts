@@ -1,5 +1,6 @@
 import { assert } from "chai";
 import {
+  createSerializedConversationDeletionEventQueue,
   resolveConversationDeletionSurfaceAction,
   type ConversationDeletionSurfaceEntry,
   type ConversationDeletionSurfaceSnapshot,
@@ -231,5 +232,35 @@ describe("resolveConversationDeletionSurfaceAction", function () {
       }),
       { type: "leave", remember: true },
     );
+  });
+});
+
+describe("createSerializedConversationDeletionEventQueue", function () {
+  it("keeps Undo behind the queued leave reaction", async function () {
+    const enqueue = createSerializedConversationDeletionEventQueue();
+    const order: string[] = [];
+    let releaseLeave: (() => void) | undefined;
+    let markLeaveStarted: (() => void) | undefined;
+    const leaveStarted = new Promise<void>((resolve) => {
+      markLeaveStarted = resolve;
+    });
+
+    const leave = enqueue(async () => {
+      order.push("leave-start");
+      markLeaveStarted?.();
+      await new Promise<void>((resolve) => {
+        releaseLeave = resolve;
+      });
+      order.push("leave-finished");
+    });
+    const undo = enqueue(async () => {
+      order.push("undo");
+    });
+
+    await leaveStarted;
+    assert.deepEqual(order, ["leave-start"]);
+    releaseLeave?.();
+    await Promise.all([leave, undo]);
+    assert.deepEqual(order, ["leave-start", "leave-finished", "undo"]);
   });
 });

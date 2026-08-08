@@ -1,4 +1,5 @@
 import type { ConversationSystem } from "../../shared/types";
+import { isConversationRecentlyDeleted } from "./recentlyDeletedConversations";
 
 export const PENDING_DELETIONS_TABLE = "llm_for_zotero_pending_deletions";
 export const DELETION_UNDO_WINDOW_MS = 6_000;
@@ -155,6 +156,15 @@ const listeners = new Set<(event: PendingDeletionEvent) => void>();
 let queueOrder: string[] = [];
 let initialized = false;
 let opChain: Promise<unknown> = Promise.resolve();
+type RestoreRequest = { committed: boolean };
+
+// Restores are user actions that must not wait behind an unrelated provider
+// finalizer. They have their own per-conversation lane, while the global chain
+// continues to serialize operations that intentionally span conversations.
+const restoreOpChains = new Map<number, Promise<unknown>>();
+const pendingRestoreRequests = new Map<number, Set<RestoreRequest>>();
+const activeFinalizationIds = new Set<string>();
+const destructivelyFinalizedIds = new Set<string>();
 let idCounter = 0;
 // Queue intents that have been REQUESTED but are not yet visible in `entries`,
 // counted per conversation key. The short-circuits below read `entries`
@@ -164,22 +174,108 @@ let idCounter = 0;
 // conversation's queue op cannot force every send onto the shared chain, and
 // released only once the intent is recorded — or has definitively failed.
 const unrecordedQueueIntents = new Map<number, number>();
+const unrecordedConversationQueueIntents = new Map<number, number>();
 
-function retainQueueIntent(conversationKey: number): void {
+function retainQueueIntent(
+  conversationKey: number,
+  kind: PendingDeletionEntry["kind"],
+): void {
   unrecordedQueueIntents.set(
     conversationKey,
     (unrecordedQueueIntents.get(conversationKey) || 0) + 1,
   );
+  if (kind === "conversation") {
+    unrecordedConversationQueueIntents.set(
+      conversationKey,
+      (unrecordedConversationQueueIntents.get(conversationKey) || 0) + 1,
+    );
+  }
 }
 
-function releaseQueueIntent(conversationKey: number): void {
+function releaseQueueIntent(
+  conversationKey: number,
+  kind: PendingDeletionEntry["kind"],
+): void {
   const next = (unrecordedQueueIntents.get(conversationKey) || 0) - 1;
   if (next > 0) unrecordedQueueIntents.set(conversationKey, next);
   else unrecordedQueueIntents.delete(conversationKey);
+  if (kind === "conversation") {
+    const conversationNext =
+      (unrecordedConversationQueueIntents.get(conversationKey) || 0) - 1;
+    if (conversationNext > 0) {
+      unrecordedConversationQueueIntents.set(conversationKey, conversationNext);
+    } else {
+      unrecordedConversationQueueIntents.delete(conversationKey);
+    }
+  }
 }
 
 function hasUnrecordedQueueIntent(conversationKey: number): boolean {
   return (unrecordedQueueIntents.get(conversationKey) || 0) > 0;
+}
+
+function hasUnrecordedConversationQueueIntent(
+  conversationKey: number,
+): boolean {
+  return (unrecordedConversationQueueIntents.get(conversationKey) || 0) > 0;
+}
+
+function hasConversationEntriesForConversation(
+  conversationKey: number,
+): boolean {
+  for (const entry of entries.values()) {
+    if (
+      entry.kind === "conversation" &&
+      entry.conversationKey === conversationKey
+    ) {
+      return true;
+    }
+  }
+  return false;
+}
+
+function registerRestoreRequest(conversationKey: number): RestoreRequest {
+  const request: RestoreRequest = { committed: false };
+  const requests = pendingRestoreRequests.get(conversationKey) || new Set();
+  requests.add(request);
+  pendingRestoreRequests.set(conversationKey, requests);
+  return request;
+}
+
+function unregisterRestoreRequest(
+  conversationKey: number,
+  request: RestoreRequest,
+): void {
+  const requests = pendingRestoreRequests.get(conversationKey);
+  if (!requests) return;
+  requests.delete(request);
+  if (requests.size === 0) pendingRestoreRequests.delete(conversationKey);
+}
+
+function hasPendingRestoreRequest(conversationKey: number): boolean {
+  return (pendingRestoreRequests.get(conversationKey)?.size || 0) > 0;
+}
+
+function markRestoreRequestsCommitted(conversationKey: number): void {
+  for (const request of pendingRestoreRequests.get(conversationKey) || []) {
+    request.committed = true;
+  }
+}
+
+function enqueueRestoreOp<T>(
+  conversationKey: number,
+  fn: () => Promise<T>,
+): Promise<T> {
+  const previous = restoreOpChains.get(conversationKey) || Promise.resolve();
+  const run = previous.then(fn, fn);
+  const settled = run.catch(() => undefined);
+  restoreOpChains.set(conversationKey, settled);
+  void settled.then(() => {
+    if (restoreOpChains.get(conversationKey) === settled) {
+      restoreOpChains.delete(conversationKey);
+    }
+  });
+  return run;
 }
 
 export function configurePendingDeletionFinalizers(
@@ -220,7 +316,12 @@ export function resetPendingDeletionStoreForTests(): void {
   initialized = false;
   finalizers = null;
   opChain = Promise.resolve();
+  restoreOpChains.clear();
+  pendingRestoreRequests.clear();
+  activeFinalizationIds.clear();
+  destructivelyFinalizedIds.clear();
   unrecordedQueueIntents.clear();
+  unrecordedConversationQueueIntents.clear();
   env = defaultEnv();
 }
 
@@ -270,6 +371,7 @@ function armTimer(id: string, delayMs: number): void {
 function removeEntry(id: string): void {
   clearEntryTimer(id);
   entries.delete(id);
+  destructivelyFinalizedIds.delete(id);
   queueOrder = queueOrder.filter((entryId) => entryId !== id);
 }
 
@@ -402,6 +504,11 @@ async function supersedeOthers(
 async function undoInternal(id: string): Promise<PendingDeletionEntry | null> {
   const entry = entries.get(id);
   if (!entry) return null;
+  if (activeFinalizationIds.has(id) || destructivelyFinalizedIds.has(id)) {
+    // Once destructive finalization has started, deleting the write-ahead row
+    // would falsely restore visibility over data that may already be gone.
+    return null;
+  }
   try {
     await deleteRowStrict(id);
   } catch (err) {
@@ -420,6 +527,35 @@ async function undoInternal(id: string): Promise<PendingDeletionEntry | null> {
 }
 
 async function finalizeInternal(id: string, reason: string): Promise<boolean> {
+  const entry = entries.get(id);
+  if (!entry) return true;
+  if (
+    entry.kind === "conversation" &&
+    hasPendingRestoreRequest(entry.conversationKey)
+  ) {
+    // A user action has already asked to withdraw this conversation's delete
+    // intent. Let the keyed restore lane win instead of starting destructive
+    // work behind it.
+    env.log("LLM: deferring conversation finalize for pending restore", {
+      id,
+      conversationKey: entry.conversationKey,
+      reason,
+    });
+    armTimer(id, FINALIZE_RETRY_DELAY_MS);
+    return false;
+  }
+  activeFinalizationIds.add(id);
+  try {
+    return await finalizeInternalUnsafe(id, reason);
+  } finally {
+    activeFinalizationIds.delete(id);
+  }
+}
+
+async function finalizeInternalUnsafe(
+  id: string,
+  reason: string,
+): Promise<boolean> {
   const entry = entries.get(id);
   if (!entry) return true;
   clearEntryTimer(id);
@@ -448,6 +584,13 @@ async function finalizeInternal(id: string, reason: string): Promise<boolean> {
     ok = false;
   }
   if (ok) {
+    if (!dropped) {
+      // Mark this before withdrawing the write-ahead row. A restore request
+      // racing an already-completed destructive finalizer must fail closed,
+      // even if the entry disappears before the restore lane runs.
+      destructivelyFinalizedIds.add(id);
+      markRestoreRequestsCommitted(entry.conversationKey);
+    }
     // The destructive work is done; a surviving write-ahead row is a live
     // delete intent that the next startup sweep would replay against whatever
     // conversation owns the key by then. Same invariant as undo and give-up:
@@ -606,7 +749,7 @@ export const pendingDeletionStore = {
     // FINISHED. Releasing when the op merely started still left a window as
     // wide as the DB insert during which the intent was invisible to the
     // synchronous short-circuits below.
-    retainQueueIntent(input.conversationKey);
+    retainQueueIntent(input.conversationKey, "conversation");
     return enqueueOp(async () => {
       try {
         const catalogCreatedAt = Math.floor(
@@ -661,7 +804,7 @@ export const pendingDeletionStore = {
         await supersedeOthers("conversation", entry.id);
         return entry;
       } finally {
-        releaseQueueIntent(input.conversationKey);
+        releaseQueueIntent(input.conversationKey, "conversation");
       }
     });
   },
@@ -675,7 +818,7 @@ export const pendingDeletionStore = {
     // Same contract as queueConversationDeletion: a turn intent must be visible
     // to finalizeTurnsForConversation's short-circuit from the moment it is
     // requested, not merely from when its op starts.
-    retainQueueIntent(input.conversationKey);
+    retainQueueIntent(input.conversationKey, "turn");
     return enqueueOp(async () => {
       try {
         const existing = Array.from(entries.values()).find(
@@ -713,7 +856,7 @@ export const pendingDeletionStore = {
         await supersedeOthers("turn", entry.id);
         return entry;
       } finally {
-        releaseQueueIntent(input.conversationKey);
+        releaseQueueIntent(input.conversationKey, "turn");
       }
     });
   },
@@ -790,18 +933,27 @@ export const pendingDeletionStore = {
   // could not be withdrawn — callers must abort rather than write into a chat
   // whose write-ahead deletion row survives.
   restoreConversationDeletionsFor(conversationKey: number): Promise<boolean> {
+    const hasUnrecordedConversationIntent =
+      hasUnrecordedConversationQueueIntent(conversationKey);
     // Nothing to withdraw AND no deletion intent still waiting to be recorded:
     // answer without joining the shared chain. The counter is what makes this
     // safe — a queue op that has been requested but not yet run would not be
     // visible in `entries`, and skipping the chain would let the caller write
     // into a chat that is about to be hidden.
     if (
-      !hasUnrecordedQueueIntent(conversationKey) &&
-      !pendingDeletionStore.isConversationPendingDeletion(conversationKey)
+      !hasUnrecordedConversationIntent &&
+      !hasConversationEntriesForConversation(conversationKey)
     ) {
-      return Promise.resolve(true);
+      // A surface can still be mounted on a key after the store has emitted
+      // `finalized` and removed its entry. Its tombstone means this is not an
+      // ordinary no-op restore: the conversation is already gone, so callers
+      // must abort instead of writing into the stale item.
+      return Promise.resolve(!isConversationRecentlyDeleted(conversationKey));
     }
-    return enqueueOp(async () => {
+
+    const request = registerRestoreRequest(conversationKey);
+    const restore = async (): Promise<boolean> => {
+      if (request.committed) return false;
       const matching = Array.from(entries.values()).filter(
         (entry) =>
           entry.kind === "conversation" &&
@@ -809,12 +961,31 @@ export const pendingDeletionStore = {
       );
       let allRestored = true;
       for (const entry of matching) {
+        if (
+          request.committed ||
+          activeFinalizationIds.has(entry.id) ||
+          destructivelyFinalizedIds.has(entry.id)
+        ) {
+          allRestored = false;
+          continue;
+        }
         if (!(await undoInternal(entry.id))) {
           allRestored = false;
         }
       }
       return allRestored;
-    });
+    };
+
+    // A queue intent that has not been recorded yet must still wait for its
+    // write-ahead insert. Once an entry exists, restore runs in its own key
+    // lane and can withdraw it without waiting behind another conversation's
+    // provider finalizer.
+    const operation = hasUnrecordedConversationIntent
+      ? enqueueOp(restore)
+      : enqueueRestoreOp(conversationKey, restore);
+    return operation.finally(() =>
+      unregisterRestoreRequest(conversationKey, request),
+    );
   },
 
   getLatestPending(): PendingDeletionEntry | null {

@@ -171,7 +171,10 @@ import {
 } from "../../codexAppServer/state";
 import { loadAllCodexConversationHistory } from "../../codexAppServer/historyLoader";
 import { clearActiveConversationForPendingDeletion } from "./conversationDeletionActivation";
-import { resolveConversationDeletionSurfaceAction } from "./conversationDeletionSurfaceSync";
+import {
+  createSerializedConversationDeletionEventQueue,
+  resolveConversationDeletionSurfaceAction,
+} from "./conversationDeletionSurfaceSync";
 import {
   forgetRecentlyDeletedConversation,
   isConversationRecentlyDeleted,
@@ -2967,6 +2970,8 @@ export function openStandaloneChat(options?: {
       // by pending-deletion entry id, so an undone or abandoned deletion can
       // put the user back instead of stranding them on a fresh blank chat.
       const standaloneSurrenderedDeletions = new Map<string, SidebarConv>();
+      const enqueueStandaloneConversationDeletionEvent =
+        createSerializedConversationDeletionEventQueue();
 
       const switchStandaloneToConversationEntry = async (
         entry: SidebarConv,
@@ -3159,7 +3164,9 @@ export function openStandaloneChat(options?: {
           if (cancelled || newWin.closed) return;
           renderStandalonePendingDeletionToast();
           if (event.entry.kind === "conversation") {
-            void handleStandaloneConversationDeletionEvent(event);
+            void enqueueStandaloneConversationDeletionEvent(() =>
+              handleStandaloneConversationDeletionEvent(event),
+            );
             return;
           }
           scheduleStandaloneSidebarRender();

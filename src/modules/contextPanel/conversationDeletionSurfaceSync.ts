@@ -23,6 +23,20 @@ export type ConversationDeletionSurfaceAction =
   | { type: "restore" }
   | { type: "forget" };
 
+// Surface reactions can await fresh-chat creation or history navigation. Keep
+// each mounted surface's event reactions in notification order so a quick Undo
+// cannot run before the queued deletion has recorded that the surface left.
+export function createSerializedConversationDeletionEventQueue(): (
+  task: () => Promise<void>,
+) => Promise<void> {
+  let chain: Promise<void> = Promise.resolve();
+  return (task) => {
+    const next = chain.then(task);
+    chain = next.catch(() => undefined);
+    return next;
+  };
+}
+
 /**
  * What one mounted surface (panel or standalone window) must do about a
  * conversation-deletion event. Every surface subscribes to the same store, so

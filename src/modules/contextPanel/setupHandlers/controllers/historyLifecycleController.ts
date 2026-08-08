@@ -127,6 +127,7 @@ import {
 import type { AgentRuntime } from "../../../../agent/runtime";
 import { clearActiveConversationForPendingDeletion } from "../../conversationDeletionActivation";
 import {
+  createSerializedConversationDeletionEventQueue,
   resolveConversationDeletionSurfaceAction,
   type ConversationDeletionSurfaceSnapshot,
 } from "../../conversationDeletionSurfaceSync";
@@ -3655,6 +3656,9 @@ export function createHistoryLifecycleController(
     });
   };
 
+  const enqueueConversationDeletionEvent =
+    createSerializedConversationDeletionEventQueue();
+
   // Every panel subscribes to the same store, so each one has to decide for
   // itself whether it is the surface showing the doomed chat.
   const handleConversationPendingDeletionEvent = async (
@@ -3737,10 +3741,12 @@ export function createHistoryLifecycleController(
           "error",
         );
       }
-      void handleConversationPendingDeletionEvent(
-        event.type,
-        entry,
-        Boolean(event.dropped),
+      void enqueueConversationDeletionEvent(() =>
+        handleConversationPendingDeletionEvent(
+          event.type,
+          entry,
+          Boolean(event.dropped),
+        ),
       );
       return;
     }

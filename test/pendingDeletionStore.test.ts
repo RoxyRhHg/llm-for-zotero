@@ -10,6 +10,10 @@ import {
   PENDING_DELETIONS_TABLE,
 } from "../src/core/conversations/pendingDeletionStore";
 import { resolveFreshConversationDraft } from "../src/modules/contextPanel/freshConversationDraft";
+import {
+  markConversationRecentlyDeleted,
+  resetRecentlyDeletedConversationsForTests,
+} from "../src/core/conversations/recentlyDeletedConversations";
 
 const globalScope = globalThis as typeof globalThis & {
   Zotero?: Record<string, unknown>;
@@ -84,10 +88,12 @@ function conversationInput(
 describe("pendingDeletionStore", function () {
   beforeEach(function () {
     resetPendingDeletionStoreForTests();
+    resetRecentlyDeletedConversationsForTests();
   });
 
   afterEach(function () {
     resetPendingDeletionStoreForTests();
+    resetRecentlyDeletedConversationsForTests();
     globalScope.Zotero = originalZotero;
   });
 
@@ -482,6 +488,15 @@ describe("pendingDeletionStore", function () {
     assert.isTrue(
       pendingDeletionStore.isConversationPendingDeletion(42),
       "entry must stay pending so state matches the surviving row",
+    );
+  });
+
+  it("does not restore a stale item after a real deletion has committed", async function () {
+    installFakeEnv();
+    markConversationRecentlyDeleted(42);
+    assert.isFalse(
+      await pendingDeletionStore.restoreConversationDeletionsFor(42),
+      "a surface left on a just-deleted key must abort its user action",
     );
   });
 
@@ -1043,6 +1058,82 @@ describe("pendingDeletionStore key-scoped ops do not inherit unrelated latency",
     );
     releaseSlowFinalize?.();
     await slow;
+  });
+
+  it("restores a pending conversation without waiting for an unrelated finalizer", async function () {
+    installFakeEnv();
+    let releaseSlowFinalize: (() => void) | undefined;
+    let markSlowFinalizeStarted: (() => void) | undefined;
+    const slowFinalizeStarted = new Promise<void>((resolve) => {
+      markSlowFinalizeStarted = resolve;
+    });
+    configurePendingDeletionFinalizers({
+      finalizeConversation: async () => true,
+      finalizeTurn: async (entry) => {
+        if (entry.conversationKey !== 1) return true;
+        markSlowFinalizeStarted?.();
+        await new Promise<void>((resolve) => {
+          releaseSlowFinalize = resolve;
+        });
+        return true;
+      },
+    });
+    const conversation = await pendingDeletionStore.queueConversationDeletion(
+      conversationInput(2),
+    );
+    const turn = await pendingDeletionStore.queueTurnDeletion({
+      conversationKey: 1,
+      system: "upstream",
+      userTimestamp: 111,
+      assistantTimestamp: 222,
+    });
+    const slow = pendingDeletionStore.finalize(turn!.id, "timeout");
+    await slowFinalizeStarted;
+
+    assert.isTrue(
+      await pendingDeletionStore.restoreConversationDeletionsFor(2),
+      "the current chat must restore without joining the unrelated finalizer",
+    );
+    assert.isFalse(pendingDeletionStore.isConversationPendingDeletion(2));
+
+    releaseSlowFinalize?.();
+    await slow;
+    assert.isFalse(pendingDeletionStore.isConversationPendingDeletion(1));
+    assert.isOk(conversation);
+  });
+
+  it("fails restore when finalization is already destroying the same conversation", async function () {
+    installFakeEnv();
+    let releaseSlowFinalize: (() => void) | undefined;
+    let markSlowFinalizeStarted: (() => void) | undefined;
+    const slowFinalizeStarted = new Promise<void>((resolve) => {
+      markSlowFinalizeStarted = resolve;
+    });
+    configurePendingDeletionFinalizers({
+      finalizeConversation: async () => {
+        markSlowFinalizeStarted?.();
+        await new Promise<void>((resolve) => {
+          releaseSlowFinalize = resolve;
+        });
+        return true;
+      },
+      finalizeTurn: async () => true,
+    });
+    const entry = await pendingDeletionStore.queueConversationDeletion(
+      conversationInput(42),
+    );
+    const finalizing = pendingDeletionStore.finalize(entry!.id, "timeout");
+    await slowFinalizeStarted;
+
+    assert.isFalse(
+      await pendingDeletionStore.restoreConversationDeletionsFor(42),
+      "a restore request must abort once destructive finalization has started",
+    );
+    assert.isTrue(pendingDeletionStore.isConversationPendingDeletion(42));
+
+    releaseSlowFinalize?.();
+    assert.isTrue(await finalizing);
+    assert.isFalse(pendingDeletionStore.isConversationPendingDeletion(42));
   });
 });
 
