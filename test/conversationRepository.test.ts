@@ -672,6 +672,7 @@ describe("conversationRepository", function () {
     const originalGetCatalogEntry = conversationRepository.getCatalogEntry;
     const originalSetCatalogTitle = conversationRepository.setCatalogTitle;
     const forkCalls: string[] = [];
+    const forkTargetConversationKeys: (number | undefined)[] = [];
     const archiveCalls: string[] = [];
     const insertedMessages: unknown[][] = [];
     const registryRows = new Map<number, Record<string, unknown>>();
@@ -680,6 +681,7 @@ describe("conversationRepository", function () {
 
     codexAppServerForkService.forkThread = async (params) => {
       forkCalls.push(params.threadId);
+      forkTargetConversationKeys.push(params.targetConversationKey);
       return "thread-forked";
     };
     codexAppServerForkService.archiveThread = async (params) => {
@@ -818,6 +820,7 @@ describe("conversationRepository", function () {
       assert.equal(result?.entry.conversationKey, targetConversationKey);
       assert.equal(result?.copiedMessageCount, 2);
       assert.deepEqual(forkCalls, ["thread-source"]);
+      assert.deepEqual(forkTargetConversationKeys, [targetConversationKey]);
       assert.deepEqual(archiveCalls, []);
       assert.equal(persistedProviderSessionId, "thread-forked");
       assert.lengthOf(insertedMessages, 2);

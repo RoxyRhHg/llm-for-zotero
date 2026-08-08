@@ -28,6 +28,7 @@ import {
   ZOTERO_MCP_WRITE_TOOL_NAMES,
   getZoteroMcpDirectPdfToolNames,
   registerScopedZoteroMcpScope,
+  resolveConversationScopeToken,
   setActiveZoteroMcpScope,
   type ZoteroMcpActiveScope,
   type ZoteroMcpConfirmationRequest,
@@ -1908,8 +1909,39 @@ export async function listCodexAppServerModels(
   return proc.sendRequest("model/list", requestParams);
 }
 
+/**
+ * Builds the MCP thread config a forked conversation must be created with.
+ *
+ * `thread/fork` creates the target conversation from the source thread, so
+ * without an override it inherits the source conversation's scope header. Resume
+ * does not reliably rebind headers on a loaded thread, so that header would keep
+ * resolving to the source scope for the whole life of the fork. The override is
+ * also required while tools are disabled so the fork cannot retain an enabled
+ * source MCP server behind the preference.
+ */
+export function buildForkedCodexThreadMcpConfig(
+  targetConversationKey?: number,
+): Record<string, unknown> | undefined {
+  const conversationKey = Math.floor(Number(targetConversationKey));
+  if (!Number.isFinite(conversationKey) || conversationKey <= 0) {
+    return undefined;
+  }
+  const mcpEnabled = isCodexZoteroMcpToolsEnabled();
+  const profileSignature = getCodexProfileSignature();
+  return buildCodexZoteroMcpThreadConfig({
+    profileSignature,
+    scopeToken: resolveConversationScopeToken({
+      profileSignature,
+      conversationKey,
+    }),
+    required: mcpEnabled,
+    enabled: mcpEnabled,
+  }).config;
+}
+
 export async function forkCodexAppServerThread(params: {
   threadId: string;
+  targetConversationKey?: number;
   codexPath?: string;
   processKey?: string;
 }): Promise<string> {
@@ -1918,12 +1950,46 @@ export async function forkCodexAppServerThread(params: {
     params.processKey || CODEX_APP_SERVER_NATIVE_PROCESS_KEY,
     { codexPath },
   );
-  const result = await proc.sendRequest("thread/fork", {
+  const requestParams: Record<string, unknown> = {
     threadId: params.threadId,
-  });
-  const threadId = extractCodexAppServerThreadId(result);
-  if (!threadId) throw new Error("Codex app-server did not return a thread ID");
-  return threadId;
+  };
+  const config = buildForkedCodexThreadMcpConfig(params.targetConversationKey);
+  if (config) requestParams.config = config;
+  const targetConversationKey = Math.floor(
+    Number(params.targetConversationKey),
+  );
+  const profileSignature = getCodexProfileSignature();
+  const provisionalMcpScope =
+    config &&
+    isCodexZoteroMcpToolsEnabled() &&
+    Number.isFinite(targetConversationKey) &&
+    targetConversationKey > 0
+      ? registerScopedZoteroMcpScope(
+          {
+            profileSignature,
+            conversationKey: targetConversationKey,
+          },
+          {
+            token: resolveConversationScopeToken({
+              profileSignature,
+              conversationKey: targetConversationKey,
+            }),
+          },
+        )
+      : null;
+  try {
+    // A required MCP server performs tools/list while the fork is being
+    // created. Keep the target token resolvable for that handshake; the first
+    // target turn will register the complete conversation scope under it.
+    const result = await proc.sendRequest("thread/fork", requestParams);
+    const threadId = extractCodexAppServerThreadId(result);
+    if (!threadId) {
+      throw new Error("Codex app-server did not return a thread ID");
+    }
+    return threadId;
+  } finally {
+    provisionalMcpScope?.clear();
+  }
 }
 
 export async function archiveCodexAppServerThread(params: {
@@ -2173,8 +2239,21 @@ export async function runCodexAppServerNativeTurn(params: {
         reasoning: params.reasoning,
         skillContext,
       });
+      // Raw-PDF turns always run on a fresh ephemeral thread, so they keep a
+      // single-turn token. Persistent threads are resumed with the scope header
+      // Codex captured when the thread was created, so they need a token that
+      // stays stable for the whole conversation.
+      const persistentScopeToken = currentTurnHasLocalPdfs
+        ? ""
+        : resolveConversationScopeToken({
+            profileSignature,
+            conversationKey: params.scope.conversationKey,
+          });
       const scopedMcp = mcpEnabled
-        ? registerScopedZoteroMcpScope(scopedMcpScope)
+        ? registerScopedZoteroMcpScope(
+            scopedMcpScope,
+            persistentScopeToken ? { token: persistentScopeToken } : {},
+          )
         : null;
       const mcpThreadConfig = scopedMcp
         ? buildCodexZoteroMcpThreadConfig({
@@ -2646,6 +2725,9 @@ export async function runCodexAppServerNativeTurn(params: {
         return result;
       } finally {
         unregisterGuardianReviews();
+        // The scope registration only lives for the turn. The next turn resolves
+        // the same conversation-stable token and registers its own scope under
+        // it, so the header Codex captured at thread creation stays valid.
         scopedMcp?.clear();
         clearMcpConfirmationHandler();
         clearMcpScope();
