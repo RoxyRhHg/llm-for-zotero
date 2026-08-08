@@ -227,8 +227,9 @@ export function listClaudeSlashCommands(
 export async function listClaudeEfforts(
   coreRuntime: AgentRuntime,
   model?: string,
+  context?: ClaudeModelCatalogRequestContext,
 ): Promise<string[]> {
-  return getClaudeBridgeRuntime(coreRuntime).listEfforts(model);
+  return getClaudeBridgeRuntime(coreRuntime).listEfforts(model, context);
 }
 
 export async function listClaudeModels(

@@ -130,7 +130,10 @@ export type AgentRuntimeLike = Pick<
     source: "sdk" | "fallback";
   }>;
   refreshSlashCommands(force?: boolean): Promise<void>;
-  listEfforts(model?: string): Promise<string[]>;
+  listEfforts(
+    model?: string,
+    context?: ClaudeModelCatalogRequestContext,
+  ): Promise<string[]>;
   listModels(
     force?: boolean,
     context?: ClaudeModelCatalogRequestContext,
@@ -1967,12 +1970,25 @@ async function fetchExternalEfforts(
   baseUrl: string,
   encodedSources: string,
   model?: string,
+  context?: ClaudeModelCatalogRequestContext,
 ): Promise<ExternalEffortInfo> {
-  const modelParam = model?.trim()
-    ? `&model=${encodeURIComponent(model.trim())}`
-    : "";
+  const query = new URLSearchParams({
+    settingSources: decodeURIComponent(encodedSources),
+  });
+  const normalizedModel = model?.trim();
+  if (normalizedModel) query.set("model", normalizedModel);
+  const conversationKey =
+    context === undefined ? "" : String(context.conversationKey).trim();
+  const scopeId = context?.scopeId.trim() || "";
+  if (context && conversationKey && scopeId) {
+    query.set("conversationKey", conversationKey);
+    query.set("scopeType", context.scopeType);
+    query.set("scopeId", scopeId);
+    const scopeLabel = context.scopeLabel?.trim();
+    if (scopeLabel) query.set("scopeLabel", scopeLabel);
+  }
   const response = await fetch(
-    `${normalizeBaseUrl(baseUrl)}/efforts?settingSources=${encodedSources}${modelParam}`,
+    `${normalizeBaseUrl(baseUrl)}/efforts?${query}`,
     {
       method: "GET",
       headers: { Accept: "application/json" },
@@ -2342,7 +2358,10 @@ export function createExternalBackendBridgeRuntime(options: {
     await refreshInFlight;
   };
 
-  const listEfforts = async (model?: string): Promise<string[]> => {
+  const listEfforts = async (
+    model?: string,
+    context?: ClaudeModelCatalogRequestContext,
+  ): Promise<string[]> => {
     const bridgeUrl = normalizeBaseUrl(getBridgeUrl());
     if (!bridgeUrl || !isClaudeBridgeActive()) {
       return [];
@@ -2351,7 +2370,14 @@ export function createExternalBackendBridgeRuntime(options: {
     if (configKey !== lastCapabilityConfigKey) {
       resetCapabilityCaches(configKey);
     }
-    const key = `${configKey}|${(model || "").trim()}`;
+    const requestKey = context
+      ? [
+          String(context.conversationKey).trim(),
+          context.scopeType,
+          context.scopeId.trim(),
+        ].join("|")
+      : "runtime-root";
+    const key = `${configKey}|${requestKey}|${(model || "").trim()}`;
     const cached = cachedEffortsByModel.get(key);
     if (cached && (cached.expiresAt || 0) > Date.now()) {
       return cached.efforts;
@@ -2359,7 +2385,12 @@ export function createExternalBackendBridgeRuntime(options: {
     const encodedSources = encodeURIComponent(
       getClaudeSettingSourcesByPref().join(","),
     );
-    const info = await fetchExternalEfforts(bridgeUrl, encodedSources, model);
+    const info = await fetchExternalEfforts(
+      bridgeUrl,
+      encodedSources,
+      model,
+      context,
+    );
     cachedEffortsByModel.set(key, {
       ...info,
       expiresAt: Date.now() + EFFORT_CACHE_TTL_MS,

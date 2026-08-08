@@ -1253,17 +1253,18 @@ export function setupHandlers(
     if (!isClaudeModeAvailable()) return;
     if (claudeWarmupInFlight) return;
     claudeWarmupInFlight = initAgentSubsystem()
-      .then((coreRuntime) =>
-        Promise.allSettled([
+      .then((coreRuntime) => {
+        const context = resolveClaudeModelCatalogContext();
+        return Promise.allSettled([
           refreshClaudeSlashCommands(coreRuntime, false),
-          listClaudeEfforts(coreRuntime, getSelectedClaudeRuntimeEntry().model),
-          listClaudeModels(
+          listClaudeEfforts(
             coreRuntime,
-            false,
-            resolveClaudeModelCatalogContext(),
+            getSelectedClaudeRuntimeEntry().model,
+            context,
           ),
-        ]),
-      )
+          listClaudeModels(coreRuntime, false, context),
+        ]);
+      })
       .catch((err: unknown) => {
         ztoolkit.log("LLM: Failed to warm Claude mode caches", err);
       })

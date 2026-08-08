@@ -119,6 +119,41 @@ describe("external bridge model catalog", function () {
     assert.include(urls[1], "model=futuremodel");
   });
 
+  it("forwards conversation scope to effort discovery and caches it per scope", async function () {
+    const urls: string[] = [];
+    globalThis.fetch = (async (input: RequestInfo | URL) => {
+      urls.push(String(input));
+      return new Response(JSON.stringify({ efforts: ["high"] }), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      });
+    }) as typeof fetch;
+    const runtime = createRuntime();
+    const firstContext = {
+      conversationKey: 42,
+      scopeType: "paper" as const,
+      scopeId: "profile-test:1:42",
+      scopeLabel: "Paper 42",
+    };
+    const secondContext = {
+      conversationKey: 43,
+      scopeType: "paper" as const,
+      scopeId: "profile-test:1:43",
+      scopeLabel: "Paper 43",
+    };
+
+    await runtime.listEfforts("ScopedFutureModel", firstContext);
+    await runtime.listEfforts("ScopedFutureModel", secondContext);
+    await runtime.listEfforts("ScopedFutureModel", firstContext);
+
+    assert.lengthOf(urls, 2);
+    assert.include(urls[0], "conversationKey=42");
+    assert.include(urls[0], "scopeId=profile-test%3A1%3A42");
+    assert.include(urls[0], "scopeLabel=Paper+42");
+    assert.include(urls[1], "conversationKey=43");
+    assert.include(urls[1], "scopeId=profile-test%3A1%3A43");
+  });
+
   it("caches model catalogs separately for each conversation scope", async function () {
     const urls: string[] = [];
     globalThis.fetch = (async (input: RequestInfo | URL) => {
