@@ -3,13 +3,21 @@ import type { ConversationSystem } from "../../shared/types";
 export const PENDING_DELETIONS_TABLE = "llm_for_zotero_pending_deletions";
 export const DELETION_UNDO_WINDOW_MS = 6_000;
 export const MAX_FINALIZE_ATTEMPTS = 5;
-const FINALIZE_RETRY_DELAY_MS = 6_000;
+export const FINALIZE_RETRY_DELAY_MS = 6_000;
 
 export type PendingConversationDeletionEntry = {
   id: string;
   kind: "conversation";
   conversationKind: "paper" | "global";
   conversationID?: string;
+  // Immutable identity witness captured at queue time: the catalog row's
+  // createdAt. Conversation keys are recycled and conversation IDs are a
+  // deterministic hash of the scope, so a recycled key reproduces a
+  // byte-identical ID. This is the only value that can prove, at finalize
+  // time, that the row about to be destroyed is still the row the user asked
+  // to delete. 0 means "no witness" (a row written by an older build) and must
+  // fail closed.
+  catalogCreatedAt: number;
   conversationKey: number;
   libraryID: number;
   system: ConversationSystem;
@@ -41,13 +49,23 @@ export type PendingDeletionEntry =
 export type PendingDeletionEvent = {
   type: "queued" | "undone" | "finalized" | "finalize-failed" | "gave-up";
   entry: PendingDeletionEntry;
+  // True when the intent was DROPPED rather than applied — the conversation
+  // still exists (a stale intent, or a row from a build with no identity
+  // witness). Surfaces must not treat this as a deletion: leaving the chat and
+  // tombstoning its key would evict the user from a conversation that is very
+  // much alive.
+  dropped?: boolean;
 };
+
+export type PendingFinalizeOutcome = { ok: boolean; dropped?: boolean };
 
 export type PendingDeletionFinalizers = {
   finalizeConversation: (
     entry: PendingConversationDeletionEntry,
-  ) => Promise<boolean>;
-  finalizeTurn: (entry: PendingTurnDeletionEntry) => Promise<boolean>;
+  ) => Promise<boolean | PendingFinalizeOutcome>;
+  finalizeTurn: (
+    entry: PendingTurnDeletionEntry,
+  ) => Promise<boolean | PendingFinalizeOutcome>;
 };
 
 export type PendingDeletionStoreEnv = {
@@ -130,11 +148,39 @@ let env: Required<PendingDeletionStoreEnv> = defaultEnv();
 
 const entries = new Map<string, PendingDeletionEntry>();
 const timers = new Map<string, unknown>();
+// When each entry's own timer is next due. Session-local and deliberately NOT
+// persisted: a restart is meant to re-attempt every leftover row at once.
+const retryNotBefore = new Map<string, number>();
 const listeners = new Set<(event: PendingDeletionEvent) => void>();
 let queueOrder: string[] = [];
 let initialized = false;
 let opChain: Promise<unknown> = Promise.resolve();
 let idCounter = 0;
+// Queue intents that have been REQUESTED but are not yet visible in `entries`,
+// counted per conversation key. The short-circuits below read `entries`
+// synchronously; without this a restore/finalize could answer "nothing to do"
+// while a queue op for that key was still pending, and the caller would write
+// into a chat that is about to be hidden. Keyed (not global) so an unrelated
+// conversation's queue op cannot force every send onto the shared chain, and
+// released only once the intent is recorded — or has definitively failed.
+const unrecordedQueueIntents = new Map<number, number>();
+
+function retainQueueIntent(conversationKey: number): void {
+  unrecordedQueueIntents.set(
+    conversationKey,
+    (unrecordedQueueIntents.get(conversationKey) || 0) + 1,
+  );
+}
+
+function releaseQueueIntent(conversationKey: number): void {
+  const next = (unrecordedQueueIntents.get(conversationKey) || 0) - 1;
+  if (next > 0) unrecordedQueueIntents.set(conversationKey, next);
+  else unrecordedQueueIntents.delete(conversationKey);
+}
+
+function hasUnrecordedQueueIntent(conversationKey: number): boolean {
+  return (unrecordedQueueIntents.get(conversationKey) || 0) > 0;
+}
 
 export function configurePendingDeletionFinalizers(
   next: PendingDeletionFinalizers,
@@ -154,15 +200,27 @@ export function configurePendingDeletionStoreEnv(
   };
 }
 
+// Production wires only the logger: the plugin runtime must keep the default
+// main-window-bound timers while still leaving a diagnostic trail. Without this
+// the store's log is a no-op in the shipping plugin, and every toast that says
+// "Check logs" points at nothing.
+export function setPendingDeletionStoreLogger(
+  log: (message: string, ...args: unknown[]) => void,
+): void {
+  env.log = log;
+}
+
 export function resetPendingDeletionStoreForTests(): void {
   for (const handle of timers.values()) env.clearTimer(handle);
   timers.clear();
+  retryNotBefore.clear();
   entries.clear();
   listeners.clear();
   queueOrder = [];
   initialized = false;
   finalizers = null;
   opChain = Promise.resolve();
+  unrecordedQueueIntents.clear();
   env = defaultEnv();
 }
 
@@ -193,19 +251,19 @@ function clearEntryTimer(id: string): void {
     env.clearTimer(handle);
     timers.delete(id);
   }
+  retryNotBefore.delete(id);
 }
 
 function armTimer(id: string, delayMs: number): void {
   clearEntryTimer(id);
+  const delay = Math.max(0, delayMs);
+  retryNotBefore.set(id, env.now() + delay);
   timers.set(
     id,
-    env.setTimer(
-      () => {
-        timers.delete(id);
-        void pendingDeletionStore.finalize(id, "timeout");
-      },
-      Math.max(0, delayMs),
-    ),
+    env.setTimer(() => {
+      timers.delete(id);
+      void pendingDeletionStore.finalize(id, "timeout");
+    }, delay),
   );
 }
 
@@ -215,10 +273,22 @@ function removeEntry(id: string): void {
   queueOrder = queueOrder.filter((entryId) => entryId !== id);
 }
 
+// A failed finalize schedules its own retry; incidental sweeps must respect
+// that schedule instead of racing it. Panels sweep on every mount and panels
+// remount whenever the user browses items, so without this guard ordinary
+// browsing burned the whole MAX_FINALIZE_ATTEMPTS budget in seconds instead of
+// over the intended retry window. Entries with no schedule (rows loaded by the
+// startup sweep) are never held back.
+function isInRetryBackoff(id: string, now: number): boolean {
+  const notBefore = retryNotBefore.get(id);
+  return notBefore !== undefined && notBefore > now;
+}
+
 function serializePayload(entry: PendingDeletionEntry): string {
   if (entry.kind === "conversation") {
     return JSON.stringify({
       conversationKind: entry.conversationKind,
+      catalogCreatedAt: entry.catalogCreatedAt,
       libraryID: entry.libraryID,
       paperItemID: entry.paperItemID,
       providerSessionId: entry.providerSessionId,
@@ -292,8 +362,38 @@ async function persistAttempts(entry: PendingDeletionEntry): Promise<void> {
   }
 }
 
-async function supersedeOthers(keepId: string | null): Promise<void> {
-  const others = queueOrder.filter((id) => id !== keepId);
+// Key-scoped ops answer from these synchronous reads when nothing matches, so
+// they never join the single shared op chain — an unrelated conversation's slow
+// finalize (a codex thread archive can hold the chain for up to its 60s request
+// timeout) must not stall a send in a different chat.
+function hasEntriesForConversation(conversationKey: number): boolean {
+  for (const entry of entries.values()) {
+    if (entry.conversationKey === conversationKey) return true;
+  }
+  return false;
+}
+
+function hasTurnEntriesForConversation(conversationKey: number): boolean {
+  for (const entry of entries.values()) {
+    if (entry.kind === "turn" && entry.conversationKey === conversationKey) {
+      return true;
+    }
+  }
+  return false;
+}
+
+// Supersede is deliberately KIND-SCOPED. A second conversation deletion commits
+// the first (one conversation undo slot), and a second turn deletion commits the
+// first, but a turn deletion must never commit a pending CONVERSATION deletion:
+// they are independent user intents over disjoint data, and the conversation is
+// still inside its undo window. Same rule as finalizeTurnsForConversation.
+async function supersedeOthers(
+  kind: PendingDeletionEntry["kind"],
+  keepId: string | null,
+): Promise<void> {
+  const others = queueOrder.filter(
+    (id) => id !== keepId && entries.get(id)?.kind === kind,
+  );
   for (const id of others) {
     await finalizeInternal(id, "superseded");
   }
@@ -331,19 +431,46 @@ async function finalizeInternal(id: string, reason: string): Promise<boolean> {
     return false;
   }
   let ok = false;
+  let dropped = false;
   try {
-    ok =
+    const outcome =
       entry.kind === "conversation"
         ? await finalizers.finalizeConversation(entry)
         : await finalizers.finalizeTurn(entry);
+    if (typeof outcome === "boolean") {
+      ok = outcome;
+    } else {
+      ok = Boolean(outcome?.ok);
+      dropped = Boolean(outcome?.dropped);
+    }
   } catch (err) {
     env.log("LLM: pending deletion finalize threw", { id, reason, err });
     ok = false;
   }
   if (ok) {
+    // The destructive work is done; a surviving write-ahead row is a live
+    // delete intent that the next startup sweep would replay against whatever
+    // conversation owns the key by then. Same invariant as undo and give-up:
+    // never report completion while the row survives. Attempts are NOT
+    // incremented here — hitting the give-up cap would restore visibility of a
+    // conversation whose rows are already gone, so this retries until the row
+    // is really removed. Any replay is non-destructive: the catalog row is
+    // gone, so the staleness check classifies the entry as stale.
+    try {
+      await deleteRowStrict(id);
+    } catch (err) {
+      env.log(
+        "LLM: failed to withdraw pending-deletion row after finalize; retrying",
+        { id, reason, err },
+      );
+      armTimer(id, FINALIZE_RETRY_DELAY_MS);
+      // Carry `dropped` through: for an intent that was dropped (the chat is
+      // alive), surfaces must not react to this retry by evicting the user.
+      notify({ type: "finalize-failed", entry, dropped });
+      return false;
+    }
     removeEntry(id);
-    await deleteRow(id);
-    notify({ type: "finalized", entry });
+    notify({ type: "finalized", entry, dropped });
     return true;
   }
   entry.attempts += 1;
@@ -372,6 +499,13 @@ async function finalizeInternal(id: string, reason: string): Promise<boolean> {
     notify({ type: "gave-up", entry });
     return false;
   }
+  env.log("LLM: pending deletion finalize failed; scheduling retry", {
+    id,
+    reason,
+    attempts: entry.attempts,
+    maxAttempts: MAX_FINALIZE_ATTEMPTS,
+    retryInMs: FINALIZE_RETRY_DELAY_MS,
+  });
   await persistAttempts(entry);
   armTimer(id, FINALIZE_RETRY_DELAY_MS);
   notify({ type: "finalize-failed", entry });
@@ -418,6 +552,9 @@ function rowToEntry(row: Record<string, unknown>): PendingDeletionEntry | null {
     id,
     kind,
     conversationKind: payload.conversationKind === "paper" ? "paper" : "global",
+    // Absent for rows persisted before the witness existed; 0 makes the
+    // finalize-time check fail closed instead of trusting the recycled key.
+    catalogCreatedAt: Math.floor(Number(payload.catalogCreatedAt || 0)) || 0,
     conversationID:
       typeof row.conversation_id === "string" && row.conversation_id
         ? row.conversation_id
@@ -465,34 +602,67 @@ export const pendingDeletionStore = {
       "id" | "kind" | "queuedAt" | "expiresAt" | "attempts"
     >,
   ): Promise<PendingConversationDeletionEntry | null> {
+    // Retained synchronously at CALL time and released only once the op has
+    // FINISHED. Releasing when the op merely started still left a window as
+    // wide as the DB insert during which the intent was invisible to the
+    // synchronous short-circuits below.
+    retainQueueIntent(input.conversationKey);
     return enqueueOp(async () => {
-      const existing = Array.from(entries.values()).find(
-        (entry) =>
-          entry.kind === "conversation" &&
-          entry.conversationKey === input.conversationKey,
-      ) as PendingConversationDeletionEntry | undefined;
-      if (existing) return existing;
-      const queuedAt = env.now();
-      const entry: PendingConversationDeletionEntry = {
-        ...input,
-        id: generateId(),
-        kind: "conversation",
-        queuedAt,
-        expiresAt: queuedAt + DELETION_UNDO_WINDOW_MS,
-        attempts: 0,
-      };
-      await supersedeOthers(null);
       try {
-        await insertRow(entry);
-      } catch (err) {
-        env.log("LLM: failed to persist pending conversation deletion", err);
-        return null;
+        const catalogCreatedAt = Math.floor(
+          Number(input.catalogCreatedAt || 0),
+        );
+        if (!(catalogCreatedAt > 0)) {
+          // Without a witness the intent could never be proven, at finalize time,
+          // to still target the user's conversation — keys are recycled and
+          // conversation IDs are deterministic. Refuse up front so the caller
+          // reports the failure, instead of persisting a delete intent that can
+          // only ever be dropped or (worse) misapplied.
+          env.log(
+            "LLM: refusing to queue conversation deletion without a catalog identity witness",
+            {
+              conversationKey: input.conversationKey,
+              conversationID: input.conversationID,
+            },
+          );
+          return null;
+        }
+        const existing = Array.from(entries.values()).find(
+          (entry) =>
+            entry.kind === "conversation" &&
+            entry.conversationKey === input.conversationKey,
+        ) as PendingConversationDeletionEntry | undefined;
+        if (existing) return existing;
+        const queuedAt = env.now();
+        const entry: PendingConversationDeletionEntry = {
+          ...input,
+          catalogCreatedAt,
+          id: generateId(),
+          kind: "conversation",
+          queuedAt,
+          expiresAt: queuedAt + DELETION_UNDO_WINDOW_MS,
+          attempts: 0,
+        };
+        // Write-ahead FIRST. Superseding before the insert destroyed the prior
+        // pending deletion even when this queue attempt then failed; a failed
+        // queue must leave every existing pending entry exactly as it was.
+        try {
+          await insertRow(entry);
+        } catch (err) {
+          env.log("LLM: failed to persist pending conversation deletion", err);
+          return null;
+        }
+        entries.set(entry.id, entry);
+        queueOrder.push(entry.id);
+        armTimer(entry.id, entry.expiresAt - env.now());
+        notify({ type: "queued", entry });
+        // Only once the new intent is fully live do we commit the older one, so a
+        // supersede failure can never strand the deletion the user just made.
+        await supersedeOthers("conversation", entry.id);
+        return entry;
+      } finally {
+        releaseQueueIntent(input.conversationKey);
       }
-      entries.set(entry.id, entry);
-      queueOrder.push(entry.id);
-      armTimer(entry.id, entry.expiresAt - env.now());
-      notify({ type: "queued", entry });
-      return entry;
     });
   },
 
@@ -502,38 +672,49 @@ export const pendingDeletionStore = {
       "id" | "kind" | "queuedAt" | "expiresAt" | "attempts"
     >,
   ): Promise<PendingTurnDeletionEntry | null> {
+    // Same contract as queueConversationDeletion: a turn intent must be visible
+    // to finalizeTurnsForConversation's short-circuit from the moment it is
+    // requested, not merely from when its op starts.
+    retainQueueIntent(input.conversationKey);
     return enqueueOp(async () => {
-      const existing = Array.from(entries.values()).find(
-        (entry) =>
-          entry.kind === "turn" &&
-          entry.conversationKey === input.conversationKey &&
-          entry.userTimestamp === Math.floor(input.userTimestamp) &&
-          entry.assistantTimestamp === Math.floor(input.assistantTimestamp),
-      ) as PendingTurnDeletionEntry | undefined;
-      if (existing) return existing;
-      const queuedAt = env.now();
-      const entry: PendingTurnDeletionEntry = {
-        ...input,
-        userTimestamp: Math.floor(input.userTimestamp),
-        assistantTimestamp: Math.floor(input.assistantTimestamp),
-        id: generateId(),
-        kind: "turn",
-        queuedAt,
-        expiresAt: queuedAt + DELETION_UNDO_WINDOW_MS,
-        attempts: 0,
-      };
-      await supersedeOthers(null);
       try {
-        await insertRow(entry);
-      } catch (err) {
-        env.log("LLM: failed to persist pending turn deletion", err);
-        return null;
+        const existing = Array.from(entries.values()).find(
+          (entry) =>
+            entry.kind === "turn" &&
+            entry.conversationKey === input.conversationKey &&
+            entry.userTimestamp === Math.floor(input.userTimestamp) &&
+            entry.assistantTimestamp === Math.floor(input.assistantTimestamp),
+        ) as PendingTurnDeletionEntry | undefined;
+        if (existing) return existing;
+        const queuedAt = env.now();
+        const entry: PendingTurnDeletionEntry = {
+          ...input,
+          userTimestamp: Math.floor(input.userTimestamp),
+          assistantTimestamp: Math.floor(input.assistantTimestamp),
+          id: generateId(),
+          kind: "turn",
+          queuedAt,
+          expiresAt: queuedAt + DELETION_UNDO_WINDOW_MS,
+          attempts: 0,
+        };
+        // Write-ahead FIRST (see queueConversationDeletion), and supersede only
+        // other TURN entries — a turn deletion must never commit a conversation
+        // deletion that is still undoable.
+        try {
+          await insertRow(entry);
+        } catch (err) {
+          env.log("LLM: failed to persist pending turn deletion", err);
+          return null;
+        }
+        entries.set(entry.id, entry);
+        queueOrder.push(entry.id);
+        armTimer(entry.id, entry.expiresAt - env.now());
+        notify({ type: "queued", entry });
+        await supersedeOthers("turn", entry.id);
+        return entry;
+      } finally {
+        releaseQueueIntent(input.conversationKey);
       }
-      entries.set(entry.id, entry);
-      queueOrder.push(entry.id);
-      armTimer(entry.id, entry.expiresAt - env.now());
-      notify({ type: "queued", entry });
-      return entry;
     });
   },
 
@@ -549,6 +730,15 @@ export const pendingDeletionStore = {
     conversationKey: number,
     reason: string,
   ): Promise<boolean> {
+    // Nothing queued for this key: answer without joining the shared chain.
+    // Same answer the queued path gives ("no matching entries counts as
+    // finalized"), without inheriting an unrelated conversation's latency.
+    if (
+      !hasUnrecordedQueueIntent(conversationKey) &&
+      !hasEntriesForConversation(conversationKey)
+    ) {
+      return Promise.resolve(true);
+    }
     return enqueueOp(async () => {
       const matching = Array.from(entries.values()).filter(
         (entry) => entry.conversationKey === conversationKey,
@@ -571,6 +761,14 @@ export const pendingDeletionStore = {
     conversationKey: number,
     reason: string,
   ): Promise<boolean> {
+    // See finalizeForConversation: no pending turns means no work, and the user
+    // path must not queue behind another conversation's finalize.
+    if (
+      !hasUnrecordedQueueIntent(conversationKey) &&
+      !hasTurnEntriesForConversation(conversationKey)
+    ) {
+      return Promise.resolve(true);
+    }
     return enqueueOp(async () => {
       const matching = Array.from(entries.values()).filter(
         (entry) =>
@@ -592,6 +790,17 @@ export const pendingDeletionStore = {
   // could not be withdrawn — callers must abort rather than write into a chat
   // whose write-ahead deletion row survives.
   restoreConversationDeletionsFor(conversationKey: number): Promise<boolean> {
+    // Nothing to withdraw AND no deletion intent still waiting to be recorded:
+    // answer without joining the shared chain. The counter is what makes this
+    // safe — a queue op that has been requested but not yet run would not be
+    // visible in `entries`, and skipping the chain would let the caller write
+    // into a chat that is about to be hidden.
+    if (
+      !hasUnrecordedQueueIntent(conversationKey) &&
+      !pendingDeletionStore.isConversationPendingDeletion(conversationKey)
+    ) {
+      return Promise.resolve(true);
+    }
     return enqueueOp(async () => {
       const matching = Array.from(entries.values()).filter(
         (entry) =>
@@ -613,7 +822,27 @@ export const pendingDeletionStore = {
     return (lastId && entries.get(lastId)) || null;
   },
 
+  // Conversation and turn deletions can now be pending at the same time. A
+  // surface that renders only one of them (the standalone window's conversation
+  // toast) must fall back to the newest entry of THAT kind rather than going
+  // blank because a turn deletion happens to be newer.
+  getLatestPendingOfKind<K extends PendingDeletionEntry["kind"]>(
+    kind: K,
+  ): Extract<PendingDeletionEntry, { kind: K }> | null {
+    for (let i = queueOrder.length - 1; i >= 0; i--) {
+      const entry = entries.get(queueOrder[i]);
+      if (entry && entry.kind === kind) {
+        return entry as Extract<PendingDeletionEntry, { kind: K }>;
+      }
+    }
+    return null;
+  },
+
+  // Includes intents that have been REQUESTED but are not yet recorded, so
+  // callers guarding destructive/adopting behaviour (fresh-draft reuse, the
+  // created_at touch) cannot act inside the insert window.
   isConversationPendingDeletion(conversationKey: number): boolean {
+    if (hasUnrecordedQueueIntent(conversationKey)) return true;
     for (const entry of entries.values()) {
       if (
         entry.kind === "conversation" &&
@@ -694,7 +923,7 @@ export const pendingDeletionStore = {
     return enqueueOp(async () => {
       const now = env.now();
       const expired = Array.from(entries.values()).filter(
-        (entry) => entry.expiresAt <= now,
+        (entry) => entry.expiresAt <= now && !isInRetryBackoff(entry.id, now),
       );
       for (const entry of expired) {
         await finalizeInternal(entry.id, reason);

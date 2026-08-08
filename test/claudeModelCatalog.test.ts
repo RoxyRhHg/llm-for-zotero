@@ -316,3 +316,79 @@ describe("Claude Code model catalog", function () {
     );
   });
 });
+
+describe("Claude Code model catalog request bounding", function () {
+  it("fails with an actionable error instead of hanging forever when the bridge never answers", async function () {
+    // Blocker: the fetch had no timeout, so a wedged Claude CLI (stale auth)
+    // left the preferences model picker and the panel model menu disabled with
+    // no reachable Retry for the life of the window.
+    let settled = false;
+    const neverSettles = () => new Promise<Response>(() => {});
+    const promise = fetchClaudeModelCatalog({
+      bridgeUrl: "http://127.0.0.1:19787",
+      settingSources: ["user"],
+      timeoutMs: 20,
+      fetchImpl: neverSettles as unknown as typeof fetch,
+    });
+    void promise.then(
+      () => {
+        settled = true;
+      },
+      () => {
+        settled = true;
+      },
+    );
+    let message = "";
+    try {
+      await promise;
+      assert.fail("the request must not resolve");
+    } catch (err) {
+      message = (err as Error).message;
+    }
+    assert.isTrue(settled, "the request must settle rather than hang");
+    assert.include(message, "did not return the model list");
+    // Must not read as "bridge not running": the bridge answered the
+    // connection, it just never replied.
+    assert.notInclude(message.toLowerCase(), "fetch failed");
+    assert.notInclude(message.toLowerCase(), "econnrefused");
+  });
+
+  it("returns the catalog normally when the bridge answers in time", async function () {
+    const catalog = await fetchClaudeModelCatalog({
+      bridgeUrl: "http://127.0.0.1:19787",
+      settingSources: ["user"],
+      timeoutMs: 5_000,
+      fetchImpl: (async () => ({
+        ok: true,
+        status: 200,
+        json: async () => ({
+          modelInfos: [{ value: "claude-sonnet-5", displayName: "Sonnet 5" }],
+        }),
+      })) as unknown as typeof fetch,
+    });
+    assert.lengthOf(catalog.models, 1);
+    assert.equal(catalog.models[0]!.value, "claude-sonnet-5");
+    assert.isFalse(catalog.legacy);
+  });
+
+  it("does not leave the timer armed after a fast success", async function () {
+    // A leaked timer would keep the Zotero window alive; clearTimeout runs in
+    // a finally so the race cannot outlive the request.
+    const before = Date.now();
+    await fetchClaudeModelCatalog({
+      bridgeUrl: "http://127.0.0.1:19787",
+      settingSources: ["user"],
+      timeoutMs: 60_000,
+      fetchImpl: (async () => ({
+        ok: true,
+        status: 200,
+        json: async () => ({ models: ["sonnet"] }),
+      })) as unknown as typeof fetch,
+    });
+    assert.isBelow(
+      Date.now() - before,
+      5_000,
+      "a success must not wait for the timeout",
+    );
+  });
+});

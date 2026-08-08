@@ -1321,7 +1321,10 @@ export function setupHandlers(
     userTimestamp: number;
     assistantTimestamp: number;
   }) => Promise<void> = async () => {};
-  let finalizePendingDeletionsForConversation: (
+  let finalizePendingTurnDeletionsForConversation: (
+    conversationKey: number,
+  ) => Promise<boolean> = async () => true;
+  let restorePendingConversationDeletionsFor: (
     conversationKey: number,
   ) => Promise<boolean> = async () => true;
   let closePaperPicker = () => {};
@@ -4720,8 +4723,10 @@ export function setupHandlers(
   }
   forkConversationFromTurn =
     historyLifecycleController.forkConversationFromTurn;
-  finalizePendingDeletionsForConversation =
-    historyLifecycleController.finalizePendingDeletionsForConversation;
+  finalizePendingTurnDeletionsForConversation =
+    historyLifecycleController.finalizePendingTurnDeletionsForConversation;
+  restorePendingConversationDeletionsFor =
+    historyLifecycleController.restorePendingConversationDeletionsFor;
   resetHistorySearchState = historyLifecycleController.resetHistorySearchState;
 
   const switchRuntimeSystemFromControl = async (
@@ -6864,8 +6869,10 @@ export function setupHandlers(
     setCancelledRequestId,
     setPendingRequestId,
     setAbortController,
-    finalizePendingDeletionsForConversation: (conversationKey) =>
-      finalizePendingDeletionsForConversation(conversationKey),
+    finalizePendingTurnDeletionsForConversation: (conversationKey) =>
+      finalizePendingTurnDeletionsForConversation(conversationKey),
+    restorePendingConversationDeletionsFor: (conversationKey) =>
+      restorePendingConversationDeletionsFor(conversationKey),
     validateConversationScope: async (conversationKey) => {
       if (!item) return true;
       const conversationSystem = resolveConversationSystemForItem(item);

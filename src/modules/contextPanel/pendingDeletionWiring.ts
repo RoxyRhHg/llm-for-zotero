@@ -1,4 +1,7 @@
-import { configurePendingDeletionFinalizers } from "../../core/conversations/pendingDeletionStore";
+import {
+  configurePendingDeletionFinalizers,
+  setPendingDeletionStoreLogger,
+} from "../../core/conversations/pendingDeletionStore";
 import {
   finalizeQueuedConversationDeletion,
   finalizeQueuedTurnDeletion,
@@ -31,6 +34,11 @@ function safeLog(message: string, ...args: unknown[]): void {
 export function configurePendingDeletionSubsystem(): void {
   if (configured) return;
   configured = true;
+  // The store's default logger is a no-op, so in production every queue
+  // failure, retry and give-up was silent while the UI told the user to
+  // "Check logs". Only the logger is replaced — the store keeps its default
+  // main-window-bound timers.
+  setPendingDeletionStoreLogger(safeLog);
   const scheduleAttachmentGc = () => {
     void collectAndDeleteUnreferencedBlobs(ATTACHMENT_GC_MIN_AGE_MS).catch(
       (err) => safeLog("LLM: attachment GC after queued deletion failed", err),

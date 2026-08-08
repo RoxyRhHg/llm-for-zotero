@@ -395,6 +395,37 @@ function getAbortControllerCtor(): new () => AbortController {
   );
 }
 
+// Committing hidden turns is best effort: prompt, retry-target, render and
+// history-search correctness all come from filterMessagesInPendingTurns, which
+// reads the store's in-memory entries synchronously and does not depend on the
+// finalize completing. The store serializes every op on one chain, so a slow
+// finalize belonging to an UNRELATED conversation would otherwise hold this
+// user action for as long as its provider call takes (a codex thread archive
+// can run to its 60s request timeout). Bound the wait and move on; the entry
+// stays queued and hidden, and its own retry timer finalizes it.
+// AbortController is not reliably available under Gecko, so this uses the
+// repo's Promise.race + setTimeout/clearTimeout idiom.
+const PENDING_TURN_FINALIZE_WAIT_MS = 3_000;
+
+async function awaitPendingTurnFinalize(
+  finalize: Promise<boolean>,
+): Promise<void> {
+  let timeoutId: ReturnType<typeof setTimeout> | undefined;
+  try {
+    await Promise.race([
+      finalize.then(
+        () => undefined,
+        () => undefined,
+      ),
+      new Promise<void>((resolve) => {
+        timeoutId = setTimeout(resolve, PENDING_TURN_FINALIZE_WAIT_MS);
+      }),
+    ]);
+  } finally {
+    if (timeoutId !== undefined) clearTimeout(timeoutId);
+  }
+}
+
 const blockedConversationLoadKeys = new Set<number>();
 
 function isEffectiveWebChatRequest(item: Zotero.Item): boolean {
@@ -6645,11 +6676,10 @@ export async function editLatestUserMessageAndRetry(
   const conversationKey = getConversationKey(item);
   // Retry must act on the state the user SEES: complete any pending turn
   // deletion first so the hidden turn cannot be the retry target. finalize is
-  // best-effort — on failure the turn stays queued, so select the target from
-  // the filtered (user-visible) view.
-  await pendingDeletionStore.finalizeTurnsForConversation(
-    conversationKey,
-    "retry",
+  // best-effort and time-boxed — on failure or timeout the turn stays queued,
+  // so select the target from the filtered (user-visible) view.
+  await awaitPendingTurnFinalize(
+    pendingDeletionStore.finalizeTurnsForConversation(conversationKey, "retry"),
   );
   // Editing a turn means the user wants this chat alive: restore a pending
   // conversation deletion instead of letting it commit underneath the edit.
@@ -6977,11 +7007,11 @@ export async function retryLatestAssistantResponse(
   const conversationKey = getConversationKey(item);
   // Retry must act on the state the user SEES: complete any pending turn
   // deletion first so the hidden turn cannot be the retry target. finalize is
-  // best-effort — on failure the turn stays queued, so select the target and
-  // build the prompt from the filtered (user-visible) view.
-  await pendingDeletionStore.finalizeTurnsForConversation(
-    conversationKey,
-    "retry",
+  // best-effort and time-boxed — on failure or timeout the turn stays queued,
+  // so select the target and build the prompt from the filtered
+  // (user-visible) view.
+  await awaitPendingTurnFinalize(
+    pendingDeletionStore.finalizeTurnsForConversation(conversationKey, "retry"),
   );
   // A retry means the user wants this chat alive: restore a pending
   // conversation deletion instead of letting it commit underneath the retry.
@@ -7740,9 +7770,8 @@ export async function editUserTurnAndRetry(opts: {
   // first. history stays RAW below on purpose — truncation after the edited
   // pair must also purge hidden trailing pairs and their rows; a preceding
   // hidden pair is excluded from the prompt by the delegated retry path.
-  await pendingDeletionStore.finalizeTurnsForConversation(
-    conversationKey,
-    "edit",
+  await awaitPendingTurnFinalize(
+    pendingDeletionStore.finalizeTurnsForConversation(conversationKey, "edit"),
   );
   // An edit means the user wants this chat alive: restore a pending
   // conversation deletion instead of letting it commit underneath the edit.
@@ -8655,9 +8684,11 @@ async function retryLatestAgentResponse(
   // entries only — a pending conversation deletion is the callers' concern.
   const agentRetryConversationKey = getConversationKey(item);
   if (agentRetryConversationKey) {
-    await pendingDeletionStore.finalizeTurnsForConversation(
-      agentRetryConversationKey,
-      "retry",
+    await awaitPendingTurnFinalize(
+      pendingDeletionStore.finalizeTurnsForConversation(
+        agentRetryConversationKey,
+        "retry",
+      ),
     );
   }
   await initAgentSubsystem();
@@ -8783,9 +8814,8 @@ export async function sendQuestion(
     // the hidden turn is neither included in the prompt nor resurrected later.
     const pendingKey = getConversationKey(item);
     if (pendingKey) {
-      await pendingDeletionStore.finalizeTurnsForConversation(
-        pendingKey,
-        "send",
+      await awaitPendingTurnFinalize(
+        pendingDeletionStore.finalizeTurnsForConversation(pendingKey, "send"),
       );
       // A send also means the user is actively continuing THIS chat: a still-
       // undoable conversation deletion (queued from another mount of the same

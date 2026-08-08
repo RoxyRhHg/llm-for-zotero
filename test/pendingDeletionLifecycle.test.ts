@@ -174,6 +174,8 @@ function conversationInput(key: number) {
   return {
     conversationKind: "global" as const,
     conversationID: `lfz:test:upstream:global:lib-1:paper-0:legacy-${key}`,
+    // Identity witness captured at queue time; queueing is refused without one.
+    catalogCreatedAt: 1_700_000_000_000,
     conversationKey: key,
     libraryID: 1,
     system: "upstream" as const,

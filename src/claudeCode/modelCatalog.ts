@@ -5,6 +5,14 @@ const CLAUDE_RUNTIME_ENTRY_PREFIX = "claude_runtime";
 const CLAUDE_RUNTIME_PROVIDER_LABEL = "Claude Code";
 export const CLAUDE_CUSTOMIZED_MODEL_OPTION_KEY = "customized";
 
+// The bridge answers GET /models by spawning an SDK session and asking the
+// Claude CLI for its catalog, so a cold start can legitimately take several
+// seconds; the bound is generous on purpose. It exists only so a wedged CLI
+// (stale auth is the realistic trigger) cannot pin the request — and with it
+// the preferences model picker and the panel model menu, both of which disable
+// their controls for the duration — forever.
+export const CLAUDE_MODEL_CATALOG_REQUEST_TIMEOUT_MS = 20_000;
+
 export type ClaudeModelCatalogEntry = {
   value: string;
   resolvedModel?: string;
@@ -34,6 +42,7 @@ export type FetchClaudeModelCatalogParams = {
   settingSources: readonly string[] | string;
   context?: ClaudeModelCatalogRequestContext;
   forceRefresh?: boolean;
+  timeoutMs?: number;
   fetchImpl?: typeof fetch;
 };
 
@@ -172,6 +181,7 @@ export async function fetchClaudeModelCatalog({
   settingSources,
   context,
   forceRefresh = false,
+  timeoutMs = CLAUDE_MODEL_CATALOG_REQUEST_TIMEOUT_MS,
   fetchImpl = fetch,
 }: FetchClaudeModelCatalogParams): Promise<ClaudeModelCatalog> {
   const baseUrl = normalizeBridgeUrl(bridgeUrl);
@@ -194,14 +204,42 @@ export async function fetchClaudeModelCatalog({
     if (scopeLabel) query.set("scopeLabel", scopeLabel);
   }
   if (forceRefresh) query.set("refresh", "1");
-  const response = await fetchImpl(`${baseUrl}/models?${query}`, {
-    method: "GET",
-    headers: { Accept: "application/json" },
+  // Gecko has no dependable AbortController, so the whole request is bounded
+  // the way the rest of the codebase bounds work (runCommand, zoteroScript,
+  // codexAppServerProcess): race it against a timer and clear the timer on
+  // settle. The body read is inside the race too — a bridge that sends headers
+  // but never finishes the body is the same hang to the caller.
+  const requestPromise = (async () => {
+    const response = await fetchImpl(`${baseUrl}/models?${query}`, {
+      method: "GET",
+      headers: { Accept: "application/json" },
+    });
+    if (!response.ok) {
+      throw new Error(`Bridge HTTP ${response.status}`);
+    }
+    return normalizeClaudeModelCatalog(await response.json());
+  })();
+  let timeoutHandle: ReturnType<typeof setTimeout> | undefined;
+  const timeoutPromise = new Promise<"timeout">((resolve) => {
+    timeoutHandle = setTimeout(() => resolve("timeout"), timeoutMs);
   });
-  if (!response.ok) {
-    throw new Error(`Bridge HTTP ${response.status}`);
+  let raceResult: ClaudeModelCatalog | "timeout";
+  try {
+    raceResult = await Promise.race([requestPromise, timeoutPromise]);
+  } finally {
+    if (timeoutHandle !== undefined) clearTimeout(timeoutHandle);
   }
-  return normalizeClaudeModelCatalog(await response.json());
+  if (raceResult === "timeout") {
+    // Kept free of the network-error tokens formatBridgeUserError matches on
+    // (fetch failed / NetworkError / ECONNREFUSED / ETIMEDOUT / aborted):
+    // those cases drop the message and show only the generic "bridge not
+    // running" hint, which is the wrong diagnosis for a bridge that accepted
+    // the connection but never answered.
+    throw new Error(
+      `Claude Code bridge did not return the model list within ${timeoutMs}ms. Make sure the bridge service is running and your Claude Code login is still valid, then retry.`,
+    );
+  }
+  return raceResult;
 }
 
 export function buildClaudeModelPreferenceOptions(

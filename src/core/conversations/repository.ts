@@ -1,3 +1,4 @@
+import { pendingDeletionStore } from "./pendingDeletionStore";
 import {
   createClaudeGlobalConversation,
   createClaudePaperConversation,
@@ -104,6 +105,11 @@ export type ConversationCatalogEntry = {
   cwd?: string;
   model?: string;
   effort?: string;
+};
+
+export type ConversationCatalogIdentityWitness = {
+  catalogCreatedAt: number;
+  conversationID: string;
 };
 
 export type ConversationCatalogScope = {
@@ -480,6 +486,33 @@ export const conversationRepository = {
       );
     }
     return null;
+  },
+
+  // Conversation keys are recycled and conversation IDs are a deterministic
+  // hash of the scope, so a recycled key reproduces a byte-identical ID.
+  // Neither can prove that the row a queued deletion is about to destroy is the
+  // row the user asked to delete; only the catalog row's own createdAt, which a
+  // re-created row never inherits, can. Returns null when no witness can be
+  // read — callers must treat that as "unverifiable", never as "proceed".
+  async getCatalogIdentityWitness(
+    target: ConversationCatalogMutationTarget,
+  ): Promise<ConversationCatalogIdentityWitness | null> {
+    try {
+      const entry = await conversationRepository.getCatalogEntry(target);
+      if (!entry) return null;
+      const catalogCreatedAt = normalizeTimestamp(entry.createdAt);
+      if (!catalogCreatedAt) return null;
+      return {
+        catalogCreatedAt,
+        conversationID:
+          typeof entry.conversationID === "string"
+            ? entry.conversationID.trim()
+            : "",
+      };
+    } catch {
+      // A witness that cannot be read is not a witness.
+      return null;
+    }
   },
 
   async loadMessages(
@@ -976,6 +1009,15 @@ export const conversationRepository = {
   ): Promise<void> {
     const conversationKey = normalizePositiveInt(target.conversationKey);
     if (!conversationKey) return;
+    // The upstream variants of this touch rewrite created_at, which is the
+    // immutable identity witness a queued deletion is verified against. Moving
+    // it would make the finalizer classify the user's own deletion as "stale"
+    // and silently abandon it, so a conversation awaiting deletion is never
+    // touched. (Nothing should be adopting such a conversation anyway — see
+    // resolveFreshConversationDraft — this is the backstop.)
+    if (pendingDeletionStore.isConversationPendingDeletion(conversationKey)) {
+      return;
+    }
     const timestamp = normalizeTimestamp(target.timestamp, Date.now());
     if (target.system === "claude_code" || target.system === "codex") {
       const entry = await conversationRepository.getCatalogEntry(target);

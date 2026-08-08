@@ -105,84 +105,216 @@ describe("finalizeQueuedConversationDeletion stale-intent guards", function () {
       title: "Chat",
       wasActive: false,
       queuedAt: 1_000,
+      // Identity witness captured when the deletion was queued. The catalog
+      // row's createdAt must still match this exactly at finalize time.
+      catalogCreatedAt: 500,
       expiresAt: 7_000,
       attempts: 0,
       ...overrides,
     };
   }
 
-  it("drops a stale intent when the key is now registered to a different conversation", async function () {
-    const destructive: string[] = [];
+  // Builds a Zotero.DB stub whose catalog SELECT returns one global-conversation
+  // row (or none), recording every destructive statement it is asked to run.
+  function installDb(options: {
+    catalogRow?: {
+      conversationID?: string;
+      createdAt: number;
+    } | null;
+    catalogThrows?: boolean;
+    registryRows?: () => unknown[];
+    destructive: string[];
+  }) {
     globalScope.Zotero = {
       ...(originalZotero || {}),
       DB: {
         queryAsync: async (sql: string) => {
+          const isSelect = sql.trimStart().toUpperCase().startsWith("SELECT");
           if (sql.includes("llm_for_zotero_conversation_registry")) {
-            if (sql.trimStart().toUpperCase().startsWith("SELECT")) {
-              return [
-                {
-                  conversationID: "lfz:other:owner",
-                  conversationKey: 2_000_000_777,
-                  system: "upstream",
-                  kind: "global",
-                  profile_signature: "sig",
-                  libraryID: 1,
-                  paperItemID: null,
-                  valid: 1,
-                  invalidReason: null,
-                },
-              ];
-            }
+            if (isSelect) return options.registryRows?.() ?? [];
             return [];
           }
-          if (sql.includes("DELETE")) destructive.push(sql);
+          if (isSelect && sql.includes("llm_for_zotero_global_conversations")) {
+            if (options.catalogThrows) throw new Error("db locked");
+            if (!options.catalogRow) return [];
+            return [
+              {
+                conversationID: options.catalogRow.conversationID ?? "",
+                conversationKey: 2_000_000_777,
+                libraryID: 1,
+                sessionVersion: 1,
+                createdAt: options.catalogRow.createdAt,
+                title: "Chat",
+                lastActivityAt: options.catalogRow.createdAt + 10,
+                userTurnCount: 1,
+              },
+            ];
+          }
+          if (sql.includes("DELETE")) options.destructive.push(sql);
           return [];
         },
         executeTransaction: async (fn: () => Promise<unknown>) => fn(),
       },
     };
+  }
+
+  // DROPPED = the row was withdrawn and the conversation is still ALIVE (we
+  // never deleted anything), so surfaces must not tombstone it or evict the
+  // user from it.
+  function assertDroppedAlive(result: unknown, message: string) {
+    assert.deepEqual(result, { ok: true, dropped: true }, message);
+  }
+
+  // COMPLETED = the queued conversation is genuinely gone (nothing owns the key,
+  // or the key belongs to a different conversation now). Surfaces must treat it
+  // as a real deletion — restoring anyone onto this key is what resurrected
+  // deleted chats as empty "New chat" rows.
+  function assertCompletedGone(result: unknown, message: string) {
+    assert.strictEqual(result, true, message);
+  }
+
+  it("never destroys the key's new owner: a re-created catalog row under the same key is dropped", async function () {
+    // The regression test for the wrong-conversation-deletion blocker. The
+    // conversationID is byte-identical (it is a deterministic hash of the
+    // scope, and the key was recycled), so ONLY the createdAt witness can tell
+    // these two conversations apart.
+    const destructive: string[] = [];
+    installDb({
+      catalogRow: { conversationID: "lfz:original:owner", createdAt: 9_000 },
+      registryRows: () => [
+        {
+          conversationID: "lfz:original:owner",
+          conversationKey: 2_000_000_777,
+          system: "upstream",
+          kind: "global",
+          profileSignature: "profile-default",
+          libraryID: 1,
+          paperItemID: null,
+          valid: 1,
+          invalidReason: null,
+        },
+      ],
+      destructive,
+    });
+    const ok = await finalizeQueuedConversationDeletion(
+      baseEntry({
+        conversationID: "lfz:original:owner",
+        catalogCreatedAt: 500,
+      }) as never,
+    );
+    assertCompletedGone(
+      ok,
+      "the key belongs to another conversation now — not a survival",
+    );
+    assert.lengthOf(
+      destructive,
+      0,
+      "the conversation that now owns the recycled key must not be touched",
+    );
+  });
+
+  it("proceeds when the catalog identity witness still matches", async function () {
+    // Guards against the fix over-blocking legitimate deletions.
+    const destructive: string[] = [];
+    installDb({
+      catalogRow: { conversationID: "lfz:original:owner", createdAt: 500 },
+      registryRows: () => [],
+      destructive,
+    });
+    const ok = await finalizeQueuedConversationDeletion(
+      baseEntry({
+        conversationID: "lfz:original:owner",
+        catalogCreatedAt: 500,
+      }) as never,
+    );
+    assert.isTrue(ok, "a verified intent must complete");
+    assert.isAbove(
+      destructive.length,
+      0,
+      "a verified deletion must actually delete the conversation's rows",
+    );
+  });
+
+  it("drops the intent when no catalog row owns the key any more", async function () {
+    const destructive: string[] = [];
+    installDb({ catalogRow: null, destructive });
     const ok = await finalizeQueuedConversationDeletion(
       baseEntry({ conversationID: "lfz:original:owner" }) as never,
     );
-    assert.isTrue(ok, "stale intent must be treated as complete (drop row)");
+    assertCompletedGone(
+      ok,
+      "a key with no catalog row leaves nothing to delete",
+    );
+    assert.lengthOf(destructive, 0);
+  });
+
+  it("drops an intent persisted without an identity witness (older build)", async function () {
+    // Rows written before the witness existed can never be verified, so they
+    // must fail closed rather than trusting the recycled key.
+    const destructive: string[] = [];
+    installDb({
+      catalogRow: { conversationID: "lfz:original:owner", createdAt: 500 },
+      destructive,
+    });
+    const ok = await finalizeQueuedConversationDeletion(
+      baseEntry({
+        conversationID: "lfz:original:owner",
+        catalogCreatedAt: 0,
+      }) as never,
+    );
+    assertDroppedAlive(ok, "nothing was deleted, so the chat is still alive");
+    assert.lengthOf(destructive, 0);
+  });
+
+  it("defers when the catalog read throws", async function () {
+    const destructive: string[] = [];
+    installDb({ catalogThrows: true, destructive });
+    const ok = await finalizeQueuedConversationDeletion(
+      baseEntry({ conversationID: "lfz:original:owner" }) as never,
+    );
+    assert.isFalse(ok, "unverifiable ownership must defer for retry");
+    assert.lengthOf(destructive, 0);
+  });
+
+  it("drops a stale intent when the key is now registered to a different conversation", async function () {
+    // The catalog witness AND the catalog conversation id both match, so the
+    // registry branch is genuinely reached rather than short-circuited.
+    const destructive: string[] = [];
+    installDb({
+      catalogRow: { conversationID: "lfz:original:owner", createdAt: 500 },
+      registryRows: () => [
+        {
+          conversationID: "lfz:other:owner",
+          conversationKey: 2_000_000_777,
+          system: "upstream",
+          kind: "global",
+          profileSignature: "profile-default",
+          libraryID: 1,
+          paperItemID: null,
+          valid: 1,
+          invalidReason: null,
+        },
+      ],
+      destructive,
+    });
+    const ok = await finalizeQueuedConversationDeletion(
+      baseEntry({ conversationID: "lfz:original:owner" }) as never,
+    );
+    assertCompletedGone(ok, "the key is owned by another conversation now");
     assert.lengthOf(destructive, 0, "the key's new owner must not be touched");
   });
 
-  it("treats a failed stale-check as retryable instead of proceeding destructively", async function () {
+  it("treats a failed registry stale-check as retryable instead of proceeding destructively", async function () {
     const destructive: string[] = [];
-    let registrySelects = 0;
-    globalScope.Zotero = {
-      ...(originalZotero || {}),
-      DB: {
-        queryAsync: async (sql: string) => {
-          if (sql.includes("llm_for_zotero_conversation_registry")) {
-            if (sql.trimStart().toUpperCase().startsWith("SELECT")) {
-              registrySelects += 1;
-              // The stale-check read fails transiently; every later read
-              // succeeds and reports the key's NEW owner.
-              if (registrySelects === 1) throw new Error("db locked");
-              return [
-                {
-                  conversationID: "lfz:new:owner",
-                  conversationKey: 2_000_000_777,
-                  system: "upstream",
-                  kind: "global",
-                  profileSignature: "profile-default",
-                  libraryID: 1,
-                  paperItemID: null,
-                  valid: 1,
-                  invalidReason: null,
-                },
-              ];
-            }
-            return [];
-          }
-          if (sql.includes("DELETE")) destructive.push(sql);
-          return [];
-        },
-        executeTransaction: async (fn: () => Promise<unknown>) => fn(),
+    installDb({
+      // The catalog witness and conversation id match, so the registry read is
+      // reached; that read fails and ownership cannot be verified.
+      catalogRow: { conversationID: "lfz:original:owner", createdAt: 500 },
+      registryRows: () => {
+        throw new Error("db locked");
       },
-    };
+      destructive,
+    });
     const ok = await finalizeQueuedConversationDeletion(
       baseEntry({ conversationID: "lfz:original:owner" }) as never,
     );
@@ -197,39 +329,20 @@ describe("finalizeQueuedConversationDeletion stale-intent guards", function () {
     );
   });
 
-  it("drops a stale ID-less intent when the catalog row was created after queueing", async function () {
+  it("drops an ID-less intent whose witness no longer matches the catalog row", async function () {
     const destructive: string[] = [];
-    globalScope.Zotero = {
-      ...(originalZotero || {}),
-      DB: {
-        queryAsync: async (sql: string) => {
-          if (
-            sql.trimStart().toUpperCase().startsWith("SELECT") &&
-            sql.includes("llm_for_zotero_global_conversations")
-          ) {
-            return [
-              {
-                conversationID: "",
-                conversationKey: 2_000_000_777,
-                libraryID: 1,
-                sessionVersion: 1,
-                createdAt: 5_000, // AFTER queuedAt 1_000: a NEW conversation
-                title: "New unrelated chat",
-                lastActivityAt: 6_000,
-                userTurnCount: 1,
-              },
-            ];
-          }
-          if (sql.includes("DELETE")) destructive.push(sql);
-          return [];
-        },
-        executeTransaction: async (fn: () => Promise<unknown>) => fn(),
-      },
-    };
+    installDb({
+      // A different conversation owns the key now: same key, newer createdAt.
+      catalogRow: { conversationID: "", createdAt: 5_000 },
+      destructive,
+    });
     const ok = await finalizeQueuedConversationDeletion(
-      baseEntry({ conversationID: undefined }) as never,
+      baseEntry({
+        conversationID: undefined,
+        catalogCreatedAt: 500,
+      }) as never,
     );
-    assert.isTrue(ok);
+    assertCompletedGone(ok, "a witness mismatch means the original is gone");
     assert.lengthOf(destructive, 0);
   });
 });

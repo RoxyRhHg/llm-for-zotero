@@ -14,7 +14,10 @@ import {
   setPendingRequestId,
 } from "./state";
 import { clearConversationSummary as clearConversationSummaryFromCache } from "./conversationSummaryCache";
-import { conversationRepository } from "../../core/conversations/repository";
+import {
+  conversationRepository,
+  type ConversationCatalogEntry,
+} from "../../core/conversations/repository";
 import {
   buildPaperStateKey,
   getLastUsedUpstreamGlobalConversationKey,
@@ -30,6 +33,7 @@ import {
 } from "../../utils/attachmentRefStore";
 import type {
   PendingConversationDeletionEntry,
+  PendingFinalizeOutcome,
   PendingTurnDeletionEntry,
 } from "../../core/conversations/pendingDeletionStore";
 import type { Message } from "./types";
@@ -675,69 +679,127 @@ export async function finalizeConversationDeletion(
 // they must not touch DOM or per-controller state; live panels react to the
 // store's events instead.
 
-// Conversation keys are reusable (MAX+1 allocation), so a stale queued intent
-// must never be allowed to resolve against whatever conversation owns the key
-// NOW. "stale" intents are simply dropped; "unknown" means ownership could not
-// be verified, so nothing destructive may run until a later retry can verify.
+// Conversation keys are reusable (MAX+1 allocation; paper sessions key on the
+// item id) AND conversationIDs are a deterministic hash of the scope, so a
+// recycled key reproduces a byte-identical conversationID. Neither value can
+// prove ownership. The only sound proof is exact equality against the identity
+// witness captured at queue time — the catalog row's createdAt, which a
+// re-created row never inherits. Exact equality is strictly stronger than the
+// old createdAt-vs-queuedAt ordering test and is immune to clock rollback.
+// "stale" intents are simply dropped; "unknown" means ownership could not be
+// verified, so nothing destructive may run until a later retry can verify.
 async function classifyQueuedConversationDeletionStaleness(
   entry: PendingConversationDeletionEntry,
   log?: (message: string, ...args: unknown[]) => void,
-): Promise<"stale" | "fresh" | "unknown"> {
+): Promise<"stale" | "fresh" | "unknown" | "unverifiable"> {
+  const witness = Math.floor(Number(entry.catalogCreatedAt || 0));
+  if (witness <= 0) {
+    // Persisted by a build that recorded no witness. The intent is unverifiable
+    // now and forever, so drop it rather than gamble on whatever conversation
+    // owns the key today. The user's conversation simply reappears and can be
+    // deleted again.
+    log?.("LLM: dropping queued deletion carrying no identity witness", {
+      conversationKey: entry.conversationKey,
+      conversationID: entry.conversationID,
+    });
+    // "unverifiable", NOT "stale": nothing was deleted and the conversation on
+    // this key is still there. Surfaces must not treat this as a deletion.
+    return "unverifiable";
+  }
+  let summary: ConversationCatalogEntry | null = null;
   try {
-    if (entry.conversationID) {
-      const registered = await getRegisteredConversationScope(
-        entry.conversationKey,
-      );
-      if (registered && registered.conversationID !== entry.conversationID) {
-        log?.(
-          "LLM: dropping stale queued deletion — key now owned by another conversation",
-          {
-            conversationKey: entry.conversationKey,
-            queuedConversationID: entry.conversationID,
-            currentConversationID: registered.conversationID,
-          },
-        );
-        return "stale";
-      }
-      return "fresh";
-    }
-    const summary = await conversationRepository.getCatalogEntry({
+    summary = await conversationRepository.getCatalogEntry({
       system: entry.system,
       kind: entry.conversationKind,
       conversationKey: entry.conversationKey,
     });
-    if (
-      summary &&
-      Number(summary.createdAt || 0) > Number(entry.queuedAt || 0)
-    ) {
-      log?.(
-        "LLM: dropping stale queued deletion — conversation was created after the delete was queued",
-        {
-          conversationKey: entry.conversationKey,
-          createdAt: summary.createdAt,
-          queuedAt: entry.queuedAt,
-        },
-      );
-      return "stale";
-    }
-    return "fresh";
   } catch (err) {
     log?.("LLM: stale-deletion check failed; deferring for retry", err);
     return "unknown";
   }
+  if (!summary) {
+    // No catalog row owns the key any more: the queued conversation is already
+    // gone, so there is nothing left to delete — and nothing may be deleted.
+    log?.("LLM: dropping queued deletion — catalog row no longer exists", {
+      conversationKey: entry.conversationKey,
+      conversationID: entry.conversationID,
+    });
+    return "stale";
+  }
+  if (Math.floor(Number(summary.createdAt || 0)) !== witness) {
+    log?.(
+      "LLM: dropping stale queued deletion — the key is owned by a different catalog row now",
+      {
+        conversationKey: entry.conversationKey,
+        queuedCatalogCreatedAt: witness,
+        currentCatalogCreatedAt: summary.createdAt,
+      },
+    );
+    return "stale";
+  }
+  const catalogConversationID = normalizeConversationID(summary.conversationID);
+  if (
+    entry.conversationID &&
+    catalogConversationID &&
+    catalogConversationID !== entry.conversationID
+  ) {
+    log?.(
+      "LLM: dropping stale queued deletion — catalog row carries a different conversation id",
+      {
+        conversationKey: entry.conversationKey,
+        queuedConversationID: entry.conversationID,
+        currentConversationID: catalogConversationID,
+      },
+    );
+    return "stale";
+  }
+  if (entry.conversationID) {
+    let registered: Awaited<ReturnType<typeof getRegisteredConversationScope>> =
+      null;
+    try {
+      registered = await getRegisteredConversationScope(entry.conversationKey);
+    } catch (err) {
+      log?.(
+        "LLM: stale-deletion registry check failed; deferring for retry",
+        err,
+      );
+      return "unknown";
+    }
+    if (registered && registered.conversationID !== entry.conversationID) {
+      log?.(
+        "LLM: dropping stale queued deletion — key now registered to another conversation",
+        {
+          conversationKey: entry.conversationKey,
+          queuedConversationID: entry.conversationID,
+          currentConversationID: registered.conversationID,
+        },
+      );
+      return "stale";
+    }
+  }
+  return "fresh";
 }
 
 export async function finalizeQueuedConversationDeletion(
   entry: PendingConversationDeletionEntry,
   deps: ConversationDeletionDeps = {},
-): Promise<boolean> {
+): Promise<boolean | PendingFinalizeOutcome> {
   const staleness = await classifyQueuedConversationDeletionStaleness(
     entry,
     deps.log,
   );
+  if (staleness === "unverifiable") {
+    // Withdraw the row, but report DROPPED: nothing was deleted, so the chat
+    // the user is looking at is still alive. Surfaces must not tombstone it or
+    // evict the user from it.
+    return { ok: true, dropped: true };
+  }
   if (staleness === "stale") {
-    // Treat as complete: the originally queued conversation is already gone
-    // and the row must not be retried against the key's new owner.
+    // The queued conversation is genuinely gone (no catalog row owns the key,
+    // or the key now belongs to a different conversation). Report a plain
+    // completion: surfaces must NOT restore anyone onto this key — that is how
+    // a deleted chat came back as an empty "New chat" — and the write-ahead row
+    // must not be retried against the key's new owner.
     return true;
   }
   if (staleness === "unknown") {
@@ -779,7 +841,19 @@ export async function finalizeQueuedConversationDeletion(
         issue.code === "message_rows" ||
         issue.code === "catalog_row",
     );
-  if (retrySafe) return false;
+  if (retrySafe) {
+    // The individual issues were logged as they were recorded, but nothing
+    // recorded the DECISION. Without it the log cannot distinguish "deferred,
+    // will retry" from "gave up", which is exactly what the user's
+    // "Failed to fully delete conversation. Check logs." toast points at.
+    deps.log?.("LLM: queued conversation deletion deferred; will retry", {
+      conversationKey: entry.conversationKey,
+      conversationID: entry.conversationID,
+      blocked: result.blocked,
+      errors: result.errors,
+    });
+    return false;
+  }
   deps.log?.(
     "LLM: queued conversation deletion completed with cleanup errors",
     result.errors,

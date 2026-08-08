@@ -39,6 +39,21 @@ describe("normalizeBlockBoundaries", function () {
       assert.include(result, "[1]\n\n#### Subsection");
     });
 
+    it("inserts newline before ##### mid-line", function () {
+      // The repair regex was capped at #{1,4} while the rest of the module
+      // recognizes #{1,6}, so a mid-line h5 was never split and rendered as
+      // literal "##### " text inside the paragraph.
+      const input = "as discussed above. ##### Implementation Details";
+      const result = normalizeBlockBoundaries(input);
+      assert.include(result, "above.\n\n##### Implementation Details");
+    });
+
+    it("inserts newline before ###### mid-line", function () {
+      const input = "see below. ###### Deepest Subsection";
+      const result = normalizeBlockBoundaries(input);
+      assert.include(result, "below.\n\n###### Deepest Subsection");
+    });
+
     it("preserves header at line start (no extra newline)", function () {
       const input = "### Already at line start";
       const result = normalizeBlockBoundaries(input);

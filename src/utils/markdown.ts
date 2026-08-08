@@ -1110,9 +1110,9 @@ function splitIntoBlocks(text: string): TextBlock[] {
  * (headers, blockquotes) that the model emitted mid-line —
  * e.g. `...drift. (Zheng et al., 2026) ### 2. In the Results`
  *
- * For headers (`#{1,4} `): triggers whenever the marker appears mid-line
+ * For headers (`#{1,6} `): triggers whenever the marker appears mid-line
  * after any non-newline character followed by whitespace.  Multi-hash
- * headers (`## `, `### `, `#### `) are unambiguous markers that virtually
+ * headers (`## ` through `###### `) are unambiguous markers that virtually
  * never appear as legitimate inline text.
  *
  * For blockquotes (`> `): triggers only after unambiguous sentence-ending
@@ -1124,12 +1124,14 @@ function splitIntoBlocks(text: string): TextBlock[] {
 export function normalizeBlockBoundaries(text: string): string {
   let result = text;
 
-  // Header markers (#{1,4} ) mid-line after any content + whitespace.
-  // Safe because #{1,4} followed by a space is an unambiguous header marker
+  // Header markers (#{1,6} ) mid-line after any content + whitespace.
+  // Safe because #{1,6} followed by a space is an unambiguous header marker
   // and almost never appears as inline text outside code blocks (which are
-  // already extracted before this function is called).
+  // already extracted before this function is called). The depth must match
+  // the #{1,6} the rest of this module recognizes — a narrower bound here left
+  // a mid-line h5/h6 unsplit, so it rendered as literal "##### " text.
   result = result.replace(
-    /([^\n])([ \t]+)(#{1,4} )/g,
+    /([^\n])([ \t]+)(#{1,6} )/g,
     (match, before: string, spaces: string, marker: string, offset: number) => {
       const markerIndex = offset + before.length + spaces.length;
       return isInsidePipeTableCell(result, markerIndex)
