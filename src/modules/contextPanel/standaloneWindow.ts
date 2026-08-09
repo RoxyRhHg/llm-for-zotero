@@ -3903,7 +3903,11 @@ export function openStandaloneChat(options?: {
       for (const system of RUNTIME_CONVERSATION_SYSTEMS) {
         standaloneRuntimeSystemControls.buttons[system].addEventListener(
           "click",
-          () => {
+          (event) => {
+            event.preventDefault();
+            // A rebuilt standalone shell must never let duplicate listeners
+            // turn one physical click into two runtime toggles.
+            event.stopImmediatePropagation();
             if (cancelled || newWin.closed || isInWebChatMode) return;
             void switchConversationSystem(
               resolveRuntimeSystemToggleTarget(
