@@ -556,6 +556,12 @@ const zhCN: Record<string, string> = {
   "Fetching models…": "正在获取模型…",
   "No models found": "未找到模型",
   "Synced %n models": "已同步 %n 个模型",
+  "Enter the API key above to fetch this provider's models.":
+    "请先在上方填写 API Key，以获取该服务商的模型列表。",
+  "Couldn't fetch models:": "无法获取模型列表：",
+  "The provider returned no models.": "该服务商未返回任何模型。",
+  "Select a model…": "请选择模型…",
+  "Customized…": "自定义…",
   "Loading Codex models…": "正在加载 Codex 模型…",
   "Could not load Codex models. Showing current model only.":
     "无法加载 Codex 模型。仅显示当前模型。",

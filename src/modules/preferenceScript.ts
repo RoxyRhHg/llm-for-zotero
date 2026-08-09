@@ -20,6 +20,7 @@ import {
   resolveModelInputMode,
 } from "../utils/modelInputMode";
 import {
+  buildProviderCatalogIdentity,
   createEmptyProviderGroup,
   createProviderModelEntry,
   getModelProviderGroups,
@@ -29,6 +30,16 @@ import {
   type ModelProviderGroup,
   type ModelProviderModel,
 } from "../utils/modelProviders";
+import {
+  CUSTOMIZED_MODEL_OPTION_VALUE,
+  buildProviderModelSelectRows,
+  canFetchProviderModels,
+  resolveProviderModelFetchStatus,
+} from "../utils/providerModelPicker";
+import {
+  getModelCatalogStatus,
+  refreshModelCatalog,
+} from "../modelCapabilities";
 import {
   PROVIDER_PRESETS,
   detectProviderPreset,
@@ -412,6 +423,166 @@ function iconBtn(
   btn.title = title;
   btn.setAttribute("aria-label", title);
   return btn;
+}
+
+// ── Provider model select (fetch & choose) ─────────────────────────
+
+/**
+ * Replace a provider-card model input with a native dropdown listing the
+ * provider's live model catalog plus a trailing "Customized…" option.
+ * Choosing "Customized…" reveals the classic text input for manual entry;
+ * choosing a model from the list hides it again. The text input element is
+ * the caller's — its existing listeners keep persisting typed values.
+ *
+ * Returns the row container and the status line to place under the row.
+ */
+function attachProviderModelSelect(args: {
+  doc: Document;
+  input: HTMLInputElement;
+  group: ModelProviderGroup;
+  modelEntry: ModelProviderModel;
+  onModelPicked: (modelId: string) => void;
+}): { container: HTMLElement; statusEl: HTMLElement } {
+  const { doc, input, group, modelEntry } = args;
+
+  const container = el(
+    doc,
+    "div",
+    "flex: 1; min-width: 0; display: flex; align-items: center; gap: 5px;",
+  );
+  const select = el(
+    doc,
+    "select",
+    "flex: 1; min-width: 0; padding: 6px 10px; font-size: 13px;" +
+      " border: 1px solid var(--stroke-secondary, #c8c8c8); border-radius: 6px;" +
+      " box-sizing: border-box; background: Field; color: FieldText;",
+  ) as HTMLSelectElement;
+  container.append(select, input);
+
+  const statusEl = el(doc, "span", HELPER_STYLE);
+  statusEl.style.display = "none";
+
+  let customizedActive = false;
+  let loading = false;
+  let fetchToken = 0;
+
+  const readSnapshot = () =>
+    getModelCatalogStatus(buildProviderCatalogIdentity(group));
+
+  const syncModes = () => {
+    if (customizedActive) {
+      input.style.display = "";
+      select.style.flex = "0 0 auto";
+      select.style.width = "auto";
+      select.style.maxWidth = "45%";
+    } else {
+      input.style.display = "none";
+      select.style.flex = "1";
+      select.style.width = "";
+      select.style.maxWidth = "";
+    }
+  };
+
+  const rebuildOptions = () => {
+    const rows = buildProviderModelSelectRows({
+      savedModel: modelEntry.model,
+      catalog: readSnapshot()?.models || [],
+      customizedActive,
+    });
+    select.textContent = "";
+    for (const row of rows) {
+      const option = el(doc, "option") as HTMLOptionElement;
+      if (row.kind === "placeholder") {
+        option.value = "";
+        option.textContent = t("Select a model…");
+        option.disabled = true;
+      } else if (row.kind === "model") {
+        option.value = row.id;
+        option.textContent = row.id;
+      } else {
+        option.value = CUSTOMIZED_MODEL_OPTION_VALUE;
+        option.textContent = t("Customized…");
+      }
+      select.appendChild(option);
+    }
+    select.value = customizedActive
+      ? CUSTOMIZED_MODEL_OPTION_VALUE
+      : modelEntry.model.trim();
+  };
+
+  const updateStatus = () => {
+    const status = resolveProviderModelFetchStatus({
+      apiKey: group.apiKey,
+      loading,
+      snapshot: readSnapshot(),
+    });
+    if (status.kind === "needs_api_key") {
+      statusEl.textContent = t(
+        "Enter the API key above to fetch this provider's models.",
+      );
+      statusEl.style.color = "var(--fill-secondary, #888)";
+      statusEl.style.display = "block";
+    } else if (status.kind === "loading") {
+      statusEl.textContent = t("Fetching models…");
+      statusEl.style.color = "var(--fill-secondary, #888)";
+      statusEl.style.display = "block";
+    } else if (status.kind === "error") {
+      statusEl.textContent = `✗ ${t("Couldn't fetch models:")} ${status.message}`;
+      statusEl.style.color = "red";
+      statusEl.style.display = "block";
+    } else if (status.total === 0) {
+      statusEl.textContent = t("The provider returned no models.");
+      statusEl.style.color = "var(--fill-secondary, #888)";
+      statusEl.style.display = "block";
+    } else {
+      statusEl.style.display = "none";
+    }
+  };
+
+  const refreshCatalog = async () => {
+    if (!group.apiKey.trim()) {
+      updateStatus();
+      return;
+    }
+    const token = ++fetchToken;
+    loading = true;
+    updateStatus();
+    try {
+      await refreshModelCatalog(buildProviderCatalogIdentity(group));
+    } finally {
+      if (token === fetchToken) {
+        loading = false;
+        rebuildOptions();
+        updateStatus();
+      }
+    }
+  };
+
+  // The refresh is TTL-cached, so re-checking on every open stays cheap and
+  // picks up an API key the user pasted since the card rendered.
+  select.addEventListener("mousedown", () => void refreshCatalog());
+  select.addEventListener("change", () => {
+    if (select.value === CUSTOMIZED_MODEL_OPTION_VALUE) {
+      customizedActive = true;
+      input.value = modelEntry.model;
+      syncModes();
+      rebuildOptions();
+      input.focus();
+      return;
+    }
+    customizedActive = false;
+    input.value = select.value;
+    args.onModelPicked(select.value);
+    syncModes();
+    rebuildOptions();
+  });
+
+  syncModes();
+  rebuildOptions();
+  updateStatus();
+  void refreshCatalog();
+
+  return { container, statusEl };
 }
 
 // ── Data helpers ───────────────────────────────────────────────────
@@ -1664,6 +1835,9 @@ export async function registerPrefsScripts(_window: Window | undefined | null) {
 
         const advGearBtn = iconBtn(doc, "⚙", t("Advanced options"));
 
+        // Status line owned by the fetch-and-select model dropdown, when used.
+        let pickerStatusEl: HTMLElement | null = null;
+
         // [webchat] Replace text input with a dropdown for webchat model selection
         if (group.authMode === "webchat") {
           const validWebchatModels = WEBCHAT_TARGETS.map((wt) => ({
@@ -1696,6 +1870,22 @@ export async function registerPrefsScripts(_window: Window | undefined | null) {
             persistGroups(groups);
           });
           mainRow.append(modelInput, modelSelect);
+        } else if (canFetchProviderModels(group)) {
+          const picker = attachProviderModelSelect({
+            doc,
+            input: modelInput,
+            group,
+            modelEntry,
+            onModelPicked: (modelId) => {
+              modelEntry.model = modelId;
+              persistGroups(groups);
+              syncAddModelBtn();
+              syncAddProviderBtn();
+              syncAdvAvailability();
+            },
+          });
+          pickerStatusEl = picker.statusEl;
+          mainRow.append(picker.container, testBtn, advGearBtn);
         } else {
           mainRow.append(modelInput, testBtn, advGearBtn);
         }
@@ -2024,7 +2214,9 @@ export async function registerPrefsScripts(_window: Window | undefined | null) {
         testBtn.addEventListener("click", () => void runTest());
         testBtn.addEventListener("command", () => void runTest());
 
-        rowWrap.append(mainRow, statusLine, advRow);
+        rowWrap.append(mainRow);
+        if (pickerStatusEl) rowWrap.append(pickerStatusEl);
+        rowWrap.append(statusLine, advRow);
         modelsWrap.appendChild(rowWrap);
       });
 

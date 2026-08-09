@@ -1,0 +1,318 @@
+import { assert } from "chai";
+import {
+  compileReasoningControls,
+  configureModelCapabilityRuntime,
+  ensureModelCapabilities,
+  getModelCapabilities,
+  getDiscoveredModels,
+  refreshModelCapabilityRegistry,
+  refreshModelCatalog,
+  resetModelCapabilityStateForTests,
+  setModelCapabilityRegistryForTests,
+  type ModelCapabilityRegistry,
+} from "../src/modelCapabilities";
+import {
+  getModelInputTokenLimit,
+  resolveContextWindowTokens,
+} from "../src/utils/modelInputCap";
+import { buildReasoningPayload } from "../src/utils/llmClient";
+
+describe("model capability service", function () {
+  afterEach(function () {
+    resetModelCapabilityStateForTests();
+  });
+
+  it("recognizes a new Kimi model from registry data without a plugin release", function () {
+    const registry: ModelCapabilityRegistry = {
+      schemaVersion: 1,
+      revision: 2,
+      models: [
+        {
+          match: { provider: "kimi", exact: "kimi-v4" },
+          limits: {
+            contextWindowTokens: 2_000_000,
+            inputTokens: 2_000_000,
+          },
+          reasoning: {
+            kind: "select",
+            defaultOptionId: "ultra",
+            options: [
+              {
+                id: "ultra",
+                label: "Ultra",
+                controls: {
+                  body: {
+                    thinking: { type: "enabled", effort: "ultra" },
+                  },
+                  omitTemperature: true,
+                },
+              },
+            ],
+          },
+        },
+      ],
+    };
+
+    assert.isTrue(setModelCapabilityRegistryForTests(registry));
+    const capabilities = getModelCapabilities({
+      provider: "kimi",
+      model: "kimi-v4",
+      apiBase: "https://api.moonshot.ai/v1",
+    });
+    assert.equal(capabilities.limits.inputTokens, 2_000_000);
+    assert.deepEqual(
+      capabilities.reasoning.options.map((option) => option.id),
+      ["ultra"],
+    );
+    assert.equal(
+      getModelInputTokenLimit("kimi-v4", {
+        provider: "kimi",
+        apiBase: "https://api.moonshot.ai/v1",
+      }),
+      2_000_000,
+    );
+    assert.deepEqual(
+      compileReasoningControls(capabilities, { level: "ultra" }),
+      {
+        extra: { thinking: { type: "enabled", effort: "ultra" } },
+        omitTemperature: true,
+      },
+    );
+    assert.deepEqual(
+      buildReasoningPayload(
+        { provider: "kimi", level: "ultra" },
+        false,
+        "kimi-v4",
+        "https://api.moonshot.ai/v1",
+        "openai_chat_compat",
+      ),
+      {
+        extra: { thinking: { type: "enabled", effort: "ultra" } },
+        omitTemperature: true,
+      },
+    );
+  });
+
+  it("uses live model metadata and preserves exact opaque model IDs", async function () {
+    configureModelCapabilityRuntime({
+      fetch: (async () =>
+        new Response(
+          JSON.stringify({
+            data: [
+              {
+                id: "kimi-v4-20260809",
+                context_length: 2_000_000,
+                supports_reasoning: true,
+                supports_image_in: true,
+              },
+            ],
+          }),
+          { status: 200, headers: { "content-type": "application/json" } },
+        )) as typeof fetch,
+    });
+    const identity = {
+      provider: "kimi",
+      model: "configured-placeholder",
+      apiBase: "https://api.moonshot.ai/v1",
+      protocol: "openai_chat_compat",
+      apiKey: "secret-for-test",
+    } as const;
+    await refreshModelCatalog(identity);
+    assert.deepEqual(
+      getDiscoveredModels(identity).map((model) => model.id),
+      ["kimi-v4-20260809"],
+    );
+    const capabilities = getModelCapabilities({
+      ...identity,
+      model: "kimi-v4-20260809",
+    });
+    assert.equal(capabilities.limits.contextWindowTokens, 2_000_000);
+    assert.equal(capabilities.reasoning.kind, "server_default");
+    assert.isTrue(capabilities.inputs.image);
+  });
+
+  it("runs bounded first-use discovery and applies scoped catalog data to requests", async function () {
+    const calls: string[] = [];
+    configureModelCapabilityRuntime({
+      environment: "production",
+      fetch: (async (input: RequestInfo | URL) => {
+        const url = String(input);
+        calls.push(url);
+        if (url.includes("raw.githubusercontent.com")) {
+          return new Response(
+            JSON.stringify({
+              schemaVersion: 1,
+              revision: 2,
+              models: [
+                {
+                  match: { provider: "kimi", exact: "kimi-v4" },
+                  reasoning: {
+                    kind: "select",
+                    defaultOptionId: "ultra",
+                    options: [{ id: "ultra", label: "Ultra" }],
+                  },
+                },
+              ],
+            }),
+            { status: 200 },
+          );
+        }
+        return new Response(
+          JSON.stringify({
+            data: [{ id: "kimi-v4", context_length: 2_000_000 }],
+          }),
+          { status: 200 },
+        );
+      }) as typeof fetch,
+    });
+    const identity = {
+      provider: "kimi",
+      model: "kimi-v4",
+      apiBase: "https://api.moonshot.ai/v1",
+      protocol: "openai_chat_compat",
+      authMode: "api_key",
+      apiKey: "secret-for-test",
+      scope: "group-1",
+    } as const;
+
+    await ensureModelCapabilities(identity, { timeoutMs: 100 });
+
+    assert.lengthOf(calls, 2);
+    const capabilities = getModelCapabilities({
+      provider: identity.provider,
+      model: identity.model,
+      apiBase: identity.apiBase,
+      protocol: identity.protocol,
+      authMode: identity.authMode,
+    });
+    assert.equal(capabilities.limits.contextWindowTokens, 2_000_000);
+    assert.equal(
+      getModelInputTokenLimit("kimi-v4", {
+        provider: identity.provider,
+        apiBase: identity.apiBase,
+        protocol: identity.protocol,
+        authMode: identity.authMode,
+      }),
+      2_000_000,
+    );
+    assert.deepEqual(
+      capabilities.reasoning.options.map((option) => option.id),
+      ["ultra"],
+    );
+  });
+
+  it("accepts a newer validated remote registry revision", async function () {
+    configureModelCapabilityRuntime({
+      fetch: (async () => {
+        return {
+          ok: true,
+          text: async () =>
+            JSON.stringify({
+              schemaVersion: 1,
+              revision: 2,
+              models: [
+                {
+                  match: { provider: "kimi", exact: "kimi-v4" },
+                  limits: {
+                    contextWindowTokens: 2_000_000,
+                    inputTokens: 2_000_000,
+                  },
+                  reasoning: {
+                    kind: "select",
+                    defaultOptionId: "ultra",
+                    options: [{ id: "ultra", label: "Ultra" }],
+                  },
+                },
+              ],
+            }),
+        };
+      }) as typeof fetch,
+    });
+    assert.isTrue(await refreshModelCapabilityRegistry({ force: true }));
+    assert.deepEqual(
+      getModelCapabilities({
+        provider: "kimi",
+        model: "kimi-v4",
+      }).reasoning.options.map((option) => option.id),
+      ["ultra"],
+    );
+  });
+
+  it("rejects registry controls outside the model-control allowlist", function () {
+    const accepted = setModelCapabilityRegistryForTests({
+      schemaVersion: 1,
+      revision: 3,
+      models: [
+        {
+          match: { provider: "kimi", exact: "unsafe" },
+          reasoning: {
+            kind: "select",
+            options: [
+              {
+                id: "ultra",
+                label: "Ultra",
+                controls: { body: { messages: ["must-not-be-allowed"] } },
+              },
+            ],
+          },
+        },
+      ],
+    });
+    assert.isFalse(accepted);
+  });
+
+  it("keeps user caps below discovered hard limits", function () {
+    assert.equal(
+      getModelInputTokenLimit("kimi-k3", {
+        provider: "kimi",
+        apiBase: "https://api.moonshot.ai/v1",
+      }),
+      1048576,
+    );
+    assert.equal(
+      resolveContextWindowTokens("kimi-k3", 2_000_000, {
+        provider: "kimi",
+        apiBase: "https://api.moonshot.ai/v1",
+      }),
+      1048576,
+    );
+  });
+
+  it("coalesces concurrent catalog refreshes for the same identity", async function () {
+    let fetchCalls = 0;
+    let releaseFetch: (() => void) | null = null;
+    const gate = new Promise<void>((resolve) => {
+      releaseFetch = resolve;
+    });
+    configureModelCapabilityRuntime({
+      environment: "test",
+      fetch: (async () => {
+        fetchCalls += 1;
+        await gate;
+        return {
+          ok: true,
+          json: async () => ({ data: [{ id: "kimi-k3" }] }),
+        };
+      }) as unknown as typeof fetch,
+    });
+    const identity = {
+      provider: "kimi",
+      model: "",
+      apiBase: "https://api.moonshot.ai/v1",
+      protocol: "openai_chat_compat",
+      authMode: "api_key",
+      apiKey: "k",
+      scope: "group-1",
+    };
+    const first = refreshModelCatalog(identity);
+    const second = refreshModelCatalog(identity);
+    releaseFetch?.();
+    const [firstModels, secondModels] = await Promise.all([first, second]);
+    assert.equal(fetchCalls, 1, "concurrent callers share one request");
+    assert.deepEqual(
+      firstModels.map((model) => model.id),
+      ["kimi-k3"],
+    );
+    assert.deepEqual(secondModels, firstModels);
+  });
+});
