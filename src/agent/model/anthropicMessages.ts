@@ -791,6 +791,11 @@ export class AnthropicMessagesAgentAdapter implements AgentModelAdapter {
     const maxTokens = normalizeMaxTokensForModel(
       request.advanced?.maxTokens,
       request.model,
+      {
+        apiBase: request.apiBase,
+        protocol: "anthropic_messages",
+        authMode: request.authMode,
+      },
     );
     const buildPayload = (
       reasoningOverride: ReasoningSelection | undefined,

@@ -24,6 +24,7 @@
     "start": "zotero-plugin serve",
     "build": "zotero-plugin build && npm run typecheck",
     "check:cycles": "node scripts/check-import-cycles.cjs",
+    "validate:model-registry": "node scripts/validate-model-capability-registry.mjs",
     "lint:check": "prettier --check . && eslint .",
     "lint:fix": "prettier --write . && eslint . --fix",
     "release": "zotero-plugin release",

@@ -231,6 +231,20 @@ function scheduleMineruAutoWatchRegistration(): void {
   });
 }
 
+function scheduleModelCapabilityRefresh(): void {
+  if (__env__ === "test") return;
+  runDeferredStartupTask("model capability registry", async () => {
+    const { refreshModelCapabilityRegistry } =
+      await import("./modelCapabilities");
+    await refreshModelCapabilityRegistry();
+  });
+  runDeferredStartupTask("provider model catalogs", async () => {
+    const { refreshConfiguredProviderModelCatalogs } =
+      await import("./utils/modelProviders");
+    await refreshConfiguredProviderModelCatalogs();
+  });
+}
+
 function scheduleDeferredStartupWork(
   readiness: ConversationStoreReadiness,
 ): void {
@@ -249,6 +263,7 @@ function scheduleDeferredStartupWork(
   scheduleAttachmentMaintenance();
   scheduleWebChatRelayRegistration();
   scheduleMineruAutoWatchRegistration();
+  scheduleModelCapabilityRefresh();
 }
 
 async function onStartup() {

@@ -8,6 +8,10 @@
 
 import { DEFAULT_INPUT_TOKEN_CAP } from "./llmDefaults";
 import { normalizeInputTokenCap } from "./normalization";
+import {
+  getModelCapabilities,
+  type ModelCapabilityIdentity,
+} from "../modelCapabilities";
 
 type TextPart = {
   type: "text";
@@ -55,11 +59,6 @@ export type ContextEstimateMessage = {
   }>;
 };
 
-type ModelInputLimitRule = {
-  pattern: RegExp;
-  limit: number;
-};
-
 export const DEFAULT_MODEL_INPUT_TOKEN_LIMIT = DEFAULT_INPUT_TOKEN_CAP;
 export const TOKEN_ESTIMATE_CHARS_PER_TOKEN = 4;
 
@@ -74,50 +73,6 @@ const CONTEXT_PREFIX = "Document Context:\n";
 const CONTEXT_TRUNCATION_NOTICE =
   "[Context truncated to fit model input limit]";
 const PROMPT_TRUNCATION_NOTICE = "[Prompt truncated to fit model input limit]";
-
-const MODEL_INPUT_LIMIT_RULES: ModelInputLimitRule[] = [
-  // Qwen (Alibaba Model Studio)
-  { pattern: /^qwen-long(?:[.-]|$)/, limit: 10_000_000 },
-  { pattern: /^qwen-turbo(?:[.-]|$)/, limit: 1_000_000 },
-  { pattern: /^qwen-max(?:-latest)?(?:[.-]|$)/, limit: 129_024 },
-
-  // Gemini
-  { pattern: /^gemini-2[.-]?5(?:[.-]|$)/, limit: 1_048_576 },
-  { pattern: /^gemini-3(?:[.-]|$)/, limit: 1_000_000 },
-  { pattern: /^gemini-1[.-]?5(?:[.-]|$)/, limit: 1_000_000 },
-
-  // OpenAI
-  { pattern: /^gpt-4[.-]?1(?:[.-]|$)/, limit: 1_047_576 },
-  { pattern: /^gpt-5\.4(?:[.-]|$)/, limit: 1_050_000 },
-  { pattern: /^gpt-5(?:[.-]|$)/, limit: 400_000 },
-  { pattern: /^o(?:3|1(?:-pro)?)(?:[.-]|$)/, limit: 200_000 },
-  { pattern: /^gpt-4o(?:[.-]|$)/, limit: 128_000 },
-
-  // Anthropic
-  { pattern: /^claude(?:[.-]|$)/, limit: 200_000 },
-
-  // xAI
-  { pattern: /^grok-(?:4[.-]?1-fast|4-fast)(?:[.-]|$)/, limit: 2_000_000 },
-  { pattern: /^grok-code-fast-1(?:[.-]|$)/, limit: 256_000 },
-  { pattern: /^grok-4(?:[.-]|$)/, limit: 256_000 },
-  { pattern: /^grok-3(?:[.-]|$)/, limit: 131_072 },
-
-  // Cohere
-  { pattern: /^command-a(?:-reasoning)?(?:[.-]|$)/, limit: 256_000 },
-  { pattern: /^command-r(?:\+|-plus)?(?:[.-]|$)/, limit: 128_000 },
-
-  // Mistral
-  { pattern: /^mistral-large-3(?:[.-]|$)/, limit: 256_000 },
-  { pattern: /^ministral-3(?:-14b)?(?:[.-]|$)/, limit: 256_000 },
-  { pattern: /^mistral-medium-3(?:[.-]|$)/, limit: 128_000 },
-  { pattern: /^mistral-small-3(?:[.-]|$)/, limit: 128_000 },
-  { pattern: /^codestral(?:[.-]|$)/, limit: 128_000 },
-
-  // DeepSeek
-  { pattern: /^deepseek-v4-(?:flash|pro)(?:[.-]|$)/, limit: 1_000_000 },
-  { pattern: /^deepseek-(?:chat|reasoner)(?:[.-]|$)/, limit: 1_000_000 },
-  { pattern: /^deepseek(?:[.-]|$)/, limit: 128_000 },
-];
 
 function stripTrailingNotice(text: string, notice: string): string {
   if (!text) return "";
@@ -374,31 +329,27 @@ export function estimateContextMessagesTokens(
   return total;
 }
 
-export function getModelInputTokenLimit(modelName: string): number {
-  const normalized = (modelName || "").trim().toLowerCase();
-  if (!normalized) return DEFAULT_MODEL_INPUT_TOKEN_LIMIT;
-  const normalizedTail = normalized.split("/").pop() || "";
-  const candidates =
-    normalizedTail && normalizedTail !== normalized
-      ? [normalized, normalizedTail]
-      : [normalized];
-  for (const rule of MODEL_INPUT_LIMIT_RULES) {
-    for (const candidate of candidates) {
-      if (rule.pattern.test(candidate)) {
-        return rule.limit;
-      }
-    }
-  }
-  return DEFAULT_MODEL_INPUT_TOKEN_LIMIT;
+export function getModelInputTokenLimit(
+  modelName: string,
+  identity?: Omit<ModelCapabilityIdentity, "model">,
+): number {
+  const limits = getModelCapabilities({ model: modelName, ...identity }).limits;
+  return (
+    limits.inputTokens ||
+    limits.contextWindowTokens ||
+    DEFAULT_MODEL_INPUT_TOKEN_LIMIT
+  );
 }
 
 export function resolveContextWindowTokens(
   modelName: string,
   inputTokenCapOverride?: number,
+  identity?: Omit<ModelCapabilityIdentity, "model">,
 ): number {
-  return normalizeInputTokenCap(
-    inputTokenCapOverride,
-    getModelInputTokenLimit(modelName),
+  const modelLimit = getModelInputTokenLimit(modelName, identity);
+  return Math.min(
+    normalizeInputTokenCap(inputTokenCapOverride, modelLimit),
+    modelLimit,
   );
 }
 
@@ -423,10 +374,11 @@ export function applyModelInputTokenCap(
   messages: InputCapMessage[],
   modelName: string,
   inputTokenCapOverride?: number,
+  identity?: Omit<ModelCapabilityIdentity, "model">,
 ): InputCapResult {
-  const modelLimitTokens = getModelInputTokenLimit(modelName);
-  const limitTokens = normalizeInputTokenCap(
-    inputTokenCapOverride,
+  const modelLimitTokens = getModelInputTokenLimit(modelName, identity);
+  const limitTokens = Math.min(
+    normalizeInputTokenCap(inputTokenCapOverride, modelLimitTokens),
     modelLimitTokens,
   );
   const softLimitTokens = Math.max(

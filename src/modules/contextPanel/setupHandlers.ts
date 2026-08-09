@@ -152,6 +152,11 @@ import {
   setLockedGlobalConversationKey,
   buildPaperStateKey,
 } from "./prefHelpers";
+import { refreshConfiguredProviderModelCatalogs } from "../../utils/modelProviders";
+import {
+  refreshModelCapabilityRegistry,
+  subscribeModelCapabilities,
+} from "../../modelCapabilities";
 import {
   sendQuestion,
   refreshChat,
@@ -176,7 +181,10 @@ import {
   scheduleConversationQuoteRevalidation,
   type EditLatestTurnMarker,
 } from "./chat";
-import { getWorkflowTestSendInterceptor } from "./workflowTestHooks";
+import {
+  getWorkflowTestSendInterceptor,
+  notifyWorkflowTestSendSettled,
+} from "./workflowTestHooks";
 import {
   getActiveContextAttachmentFromTabs,
   addSelectedTextContext,
@@ -1708,6 +1716,7 @@ export function setupHandlers(
   // Preferences window (which runs in a separate window context).
   let cleanupPrefObservers: (() => void) | null = null;
   let cleanupMineruPaperSourceObservers: (() => void) | null = null;
+  let cleanupModelCapabilitySubscription: (() => void) | null = null;
   {
     const agentPrefKey = `${config.prefsPrefix}.enableAgentMode`;
     const claudeModePrefKey = `${config.prefsPrefix}.enableClaudeCodeMode`;
@@ -4134,8 +4143,10 @@ export function setupHandlers(
     if (!hasAnyContext) {
       paperPreview.style.display = "none";
       paperPreviewList.innerHTML = "";
-      clearSelectedPaperState(itemId);
-      clearPaperContentSourceOverrides(itemId);
+      // Rendering an empty preview must not clear item-scoped compose state.
+      // Another mounted panel can share this conversation while resolving a
+      // different local context source; explicit remove/reset actions own the
+      // corresponding state mutation.
       return;
     }
     if (selectedPapers.length) {
@@ -5020,6 +5031,10 @@ export function setupHandlers(
 
   const rebuildModelMenu = () => {
     if (!item || !modelMenu) return;
+    // Refresh cached provider catalogs when the picker is opened.  The current
+    // snapshot renders synchronously; a subsequent open reflects new models.
+    void refreshModelCapabilityRegistry();
+    void refreshConfiguredProviderModelCatalogs();
     const { groupedChoices, selectedEntryId } = getSelectedModelInfo();
 
     modelMenu.innerHTML = "";
@@ -5960,6 +5975,11 @@ export function setupHandlers(
     }
   };
 
+  cleanupModelCapabilitySubscription = subscribeModelCapabilities(() => {
+    if (setupHandlersCleaned) return;
+    syncModelFromPrefs();
+  });
+
   (body as any).__llmRefreshContextSourceForCurrentItem = () => {
     withScrollGuard(chatBox, conversationKey, () => {
       refreshAutoLoadedPaperContextForCurrentItem();
@@ -6752,6 +6772,8 @@ export function setupHandlers(
       currentItem: Zotero.Item,
       selectedPaperContexts?: PaperContextRef[],
     ) => getActiveWebChatPdfPaperContexts(currentItem, selectedPaperContexts),
+    resolvePaperContextNextSendMode,
+    setPaperModeOverride,
     resolvePdfPaperAttachments: pdfPaperResolver.resolvePdfPaperAttachments,
     resolveLocalPdfResources: localPdfResourceResolver.resolve,
     preflightLocalPdfCapability: async () => {
@@ -6851,6 +6873,8 @@ export function setupHandlers(
         syncConversationIdentity();
       }
     },
+    onSendSettled:
+      __env__ === "test" ? notifyWorkflowTestSendSettled : undefined,
     setStatusMessage: status
       ? (message, level) => {
           setStatus(status, message, level);
@@ -7858,6 +7882,8 @@ export function setupHandlers(
     disconnectObserverCleanup = null;
     cleanupPrefObservers?.();
     cleanupMineruPaperSourceObservers?.();
+    cleanupModelCapabilitySubscription?.();
+    cleanupModelCapabilitySubscription = null;
     body.removeEventListener(
       QUOTE_PROVENANCE_REVALIDATION_REQUEST_EVENT,
       handleQuoteProvenanceRevalidationRequest,

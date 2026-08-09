@@ -15,7 +15,9 @@ export type ReasoningLevel =
   | "low"
   | "medium"
   | "high"
-  | "xhigh";
+  | "xhigh"
+  /** Future provider-defined values (for example `ultra`). */
+  | (string & {});
 export type OpenAIReasoningEffort =
   | "default"
   | "none"
@@ -23,7 +25,8 @@ export type OpenAIReasoningEffort =
   | "low"
   | "medium"
   | "high"
-  | "xhigh";
+  | "xhigh"
+  | (string & {});
 export type GeminiThinkingParam = "thinking_level" | "thinking_budget";
 export type GeminiThinkingValue = "low" | "medium" | "high" | number;
 export type GeminiReasoningOption = {
@@ -965,14 +968,15 @@ export function getGeminiReasoningProfileForModel(
     .filter((optionState) => optionState.enabled)
     .map((optionState) => {
       const mappedValue = levelToValue[optionState.level];
-      const value =
+      const value = (
         mappedValue !== undefined
           ? mappedValue
           : optionState.level === "low" ||
               optionState.level === "medium" ||
               optionState.level === "high"
             ? optionState.level
-            : (geminiProfile?.defaultValue ?? "medium");
+            : (geminiProfile?.defaultValue ?? "medium")
+      ) as GeminiThinkingValue;
       return {
         level: optionState.level,
         value,

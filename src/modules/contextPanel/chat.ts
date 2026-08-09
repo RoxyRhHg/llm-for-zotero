@@ -70,7 +70,6 @@ import {
   type ChatParams,
   ChatFileAttachment,
   ChatMessage,
-  getRuntimeReasoningOptions,
   prepareChatRequest,
   type PreparedChatRequest,
   ReasoningConfig as LLMReasoningConfig,
@@ -79,6 +78,10 @@ import {
   UsageStats,
   checkEmbeddingAvailability,
 } from "../../utils/llmClient";
+import {
+  getModelCapabilities,
+  getRuntimeReasoningOptions as getCatalogReasoningOptions,
+} from "../../modelCapabilities";
 import { applyModelInputTokenCap } from "../../utils/modelInputCap";
 import { formatDisplayModelName } from "../../utils/modelDisplayLabel";
 import type { ProviderProtocol } from "../../utils/providerProtocol";
@@ -1446,6 +1449,11 @@ function estimateHistoryContextUsageSnapshot(
     messages,
     effectiveRequestConfig.model || "",
     effectiveRequestConfig.advanced?.inputTokenCap,
+    {
+      apiBase: effectiveRequestConfig.apiBase,
+      protocol: effectiveRequestConfig.providerProtocol,
+      authMode: effectiveRequestConfig.authMode,
+    },
   );
   if (inputCap.estimatedAfterTokens <= 0) return undefined;
   return {
@@ -2041,7 +2049,7 @@ export function detectReasoningProvider(
   if (name.startsWith("deepseek")) {
     return "deepseek";
   }
-  if (name.startsWith("kimi")) {
+  if (/(^|[/:])kimi(?:\b|[.-])/.test(name)) {
     return "kimi";
   }
   if (/(^|[/:])mimo-v2(?:\.5)?(?:-(?:pro|omni|flash))?(?:\b|[.-])/.test(name)) {
@@ -2067,7 +2075,6 @@ export function getReasoningOptions(
   apiBase?: string,
   providerProtocol?: ProviderProtocol,
 ): ReasoningOption[] {
-  if (provider === "unsupported") return [];
   if (provider === "anthropic") {
     const resolvedProtocol =
       providerProtocol ||
@@ -2077,7 +2084,12 @@ export function getReasoningOptions(
       });
     if (resolvedProtocol !== "anthropic_messages") return [];
   }
-  return getRuntimeReasoningOptions(provider, modelName).map((option) => ({
+  return getCatalogReasoningOptions({
+    provider: provider === "unsupported" ? undefined : provider,
+    model: modelName,
+    apiBase,
+    protocol: providerProtocol,
+  }).map((option) => ({
     level: option.level as LLMReasoningLevel,
     enabled: option.enabled,
     label: option.label,
@@ -2182,8 +2194,25 @@ export function getSelectedReasoningForItem(
   apiBase?: string,
   providerProtocol?: ProviderProtocol,
 ): LLMReasoningConfig | undefined {
-  const provider = detectReasoningProvider(modelName);
-  if (provider === "unsupported") return undefined;
+  const detectedProvider = detectReasoningProvider(modelName);
+  const resolvedCapabilityProvider = getModelCapabilities({
+    provider: detectedProvider === "unsupported" ? undefined : detectedProvider,
+    model: modelName,
+    apiBase,
+    protocol: providerProtocol,
+  }).provider;
+  const provider: ReasoningProviderKind = [
+    "openai",
+    "gemini",
+    "deepseek",
+    "kimi",
+    "mimo",
+    "qwen",
+    "grok",
+    "anthropic",
+  ].includes(resolvedCapabilityProvider as ReasoningProviderKind)
+    ? (resolvedCapabilityProvider as ReasoningProviderKind)
+    : detectedProvider;
   const enabledLevels = getReasoningOptions(
     provider,
     modelName,
@@ -2216,6 +2245,7 @@ export function getSelectedReasoningForItem(
   setLastUsedReasoningLevelForProvider(provider, selectedLevel);
   if (selectedLevel === "none") return undefined;
 
+  if (provider === "unsupported") return undefined;
   return { provider, level: selectedLevel as LLMReasoningLevel };
 }
 

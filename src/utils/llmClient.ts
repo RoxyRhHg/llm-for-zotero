@@ -100,6 +100,11 @@ import {
   type ContextCachePlan,
 } from "../contextCache/manager";
 import type { ModelInputMode } from "../shared/types";
+import {
+  compileReasoningControls,
+  ensureModelCapabilities,
+  getModelCapabilities,
+} from "../modelCapabilities";
 
 // =============================================================================
 // Types
@@ -1411,6 +1416,12 @@ export function prepareChatRequest(params: ChatParams): PreparedChatRequest {
     rawMessages,
     model,
     params.inputTokenCap,
+    {
+      provider: detectProviderPreset(apiBase).toString(),
+      apiBase,
+      protocol: providerProtocol,
+      authMode,
+    },
   );
   return {
     apiBase,
@@ -1423,6 +1434,34 @@ export function prepareChatRequest(params: ChatParams): PreparedChatRequest {
     providerProtocol,
     contextCache: params.contextCache,
   };
+}
+
+async function preflightRequestModelCapabilities(
+  params: ChatParams,
+): Promise<void> {
+  try {
+    const resolved = getApiConfig({
+      apiBase: params.apiBase,
+      apiKey: params.apiKey,
+      authMode: params.authMode,
+      model: params.model,
+      providerProtocol: params.providerProtocol,
+    });
+    await ensureModelCapabilities(
+      {
+        provider: detectProviderPreset(resolved.apiBase).toString(),
+        model: resolved.model,
+        apiBase: resolved.apiBase,
+        protocol: resolved.providerProtocol,
+        authMode: resolved.authMode,
+        apiKey: resolved.apiKey,
+      },
+      { timeoutMs: 5_000 },
+    );
+  } catch {
+    // Capability discovery is best effort. The request must retain its
+    // bundled/legacy fallback when a provider catalog is unavailable.
+  }
 }
 
 function getReasoningReserveTokens(reasoning?: ReasoningConfig): number {
@@ -1439,6 +1478,8 @@ function getReasoningReserveTokens(reasoning?: ReasoningConfig): number {
     case "high":
       return 4_096;
     case "xhigh":
+    case "ultra":
+    case "max":
       return 8_192;
     default:
       return 256;
@@ -1455,19 +1496,32 @@ export function estimateAvailableContextBudget(params: {
   maxTokens?: number;
   inputTokenCap?: number;
   systemPrompt?: string;
+  apiBase?: string;
+  providerProtocol?: ProviderProtocol;
+  authMode?: ModelProviderAuthMode;
 }): ContextBudgetPlan {
   const normalizedModel =
     (params.model || DEFAULT_MODEL).trim() || DEFAULT_MODEL;
-  const modelLimitTokens = getModelInputTokenLimit(normalizedModel);
+  const modelLimitTokens = getModelInputTokenLimit(normalizedModel, {
+    provider: params.apiBase
+      ? detectProviderPreset(params.apiBase).toString()
+      : undefined,
+    apiBase: params.apiBase,
+    protocol: params.providerProtocol,
+    authMode: params.authMode,
+  });
   const limitTokens = normalizeInputTokenCap(
     params.inputTokenCap,
     modelLimitTokens,
   );
   const softLimitTokens = Math.max(1, Math.floor(limitTokens * 0.9));
-  const outputReserveTokens = normalizeMaxTokensForModel(
-    params.maxTokens,
-    normalizedModel,
-  );
+  const outputReserveTokens = normalizeMaxTokensForRequest({
+    value: params.maxTokens,
+    model: normalizedModel,
+    apiBase: params.apiBase,
+    protocol: params.providerProtocol,
+    authMode: params.authMode,
+  });
   const reasoningReserveTokens = getReasoningReserveTokens(params.reasoning);
 
   const baseMessages = buildMessages(
@@ -1612,6 +1666,33 @@ function buildTokenParam(model: string, maxTokens: number) {
 
 function buildResponsesTokenParam(maxTokens: number) {
   return { max_output_tokens: maxTokens };
+}
+
+function normalizeMaxTokensForRequest(params: {
+  value?: number;
+  model: string;
+  apiBase?: string;
+  protocol?: ProviderProtocol;
+  authMode?: ModelProviderAuthMode;
+}): number {
+  const normalized = normalizeMaxTokensForModel(params.value, params.model, {
+    provider: params.apiBase
+      ? detectProviderPreset(params.apiBase).toString()
+      : undefined,
+    apiBase: params.apiBase,
+    protocol: params.protocol,
+    authMode: params.authMode,
+  });
+  const discovered = getModelCapabilities({
+    provider: params.apiBase
+      ? detectProviderPreset(params.apiBase).toString()
+      : undefined,
+    model: params.model,
+    apiBase: params.apiBase,
+    protocol: params.protocol,
+    authMode: params.authMode,
+  }).limits.outputTokens;
+  return discovered ? Math.min(normalized, discovered) : normalized;
 }
 
 const OPENAI_EFFORT_ORDER: OpenAIReasoningEffort[] = [
@@ -2026,7 +2107,18 @@ export function buildReasoningPayload(
   if (!reasoning) {
     return emptyReasoningPayload();
   }
-  if (!supportsReasoningForModel(reasoning.provider, modelName)) {
+  const capabilities = getModelCapabilities({
+    provider: reasoning.provider,
+    model: modelName || "",
+    apiBase,
+    protocol: providerProtocol,
+  });
+  const declarativeControls = compileReasoningControls(capabilities, reasoning);
+  if (declarativeControls) return declarativeControls;
+  if (
+    capabilities.reasoning.kind === "none" &&
+    !supportsReasoningForModel(reasoning.provider, modelName)
+  ) {
     return emptyReasoningPayload();
   }
 
@@ -2430,9 +2522,12 @@ async function parseAnthropicStreamResponse(
 }
 
 function buildGeminiNativePayload(params: {
+  model: string;
+  apiBase?: string;
   messages: ChatMessage[];
   effectiveMaxTokens: number;
   effectiveTemperature: number;
+  reasoning?: ReasoningConfig;
   pdfParts?: Array<{ base64: string }>;
 }): Record<string, unknown> {
   const systemParts = params.messages
@@ -2490,6 +2585,58 @@ function buildGeminiNativePayload(params: {
       temperature: params.effectiveTemperature,
     },
   };
+  if (params.reasoning?.provider === "gemini") {
+    const declarative = compileReasoningControls(
+      getModelCapabilities({
+        provider: "gemini",
+        model: params.model,
+        apiBase: params.apiBase,
+        protocol: "gemini_native",
+      }),
+      params.reasoning,
+    );
+    const generationConfig = payload.generationConfig as Record<
+      string,
+      unknown
+    >;
+    const declaredGenerationConfig =
+      declarative?.extra.generationConfig ||
+      declarative?.extra.generation_config;
+    if (
+      declaredGenerationConfig &&
+      typeof declaredGenerationConfig === "object" &&
+      !Array.isArray(declaredGenerationConfig)
+    ) {
+      Object.assign(generationConfig, declaredGenerationConfig);
+    }
+    const declarativeConfig =
+      declarative?.extra.thinkingConfig ||
+      declarative?.extra.thinking_config ||
+      generationConfig.thinkingConfig;
+    if (declarativeConfig && typeof declarativeConfig === "object") {
+      generationConfig.thinkingConfig = declarativeConfig;
+    } else {
+      const profile = getGeminiReasoningProfile(params.model);
+      const value =
+        profile.levelToValue[params.reasoning.level] ??
+        profile.levelToValue[profile.defaultLevel] ??
+        profile.defaultValue;
+      (payload.generationConfig as Record<string, unknown>).thinkingConfig =
+        profile.param === "thinking_budget"
+          ? {
+              includeThoughts: true,
+              thinkingBudget: typeof value === "number" ? value : 8192,
+            }
+          : {
+              includeThoughts: true,
+              thinkingLevel:
+                value === "low" || value === "medium" || value === "high"
+                  ? value
+                  : "medium",
+            };
+    }
+    if (declarative?.omitTemperature) delete generationConfig.temperature;
+  }
   if (systemParts.length > 0) {
     payload.systemInstruction = { parts: systemParts };
   }
@@ -3219,9 +3366,12 @@ async function callNativeProtocol(params: {
           contextCache: params.contextCache,
         })
       : buildGeminiNativePayload({
+          model,
+          apiBase,
           messages,
           effectiveMaxTokens,
           effectiveTemperature,
+          reasoning: reasoningOverride,
           pdfParts: pdfParts.length ? pdfParts : undefined,
         });
   const res = await postWithReasoningFallback({
@@ -3268,6 +3418,7 @@ async function callNativeProtocol(params: {
  * Call LLM API (non-streaming)
  */
 export async function callLLM(params: ChatParams): Promise<string> {
+  await preflightRequestModelCapabilities(params);
   const prepared = prepareChatRequest(params);
   const {
     apiBase,
@@ -3288,7 +3439,13 @@ export async function callLLM(params: ChatParams): Promise<string> {
       apiKey,
       model,
       messages,
-      effectiveMaxTokens: normalizeMaxTokensForModel(params.maxTokens, model),
+      effectiveMaxTokens: normalizeMaxTokensForRequest({
+        value: params.maxTokens,
+        model,
+        apiBase,
+        protocol: providerProtocol,
+        authMode,
+      }),
       effectiveTemperature: normalizeTemperature(params.temperature),
       signal: params.signal,
       attachments: params.attachments,
@@ -3340,10 +3497,13 @@ export async function callLLM(params: ChatParams): Promise<string> {
       })
     : [];
   const effectiveTemperature = normalizeTemperature(params.temperature);
-  const effectiveMaxTokens = normalizeMaxTokensForModel(
-    params.maxTokens,
+  const effectiveMaxTokens = normalizeMaxTokensForRequest({
+    value: params.maxTokens,
     model,
-  );
+    apiBase,
+    protocol: providerProtocol,
+    authMode,
+  });
 
   const url = resolveProviderTransportEndpoint({
     protocol: providerProtocol,
@@ -3403,6 +3563,7 @@ export async function callLLMStream(
   onReasoning?: (event: ReasoningEvent) => void,
   onUsage?: (usage: UsageStats) => void,
 ): Promise<string> {
+  await preflightRequestModelCapabilities(params);
   const prepared = prepareChatRequest(params);
   const {
     apiBase,
@@ -3423,7 +3584,13 @@ export async function callLLMStream(
       apiKey,
       model,
       messages,
-      effectiveMaxTokens: normalizeMaxTokensForModel(params.maxTokens, model),
+      effectiveMaxTokens: normalizeMaxTokensForRequest({
+        value: params.maxTokens,
+        model,
+        apiBase,
+        protocol: providerProtocol,
+        authMode,
+      }),
       effectiveTemperature: normalizeTemperature(params.temperature),
       signal: params.signal,
       onDelta,
@@ -3475,10 +3642,13 @@ export async function callLLMStream(
       })
     : [];
   const effectiveTemperature = normalizeTemperature(params.temperature);
-  const effectiveMaxTokens = normalizeMaxTokensForModel(
-    params.maxTokens,
+  const effectiveMaxTokens = normalizeMaxTokensForRequest({
+    value: params.maxTokens,
     model,
-  );
+    apiBase,
+    protocol: providerProtocol,
+    authMode,
+  });
 
   const url = resolveProviderTransportEndpoint({
     protocol: providerProtocol,

@@ -13,39 +13,16 @@ import {
   MAX_ALLOWED_TOKENS,
   MAX_ALLOWED_INPUT_TOKEN_CAP,
 } from "./llmDefaults";
+import {
+  getModelOutputTokenLimit as getCatalogOutputTokenLimit,
+  type ModelCapabilityIdentity,
+} from "../modelCapabilities";
 
-type ModelOutputLimitRule = {
-  pattern: RegExp;
-  limit: number;
-};
-
-const MODEL_OUTPUT_LIMIT_RULES: ModelOutputLimitRule[] = [
-  {
-    pattern: /(^|[/:.])claude-(?:opus-4-7|opus-4-6)(?:[.-]|$)/,
-    limit: 128_000,
-  },
-  {
-    pattern: /(^|[/:.])claude-(?:sonnet-4-6|haiku-4-5)(?:[.-]|$)/,
-    limit: 64_000,
-  },
-  { pattern: /^deepseek-v4-(?:flash|pro)(?:[.-]|$)/, limit: 384_000 },
-  { pattern: /^deepseek-(?:chat|reasoner)(?:[.-]|$)/, limit: 384_000 },
-];
-
-function getModelNameCandidates(modelName?: string): string[] {
-  const normalized = (modelName || "").trim().toLowerCase();
-  if (!normalized) return [];
-  const tail = normalized.split("/").pop() || "";
-  return tail && tail !== normalized ? [normalized, tail] : [normalized];
-}
-
-export function getModelOutputTokenLimit(modelName?: string): number {
-  for (const candidate of getModelNameCandidates(modelName)) {
-    for (const rule of MODEL_OUTPUT_LIMIT_RULES) {
-      if (rule.pattern.test(candidate)) return rule.limit;
-    }
-  }
-  return MAX_ALLOWED_TOKENS;
+export function getModelOutputTokenLimit(
+  modelName?: string,
+  identity?: Omit<ModelCapabilityIdentity, "model">,
+): number {
+  return getCatalogOutputTokenLimit(modelName || "", identity);
 }
 
 /** Clamp a temperature value to [0, 2], falling back to DEFAULT_TEMPERATURE. */
@@ -70,13 +47,17 @@ export function normalizeMaxTokens(value?: number | string): number {
 export function normalizeMaxTokensForModel(
   value?: number | string,
   modelName?: string,
+  identity?: Omit<ModelCapabilityIdentity, "model">,
 ): number {
   const parsed =
     typeof value === "string"
       ? Number.parseInt(value, 10)
       : Math.floor(Number(value));
   if (!Number.isFinite(parsed) || parsed < 1) return DEFAULT_MAX_TOKENS;
-  return Math.min(parsed, getModelOutputTokenLimit(modelName));
+  return Math.min(
+    parsed,
+    getCatalogOutputTokenLimit(modelName || "", identity),
+  );
 }
 
 /** Clamp an input-token-cap value to [1, MAX_ALLOWED_INPUT_TOKEN_CAP], with configurable fallback. */

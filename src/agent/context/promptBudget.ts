@@ -65,10 +65,18 @@ export type AgentPromptBudgetResult = {
 export function resolveAgentPromptBudgetLimits(params: {
   model?: string;
   inputTokenCap?: number;
+  apiBase?: string;
+  providerProtocol?: string;
+  authMode?: string;
 }): AgentPromptBudgetLimits {
   const contextWindow = resolveContextWindowTokens(
     params.model || "",
     params.inputTokenCap,
+    {
+      apiBase: params.apiBase,
+      protocol: params.providerProtocol,
+      authMode: params.authMode,
+    },
   );
   return {
     contextWindow,
@@ -1019,12 +1027,18 @@ export function enforceAgentPromptBudget(params: {
   messages: AgentModelMessage[];
   model?: string;
   inputTokenCap?: number;
+  apiBase?: string;
+  providerProtocol?: string;
+  authMode?: string;
   conversationKey?: number;
   resourceSignature?: string;
 }): AgentPromptBudgetResult {
   const limits = resolveAgentPromptBudgetLimits({
     model: params.model,
     inputTokenCap: params.inputTokenCap,
+    apiBase: params.apiBase,
+    providerProtocol: params.providerProtocol,
+    authMode: params.authMode,
   });
   let messages = params.messages.map((message) => cloneMessage(message));
   const reductions: AgentPromptReduction[] = [];

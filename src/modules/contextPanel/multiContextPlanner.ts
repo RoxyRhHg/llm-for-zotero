@@ -1636,6 +1636,15 @@ export async function resolveMultiContextPlan(params: {
     maxTokens: params.advanced?.maxTokens,
     inputTokenCap: params.advanced?.inputTokenCap,
     systemPrompt: params.systemPrompt,
+    apiBase: params.apiBase,
+    providerProtocol: params.providerProtocol,
+    authMode: params.authMode as
+      | "api_key"
+      | "codex_auth"
+      | "codex_app_server"
+      | "copilot_auth"
+      | "webchat"
+      | undefined,
   });
   const pageFallbackContext = renderSelectedTextPageFallbackContext({
     anchors: params.resolvedSelectedTextAnchors || [],

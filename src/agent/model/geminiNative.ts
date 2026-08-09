@@ -1,6 +1,10 @@
 import { getGeminiReasoningProfile } from "../../utils/llmClient";
 import {
-  normalizeMaxTokens,
+  compileReasoningControls,
+  getModelCapabilities,
+} from "../../modelCapabilities";
+import {
+  normalizeMaxTokensForModel,
   normalizeTemperature,
 } from "../../utils/normalization";
 import {
@@ -226,6 +230,20 @@ function buildGeminiTools(tools: ToolSpec[]) {
 function resolveGeminiReasoningConfig(request: AgentRuntimeRequest) {
   if (!request.reasoning || request.reasoning.provider !== "gemini") {
     return undefined;
+  }
+  const declarative = compileReasoningControls(
+    getModelCapabilities({
+      provider: "gemini",
+      model: request.model || "",
+      apiBase: request.apiBase,
+      protocol: "gemini_native",
+    }),
+    request.reasoning,
+  );
+  const declarativeConfig =
+    declarative?.extra.thinkingConfig || declarative?.extra.thinking_config;
+  if (declarativeConfig && typeof declarativeConfig === "object") {
+    return declarativeConfig;
   }
   const profile = getGeminiReasoningProfile(request.model);
   const value =
@@ -805,7 +823,15 @@ export class GeminiNativeAgentAdapter implements AgentModelAdapter {
       },
       generationConfig: {
         temperature: normalizeTemperature(request.advanced?.temperature),
-        maxOutputTokens: normalizeMaxTokens(request.advanced?.maxTokens),
+        maxOutputTokens: normalizeMaxTokensForModel(
+          request.advanced?.maxTokens,
+          request.model,
+          {
+            apiBase: request.apiBase,
+            protocol: "gemini_native",
+            authMode: request.authMode,
+          },
+        ),
         ...(resolveGeminiReasoningConfig(request)
           ? { thinkingConfig: resolveGeminiReasoningConfig(request) }
           : {}),

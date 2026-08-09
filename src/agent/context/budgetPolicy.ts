@@ -97,6 +97,9 @@ export function buildAgentContextBudgetState(params: {
   messages: ContextEstimateMessage[];
   model?: string;
   inputTokenCap?: number;
+  apiBase?: string;
+  providerProtocol?: string;
+  authMode?: string;
   policy?: Partial<AgentContextBudgetPolicy>;
   forceCompact?: boolean;
   recentlyCompacted?: boolean;
@@ -105,6 +108,11 @@ export function buildAgentContextBudgetState(params: {
   const contextWindow = resolveContextWindowTokens(
     params.model || "",
     params.inputTokenCap,
+    {
+      apiBase: params.apiBase,
+      protocol: params.providerProtocol,
+      authMode: params.authMode,
+    },
   );
   const contextTokens = estimateContextMessagesTokens(params.messages);
   const ratio = contextWindow > 0 ? contextTokens / contextWindow : 0;

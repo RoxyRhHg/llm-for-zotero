@@ -764,3 +764,20 @@ Contributions are welcome. Bug reports, feature requests, documentation
 improvements, and pull requests are all useful. Please
 [open an issue](https://github.com/yilewang/llm-for-zotero/issues) or submit a
 PR.
+
+### Model capability registry
+
+Model context limits and provider-defined reasoning options are maintained in
+[`registry/model-capabilities.v1.json`](./registry/model-capabilities.v1.json).
+
+The plugin refreshes this schema-validated registry and each configured
+provider's model catalog in the background, and performs a bounded first-use
+refresh when needed.
+
+Adding a model to the registry does not require a plugin release; increment the
+registry revision, run `npm run validate:model-registry`, and publish the JSON
+change.
+
+When a provider does not expose reasoning controls or context metadata through
+its model catalog, the registry remains the authoritative provider-maintained
+fallback.

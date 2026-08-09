@@ -69,6 +69,7 @@ import {
   LocalDocumentPathStreamRedactor,
 } from "./privacy/localDocumentPathRedaction";
 import { validateLocalPdfDocumentBatch } from "./context/localDocumentBatch";
+import { ensureModelCapabilities } from "../modelCapabilities";
 import {
   AgentPromptBudgetError,
   enforceAgentPromptBudget,
@@ -685,6 +686,21 @@ export class AgentRuntime {
     signal?: AbortSignal;
   }): Promise<AgentRuntimeOutcome> {
     const request = params.request;
+    try {
+      await ensureModelCapabilities(
+        {
+          model: request.model || "",
+          apiBase: request.apiBase,
+          protocol: request.providerProtocol,
+          authMode: request.authMode,
+          apiKey: request.apiKey,
+        },
+        { timeoutMs: 5_000 },
+      );
+    } catch {
+      // Capability discovery is advisory; the adapter retains its fallback
+      // profile when a provider does not expose a catalog.
+    }
     validateLocalPdfDocumentBatch({
       pdfPaperContexts: request.pdfPaperContexts,
       localDocuments: request.localDocuments,
@@ -794,6 +810,9 @@ export class AgentRuntime {
           messages: transcriptMessagesForPrompt,
           model: request.model,
           inputTokenCap: request.advanced?.inputTokenCap,
+          apiBase: request.apiBase,
+          providerProtocol: request.providerProtocol,
+          authMode: request.authMode,
           policy,
           forceCompact: true,
         });
@@ -890,6 +909,9 @@ export class AgentRuntime {
         messages,
         model: request.model,
         inputTokenCap: request.advanced?.inputTokenCap,
+        apiBase: request.apiBase,
+        providerProtocol: request.providerProtocol,
+        authMode: request.authMode,
         recentlyCompacted: Boolean(transcriptSegment.compactedAt),
       });
       if (budgetState.shouldCompact && transcriptMessagesForPrompt.length) {
@@ -1112,6 +1134,9 @@ export class AgentRuntime {
           messages,
           model: request.model,
           inputTokenCap: request.advanced?.inputTokenCap,
+          apiBase: request.apiBase,
+          providerProtocol: request.providerProtocol,
+          authMode: request.authMode,
           conversationKey: request.conversationKey,
           resourceSignature: resourceContextPlan.resourceSignature,
         });

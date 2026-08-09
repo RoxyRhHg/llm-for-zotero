@@ -138,6 +138,11 @@ export class OpenAIResponsesAgentAdapter implements AgentModelAdapter {
           max_output_tokens: normalizeMaxTokensForModel(
             request.advanced?.maxTokens,
             request.model,
+            {
+              apiBase: request.apiBase,
+              protocol: "responses_api",
+              authMode: request.authMode,
+            },
           ),
           ...reasoningPayload.extra,
           ...(reasoningPayload.omitTemperature
