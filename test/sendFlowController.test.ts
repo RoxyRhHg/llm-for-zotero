@@ -275,6 +275,11 @@ describe("sendFlowController", function () {
     let persistDraftInputCalls = 0;
     let setActiveEditSessionCalls = 0;
     let composerDraftClearedCalls = 0;
+    const restoredPaperModes: Array<{
+      itemId: number;
+      paperContext: PaperContextRef;
+      mode: string;
+    }> = [];
     let lastSentQuestion = "";
     let lastSentDisplayQuestion: string | undefined;
     let lastRuntimeMode = "";
@@ -321,6 +326,14 @@ describe("sendFlowController", function () {
       getSelectedTagContexts: () => [],
       getFullTextPaperContexts: () => [selectedPaper],
       getPdfModePaperContexts: () => [],
+      resolvePaperContextNextSendMode: () => "full-next" as const,
+      setPaperModeOverride: (
+        itemId: number,
+        paperContext: PaperContextRef,
+        mode: string,
+      ) => {
+        restoredPaperModes.push({ itemId, paperContext, mode });
+      },
       resolvePdfPaperAttachments: async () => [],
       resolveLocalPdfResources: async () => [],
       preflightLocalPdfCapability: async () => undefined,
@@ -479,6 +492,7 @@ describe("sendFlowController", function () {
       getLastEditContextSource: () => lastEditContextSource,
       getLastStatus: () => lastStatus,
       getStatuses: () => statuses.slice(),
+      getRestoredPaperModes: () => restoredPaperModes.slice(),
     };
   }
 
@@ -1931,7 +1945,7 @@ describe("sendFlowController", function () {
       title: "Selected PDF",
       contentSourceMode: "pdf",
     };
-    const { controller, getCounts } = createBaseDeps({
+    const { controller, getCounts, getRestoredPaperModes } = createBaseDeps({
       getSelectedProfile: () => ({
         entryId: "entry-1",
         model: "chatgpt-web",
@@ -1956,6 +1970,54 @@ describe("sendFlowController", function () {
     await controller.doSend();
 
     assert.equal(getCounts().consumePaperModeStateCalled, 0);
+    assert.deepEqual(getRestoredPaperModes(), [
+      {
+        itemId: item.id,
+        paperContext: pdf,
+        mode: "full-next",
+      },
+    ]);
+  });
+
+  it("restores a sticky WebChat PDF mode after a verified failure", async function () {
+    const pdf: PaperContextRef = {
+      itemId: 10,
+      contextItemId: 101,
+      title: "Selected PDF",
+      contentSourceMode: "pdf",
+    };
+    const { controller, getRestoredPaperModes } = createBaseDeps({
+      getSelectedProfile: () => ({
+        entryId: "entry-1",
+        model: "chatgpt-web",
+        apiBase: "",
+        apiKey: "",
+        providerLabel: "ChatGPT",
+        authMode: "webchat",
+        providerProtocol: "web_sync",
+      }),
+      getSelectedPaperContexts: () => [pdf],
+      getPdfModePaperContexts: () => [pdf],
+      getActiveWebChatPdfPaperContexts: () => [pdf],
+      getFullTextPaperContexts: () => [],
+      getSelectedFiles: () => [],
+      resolvePaperContextNextSendMode: () => "full-sticky",
+      sendQuestion: async (options: {
+        onWebChatSendOutcome?: (outcome: "failed") => void;
+      }) => {
+        options.onWebChatSendOutcome?.("failed");
+      },
+    });
+
+    await controller.doSend();
+
+    assert.deepEqual(getRestoredPaperModes(), [
+      {
+        itemId: item.id,
+        paperContext: pdf,
+        mode: "full-sticky",
+      },
+    ]);
   });
 
   it("re-arms a swallowed forced-new text-only WebChat failure", async function () {

@@ -25,6 +25,7 @@
 const PREFIX = "/llm-for-zotero/webchat";
 const PRE_SUBMIT_RECLAIM_MS = 120_000;
 const PIPELINE_TIMEOUT_MS = 180_000;
+export const ATTACHMENT_DELIVERY_CONTRACT_VERSION = 1;
 
 /**
  * Get the actual base URL of the embedded relay server.
@@ -120,7 +121,13 @@ export interface RelayTurnDiagnostic {
   attachmentMethod?: string | null;
   attachmentVerificationMs?: number | null;
   attachmentPreviewVerified?: boolean | null;
+  attachmentRequested?: boolean | null;
+  attachmentFilenameConfirmed?: boolean | null;
+  attachmentReadyVerified?: boolean | null;
   submittedAttachmentVerified?: boolean | null;
+  submittedAttachmentCount?: number | null;
+  submittedPdfCount?: number | null;
+  attachmentContractVerified?: boolean | null;
   completionDetectionMs?: number | null;
 }
 
@@ -142,6 +149,7 @@ export interface RelayState {
     /** Which webchat site to target: "chatgpt" | "deepseek". */
     target: string | null;
     force_new_chat: boolean;
+    delivery_contract_version: number;
     seq: number;
     attempt: number;
     phase: RelayQueryPhase;
@@ -149,6 +157,7 @@ export interface RelayState {
   active_seq: number;
   active_attempt: number;
   running_since: number;
+  last_activity_at: number;
   partial_text: string | null;
   partial_thinking: string | null;
   answer_anchor_id: string | null;
@@ -184,6 +193,8 @@ export interface RelayState {
   reported_mode: string | null;
   /** [webchat] Set by cancel button — polled separately so it works during active pipeline. */
   stopRequested: boolean;
+  stopRequestedSeq: number;
+  stopRequestedAttempt: number;
   /** [webchat] Active target site: "chatgpt" | "deepseek". Set by the plugin when submitting queries. */
   active_target: string | null;
 }
@@ -201,6 +212,7 @@ interface ExtensionStatus {
   sendControlState: string | null;
   uploadControlFound: boolean;
   networkHookActive: boolean;
+  supportedDeliveryContracts: number[];
   lastRequestAt: number | null;
   lastStreamAt: number | null;
   lastDiagnostic: RelayTurnDiagnostic | null;
@@ -253,6 +265,7 @@ if (!Z._webchatRelay) {
         chatgpt_mode: null,
         target: null,
         force_new_chat: false,
+        delivery_contract_version: 0,
         seq: 0,
         attempt: 0,
         phase: "pending",
@@ -260,6 +273,7 @@ if (!Z._webchatRelay) {
       active_seq: 0,
       active_attempt: 0,
       running_since: 0,
+      last_activity_at: 0,
       partial_text: null,
       partial_thinking: null,
       answer_anchor_id: null,
@@ -273,6 +287,8 @@ if (!Z._webchatRelay) {
       pendingCommand: null,
       reported_mode: null,
       stopRequested: false,
+      stopRequestedSeq: 0,
+      stopRequestedAttempt: 0,
       active_target: null,
     },
     mirroredHistory: [],
@@ -553,6 +569,7 @@ function resetState() {
     chatgpt_mode: null,
     target: null,
     force_new_chat: false,
+    delivery_contract_version: 0,
     seq: prevSeq,
     attempt: 0,
     phase: "pending",
@@ -560,6 +577,7 @@ function resetState() {
   S().active_seq = 0;
   S().active_attempt = 0;
   S().running_since = 0;
+  S().last_activity_at = 0;
   S().partial_text = null;
   S().partial_thinking = null;
   S().answer_anchor_id = null;
@@ -570,6 +588,9 @@ function resetState() {
   S().responses = [];
   S().activeSessionId = null;
   S().pendingCommand = null;
+  S().stopRequested = false;
+  S().stopRequestedSeq = 0;
+  S().stopRequestedAttempt = 0;
   S().reported_mode = null;
   setScrapedTranscript(null);
 }
@@ -602,6 +623,40 @@ function parseBody(data: unknown): Record<string, unknown> {
   if (typeof data === "object" && data !== null)
     return data as Record<string, unknown>;
   return {};
+}
+
+function normalizeSupportedDeliveryContracts(value: unknown): number[] {
+  if (!Array.isArray(value)) return [];
+  return Array.from(
+    new Set(
+      value
+        .map((entry) => Number(entry))
+        .filter((entry) => Number.isInteger(entry) && entry > 0),
+    ),
+  ).sort((a, b) => a - b);
+}
+
+function validateDeliveryContractForDispatch(
+  requestedVersion: number,
+): string | null {
+  if (requestedVersion === 0) return null;
+  if (requestedVersion !== ATTACHMENT_DELIVERY_CONTRACT_VERSION) {
+    return `Unsupported WebChat delivery contract version ${requestedVersion}.`;
+  }
+  const extensionStatus = relayGetExtensionStatus();
+  if (!extensionStatus) {
+    return "Sync for Zotero has not reported a fresh delivery-contract capability. Reload the chat tab and try again.";
+  }
+  if (
+    extensionStatus.chatTabAlive !== true ||
+    extensionStatus.contentScriptAlive !== true
+  ) {
+    return "Sync for Zotero cannot verify a live chat tab and content script. Reload the chat tab and try again.";
+  }
+  if (!extensionStatus.supportedDeliveryContracts.includes(requestedVersion)) {
+    return `The active Sync for Zotero content script does not support WebChat delivery contract ${requestedVersion}. Reload or update the extension before sending.`;
+  }
+  return null;
 }
 
 function isPreSubmitPhase(phase: RelayQueryPhase): boolean {
@@ -654,6 +709,7 @@ function expireStaleClaimIfNeeded(): void {
   S().active_seq = 0;
   S().active_attempt = 0;
   S().running_since = 0;
+  S().last_activity_at = 0;
   S().partial_text = null;
   S().partial_thinking = null;
   S().answer_anchor_id = null;
@@ -757,8 +813,24 @@ function normalizeTurnDiagnostic(
     attachmentPreviewVerified: readNullableBoolean(
       raw.attachmentPreviewVerified,
     ),
+    attachmentRequested: readNullableBoolean(raw.attachmentRequested),
+    attachmentFilenameConfirmed: readNullableBoolean(
+      raw.attachmentFilenameConfirmed,
+    ),
+    attachmentReadyVerified: readNullableBoolean(raw.attachmentReadyVerified),
     submittedAttachmentVerified: readNullableBoolean(
       raw.submittedAttachmentVerified,
+    ),
+    submittedAttachmentCount:
+      raw.submittedAttachmentCount == null
+        ? null
+        : Math.max(0, Math.floor(Number(raw.submittedAttachmentCount) || 0)),
+    submittedPdfCount:
+      raw.submittedPdfCount == null
+        ? null
+        : Math.max(0, Math.floor(Number(raw.submittedPdfCount) || 0)),
+    attachmentContractVerified: readNullableBoolean(
+      raw.attachmentContractVerified,
     ),
     completionDetectionMs:
       raw.completionDetectionMs == null
@@ -776,6 +848,68 @@ function applyTurnDiagnostic(body: Record<string, unknown>): void {
   if (diagnostic) {
     S().last_diagnostic = diagnostic;
   }
+}
+
+function validateTerminalDeliveryContract(
+  body: Record<string, unknown>,
+  diagnostic: RelayTurnDiagnostic | null,
+): string | null {
+  if (body.error) return null;
+  const requestedVersion = Math.max(
+    0,
+    Math.floor(Number(S().query.delivery_contract_version) || 0),
+  );
+  if (requestedVersion === 0) return null;
+  if (requestedVersion !== ATTACHMENT_DELIVERY_CONTRACT_VERSION) {
+    return `Unsupported WebChat delivery contract version ${requestedVersion}.`;
+  }
+  if (!diagnostic) {
+    return "WebChat returned no terminal delivery receipt.";
+  }
+  if (diagnostic.composerTextMatched !== true) {
+    return "WebChat did not verify the submitted prompt in the composer.";
+  }
+  if (diagnostic.userTurnMatched !== true) {
+    return "WebChat did not verify the submitted user turn.";
+  }
+  if (diagnostic.assistantTurnMatched !== true) {
+    return "WebChat did not bind the response to the submitted user turn.";
+  }
+
+  const pdfRequested = Boolean(S().query.pdf_base64);
+  if (diagnostic.attachmentRequested !== pdfRequested) {
+    return "WebChat attachment mode did not match the Zotero request.";
+  }
+  if (diagnostic.attachmentContractVerified !== true) {
+    return "WebChat did not verify the terminal attachment contract.";
+  }
+
+  if (!pdfRequested) {
+    if (diagnostic.submittedPdfCount !== 0) {
+      return "A prompt-only WebChat turn contained an unexpected PDF.";
+    }
+    return null;
+  }
+
+  const expectedFilename = String(S().query.pdf_filename || "").trim();
+  if (!expectedFilename) {
+    return "The Zotero PDF request did not include a filename.";
+  }
+  if (diagnostic.attachmentFilename !== expectedFilename) {
+    return "The WebChat receipt did not identify the requested Zotero PDF.";
+  }
+  if (
+    diagnostic.uploadDetected !== true ||
+    diagnostic.attachmentPreviewVerified !== true ||
+    diagnostic.attachmentFilenameConfirmed !== true ||
+    diagnostic.attachmentReadyVerified !== true ||
+    diagnostic.submittedAttachmentVerified !== true ||
+    !Number.isFinite(diagnostic.submittedPdfCount) ||
+    Number(diagnostic.submittedPdfCount) !== 1
+  ) {
+    return `WebChat could not prove delivery of "${expectedFilename}".`;
+  }
+  return null;
 }
 
 function deriveRemoteChatIdFromUrl(url: string | null): string | null {
@@ -851,11 +985,87 @@ function resetPerTurnTracking(): void {
 
 function isRunningExpired(): boolean {
   if (S().status !== "running" || S().running_since <= 0) return false;
-  const elapsed = Date.now() - S().running_since;
+  const activityAt = S().last_activity_at || S().running_since;
+  const elapsed = Date.now() - activityAt;
   if (isPreSubmitPhase(S().query.phase)) {
     return elapsed > PRE_SUBMIT_RECLAIM_MS;
   }
   return elapsed > PIPELINE_TIMEOUT_MS;
+}
+
+export function describeWebChatPipelineTimeout(
+  diagnostic: RelayTurnDiagnostic | null,
+): { reasonCode: string; message: string } {
+  const timeoutSeconds = Math.floor(PIPELINE_TIMEOUT_MS / 1000);
+  if (diagnostic?.attachmentContractVerified === true) {
+    if (diagnostic.attachmentRequested === true) {
+      return {
+        reasonCode: "provider_timeout_after_verified_pdf_delivery",
+        message:
+          `The web provider made no verified progress for ${timeoutSeconds} seconds. ` +
+          "PDF upload and submission were verified; no final answer was accepted.",
+      };
+    }
+    if (diagnostic.attachmentRequested === false) {
+      return {
+        reasonCode: "provider_timeout_after_verified_prompt_delivery",
+        message:
+          `The web provider made no verified progress for ${timeoutSeconds} seconds. ` +
+          "The prompt-only submission was verified with zero PDFs; no final answer was accepted.",
+      };
+    }
+  }
+  return {
+    reasonCode: "pipeline_timeout_unverified_delivery",
+    message:
+      `The WebChat pipeline made no verified progress for ${timeoutSeconds} seconds. ` +
+      "Delivery and the final response were not fully verified.",
+  };
+}
+
+function expireRunningPipelineIfNeeded(): boolean {
+  const activityAt = S().last_activity_at || S().running_since;
+  if (
+    S().status !== "running" ||
+    activityAt <= 0 ||
+    Date.now() - activityAt <= PIPELINE_TIMEOUT_MS
+  ) {
+    return false;
+  }
+
+  const timeout = describeWebChatPipelineTimeout(S().last_diagnostic);
+  const diagnostic: RelayTurnDiagnostic = {
+    ...(S().last_diagnostic || {}),
+    reasonCode: timeout.reasonCode,
+    phase: "error",
+    message: timeout.message,
+  };
+  S().status = "error";
+  S().query.phase = "error";
+  S().run_state = "error";
+  S().completion_reason = "timeout";
+  S().turn_status = "error";
+  S().last_diagnostic = diagnostic;
+  S().stopRequested = true;
+  S().stopRequestedSeq = S().active_seq;
+  S().stopRequestedAttempt = S().active_attempt;
+  S().responses.push({
+    seq: S().active_seq,
+    attempt: S().active_attempt || undefined,
+    error: timeout.message,
+    timestamp: new Date().toISOString(),
+    run_state: "error",
+    completion_reason: "timeout",
+    remote_chat_url: S().remote_chat_url,
+    remote_chat_id: S().remote_chat_id,
+    user_turn_key: S().user_turn_key,
+    assistant_turn_key: S().assistant_turn_key,
+    baseline_transcript_count: S().baseline_transcript_count,
+    baseline_transcript_hash: S().baseline_transcript_hash,
+    turn_status: "error",
+    diagnostic,
+  });
+  return true;
 }
 
 // ---------------------------------------------------------------------------
@@ -889,11 +1099,24 @@ const SubmitQueryEndpoint = createEndpoint(["POST"], (opts) => {
 
   if (S().status === "pending" || S().status === "running") {
     if (S().status === "running" && isRunningExpired()) {
-      S().status = "error";
-      S().query.phase = "error";
+      expireRunningPipelineIfNeeded();
     } else {
       return jsonReply({ error: "pipeline_busy", status: S().status });
     }
+  }
+
+  const requestedDeliveryContractVersion = Math.max(
+    0,
+    Math.floor(Number(body.delivery_contract_version) || 0),
+  );
+  const compatibilityError = validateDeliveryContractForDispatch(
+    requestedDeliveryContractVersion,
+  );
+  if (compatibilityError) {
+    return jsonReply(
+      { error: compatibilityError, reason: "incompatible_extension" },
+      409,
+    );
   }
 
   // Clear stale state
@@ -914,6 +1137,7 @@ const SubmitQueryEndpoint = createEndpoint(["POST"], (opts) => {
     S().active_target = body.target as string;
   }
   S().query.force_new_chat = body.force_new_chat === true;
+  S().query.delivery_contract_version = requestedDeliveryContractVersion;
   S().query.attempt = 0;
   S().query.phase = "pending";
   S().status = "pending";
@@ -954,6 +1178,7 @@ const ClaimQueryEndpoint = createEndpoint(["POST"], (opts) => {
   S().active_attempt = S().query.attempt;
   S().query.phase = "claimed";
   S().running_since = Date.now();
+  S().last_activity_at = S().running_since;
   S().partial_text = null;
   S().partial_thinking = null;
   resetPerTurnTracking();
@@ -976,6 +1201,9 @@ const AckQueryPhaseEndpoint = createEndpoint(["POST"], (opts) => {
   if (!attemptMatches(body)) {
     return jsonReply({ ok: false, reason: "attempt_mismatch" });
   }
+  if (S().status !== "running") {
+    return jsonReply({ ok: false, reason: "attempt_not_running" });
+  }
   if (phaseOrder(nextPhase) < phaseOrder(S().query.phase)) {
     return jsonReply({ ok: false, reason: "phase_regression" });
   }
@@ -992,6 +1220,7 @@ const AckQueryPhaseEndpoint = createEndpoint(["POST"], (opts) => {
   ) {
     S().running_since = Date.now();
   }
+  S().last_activity_at = Date.now();
   if (nextPhase === "submitted" && !S().run_state) {
     S().run_state = "submitted";
   }
@@ -1021,6 +1250,7 @@ const ReleaseQueryEndpoint = createEndpoint(["POST"], (opts) => {
   S().active_seq = 0;
   S().active_attempt = 0;
   S().running_since = 0;
+  S().last_activity_at = 0;
   S().partial_text = null;
   S().partial_thinking = null;
   resetPerTurnTracking();
@@ -1031,21 +1261,7 @@ const ReleaseQueryEndpoint = createEndpoint(["POST"], (opts) => {
 // GET /poll_response
 const PollResponseEndpoint = createEndpoint(["GET"], () => {
   expireStaleClaimIfNeeded();
-  // Passive timeout
-  if (
-    S().status === "running" &&
-    S().running_since > 0 &&
-    Date.now() - S().running_since > PIPELINE_TIMEOUT_MS
-  ) {
-    S().status = "error";
-    S().query.phase = "error";
-    S().responses.push({
-      seq: S().active_seq,
-      attempt: S().active_attempt || undefined,
-      error: "Server-side timeout: pipeline running for > 180s",
-      timestamp: new Date().toISOString(),
-    });
-  }
+  expireRunningPipelineIfNeeded();
 
   return jsonReply({
     status: S().status,
@@ -1066,6 +1282,7 @@ const PollResponseEndpoint = createEndpoint(["GET"], () => {
     turn_status: S().turn_status,
     diagnostic: S().last_diagnostic,
     current_seq: S().query.seq,
+    current_attempt: S().active_attempt,
   });
 });
 
@@ -1079,6 +1296,23 @@ const UpdatePartialEndpoint = createEndpoint(["POST"], (opts) => {
   if (!attemptMatches(body)) {
     return jsonReply({ ok: false, reason: "attempt_mismatch" });
   }
+  if (S().status !== "running") {
+    return jsonReply({ ok: false, reason: "attempt_not_running" });
+  }
+  const activityBefore = JSON.stringify([
+    S().partial_text,
+    S().partial_thinking,
+    S().answer_anchor_id,
+    S().answer_revision,
+    S().thinking_revision,
+    S().run_state,
+    S().completion_reason,
+    S().remote_chat_url,
+    S().remote_chat_id,
+    S().user_turn_key,
+    S().assistant_turn_key,
+    S().turn_status,
+  ]);
   if ("answer_snapshot" in body) {
     S().partial_text = body.answer_snapshot as string | null;
   } else if ("text" in body) {
@@ -1130,6 +1364,23 @@ const UpdatePartialEndpoint = createEndpoint(["POST"], (opts) => {
   if (!S().turn_status) {
     S().turn_status = "submitted";
   }
+  const activityAfter = JSON.stringify([
+    S().partial_text,
+    S().partial_thinking,
+    S().answer_anchor_id,
+    S().answer_revision,
+    S().thinking_revision,
+    S().run_state,
+    S().completion_reason,
+    S().remote_chat_url,
+    S().remote_chat_id,
+    S().user_turn_key,
+    S().assistant_turn_key,
+    S().turn_status,
+  ]);
+  if (activityAfter !== activityBefore) {
+    S().last_activity_at = Date.now();
+  }
   return jsonReply({ ok: true });
 });
 
@@ -1138,23 +1389,28 @@ const UpdateTurnStateEndpoint = createEndpoint(["POST"], (opts) => {
   const body = parseBody(opts.data);
   expireStaleClaimIfNeeded();
 
-  if (
-    "seq" in body &&
-    body.seq != null &&
-    S().active_seq > 0 &&
-    body.seq !== S().active_seq
-  ) {
+  const isAttemptBound =
+    ("seq" in body && body.seq != null) ||
+    ("attempt" in body && body.attempt != null);
+  if ("seq" in body && body.seq != null && body.seq !== S().active_seq) {
     return jsonReply({ ok: false, reason: "seq_mismatch" });
   }
-  if (
-    "attempt" in body &&
-    body.attempt != null &&
-    S().active_attempt > 0 &&
-    !attemptMatches(body)
-  ) {
+  if ("attempt" in body && body.attempt != null && !attemptMatches(body)) {
     return jsonReply({ ok: false, reason: "attempt_mismatch" });
   }
+  if (isAttemptBound && S().status !== "running") {
+    return jsonReply({ ok: false, reason: "attempt_not_running" });
+  }
 
+  const activityBefore = JSON.stringify([
+    S().remote_chat_url,
+    S().remote_chat_id,
+    S().user_turn_key,
+    S().assistant_turn_key,
+    S().baseline_transcript_count,
+    S().baseline_transcript_hash,
+    S().turn_status,
+  ]);
   applyTurnDiagnostic(body);
   applyRemoteTurnMetadata(body);
 
@@ -1164,6 +1420,18 @@ const UpdateTurnStateEndpoint = createEndpoint(["POST"], (opts) => {
     if (nextStatus === "ready" && S().status === "running" && !S().run_state) {
       S().run_state = "submitted";
     }
+  }
+  const activityAfter = JSON.stringify([
+    S().remote_chat_url,
+    S().remote_chat_id,
+    S().user_turn_key,
+    S().assistant_turn_key,
+    S().baseline_transcript_count,
+    S().baseline_transcript_hash,
+    S().turn_status,
+  ]);
+  if (isAttemptBound && activityAfter !== activityBefore) {
+    S().last_activity_at = Date.now();
   }
 
   return jsonReply({
@@ -1187,6 +1455,21 @@ const SubmitResponseEndpoint = createEndpoint(["POST"], (opts) => {
   }
   if (!attemptMatches(body)) {
     return jsonReply({ ok: false, reason: "attempt_mismatch" });
+  }
+  if (S().status !== "running") {
+    return jsonReply({ ok: false, reason: "attempt_not_running" });
+  }
+
+  const terminalDiagnostic = normalizeTurnDiagnostic(body, S().last_diagnostic);
+  const contractError = validateTerminalDeliveryContract(
+    body,
+    terminalDiagnostic,
+  );
+  if (contractError) {
+    return jsonReply(
+      { error: `WebChat delivery verification failed: ${contractError}` },
+      409,
+    );
   }
 
   const entry = {
@@ -1248,7 +1531,7 @@ const SubmitResponseEndpoint = createEndpoint(["POST"], (opts) => {
           ? "incomplete"
           : "done",
     ),
-    diagnostic: normalizeTurnDiagnostic(body, S().last_diagnostic) || undefined,
+    diagnostic: terminalDiagnostic || undefined,
   };
   S().responses.push(entry);
   S().partial_text = null;
@@ -1285,7 +1568,11 @@ const HeartbeatEndpoint = createEndpoint(["GET"], () => {
 
 // GET /debug — minimal endpoint used by the browser extension for port discovery
 const DebugEndpoint = createEndpoint(["GET"], () => {
-  return jsonReply({ status: S().status });
+  return jsonReply({
+    status: S().status,
+    extension_supported_delivery_contracts:
+      relayGetExtensionStatus()?.supportedDeliveryContracts || [],
+  });
 });
 
 // GET /poll_command
@@ -1304,10 +1591,14 @@ const PollCommandEndpoint = createEndpoint(["GET"], () => {
 // GET /poll_stop — lightweight endpoint polled during active pipeline
 const PollStopEndpoint = createEndpoint(["GET"], () => {
   const requested = S().stopRequested;
+  const seq = S().stopRequestedSeq;
+  const attempt = S().stopRequestedAttempt;
   if (requested) {
     S().stopRequested = false;
+    S().stopRequestedSeq = 0;
+    S().stopRequestedAttempt = 0;
   }
-  return jsonReply({ stop: requested });
+  return jsonReply({ stop: requested, seq, attempt });
 });
 
 // POST /new_chat
@@ -1441,6 +1732,9 @@ const ExtensionStatusEndpoint = createEndpoint(["POST"], (opts) => {
     sendControlState: readNullableString(body.sendControlState),
     uploadControlFound: body.uploadControlFound === true,
     networkHookActive: body.networkHookActive !== false,
+    supportedDeliveryContracts: normalizeSupportedDeliveryContracts(
+      body.supportedDeliveryContracts,
+    ),
     lastRequestAt: readNullableNumber(body.lastRequestAt),
     lastStreamAt: readNullableNumber(body.lastStreamAt),
     lastDiagnostic:
@@ -1500,15 +1794,26 @@ export function relaySubmitQuery(opts: {
   chatgpt_mode?: string | null;
   target?: string | null;
   force_new_chat?: boolean;
+  delivery_contract_version?: number;
 }): { ok: boolean; seq: number; error?: string } {
   expireStaleClaimIfNeeded();
   if (S().status === "pending" || S().status === "running") {
     if (S().status === "running" && isRunningExpired()) {
-      S().status = "error";
-      S().query.phase = "error";
+      expireRunningPipelineIfNeeded();
     } else {
       return { ok: false, seq: 0, error: "pipeline_busy" };
     }
+  }
+
+  const requestedDeliveryContractVersion = Math.max(
+    0,
+    Math.floor(Number(opts.delivery_contract_version) || 0),
+  );
+  const compatibilityError = validateDeliveryContractForDispatch(
+    requestedDeliveryContractVersion,
+  );
+  if (compatibilityError) {
+    return { ok: false, seq: 0, error: compatibilityError };
   }
 
   S().responses = [];
@@ -1525,6 +1830,7 @@ export function relaySubmitQuery(opts: {
   S().query.target = opts.target || null;
   S().active_target = opts.target || null;
   S().query.force_new_chat = opts.force_new_chat === true;
+  S().query.delivery_contract_version = requestedDeliveryContractVersion;
   S().query.attempt = 0;
   S().query.phase = "pending";
   S().status = "pending";
@@ -1568,6 +1874,7 @@ export function relayClaimQuery(seq: number): {
   S().active_attempt = S().query.attempt;
   S().query.phase = "claimed";
   S().running_since = Date.now();
+  S().last_activity_at = S().running_since;
   S().partial_text = null;
   S().partial_thinking = null;
   resetPerTurnTracking();
@@ -1605,6 +1912,7 @@ export function relayAckQueryPhase(
   ) {
     S().running_since = Date.now();
   }
+  S().last_activity_at = Date.now();
   if (phase === "submitted" && !S().run_state) {
     S().run_state = "submitted";
   }
@@ -1634,6 +1942,7 @@ export function relayReleaseQuery(
   S().active_seq = 0;
   S().active_attempt = 0;
   S().running_since = 0;
+  S().last_activity_at = 0;
   S().partial_text = null;
   S().partial_thinking = null;
   resetPerTurnTracking();
@@ -1661,23 +1970,10 @@ export function relayPollResponse(): {
   turn_status: RelayTurnStatus | null;
   diagnostic: RelayTurnDiagnostic | null;
   current_seq: number;
+  current_attempt: number;
 } {
   expireStaleClaimIfNeeded();
-  // Passive timeout
-  if (
-    S().status === "running" &&
-    S().running_since > 0 &&
-    Date.now() - S().running_since > PIPELINE_TIMEOUT_MS
-  ) {
-    S().status = "error";
-    S().query.phase = "error";
-    S().responses.push({
-      seq: S().active_seq,
-      attempt: S().active_attempt || undefined,
-      error: "Server-side timeout: pipeline running for > 180s",
-      timestamp: new Date().toISOString(),
-    });
-  }
+  expireRunningPipelineIfNeeded();
 
   return {
     status: S().status,
@@ -1698,6 +1994,7 @@ export function relayPollResponse(): {
     turn_status: S().turn_status,
     diagnostic: S().last_diagnostic,
     current_seq: S().query.seq,
+    current_attempt: S().active_attempt,
   };
 }
 
@@ -1727,15 +2024,18 @@ export function relaySetCommand(cmd: {
 /** Request the extension to stop ChatGPT generation (no HTTP). */
 export function relayRequestStop(): void {
   S().stopRequested = true;
+  S().stopRequestedSeq = S().active_seq || S().query.seq;
+  S().stopRequestedAttempt = S().active_attempt;
   // Write a cancel response so the plugin's pollForResponse exits immediately
   const currentSeq = S().query.seq;
   S().responses.push({
     seq: currentSeq,
+    attempt: S().active_attempt || undefined,
     text: S().partial_text || "",
     thinking: S().partial_thinking || undefined,
     error: undefined,
     timestamp: new Date().toISOString(),
-    run_state: "done",
+    run_state: "incomplete",
     completion_reason: "forced_cancel",
     remote_chat_url: S().remote_chat_url,
     remote_chat_id: S().remote_chat_id,
@@ -1743,13 +2043,14 @@ export function relayRequestStop(): void {
     assistant_turn_key: S().assistant_turn_key,
     baseline_transcript_count: S().baseline_transcript_count,
     baseline_transcript_hash: S().baseline_transcript_hash,
-    turn_status: "done",
+    turn_status: "incomplete",
   });
   // Reset relay state so new queries aren't rejected as "pipeline_busy"
   S().status = "idle";
   S().query.phase = "pending";
-  S().run_state = null;
+  S().run_state = "incomplete";
   S().completion_reason = "forced_cancel";
+  S().turn_status = "incomplete";
 }
 
 /** Refresh the current ChatGPT conversation by re-navigating and re-scraping. */
@@ -1879,6 +2180,32 @@ export function relayGetExtensionStatus(): ExtensionStatus | null {
   const s = _store().extensionStatus;
   if (!s || Date.now() - s.ts > 30_000) return null; // 30s staleness — heartbeat posts every 10s
   return s;
+}
+
+/** Test helper for exercising strict submissions without a browser runtime. */
+export function relaySetExtensionCapabilitiesForTests(
+  supportedDeliveryContracts: number[],
+): void {
+  _store().extensionStatus = {
+    chatTabAlive: true,
+    chatUrl: "https://chatgpt.com/",
+    siteId: "chatgpt",
+    url: "https://chatgpt.com/",
+    contentScriptAlive: true,
+    mainWorldInjected: true,
+    composerFound: true,
+    sendControlState: "enabled",
+    uploadControlFound: true,
+    networkHookActive: true,
+    supportedDeliveryContracts: normalizeSupportedDeliveryContracts(
+      supportedDeliveryContracts,
+    ),
+    lastRequestAt: null,
+    lastStreamAt: null,
+    lastDiagnostic: null,
+    ts: Date.now(),
+  };
+  _store().lastExtensionContact = Date.now();
 }
 
 /** Test helper to reset relay state without issuing commands. */

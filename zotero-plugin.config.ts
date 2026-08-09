@@ -1,7 +1,9 @@
 import { defineConfig } from "zotero-plugin-scaffold";
 import pkg from "./package.json";
 
-const workflowTestsEnabled = process.env.LLM_FOR_ZOTERO_WORKFLOW_TESTS === "1";
+const webChatLiveTestsEnabled = process.env.LLM_FOR_ZOTERO_WEBCHAT_LIVE === "1";
+const workflowTestsEnabled =
+  webChatLiveTestsEnabled || process.env.LLM_FOR_ZOTERO_WORKFLOW_TESTS === "1";
 
 export default defineConfig({
   source: ["src", "addon"],
@@ -46,11 +48,15 @@ export default defineConfig({
   },
 
   test: {
-    entries: workflowTestsEnabled ? "test-workflows" : "test",
+    entries: webChatLiveTestsEnabled
+      ? "test-live-workflows"
+      : workflowTestsEnabled
+        ? "test-workflows"
+        : "test",
     ...(workflowTestsEnabled
       ? {
           abortOnFail: true,
-          mocha: { timeout: 30000 },
+          mocha: { timeout: webChatLiveTestsEnabled ? 720000 : 30000 },
           watch: false,
         }
       : {}),

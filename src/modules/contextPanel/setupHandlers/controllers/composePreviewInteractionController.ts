@@ -531,6 +531,7 @@ export function attachComposePreviewInteractionController(
         "llm-paper-context-chip-webchat-inactive",
         deps.isWebChatMode() && contentSource === "pdf" && !nextIsFullText,
       );
+      deps.updatePaperPreviewPreservingScroll();
       deps.closePaperChipMenu();
       if (deps.isWebChatMode() && contentSource === "pdf") {
         setStatus(

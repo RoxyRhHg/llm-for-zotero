@@ -671,6 +671,15 @@ Setup:
    **Auth Mode** -> `WebChat`.
 5. ⚠️: Keep a ChatGPT tab open in your browser. A green dot in Zotero means the extension and ChatGPT tab are connected. Make sure the tab and Zotero stay in the same monitor. No minimization or backgrounding, or the connection may drop.
 
+For release validation, keep Chrome signed in with the development extension loaded and run:
+
+```bash
+npm run test:webchat:live
+```
+
+This opt-in gate creates a real Zotero PDF fixture and clicks the real Zotero composer send control.
+It verifies one exact PDF upload and answer, toggles the visible PDF chip both ways, then verifies one prompt-only turn with zero submitted PDFs through the relay and Chrome extension.
+
 ## Privacy and Data Flow
 
 Data flow depends on the backend you choose. Local models and local MinerU can

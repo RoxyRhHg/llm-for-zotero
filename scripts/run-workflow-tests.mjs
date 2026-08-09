@@ -2,6 +2,7 @@ import { spawn } from "node:child_process";
 
 const command = process.platform === "win32" ? "npx.cmd" : "npx";
 const args = ["zotero-plugin", "test", "--no-watch", "--abort-on-fail"];
+const webChatLive = process.argv.includes("--webchat-live");
 
 const child = spawn(command, args, {
   stdio: "inherit",
@@ -9,6 +10,7 @@ const child = spawn(command, args, {
     ...process.env,
     NODE_ENV: "test",
     LLM_FOR_ZOTERO_WORKFLOW_TESTS: "1",
+    ...(webChatLive ? { LLM_FOR_ZOTERO_WEBCHAT_LIVE: "1" } : {}),
   },
 });
 

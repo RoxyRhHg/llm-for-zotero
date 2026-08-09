@@ -11,6 +11,7 @@ import type {
   ChatRuntimeMode,
   CollectionContextRef,
   PaperContextRef,
+  PaperContextSendMode,
   ResolvedSelectedTextAnchor,
   ResolvedContextSource,
   SelectedTextContext,
@@ -201,6 +202,7 @@ type SendFlowControllerDeps = {
   persistDraftInput: () => void;
   autoLockGlobalChat: () => void;
   autoUnlockGlobalChat: () => void;
+  onSendSettled?: () => void;
   setStatusMessage?: (message: string, level: StatusLevel) => void;
   editStaleStatusText: string;
   onComposerDraftCleared?: () => void;
@@ -215,6 +217,15 @@ type SendFlowControllerDeps = {
     item: Zotero.Item,
     paperContexts?: PaperContextRef[],
   ) => PaperContextRef[];
+  resolvePaperContextNextSendMode: (
+    itemId: number,
+    paperContext: PaperContextRef,
+  ) => PaperContextSendMode;
+  setPaperModeOverride: (
+    itemId: number,
+    paperContext: PaperContextRef,
+    mode: PaperContextSendMode,
+  ) => void;
   consumeWebChatForceNewChatIntent?: () => boolean;
   markWebChatForceNewChatIntent?: () => void;
 };
@@ -302,6 +313,21 @@ export function createSendFlowController(deps: SendFlowControllerDeps): {
             ? pdfModePaperContexts
             : []))
         : [];
+      const webChatPdfModeSnapshot = activeWebChatPdfPaperContexts.map(
+        (paperContext) => ({
+          paperContext,
+          mode: deps.resolvePaperContextNextSendMode(item.id, paperContext),
+        }),
+      );
+      let webChatPdfModeRestored = false;
+      const restoreWebChatPdfModeAfterUnverifiedSend = () => {
+        if (webChatPdfModeRestored || !webChatPdfModeSnapshot.length) return;
+        webChatPdfModeRestored = true;
+        for (const { paperContext, mode } of webChatPdfModeSnapshot) {
+          deps.setPaperModeOverride(item.id, paperContext, mode);
+        }
+        deps.updatePaperPreviewPreservingScroll();
+      };
       if (isWebChat && activeWebChatPdfPaperContexts.length > 1) {
         deps.setStatusMessage?.(
           "Web chat supports one PDF attachment at a time. Keep one PDF active or start separate chats.",
@@ -775,6 +801,7 @@ export function createSendFlowController(deps: SendFlowControllerDeps): {
       try {
         await sendTask;
       } catch (err) {
+        restoreWebChatPdfModeAfterUnverifiedSend();
         if (isWebChat && webchatForceNewChat) {
           deps.markWebChatForceNewChatIntent?.();
         }
@@ -787,6 +814,9 @@ export function createSendFlowController(deps: SendFlowControllerDeps): {
           deps.retainPaperState(item.id);
           deps.updatePaperPreviewPreservingScroll();
         }
+        if (!webchatSendSucceeded) {
+          restoreWebChatPdfModeAfterUnverifiedSend();
+        }
         if (!webchatSendSucceeded && webchatForceNewChat) {
           deps.markWebChatForceNewChatIntent?.();
         }
@@ -794,6 +824,7 @@ export function createSendFlowController(deps: SendFlowControllerDeps): {
       deps.refreshGlobalHistoryHeader();
     } finally {
       deps.autoUnlockGlobalChat();
+      deps.onSendSettled?.();
     }
   };
 

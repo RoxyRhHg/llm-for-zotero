@@ -8,6 +8,7 @@
 
 import { createElement } from "../utils/domHelpers";
 import {
+  ATTACHMENT_DELIVERY_CONTRACT_VERSION,
   relayGetExtensionLiveness,
   relayGetExtensionStatus,
   relayClearExtensionStatus,
@@ -79,6 +80,13 @@ function describeChatSiteFailure(
     return "The Sync for Zotero content script is not responding; reload the chat tab or refresh the extension.";
   }
   if (
+    !status.supportedDeliveryContracts.includes(
+      ATTACHMENT_DELIVERY_CONTRACT_VERSION,
+    )
+  ) {
+    return `The active Sync for Zotero content script does not support WebChat delivery contract ${ATTACHMENT_DELIVERY_CONTRACT_VERSION}; reload or update the extension.`;
+  }
+  if (
     status.mainWorldInjected === false ||
     status.networkHookActive === false
   ) {
@@ -120,7 +128,10 @@ function makeChatSiteStep(targetHost?: string): PreloadStep {
         status.contentScriptAlive !== false &&
         status.mainWorldInjected !== false &&
         status.networkHookActive !== false &&
-        status.composerFound !== false
+        status.composerFound !== false &&
+        status.supportedDeliveryContracts.includes(
+          ATTACHMENT_DELIVERY_CONTRACT_VERSION,
+        )
       );
     },
     maxAttempts: 30,

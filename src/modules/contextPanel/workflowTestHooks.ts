@@ -24,6 +24,7 @@ export type WorkflowTestFinalRequestInterceptor = (
 
 let sendInterceptor: WorkflowTestSendInterceptor | null = null;
 let finalRequestInterceptor: WorkflowTestFinalRequestInterceptor | null = null;
+let sendSettledSequence = 0;
 
 export function setWorkflowTestSendInterceptor(
   interceptor: WorkflowTestSendInterceptor | null,
@@ -33,6 +34,14 @@ export function setWorkflowTestSendInterceptor(
 
 export function getWorkflowTestSendInterceptor(): WorkflowTestSendInterceptor | null {
   return sendInterceptor;
+}
+
+export function notifyWorkflowTestSendSettled(): void {
+  sendSettledSequence += 1;
+}
+
+export function getWorkflowTestSendSettledSequence(): number {
+  return sendSettledSequence;
 }
 
 export function setWorkflowTestFinalRequestInterceptor(

@@ -55,6 +55,63 @@ export type WorkflowTestDraftRefreshDiagnostics = {
   inputAfterRefresh: string;
 };
 
+export type WorkflowTestWebChatPdfChipState = {
+  fullText: boolean;
+  inactive: boolean;
+  contentSource: string;
+  paperItemId: number;
+  contextItemId: number;
+  modeOverride: string;
+};
+
+export type WorkflowTestWebChatPdfTurn = {
+  question: string;
+  outcome: "success" | "failed";
+  webchatSendPdf: boolean;
+  pdfContextItemIds: number[];
+  modeBeforeOutcome: string;
+  modeAfterOutcome: string;
+  chipAfterTurn: WorkflowTestWebChatPdfChipState;
+};
+
+export type WorkflowTestLiveWebChatTurn = {
+  question: string;
+  outcome: "success" | "failed" | "cancelled" | null;
+  webchatSendPdf: boolean;
+  pdfContextItemIds: number[];
+  chipAfterTurn: WorkflowTestWebChatPdfChipState;
+  statusText: string;
+  relayStatus: string;
+  runState: string | null;
+  completionReason: string | null;
+  responseText: string;
+  diagnostic: Record<string, unknown> | null;
+};
+
+export type WorkflowTestWebChatPdfToggleDiagnostics = {
+  webChatMode: boolean;
+  initialChip: WorkflowTestWebChatPdfChipState;
+  initialPdfTurn: WorkflowTestWebChatPdfTurn;
+  automaticPromptOnlyTurn: WorkflowTestWebChatPdfTurn;
+  chipAfterToggleOn: WorkflowTestWebChatPdfChipState;
+  toggleOnDefaultPrevented: boolean;
+  toggleOnStatusText: string;
+  failedPdfTurn: WorkflowTestWebChatPdfTurn;
+  chipAfterToggleOff: WorkflowTestWebChatPdfChipState;
+  toggleOffDefaultPrevented: boolean;
+  toggleOffStatusText: string;
+  explicitPromptOnlyTurn: WorkflowTestWebChatPdfTurn;
+  mirrorPanel: {
+    initialChip: WorkflowTestWebChatPdfChipState;
+    afterInitialPdfTurn: WorkflowTestWebChatPdfChipState;
+    afterAutomaticPromptOnlyTurn: WorkflowTestWebChatPdfChipState;
+    afterToggleOn: WorkflowTestWebChatPdfChipState;
+    afterFailedPdfTurn: WorkflowTestWebChatPdfChipState;
+    afterToggleOff: WorkflowTestWebChatPdfChipState;
+    afterExplicitPromptOnlyTurn: WorkflowTestWebChatPdfChipState;
+  } | null;
+};
+
 export type WorkflowTestRuntimeGeometry = {
   containerWidth: number;
   fontScale: number;
@@ -240,6 +297,18 @@ export type WorkflowTestApi = {
     panelId: string,
     text: string,
   ) => Promise<WorkflowTestDraftRefreshDiagnostics>;
+  exerciseWebChatPdfToggleWorkflow: (
+    panelId: string,
+    mirrorPanelId?: string,
+  ) => Promise<WorkflowTestWebChatPdfToggleDiagnostics>;
+  toggleWebChatPdfChip: (
+    panelId: string,
+  ) => Promise<WorkflowTestWebChatPdfChipState>;
+  sendLiveWebChatTurn: (
+    panelId: string,
+    question: string,
+    timeoutMs?: number,
+  ) => Promise<WorkflowTestLiveWebChatTurn>;
   seedPanelStoredUserMessage: (
     panelId: string,
     text: string,

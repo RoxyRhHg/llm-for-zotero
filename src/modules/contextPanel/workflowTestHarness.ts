@@ -9,6 +9,7 @@ import {
   activePaperConversationByPaper,
   chatHistory,
   loadedConversationKeys,
+  paperContextModeOverrides,
 } from "./state";
 import type { ResolvedContextSource, SendQuestionOptions } from "./types";
 import type {
@@ -31,6 +32,10 @@ import type {
   WorkflowTestStandaloneDiagnostics,
   WorkflowTestStandaloneNoteFixture,
   WorkflowTestTargetedQuoteRefreshResult,
+  WorkflowTestLiveWebChatTurn,
+  WorkflowTestWebChatPdfChipState,
+  WorkflowTestWebChatPdfToggleDiagnostics,
+  WorkflowTestWebChatPdfTurn,
   WorkflowTestPendingDeletionState,
   WorkflowTestHistoryRow,
   WorkflowTestHistorySearchResult,
@@ -65,6 +70,7 @@ import {
   openStandaloneChat,
 } from "./standaloneWindow";
 import {
+  getWorkflowTestSendSettledSequence,
   setWorkflowTestFinalRequestInterceptor,
   setWorkflowTestSendInterceptor,
   type WorkflowTestFinalRequestSnapshot,
@@ -83,6 +89,7 @@ import type { RuntimeConversationSystem } from "./runtimeSystemControls";
 import { collectReaderSelectionDocuments } from "./readerSelection";
 import { getReaderContextPanelForTab } from "./readerPopupPanelRouting";
 import type { ConversationSystem } from "../../shared/types";
+import { relayGetStateSnapshot } from "../../webchat/relayServer";
 import {
   activeClaudeConversationModeByLibrary,
   activeClaudeGlobalConversationByLibrary,
@@ -885,6 +892,7 @@ async function measurePanelRuntimeGeometry(
 async function ask(
   panelId: string,
   text: string,
+  settleTimeoutMs = 5000,
 ): Promise<SendQuestionOptions> {
   assertWorkflowTestEnabled();
   lastSend = null;
@@ -893,6 +901,7 @@ async function ask(
     "#llm-input",
   ) as HTMLTextAreaElement | null;
   if (!input) throw new Error("Workflow test input box was not rendered");
+  const sendSettledSequenceBefore = getWorkflowTestSendSettledSequence();
   input.value = text;
   const eventCtor = panel.body.ownerDocument.defaultView?.Event ?? Event;
   input.dispatchEvent(new eventCtor("input", { bubbles: true }));
@@ -901,7 +910,281 @@ async function ask(
   ) as HTMLButtonElement | null;
   if (!sendBtn) throw new Error("Workflow test send button was not rendered");
   sendBtn.click();
-  return waitForLastSend();
+  const send = await waitForLastSend();
+  const startedAt = Date.now();
+  while (
+    getWorkflowTestSendSettledSequence() <= sendSettledSequenceBefore &&
+    Date.now() - startedAt <= settleTimeoutMs
+  ) {
+    await Zotero.Promise.delay(10);
+  }
+  if (getWorkflowTestSendSettledSequence() <= sendSettledSequenceBefore) {
+    throw new Error(
+      `Timed out after ${settleTimeoutMs}ms waiting for workflow send controller to settle`,
+    );
+  }
+  return send;
+}
+
+function readWebChatPdfChipState(
+  panel: PanelRecord,
+): WorkflowTestWebChatPdfChipState {
+  const chip = panel.body.querySelector(
+    "#llm-paper-context-preview .llm-paper-context-chip[data-content-source='pdf']",
+  ) as HTMLElement | null;
+  if (!chip) {
+    throw new Error(`Panel ${panel.id} has no WebChat PDF chip`);
+  }
+  return {
+    fullText: chip.dataset.fullText === "true",
+    inactive: chip.classList.contains(
+      "llm-paper-context-chip-webchat-inactive",
+    ),
+    contentSource: chip.dataset.contentSource || "",
+    paperItemId: Math.floor(Number(chip.dataset.paperItemId) || 0),
+    contextItemId: Math.floor(Number(chip.dataset.paperContextItemId) || 0),
+    modeOverride:
+      paperContextModeOverrides.get(
+        `${panel.item.id}:${chip.dataset.paperItemId}:${chip.dataset.paperContextItemId}`,
+      ) || "",
+  };
+}
+
+async function toggleWebChatPdfChip(
+  panel: PanelRecord,
+): Promise<{ defaultPrevented: boolean; statusText: string }> {
+  const chip = panel.body.querySelector(
+    "#llm-paper-context-preview .llm-paper-context-chip[data-content-source='pdf']",
+  ) as HTMLElement | null;
+  if (!chip) {
+    throw new Error(`Panel ${panel.id} has no WebChat PDF chip`);
+  }
+  const MouseEventCtor =
+    panel.body.ownerDocument.defaultView?.MouseEvent ?? MouseEvent;
+  const event = new MouseEventCtor("contextmenu", {
+    bubbles: true,
+    cancelable: true,
+    button: 2,
+  });
+  chip.dispatchEvent(event);
+  await Zotero.Promise.delay(50);
+  return {
+    defaultPrevented: event.defaultPrevented,
+    statusText:
+      (
+        panel.body.querySelector("#llm-status") as HTMLElement | null
+      )?.textContent?.trim() || "",
+  };
+}
+
+async function captureWebChatPdfTurn(
+  panel: PanelRecord,
+  question: string,
+  outcome: "success" | "failed",
+): Promise<WorkflowTestWebChatPdfTurn> {
+  let modeBeforeOutcome = "";
+  let modeAfterOutcome = "";
+  setWorkflowTestSendInterceptor((opts) => {
+    lastSend = opts;
+    modeBeforeOutcome = readWebChatPdfChipState(panel).modeOverride;
+    const mountedItem = activeContextPanels.get(panel.body)?.() || panel.item;
+    const conversationKey = getConversationKey(mountedItem);
+    const history = chatHistory.get(conversationKey) || [];
+    chatHistory.set(conversationKey, [
+      ...history,
+      {
+        role: "user",
+        text: opts.question,
+        timestamp: Date.now(),
+        paperContexts: opts.paperContexts,
+        pdfPaperContexts: opts.pdfPaperContexts,
+        fullTextPaperContexts: opts.fullTextPaperContexts,
+      },
+    ]);
+    opts.onWebChatSendOutcome?.(outcome);
+    modeAfterOutcome = readWebChatPdfChipState(panel).modeOverride;
+  });
+  const send = await ask(panel.id, question);
+  await Zotero.Promise.delay(50);
+  return {
+    question: send.question,
+    outcome,
+    webchatSendPdf: send.webchatSendPdf === true,
+    pdfContextItemIds: (send.webchatPdfPaperContexts || []).map(
+      (context) => context.contextItemId,
+    ),
+    modeBeforeOutcome,
+    modeAfterOutcome,
+    chipAfterTurn: readWebChatPdfChipState(panel),
+  };
+}
+
+async function exerciseWebChatPdfToggleWorkflow(
+  panelId: string,
+  mirrorPanelId?: string,
+): Promise<WorkflowTestWebChatPdfToggleDiagnostics> {
+  assertWorkflowTestEnabled();
+  const panel = getPanel(panelId);
+  const mirrorPanel = mirrorPanelId ? getPanel(mirrorPanelId) : null;
+  const panelRoot = panel.body.querySelector("#llm-main") as HTMLElement | null;
+  if (panelRoot?.dataset.webchatMode !== "true") {
+    throw new Error(`Panel ${panelId} is not in WebChat mode`);
+  }
+
+  const initialChip = readWebChatPdfChipState(panel);
+  const mirrorInitialChip = mirrorPanel
+    ? readWebChatPdfChipState(mirrorPanel)
+    : null;
+  try {
+    const initialPdfTurn = await captureWebChatPdfTurn(
+      panel,
+      "workflow pdf initial turn",
+      "success",
+    );
+    const mirrorAfterInitialPdfTurn = mirrorPanel
+      ? readWebChatPdfChipState(mirrorPanel)
+      : null;
+    const automaticPromptOnlyTurn = await captureWebChatPdfTurn(
+      panel,
+      "workflow automatic prompt-only turn",
+      "success",
+    );
+    const mirrorAfterAutomaticPromptOnlyTurn = mirrorPanel
+      ? readWebChatPdfChipState(mirrorPanel)
+      : null;
+    const toggleOn = await toggleWebChatPdfChip(panel);
+    const chipAfterToggleOn = readWebChatPdfChipState(panel);
+    const mirrorAfterToggleOn = mirrorPanel
+      ? readWebChatPdfChipState(mirrorPanel)
+      : null;
+    const failedPdfTurn = await captureWebChatPdfTurn(
+      panel,
+      "workflow failed pdf turn",
+      "failed",
+    );
+    const mirrorAfterFailedPdfTurn = mirrorPanel
+      ? readWebChatPdfChipState(mirrorPanel)
+      : null;
+    const toggleOff = await toggleWebChatPdfChip(panel);
+    const chipAfterToggleOff = readWebChatPdfChipState(panel);
+    const mirrorAfterToggleOff = mirrorPanel
+      ? readWebChatPdfChipState(mirrorPanel)
+      : null;
+    const explicitPromptOnlyTurn = await captureWebChatPdfTurn(
+      panel,
+      "workflow explicit prompt-only turn",
+      "success",
+    );
+    const mirrorAfterExplicitPromptOnlyTurn = mirrorPanel
+      ? readWebChatPdfChipState(mirrorPanel)
+      : null;
+
+    return {
+      webChatMode: true,
+      initialChip,
+      initialPdfTurn,
+      automaticPromptOnlyTurn,
+      chipAfterToggleOn,
+      toggleOnDefaultPrevented: toggleOn.defaultPrevented,
+      toggleOnStatusText: toggleOn.statusText,
+      failedPdfTurn,
+      chipAfterToggleOff,
+      toggleOffDefaultPrevented: toggleOff.defaultPrevented,
+      toggleOffStatusText: toggleOff.statusText,
+      explicitPromptOnlyTurn,
+      mirrorPanel:
+        mirrorPanel &&
+        mirrorInitialChip &&
+        mirrorAfterInitialPdfTurn &&
+        mirrorAfterAutomaticPromptOnlyTurn &&
+        mirrorAfterToggleOn &&
+        mirrorAfterFailedPdfTurn &&
+        mirrorAfterToggleOff &&
+        mirrorAfterExplicitPromptOnlyTurn
+          ? {
+              initialChip: mirrorInitialChip,
+              afterInitialPdfTurn: mirrorAfterInitialPdfTurn,
+              afterAutomaticPromptOnlyTurn: mirrorAfterAutomaticPromptOnlyTurn,
+              afterToggleOn: mirrorAfterToggleOn,
+              afterFailedPdfTurn: mirrorAfterFailedPdfTurn,
+              afterToggleOff: mirrorAfterToggleOff,
+              afterExplicitPromptOnlyTurn: mirrorAfterExplicitPromptOnlyTurn,
+            }
+          : null,
+    };
+  } finally {
+    setWorkflowTestSendInterceptor((opts) => {
+      lastSend = opts;
+    });
+  }
+}
+
+async function toggleWebChatPdfChipForWorkflow(
+  panelId: string,
+): Promise<WorkflowTestWebChatPdfChipState> {
+  assertWorkflowTestEnabled();
+  const panel = getPanel(panelId);
+  await toggleWebChatPdfChip(panel);
+  await Zotero.Promise.delay(100);
+  return readWebChatPdfChipState(panel);
+}
+
+async function sendLiveWebChatTurn(
+  panelId: string,
+  question: string,
+  timeoutMs = 330_000,
+): Promise<WorkflowTestLiveWebChatTurn> {
+  assertWorkflowTestEnabled();
+  const panel = getPanel(panelId);
+  const panelRoot = panel.body.querySelector("#llm-main") as HTMLElement | null;
+  if (panelRoot?.dataset.webchatMode !== "true") {
+    throw new Error(`Panel ${panelId} is not in WebChat mode`);
+  }
+
+  let outcome: WorkflowTestLiveWebChatTurn["outcome"] = null;
+  setWorkflowTestSendInterceptor((opts) => {
+    lastSend = opts;
+    const reportOutcome = opts.onWebChatSendOutcome;
+    opts.onWebChatSendOutcome = (nextOutcome) => {
+      outcome = nextOutcome;
+      reportOutcome?.(nextOutcome);
+    };
+    return true;
+  });
+  try {
+    const send = await ask(panelId, question, timeoutMs);
+    await Zotero.Promise.delay(100);
+    const relayState = relayGetStateSnapshot();
+    const terminal = [...relayState.responses]
+      .reverse()
+      .find((entry) => entry.seq === relayState.query.seq);
+    return {
+      question: send.question,
+      outcome,
+      webchatSendPdf: send.webchatSendPdf === true,
+      pdfContextItemIds: (send.webchatPdfPaperContexts || []).map(
+        (context) => context.contextItemId,
+      ),
+      chipAfterTurn: readWebChatPdfChipState(panel),
+      statusText:
+        (
+          panel.body.querySelector("#llm-status") as HTMLElement | null
+        )?.textContent?.trim() || "",
+      relayStatus: relayState.status,
+      runState: terminal?.run_state || relayState.run_state,
+      completionReason:
+        terminal?.completion_reason || relayState.completion_reason,
+      responseText: terminal?.text || "",
+      diagnostic:
+        (terminal?.diagnostic as Record<string, unknown> | null | undefined) ||
+        (relayState.last_diagnostic as Record<string, unknown> | null) ||
+        null,
+    };
+  } finally {
+    setWorkflowTestSendInterceptor((opts) => {
+      lastSend = opts;
+    });
+  }
 }
 
 async function renderAssistantForPanel(
@@ -1290,6 +1573,10 @@ async function clickStandaloneSystemToggle(
 ): Promise<WorkflowTestStandaloneDiagnostics> {
   assertWorkflowTestEnabled();
   const doc = await waitForStandaloneReady();
+  const currentSystem = (readStandaloneDiagnostics().conversationSystem ||
+    "upstream") as ConversationSystem;
+  const expectedSystem: ConversationSystem =
+    currentSystem === system ? "upstream" : system;
   const button = doc.querySelector(
     `.llm-standalone-runtime-system-toggle[data-conversation-system='${system}']`,
   ) as HTMLButtonElement | null;
@@ -1297,8 +1584,28 @@ async function clickStandaloneSystemToggle(
     throw new Error(`Standalone ${system} system toggle was not rendered`);
   }
   button.click();
-  await Zotero.Promise.delay(250);
-  return readStandaloneDiagnostics();
+  return waitForStandaloneConversationSystem(expectedSystem);
+}
+
+async function waitForStandaloneConversationSystem(
+  expectedSystem: ConversationSystem,
+  timeoutMs = 5000,
+): Promise<WorkflowTestStandaloneDiagnostics> {
+  const startedAt = Date.now();
+  let diagnostics = readStandaloneDiagnostics();
+  while (
+    diagnostics.conversationSystem !== expectedSystem &&
+    Date.now() - startedAt < timeoutMs
+  ) {
+    await Zotero.Promise.delay(25);
+    diagnostics = readStandaloneDiagnostics();
+  }
+  if (diagnostics.conversationSystem !== expectedSystem) {
+    throw new Error(
+      `Timed out waiting for standalone runtime ${expectedSystem}: ${JSON.stringify(diagnostics)}`,
+    );
+  }
+  return diagnostics;
 }
 
 async function clickStandaloneSystemTogglesRapidly(
@@ -1306,6 +1613,8 @@ async function clickStandaloneSystemTogglesRapidly(
 ): Promise<WorkflowTestStandaloneDiagnostics> {
   assertWorkflowTestEnabled();
   const doc = await waitForStandaloneReady();
+  let expectedSystem = (readStandaloneDiagnostics().conversationSystem ||
+    "upstream") as ConversationSystem;
   for (const system of systems) {
     const button = doc.querySelector(
       `.llm-standalone-runtime-system-toggle[data-conversation-system='${system}']`,
@@ -1314,9 +1623,9 @@ async function clickStandaloneSystemTogglesRapidly(
       throw new Error(`Standalone ${system} system toggle was not rendered`);
     }
     button.click();
+    expectedSystem = expectedSystem === system ? "upstream" : system;
   }
-  await Zotero.Promise.delay(500);
-  return readStandaloneDiagnostics();
+  return waitForStandaloneConversationSystem(expectedSystem);
 }
 
 async function measureStandaloneRuntimeGeometry(input: {
@@ -2053,7 +2362,7 @@ async function exerciseHighlightAwareContextRetrieval(input: {
       selectedText: input.selectedText,
     });
     selectionDoc = selected.doc;
-    const clickedAt = Date.now();
+    let clickedAt = 0;
     let addTextButtonLabel = "";
     if (input.trigger === "popup") {
       popupHost = selected.doc.createElement("div");
@@ -2090,6 +2399,7 @@ async function exerciseHighlightAwareContextRetrieval(input: {
       if (!PointerEventCtor) {
         throw new Error("Workflow reader window does not expose MouseEvent");
       }
+      clickedAt = Date.now();
       addTextButton.dispatchEvent(
         new PointerEventCtor("pointerdown", {
           bubbles: true,
@@ -2110,6 +2420,7 @@ async function exerciseHighlightAwareContextRetrieval(input: {
       if (!MouseEventCtor) {
         throw new Error("Workflow panel window does not expose MouseEvent");
       }
+      clickedAt = Date.now();
       addTextButton.dispatchEvent(
         new MouseEventCtor("pointerdown", {
           bubbles: true,
@@ -2496,6 +2807,9 @@ export function installWorkflowTestHarness(targetAddon: {
     togglePanelConversationMode,
     exerciseDuplicatePanelSetup,
     exercisePanelDraftStateRefresh,
+    exerciseWebChatPdfToggleWorkflow,
+    toggleWebChatPdfChip: toggleWebChatPdfChipForWorkflow,
+    sendLiveWebChatTurn,
     seedPanelStoredUserMessage,
     clickPanelSystemToggle,
     clickPanelSystemTogglesRapidly,
