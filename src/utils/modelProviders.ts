@@ -14,6 +14,11 @@ import {
 import { detectProviderPreset, getProviderPreset } from "./providerPresets";
 import type { ProviderPresetId } from "./providerPresets";
 import type { ModelInputMode } from "../shared/types";
+import { refreshConfiguredModelCatalogs } from "../modelCapabilities";
+import type {
+  ModelCapabilityIdentity,
+  ModelCatalogIdentity,
+} from "../modelCapabilities";
 
 export type LegacyModelSlotKey =
   | "primary"
@@ -151,6 +156,7 @@ function normalizeAdvancedModelConfig(
   value?: AdvancedModelConfigInput | null,
   modelName?: string,
   runtimeMode?: unknown,
+  capabilityIdentity?: Omit<ModelCapabilityIdentity, "model">,
 ): AdvancedModelConfig {
   const inputMode = normalizeModelInputModeForRuntime(
     value?.inputMode,
@@ -163,6 +169,7 @@ function normalizeAdvancedModelConfig(
     maxTokens: normalizeMaxTokensForModel(
       `${value?.maxTokens ?? DEFAULT_MAX_TOKENS}`,
       modelName,
+      capabilityIdentity,
     ),
     inputTokenCap: normalizeOptionalInputTokenCap(value?.inputTokenCap),
     ...(inputMode ? { inputMode } : {}),
@@ -648,6 +655,10 @@ export function getRuntimeModelEntries(): RuntimeModelEntry[] {
               : authMode === "copilot_auth"
                 ? `copilot/${modelName}`
                 : modelName;
+      const providerProtocol = resolveRuntimeProviderProtocol(
+        group,
+        modelEntry,
+      );
       entries.push({
         entryId: modelEntry.id,
         groupId: group.id,
@@ -655,19 +666,73 @@ export function getRuntimeModelEntries(): RuntimeModelEntry[] {
         apiBase: normalizeApiBase(group.apiBase),
         apiKey: group.apiKey.trim(),
         authMode,
-        providerProtocol: resolveRuntimeProviderProtocol(group, modelEntry),
+        providerProtocol,
         providerLabel,
         providerOrder: groupIndex,
         displayModelLabel:
           duplicateCount > 1
             ? `${baseModelLabel} #${duplicateCount}`
             : baseModelLabel,
-        advanced: normalizeAdvancedModelConfig(modelEntry, modelName),
+        advanced: normalizeAdvancedModelConfig(
+          modelEntry,
+          modelName,
+          undefined,
+          {
+            provider: resolveStoredPresetId(group),
+            apiBase: group.apiBase,
+            protocol: providerProtocol,
+            authMode,
+            scope: group.id,
+          },
+        ),
       });
     }
+
+    // Live catalog models are deliberately NOT surfaced here.  The runtime
+    // list only contains models the user pinned in preferences; the catalog
+    // feeds capability resolution (limits, reasoning) and the preferences
+    // model picker instead.
   }
 
   return entries;
+}
+
+/**
+ * Catalog identity for a provider group, shared by the runtime refresh path
+ * and the preferences model picker so both read and write the same snapshot.
+ */
+export function buildProviderCatalogIdentity(
+  group: ModelProviderGroup,
+): ModelCatalogIdentity {
+  const presetId = resolveStoredPresetId(group);
+  return {
+    provider: presetId === "customized" ? undefined : presetId,
+    model: "",
+    apiBase: group.apiBase,
+    protocol: group.providerProtocol,
+    authMode: group.authMode,
+    apiKey: group.apiKey,
+    scope: group.id,
+  };
+}
+
+/** Refresh live /models catalogs for all configured API-key provider groups. */
+export async function refreshConfiguredProviderModelCatalogs(options?: {
+  force?: boolean;
+  timeoutMs?: number;
+}): Promise<void> {
+  const groups = getModelProviderGroups();
+  await refreshConfiguredModelCatalogs(
+    groups
+      .filter(
+        (group) =>
+          group.authMode !== "codex_auth" &&
+          group.authMode !== "codex_app_server" &&
+          group.authMode !== "webchat",
+      )
+      .map((group) => buildProviderCatalogIdentity(group)),
+    options,
+  );
 }
 
 export function getModelEntryById(

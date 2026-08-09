@@ -2,6 +2,7 @@ import { assert } from "chai";
 import { config } from "../package.json";
 import {
   buildModelProviderGroupsFromLegacySlots,
+  buildProviderCatalogIdentity,
   deriveProviderLabel,
   getRuntimeModelEntries,
   migrateApiBaseForAuthModeChange,
@@ -9,6 +10,12 @@ import {
   type LegacyModelSlot,
   type ModelProviderGroup,
 } from "../src/utils/modelProviders";
+import {
+  configureModelCapabilityRuntime,
+  getDiscoveredModels,
+  refreshModelCatalog,
+  resetModelCapabilityStateForTests,
+} from "../src/modelCapabilities";
 
 let originalZotero: typeof Zotero | undefined;
 
@@ -671,6 +678,91 @@ describe("modelProviders", function () {
         migrateApiBaseForAuthModeChange("api_key", "codex_auth", ""),
         "",
       );
+    });
+  });
+
+  describe("discovered provider catalogs", function () {
+    afterEach(function () {
+      resetModelCapabilityStateForTests();
+    });
+
+    function makeGeminiGroup(): ModelProviderGroup {
+      return {
+        id: "provider-gemini-test",
+        apiBase: "https://generativelanguage.googleapis.com/v1beta",
+        apiKey: "test-key",
+        authMode: "api_key",
+        providerProtocol: "gemini_native",
+        models: [
+          {
+            id: "model-entry-1",
+            model: "gemini-2.5-pro",
+            temperature: 0.7,
+            maxTokens: 4096,
+          },
+        ],
+      };
+    }
+
+    it("keeps the action-panel runtime list to user-configured models even when a catalog is loaded", async function () {
+      const group = makeGeminiGroup();
+      setModelProviderGroups([group]);
+      configureModelCapabilityRuntime({
+        environment: "test",
+        fetch: (async () => ({
+          ok: true,
+          json: async () => ({
+            models: [
+              {
+                name: "models/gemini-2.5-pro",
+                inputTokenLimit: 1_048_576,
+                outputTokenLimit: 65_536,
+              },
+              { name: "models/gemini-2.5-flash-preview-tts" },
+              { name: "models/gemma-4-26b-a4b-it" },
+              { name: "models/embedding-001" },
+            ],
+          }),
+        })) as unknown as typeof fetch,
+      });
+
+      const identity = buildProviderCatalogIdentity(group);
+      const catalog = await refreshModelCatalog(identity);
+      assert.lengthOf(catalog, 4, "the catalog itself keeps every model");
+      assert.lengthOf(getDiscoveredModels(identity), 4);
+
+      const entries = getRuntimeModelEntries();
+      assert.deepEqual(
+        entries.map((entry) => entry.model),
+        ["gemini-2.5-pro"],
+        "only models pinned in preferences may appear in the runtime list",
+      );
+    });
+
+    it("builds the same catalog identity for preset groups that the runtime send path uses", function () {
+      const group = makeGeminiGroup();
+      const identity = buildProviderCatalogIdentity(group);
+      assert.equal(identity.provider, "gemini");
+      assert.equal(identity.model, "");
+      assert.equal(identity.apiBase, group.apiBase);
+      assert.equal(identity.protocol, "gemini_native");
+      assert.equal(identity.authMode, "api_key");
+      assert.equal(identity.apiKey, "test-key");
+      assert.equal(identity.scope, group.id);
+    });
+
+    it("marks customized groups with an undefined provider in the catalog identity", function () {
+      const group: ModelProviderGroup = {
+        id: "provider-custom-test",
+        apiBase: "https://my-llm.example.com/v1",
+        apiKey: "k",
+        authMode: "api_key",
+        providerProtocol: "openai_chat_compat",
+        models: [],
+      };
+      const identity = buildProviderCatalogIdentity(group);
+      assert.isUndefined(identity.provider);
+      assert.equal(identity.scope, group.id);
     });
   });
 });
