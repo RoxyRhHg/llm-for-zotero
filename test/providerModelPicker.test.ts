@@ -177,7 +177,7 @@ describe("providerModelPicker", function () {
       );
     });
 
-    it("reports loading until the first snapshot arrives", function () {
+    it("reports loading while a fetch is in flight", function () {
       assert.deepEqual(
         resolveProviderModelFetchStatus({
           apiKey: "k",
@@ -186,14 +186,17 @@ describe("providerModelPicker", function () {
         }),
         { kind: "loading" },
       );
+    });
+
+    it("reports unavailable when a refresh finished without a snapshot", function () {
       assert.deepEqual(
         resolveProviderModelFetchStatus({
           apiKey: "k",
           loading: false,
           snapshot: null,
         }),
-        { kind: "loading" },
-        "no snapshot yet means the fetch is still on its way",
+        { kind: "unavailable" },
+        "a finished refresh with no snapshot means the fetch could not run",
       );
     });
 

@@ -442,7 +442,7 @@ function attachProviderModelSelect(args: {
   group: ModelProviderGroup;
   modelEntry: ModelProviderModel;
   onModelPicked: (modelId: string) => void;
-}): { container: HTMLElement; statusEl: HTMLElement } {
+}): { container: HTMLElement; statusEl: HTMLElement; refresh: () => void } {
   const { doc, input, group, modelEntry } = args;
 
   const container = el(
@@ -469,26 +469,33 @@ function attachProviderModelSelect(args: {
   const readSnapshot = () =>
     getModelCatalogStatus(buildProviderCatalogIdentity(group));
 
+  // While "Customized…" is active the text input IS the field (full width);
+  // leaving it (blur or Enter) swaps the dropdown back in, now listing the
+  // typed name as the selected option.
   const syncModes = () => {
-    if (customizedActive) {
-      input.style.display = "";
-      select.style.flex = "0 0 auto";
-      select.style.width = "auto";
-      select.style.maxWidth = "45%";
-    } else {
-      input.style.display = "none";
-      select.style.flex = "1";
-      select.style.width = "";
-      select.style.maxWidth = "";
-    }
+    input.style.display = customizedActive ? "" : "none";
+    select.style.display = customizedActive ? "none" : "";
   };
 
+  let renderedOptionsSignature = "";
   const rebuildOptions = () => {
     const rows = buildProviderModelSelectRows({
       savedModel: modelEntry.model,
       catalog: readSnapshot()?.models || [],
       customizedActive,
     });
+    const desiredValue = customizedActive
+      ? CUSTOMIZED_MODEL_OPTION_VALUE
+      : modelEntry.model.trim();
+    // Skip the DOM rewrite when nothing changed: a TTL-cached refresh resolves
+    // right after mousedown, and replacing options under the just-opened
+    // native popup can flicker or close it.
+    const signature =
+      rows
+        .map((row) => `${row.kind}:${row.kind === "model" ? row.id : ""}`)
+        .join("\n") + `\u0000${desiredValue}`;
+    if (signature === renderedOptionsSignature) return;
+    renderedOptionsSignature = signature;
     select.textContent = "";
     for (const row of rows) {
       const option = el(doc, "option") as HTMLOptionElement;
@@ -505,9 +512,7 @@ function attachProviderModelSelect(args: {
       }
       select.appendChild(option);
     }
-    select.value = customizedActive
-      ? CUSTOMIZED_MODEL_OPTION_VALUE
-      : modelEntry.model.trim();
+    select.value = desiredValue;
   };
 
   const updateStatus = () => {
@@ -528,6 +533,10 @@ function attachProviderModelSelect(args: {
       statusEl.style.display = "block";
     } else if (status.kind === "error") {
       statusEl.textContent = `✗ ${t("Couldn't fetch models:")} ${status.message}`;
+      statusEl.style.color = "red";
+      statusEl.style.display = "block";
+    } else if (status.kind === "unavailable") {
+      statusEl.textContent = t("Couldn't fetch the model list.");
       statusEl.style.color = "red";
       statusEl.style.display = "block";
     } else if (status.total === 0) {
@@ -561,6 +570,7 @@ function attachProviderModelSelect(args: {
   // The refresh is TTL-cached, so re-checking on every open stays cheap and
   // picks up an API key the user pasted since the card rendered.
   select.addEventListener("mousedown", () => void refreshCatalog());
+  select.addEventListener("focus", () => void refreshCatalog());
   select.addEventListener("change", () => {
     if (select.value === CUSTOMIZED_MODEL_OPTION_VALUE) {
       customizedActive = true;
@@ -577,12 +587,27 @@ function attachProviderModelSelect(args: {
     rebuildOptions();
   });
 
+  const exitCustomized = () => {
+    if (!customizedActive) return;
+    customizedActive = false;
+    syncModes();
+    rebuildOptions();
+  };
+  input.addEventListener("blur", exitCustomized);
+  input.addEventListener("keydown", (event) => {
+    if ((event as KeyboardEvent).key === "Enter") input.blur();
+  });
+
   syncModes();
   rebuildOptions();
   updateStatus();
   void refreshCatalog();
 
-  return { container, statusEl };
+  return {
+    container,
+    statusEl,
+    refresh: () => void refreshCatalog(),
+  };
 }
 
 // ── Data helpers ───────────────────────────────────────────────────
@@ -1396,10 +1421,21 @@ export async function registerPrefsScripts(_window: Window | undefined | null) {
       apiKeyInput.type = "password";
       apiKeyInput.placeholder = "sk-…";
       apiKeyInput.value = group.apiKey;
+      // Model dropdowns register here so a freshly pasted key refetches their
+      // catalogs without reopening the pane. Debounced to sit out keystrokes.
+      const modelPickerRefreshers: Array<() => void> = [];
+      let modelPickerRefreshTimer: ReturnType<typeof setTimeout> | null = null;
       apiKeyInput.addEventListener("input", () => {
         group.apiKey = apiKeyInput.value;
         persistGroups(groups);
         syncAddProviderBtn();
+        if (modelPickerRefreshTimer !== null)
+          clearTimeout(modelPickerRefreshTimer);
+        modelPickerRefreshTimer = setTimeout(() => {
+          modelPickerRefreshTimer = null;
+          if (!group.apiKey.trim()) return;
+          for (const refresh of modelPickerRefreshers) refresh();
+        }, 800);
       });
       apiKeyWrap.append(apiKeyLabel, apiKeyInput);
       if (
@@ -1885,6 +1921,7 @@ export async function registerPrefsScripts(_window: Window | undefined | null) {
             },
           });
           pickerStatusEl = picker.statusEl;
+          modelPickerRefreshers.push(picker.refresh);
           mainRow.append(picker.container, testBtn, advGearBtn);
         } else {
           mainRow.append(modelInput, testBtn, advGearBtn);

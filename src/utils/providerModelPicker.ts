@@ -86,6 +86,8 @@ export type ProviderModelFetchStatus =
   | { kind: "needs_api_key" }
   | { kind: "loading" }
   | { kind: "error"; message: string }
+  /** A refresh finished without producing a snapshot (no endpoint / no fetch). */
+  | { kind: "unavailable" }
   | { kind: "ready"; total: number; stale: boolean };
 
 /** Status line shown under the model row while the catalog loads or fails. */
@@ -97,7 +99,8 @@ export function resolveProviderModelFetchStatus(args: {
   if (!args.apiKey.trim()) return { kind: "needs_api_key" };
   const models = args.snapshot?.models || [];
   if (!models.length) {
-    if (args.loading || !args.snapshot) return { kind: "loading" };
+    if (args.loading) return { kind: "loading" };
+    if (!args.snapshot) return { kind: "unavailable" };
     return args.snapshot.error
       ? { kind: "error", message: args.snapshot.error }
       : { kind: "ready", total: 0, stale: false };

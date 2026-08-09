@@ -6,6 +6,7 @@ import {
   deriveProviderLabel,
   getRuntimeModelEntries,
   migrateApiBaseForAuthModeChange,
+  refreshConfiguredProviderModelCatalogs,
   setModelProviderGroups,
   type LegacyModelSlot,
   type ModelProviderGroup,
@@ -763,6 +764,50 @@ describe("modelProviders", function () {
       const identity = buildProviderCatalogIdentity(group);
       assert.isUndefined(identity.provider);
       assert.equal(identity.scope, group.id);
+    });
+
+    it("never runs the generic catalog fetch for copilot, codex, or webchat groups", async function () {
+      let fetchCalls = 0;
+      configureModelCapabilityRuntime({
+        environment: "test",
+        fetch: (async () => {
+          fetchCalls += 1;
+          return { ok: true, json: async () => ({ data: [] }) };
+        }) as unknown as typeof fetch,
+      });
+      const excluded: ModelProviderGroup[] = [
+        {
+          id: "provider-copilot",
+          apiBase: "https://api.githubcopilot.com",
+          apiKey: "gho_github-oauth-token",
+          authMode: "copilot_auth",
+          providerProtocol: "openai_chat_compat",
+          models: [],
+        },
+        {
+          id: "provider-codex",
+          apiBase: "https://chatgpt.com/backend-api/codex/responses",
+          apiKey: "",
+          authMode: "codex_auth",
+          providerProtocol: "codex_responses",
+          models: [],
+        },
+        {
+          id: "provider-webchat",
+          apiBase: "",
+          apiKey: "",
+          authMode: "webchat",
+          providerProtocol: "web_sync",
+          models: [],
+        },
+      ];
+      setModelProviderGroups(excluded);
+      await refreshConfiguredProviderModelCatalogs();
+      assert.equal(
+        fetchCalls,
+        0,
+        "copilot needs a token exchange (a raw GitHub token would 401) and codex/webchat have no catalog",
+      );
     });
   });
 });

@@ -176,6 +176,9 @@ function providerFromIdentity(
   if (base.includes("api.x.ai") || base.includes("x.ai")) return "grok";
   if (base.includes("dashscope") || base.includes("aliyuncs.com"))
     return "qwen";
+  if (base.includes("bigmodel.cn")) return "glm";
+  if (base.includes("minimax")) return "minimax";
+  if (base.includes("xiaomimimo.com")) return "mimo";
   return "unknown";
 }
 
@@ -404,18 +407,25 @@ function getRuntimeEnvironment(): CapabilityRuntime["environment"] {
   }
 }
 
+/**
+ * Auth modes whose credentials or transports cannot use the generic
+ * `/models` catalog fetch (dedicated token exchanges or no HTTP API at all).
+ * Shared with the provider-group refresh so the boundary cannot drift.
+ */
+export const CATALOG_EXCLUDED_AUTH_MODES: ReadonlySet<string> = new Set([
+  "codex_auth",
+  "codex_app_server",
+  "copilot_auth",
+  "webchat",
+]);
+
 function canRunCapabilityPreflight(identity: ModelCatalogIdentity): boolean {
   const environment = getRuntimeEnvironment();
   if (environment !== "production" && environment !== "development") {
     return false;
   }
   if (!identity.model.trim() || !identity.apiBase?.trim()) return false;
-  return !new Set([
-    "codex_auth",
-    "codex_app_server",
-    "copilot_auth",
-    "webchat",
-  ]).has(normalize(identity.authMode));
+  return !CATALOG_EXCLUDED_AUTH_MODES.has(normalize(identity.authMode));
 }
 
 /**
@@ -670,6 +680,27 @@ export async function refreshModelCapabilityRegistry(
   }
 }
 
+/**
+ * Providers whose recommended chat base is an Anthropic-compatible proxy that
+ * serves no `/models` route. Their OpenAI-compatible surface still lists
+ * models (with plain Bearer auth), so catalog requests go there instead.
+ */
+const ANTHROPIC_COMPAT_CATALOG_ENDPOINTS: Partial<Record<string, string>> = {
+  deepseek: "https://api.deepseek.com/models",
+  glm: "https://open.bigmodel.cn/api/paas/v4/models",
+  minimax: "https://api.minimax.io/v1/models",
+};
+
+function getAnthropicCompatCatalogEndpoint(
+  identity: ModelCatalogIdentity,
+): string | null {
+  const override =
+    ANTHROPIC_COMPAT_CATALOG_ENDPOINTS[providerFromIdentity(identity)];
+  if (!override) return null;
+  const base = normalize(identity.apiBase);
+  return base.includes("anthropic") ? override : null;
+}
+
 function getCatalogEndpoint(identity: ModelCatalogIdentity): string | null {
   if (!identity.apiBase) return null;
   try {
@@ -679,7 +710,6 @@ function getCatalogEndpoint(identity: ModelCatalogIdentity): string | null {
       url.pathname = (
         path.endsWith("/models") ? path : `${path || "/v1beta"}/models`
       ).replace(/\/\/+/g, "/");
-      if (identity.apiKey) url.searchParams.set("key", identity.apiKey);
       return url.toString();
     }
     if (path.endsWith("/models")) return url.toString();
@@ -812,7 +842,8 @@ async function fetchModelCatalog(
   key: string,
   cached: CatalogSnapshot | undefined,
 ): Promise<DiscoveredModel[]> {
-  const endpoint = getCatalogEndpoint(identity);
+  const compatEndpoint = getAnthropicCompatCatalogEndpoint(identity);
+  const endpoint = compatEndpoint || getCatalogEndpoint(identity);
   const fetchFn = getFetch();
   if (!endpoint || !fetchFn) return cached?.models || [];
   let timer: ReturnType<typeof setTimeout> | null = null;
@@ -828,12 +859,14 @@ async function fetchModelCatalog(
         )
       : null;
     const headers: Record<string, string> = { Accept: "application/json" };
-    if (
-      identity.apiKey &&
-      identity.authMode !== "codex_auth" &&
-      identity.protocol !== "gemini_native"
-    ) {
-      if (identity.protocol === "anthropic_messages") {
+    if (identity.apiKey && identity.authMode !== "codex_auth") {
+      if (identity.protocol === "gemini_native") {
+        // Header auth keeps the key out of URLs (and any proxy/server logs).
+        headers["x-goog-api-key"] = identity.apiKey;
+      } else if (
+        identity.protocol === "anthropic_messages" &&
+        !compatEndpoint
+      ) {
         headers["x-api-key"] = identity.apiKey;
         headers["anthropic-version"] = "2023-06-01";
       } else {

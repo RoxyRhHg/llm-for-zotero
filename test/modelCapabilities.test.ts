@@ -278,6 +278,81 @@ describe("model capability service", function () {
     );
   });
 
+  it("lists models for Anthropic-compat proxy bases via the provider's OpenAI-compatible endpoint", async function () {
+    const requests: Array<{ url: string; headers: Record<string, string> }> =
+      [];
+    configureModelCapabilityRuntime({
+      environment: "test",
+      fetch: (async (
+        url: string,
+        init?: { headers?: Record<string, string> },
+      ) => {
+        requests.push({ url, headers: init?.headers || {} });
+        return {
+          ok: true,
+          json: async () => ({ data: [{ id: "deepseek-chat" }] }),
+        };
+      }) as unknown as typeof fetch,
+    });
+    const models = await refreshModelCatalog({
+      provider: "deepseek",
+      model: "",
+      apiBase: "https://api.deepseek.com/anthropic",
+      protocol: "anthropic_messages",
+      authMode: "api_key",
+      apiKey: "sk-deepseek",
+      scope: "group-ds",
+    });
+    assert.deepEqual(
+      models.map((model) => model.id),
+      ["deepseek-chat"],
+    );
+    assert.lengthOf(requests, 1);
+    assert.equal(
+      requests[0].url,
+      "https://api.deepseek.com/models",
+      "the /anthropic proxy base has no models route; use the OpenAI-compatible one",
+    );
+    assert.equal(requests[0].headers.Authorization, "Bearer sk-deepseek");
+    assert.isUndefined(requests[0].headers["x-api-key"]);
+  });
+
+  it("authenticates Gemini catalog requests via header instead of the URL", async function () {
+    const requests: Array<{ url: string; headers: Record<string, string> }> =
+      [];
+    configureModelCapabilityRuntime({
+      environment: "test",
+      fetch: (async (
+        url: string,
+        init?: { headers?: Record<string, string> },
+      ) => {
+        requests.push({ url, headers: init?.headers || {} });
+        return {
+          ok: true,
+          json: async () => ({
+            models: [{ name: "models/gemini-2.5-pro" }],
+          }),
+        };
+      }) as unknown as typeof fetch,
+    });
+    const models = await refreshModelCatalog({
+      provider: "gemini",
+      model: "",
+      apiBase: "https://generativelanguage.googleapis.com/v1beta",
+      protocol: "gemini_native",
+      authMode: "api_key",
+      apiKey: "gemini-key",
+      scope: "group-gm",
+    });
+    assert.deepEqual(
+      models.map((model) => model.id),
+      ["gemini-2.5-pro"],
+    );
+    assert.lengthOf(requests, 1);
+    assert.notInclude(requests[0].url, "gemini-key");
+    assert.equal(requests[0].headers["x-goog-api-key"], "gemini-key");
+  });
+
   it("coalesces concurrent catalog refreshes for the same identity", async function () {
     let fetchCalls = 0;
     let releaseFetch: (() => void) | null = null;

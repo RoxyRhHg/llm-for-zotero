@@ -14,7 +14,10 @@ import {
 import { detectProviderPreset, getProviderPreset } from "./providerPresets";
 import type { ProviderPresetId } from "./providerPresets";
 import type { ModelInputMode } from "../shared/types";
-import { refreshConfiguredModelCatalogs } from "../modelCapabilities";
+import {
+  CATALOG_EXCLUDED_AUTH_MODES,
+  refreshConfiguredModelCatalogs,
+} from "../modelCapabilities";
 import type {
   ModelCapabilityIdentity,
   ModelCatalogIdentity,
@@ -724,12 +727,9 @@ export async function refreshConfiguredProviderModelCatalogs(options?: {
   const groups = getModelProviderGroups();
   await refreshConfiguredModelCatalogs(
     groups
-      .filter(
-        (group) =>
-          group.authMode !== "codex_auth" &&
-          group.authMode !== "codex_app_server" &&
-          group.authMode !== "webchat",
-      )
+      // Copilot and codex tokens need dedicated exchanges and webchat has no
+      // HTTP catalog; the generic /models fetch would fail (or 401-spam) them.
+      .filter((group) => !CATALOG_EXCLUDED_AUTH_MODES.has(group.authMode))
       .map((group) => buildProviderCatalogIdentity(group)),
     options,
   );

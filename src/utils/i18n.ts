@@ -559,6 +559,7 @@ const zhCN: Record<string, string> = {
   "Enter the API key above to fetch this provider's models.":
     "请先在上方填写 API Key，以获取该服务商的模型列表。",
   "Couldn't fetch models:": "无法获取模型列表：",
+  "Couldn't fetch the model list.": "无法获取模型列表。",
   "The provider returned no models.": "该服务商未返回任何模型。",
   "Select a model…": "请选择模型…",
   "Customized…": "自定义…",
