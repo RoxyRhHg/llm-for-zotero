@@ -82,6 +82,66 @@ export function buildProviderModelSelectRows(args: {
   return rows;
 }
 
+/**
+ * Rewriting a native `<select>`'s options while its dropdown popup is open
+ * crashes Gecko's popup helper ("this.element is null" in SelectChild.sys.mjs)
+ * and can close the popup under the user. Content code cannot observe the
+ * popup directly, so this gate tracks it conservatively: from the interaction
+ * that can open it (mousedown/keydown) until it has provably closed (change,
+ * blur). Rebuilds requested inside that window are deferred and flushed at the
+ * next safe moment — when the popup closes, or right before it opens again.
+ */
+export function createSelectRebuildGate(rebuild: () => void): {
+  /** Rebuild now if safe, otherwise once the popup is provably closed. */
+  requestRebuild: () => void;
+  /** Call on mousedown/keydown — runs before the popup opens, so it first flushes any pending rebuild. */
+  popupMayOpen: () => void;
+  /** Call on change/blur — the popup cannot still be open. */
+  popupClosed: () => void;
+} {
+  let mayBeOpen = false;
+  let pending = false;
+  const flush = () => {
+    if (!pending) return;
+    pending = false;
+    rebuild();
+  };
+  return {
+    requestRebuild: () => {
+      if (mayBeOpen) {
+        pending = true;
+        return;
+      }
+      rebuild();
+    },
+    popupMayOpen: () => {
+      flush();
+      mayBeOpen = true;
+    },
+    popupClosed: () => {
+      mayBeOpen = false;
+      flush();
+    },
+  };
+}
+
+/**
+ * Run change-listener work AFTER Gecko's select-popup teardown finishes.
+ *
+ * When a dropdown pick closes the popup, SelectChild.sys.mjs dispatches the
+ * `change` event from inside its `Forms:DismissedDropDown` handler and calls
+ * the popup helper's `uninit()` right after the dispatch returns. Change-
+ * listener work that destroys the select's frame (hiding it, replacing the
+ * card) makes `HTMLSelectEventListener::Detach` fire `mozhidedropdown`, which
+ * uninits the helper early — the trailing `uninit()` then crashes with
+ * "this.element is null". A microtask runs once the actor's `receiveMessage`
+ * fully returns (the entry-script stack must empty first) and before the next
+ * paint, so the deferred work is re-entrancy-safe and visually seamless.
+ */
+export function runAfterSelectChangeDispatch(work: () => void): void {
+  void Promise.resolve().then(work);
+}
+
 export type ProviderModelFetchStatus =
   | { kind: "needs_api_key" }
   | { kind: "loading" }

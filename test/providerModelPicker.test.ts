@@ -4,7 +4,9 @@ import {
   CUSTOMIZED_MODEL_OPTION_VALUE,
   buildProviderModelSelectRows,
   canFetchProviderModels,
+  createSelectRebuildGate,
   resolveProviderModelFetchStatus,
+  runAfterSelectChangeDispatch,
   resolveProviderPickerPresetId,
   sortModelOptions,
 } from "../src/utils/providerModelPicker";
@@ -239,6 +241,89 @@ describe("providerModelPicker", function () {
         }),
         { kind: "ready", total: 0, stale: false },
       );
+    });
+  });
+
+  describe("rebuild gate", function () {
+    function makeGate() {
+      let rebuilds = 0;
+      const gate = createSelectRebuildGate(() => {
+        rebuilds += 1;
+      });
+      return { gate, rebuilds: () => rebuilds };
+    }
+
+    it("rebuilds immediately while the popup cannot be open", function () {
+      const { gate, rebuilds } = makeGate();
+      gate.requestRebuild();
+      assert.equal(rebuilds(), 1);
+    });
+
+    it("defers a rebuild that arrives while the popup may be open", function () {
+      const { gate, rebuilds } = makeGate();
+      gate.popupMayOpen();
+      gate.requestRebuild();
+      assert.equal(
+        rebuilds(),
+        0,
+        "must not rewrite options under an open popup",
+      );
+      gate.popupClosed();
+      assert.equal(
+        rebuilds(),
+        1,
+        "deferred rebuild applies once the popup closes",
+      );
+    });
+
+    it("flushes a pending rebuild right before the popup reopens", function () {
+      const { gate, rebuilds } = makeGate();
+      // Popup opened, catalog refresh landed mid-open, user dismissed with
+      // Escape (no change/blur event) — the rebuild stays pending.
+      gate.popupMayOpen();
+      gate.requestRebuild();
+      assert.equal(rebuilds(), 0);
+      // Next mousedown fires before the popup opens: safe to flush.
+      gate.popupMayOpen();
+      assert.equal(rebuilds(), 1);
+    });
+
+    it("coalesces multiple deferred requests into one rebuild", function () {
+      const { gate, rebuilds } = makeGate();
+      gate.popupMayOpen();
+      gate.requestRebuild();
+      gate.requestRebuild();
+      gate.popupClosed();
+      assert.equal(rebuilds(), 1);
+    });
+
+    it("does not rebuild on close when nothing was requested", function () {
+      const { gate, rebuilds } = makeGate();
+      gate.popupMayOpen();
+      gate.popupClosed();
+      gate.popupMayOpen();
+      assert.equal(rebuilds(), 0);
+    });
+  });
+
+  describe("change-dispatch deferral", function () {
+    it("never runs the work synchronously inside the change dispatch", function () {
+      let ran = false;
+      runAfterSelectChangeDispatch(() => {
+        ran = true;
+      });
+      // Gecko calls the popup helper's trailing uninit() right after our
+      // change listener returns; work must not have run by then.
+      assert.isFalse(ran);
+    });
+
+    it("runs the work on a following microtask, preserving order", async function () {
+      const order: string[] = [];
+      runAfterSelectChangeDispatch(() => order.push("first"));
+      runAfterSelectChangeDispatch(() => order.push("second"));
+      order.push("dispatch-still-running");
+      await Promise.resolve();
+      assert.deepEqual(order, ["dispatch-still-running", "first", "second"]);
     });
   });
 });

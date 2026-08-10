@@ -34,7 +34,9 @@ import {
   CUSTOMIZED_MODEL_OPTION_VALUE,
   buildProviderModelSelectRows,
   canFetchProviderModels,
+  createSelectRebuildGate,
   resolveProviderModelFetchStatus,
+  runAfterSelectChangeDispatch,
 } from "../utils/providerModelPicker";
 import {
   getModelCatalogStatus,
@@ -478,7 +480,7 @@ function attachProviderModelSelect(args: {
   };
 
   let renderedOptionsSignature = "";
-  const rebuildOptions = () => {
+  const rewriteOptions = () => {
     const rows = buildProviderModelSelectRows({
       savedModel: modelEntry.model,
       catalog: readSnapshot()?.models || [],
@@ -514,6 +516,11 @@ function attachProviderModelSelect(args: {
     }
     select.value = desiredValue;
   };
+  // Rewriting the options while the native popup is open crashes Gecko's
+  // popup helper (SelectChild "this.element is null"), so rebuilds triggered
+  // by an async catalog refresh wait until the popup is provably closed.
+  const rebuildGate = createSelectRebuildGate(rewriteOptions);
+  const rebuildOptions = rebuildGate.requestRebuild;
 
   const updateStatus = () => {
     const status = resolveProviderModelFetchStatus({
@@ -568,11 +575,19 @@ function attachProviderModelSelect(args: {
   };
 
   // The refresh is TTL-cached, so re-checking on every open stays cheap and
-  // picks up an API key the user pasted since the card rendered.
-  select.addEventListener("mousedown", () => void refreshCatalog());
+  // picks up an API key the user pasted since the card rendered. Both
+  // handlers run before the popup opens, so the gate can still flush a
+  // pending rebuild into the popup the user is about to see.
+  select.addEventListener("mousedown", () => {
+    rebuildGate.popupMayOpen();
+    void refreshCatalog();
+  });
+  select.addEventListener("keydown", () => rebuildGate.popupMayOpen());
   select.addEventListener("focus", () => void refreshCatalog());
-  select.addEventListener("change", () => {
-    if (select.value === CUSTOMIZED_MODEL_OPTION_VALUE) {
+  select.addEventListener("blur", () => rebuildGate.popupClosed());
+  const applyModelChoice = (chosenValue: string) => {
+    rebuildGate.popupClosed();
+    if (chosenValue === CUSTOMIZED_MODEL_OPTION_VALUE) {
       customizedActive = true;
       input.value = modelEntry.model;
       syncModes();
@@ -581,10 +596,18 @@ function attachProviderModelSelect(args: {
       return;
     }
     customizedActive = false;
-    input.value = select.value;
-    args.onModelPicked(select.value);
+    input.value = chosenValue;
+    args.onModelPicked(chosenValue);
     syncModes();
     rebuildOptions();
+  };
+  select.addEventListener("change", () => {
+    // Hiding the select (Customized…) or rewriting its options inside the
+    // change dispatch re-enters Gecko's popup teardown and crashes it
+    // ("this.element is null" in SelectChild.sys.mjs) — same invariant as the
+    // deferred rerender() in the auth-mode/preset selects below.
+    const chosenValue = select.value;
+    runAfterSelectChangeDispatch(() => applyModelChoice(chosenValue));
   });
 
   const exitCustomized = () => {
