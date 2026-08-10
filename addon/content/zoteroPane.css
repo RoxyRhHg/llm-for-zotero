@@ -6187,6 +6187,16 @@ label.llm-search-results-item:hover {
   margin: 4px 0;
 }
 
+/* Mirror web chat rendering: list markers ("1.", "•") are semibold */
+.llm-rendered-markdown li::marker {
+  font-weight: 600;
+}
+
+/* Task-list checkboxes ("- [x]") pick up the accent color when checked */
+.llm-rendered-markdown input[type="checkbox"] {
+  accent-color: var(--color-accent, #3584e4);
+}
+
 .llm-rendered-markdown code {
   background: rgba(0, 0, 0, 0.1);
   padding: 2px 5px;
