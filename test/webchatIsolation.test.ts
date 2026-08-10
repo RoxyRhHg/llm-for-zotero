@@ -191,7 +191,7 @@ describe("webchat isolation", function () {
     );
     const entryBlock = source.slice(entryStart, entryBlockEnd);
     const paperSwitch = entryBlock.indexOf(
-      "await createAndSwitchPaperConversation();",
+      "await ensureWebChatSessionPaperConversation();",
     );
     const webchatReset = entryBlock.indexOf(
       "resetCurrentWebChatConversation();",

@@ -353,6 +353,8 @@ type SearchIndexCatalogDescriptor = {
 const UPSTREAM_GLOBAL_VALIDITY_SQL = [
   `c.conversation_key >= ${UPSTREAM_GLOBAL_CONVERSATION_KEY_BASE}`,
   `c.conversation_key < ${UPSTREAM_RUNTIME_CONVERSATION_KEY_END}`,
+  // Ephemeral webchat sessions never belong in history search.
+  "COALESCE(c.webchat_session, 0) = 0",
 ].join(" AND ");
 
 const UPSTREAM_PAPER_VALIDITY_SQL = [
@@ -362,6 +364,8 @@ const UPSTREAM_PAPER_VALIDITY_SQL = [
   "c.paper_item_id > 0",
   "c.session_version IS NOT NULL",
   "c.session_version > 0",
+  // Ephemeral webchat sessions never belong in history search.
+  "COALESCE(c.webchat_session, 0) = 0",
 ].join(" AND ");
 
 const CLAUDE_VALIDITY_SQL = [

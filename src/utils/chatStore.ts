@@ -50,6 +50,7 @@ import {
 import {
   CONVERSATION_ID_TRANSITION_MIGRATION_ID,
   hasConversationSchemaMigration,
+  runConversationSchemaMigrationOnce,
 } from "../shared/conversationSchemaMigrations";
 import {
   parseForcedSkillIdsJson,
@@ -1422,7 +1423,8 @@ export async function initChatStore(): Promise<void> {
         last_activity_at INTEGER,
         user_turn_count INTEGER NOT NULL DEFAULT 0,
         first_user_title TEXT,
-        title TEXT
+        title TEXT,
+        webchat_session INTEGER NOT NULL DEFAULT 0
       )`,
     );
 
@@ -1455,6 +1457,12 @@ export async function initChatStore(): Promise<void> {
       "first_user_title",
       "first_user_title TEXT",
     );
+    await ensureColumn(
+      GLOBAL_CONVERSATIONS_TABLE,
+      globalColumns,
+      "webchat_session",
+      "webchat_session INTEGER NOT NULL DEFAULT 0",
+    );
     await Zotero.DB.queryAsync(
       `CREATE INDEX IF NOT EXISTS ${GLOBAL_CONVERSATIONS_ACTIVITY_INDEX}
        ON ${GLOBAL_CONVERSATIONS_TABLE} (library_id, last_activity_at DESC, conversation_key DESC)`,
@@ -1476,6 +1484,7 @@ export async function initChatStore(): Promise<void> {
         user_turn_count INTEGER NOT NULL DEFAULT 0,
         first_user_title TEXT,
         title TEXT,
+        webchat_session INTEGER NOT NULL DEFAULT 0,
         UNIQUE(paper_item_id, session_version)
       )`,
     );
@@ -1526,6 +1535,12 @@ export async function initChatStore(): Promise<void> {
       "first_user_title",
       "first_user_title TEXT",
     );
+    await ensureColumn(
+      PAPER_CONVERSATIONS_TABLE,
+      paperColumnSet,
+      "webchat_session",
+      "webchat_session INTEGER NOT NULL DEFAULT 0",
+    );
     await Zotero.DB.queryAsync(
       `CREATE INDEX IF NOT EXISTS ${PAPER_CONVERSATIONS_PAPER_ACTIVITY_INDEX}
        ON ${PAPER_CONVERSATIONS_TABLE} (library_id, paper_item_id, last_activity_at DESC, conversation_key DESC)`,
@@ -1547,6 +1562,125 @@ export async function initChatStore(): Promise<void> {
       await refreshUpstreamConversationCatalogSummary();
     }
   });
+  await cleanupLeakedWebchatGhostTitlesOnce();
+  await sweepWebchatSessionConversations();
+}
+
+const WEBCHAT_GHOST_TITLE_CLEANUP_MIGRATION_ID =
+  "webchat-ghost-title-cleanup-v1";
+
+/**
+ * One-time repair for catalogs written before webchat sessions were flagged:
+ * webchat sends used to stamp their first message onto a draft row's title
+ * while never persisting any messages, leaving titled ghost conversations in
+ * the history list. Only the leaked title is cleared — the row survives as a
+ * blank draft so no user-created conversation can ever be destroyed here.
+ */
+async function cleanupLeakedWebchatGhostTitlesOnce(): Promise<void> {
+  try {
+    await runConversationSchemaMigrationOnce(
+      WEBCHAT_GHOST_TITLE_CLEANUP_MIGRATION_ID,
+      "Clear titles leaked onto message-less draft rows by pre-flag webchat sends.",
+      async () => {
+        const refreshKeys: number[] = [];
+        for (const tableName of [
+          PAPER_CONVERSATIONS_TABLE,
+          GLOBAL_CONVERSATIONS_TABLE,
+        ]) {
+          const ghostWhereSql = `COALESCE(TRIM(${tableName}.title), '') <> ''
+             AND COALESCE(${tableName}.user_turn_count, 0) = 0
+             AND NOT EXISTS (
+               SELECT 1
+               FROM ${CHAT_MESSAGES_TABLE} m0
+               WHERE ${messageJoinCondition("m0", tableName)}
+             )`;
+          const rows = (await Zotero.DB.queryAsync(
+            `SELECT conversation_key AS conversationKey
+             FROM ${tableName}
+             WHERE ${ghostWhereSql}`,
+          )) as Array<{ conversationKey?: unknown }> | undefined;
+          const keys = (rows || [])
+            .map((row) => normalizeConversationKey(Number(row.conversationKey)))
+            .filter((key): key is number => Boolean(key));
+          if (!keys.length) continue;
+          await Zotero.DB.queryAsync(
+            `UPDATE ${tableName}
+             SET title = NULL
+             WHERE ${ghostWhereSql}`,
+          );
+          refreshKeys.push(...keys);
+        }
+        for (const key of refreshKeys) {
+          await refreshUpstreamConversationSearchIndex(key);
+        }
+        if (refreshKeys.length) {
+          logChatStoreWarning(
+            `Cleared leaked webchat titles from ${refreshKeys.length} message-less draft conversation(s).`,
+          );
+        }
+      },
+    );
+  } catch (err) {
+    logChatStoreWarning(
+      `Failed to clear leaked webchat ghost titles: ${String(err)}`,
+    );
+  }
+}
+
+/**
+ * Webchat sessions are ephemeral by design: their transcripts live on the
+ * provider site and the local catalog row exists only to anchor the panel
+ * while the session is active. Rows still flagged at startup belong to
+ * finished sessions, so they are removed before any panel can restore them.
+ * A flagged row that somehow owns persisted messages is adopted (flag
+ * cleared) instead of deleted — the sweep must never destroy transcripts.
+ */
+async function sweepWebchatSessionConversations(): Promise<void> {
+  const sweepTable = async (
+    tableName: string,
+    deleteConversation: (conversationKey: number) => Promise<void>,
+  ) => {
+    const rows = (await Zotero.DB.queryAsync(
+      `SELECT conversation_key AS conversationKey,
+              EXISTS (
+                SELECT 1
+                FROM ${CHAT_MESSAGES_TABLE} m0
+                WHERE ${messageJoinCondition("m0", tableName)}
+              ) AS hasMessages
+       FROM ${tableName}
+       WHERE COALESCE(${tableName}.webchat_session, 0) = 1`,
+    )) as
+      | Array<{ conversationKey?: unknown; hasMessages?: unknown }>
+      | undefined;
+    for (const row of rows || []) {
+      const conversationKey = normalizeConversationKey(
+        Number(row.conversationKey),
+      );
+      if (!conversationKey) continue;
+      if (Number(row.hasMessages)) {
+        await Zotero.DB.queryAsync(
+          `UPDATE ${tableName}
+           SET webchat_session = 0
+           WHERE conversation_key = ?`,
+          [conversationKey],
+        );
+        await refreshUpstreamConversationSearchIndex(conversationKey);
+        logChatStoreWarning(
+          `Adopted webchat session ${conversationKey} instead of sweeping it; the row owns persisted messages.`,
+        );
+        continue;
+      }
+      await deleteConversation(conversationKey);
+    }
+  };
+  try {
+    await sweepTable(PAPER_CONVERSATIONS_TABLE, deletePaperConversation);
+    await sweepTable(GLOBAL_CONVERSATIONS_TABLE, deleteGlobalConversation);
+  } catch (err) {
+    logChatStoreWarning(
+      `Failed to sweep webchat session conversations: ${String(err)}`,
+    );
+  }
 }
 
 export async function loadConversation(
@@ -2077,6 +2211,20 @@ export async function appendMessage(
           : null,
       ],
     );
+    // Adoption: once a real message is persisted into a webchat-flagged row
+    // (the user exited webchat mode and kept chatting in the draft), the row
+    // is a normal conversation and must become visible in history again.
+    await Zotero.DB.queryAsync(
+      `UPDATE ${
+        isUpstreamPaperConversationKey(normalizedKey)
+          ? PAPER_CONVERSATIONS_TABLE
+          : GLOBAL_CONVERSATIONS_TABLE
+      }
+       SET webchat_session = 0
+       WHERE conversation_key = ?
+         AND COALESCE(webchat_session, 0) = 1`,
+      [normalizedKey],
+    );
     await refreshUpstreamConversationCatalogSummary(normalizedKey);
   });
   await refreshUpstreamConversationSearchIndex(normalizedKey);
@@ -2562,6 +2710,7 @@ async function resolveNextPaperConversationKey(): Promise<number> {
 
 async function findLowestMissingPaperSessionVersion(
   paperItemID: number,
+  minimumVersion = 1,
 ): Promise<number> {
   const rows = (await Zotero.DB.queryAsync(
     `SELECT session_version AS sessionVersion
@@ -2576,7 +2725,7 @@ async function findLowestMissingPaperSessionVersion(
     if (!normalized) continue;
     used.add(normalized);
   }
-  let candidate = 1;
+  let candidate = Math.max(1, Math.floor(minimumVersion));
   while (used.has(candidate)) {
     candidate += 1;
   }
@@ -2626,13 +2775,18 @@ export async function ensurePaperV1Conversation(
 export async function createPaperConversation(
   libraryID: number,
   paperItemID: number,
+  options: { webchatSession?: boolean } = {},
 ): Promise<PaperConversationSummary | null> {
   const normalizedLibraryID = normalizeLibraryID(libraryID);
   const normalizedPaperItemID = normalizePaperItemID(paperItemID);
   if (!normalizedLibraryID || !normalizedPaperItemID) return null;
   return await Zotero.DB.executeTransaction(async () => {
+    // Webchat sessions must never claim the paper's v1 identity: version 1 is
+    // keyed by the paper item id itself, and that key doubles as the paper's
+    // default conversation everywhere else.
     const nextVersion = await findLowestMissingPaperSessionVersion(
       normalizedPaperItemID,
+      options.webchatSession ? 2 : 1,
     );
     const createdAt = Date.now();
     const nextConversationKey =
@@ -2647,8 +2801,8 @@ export async function createPaperConversation(
     });
     await Zotero.DB.queryAsync(
       `INSERT INTO ${PAPER_CONVERSATIONS_TABLE}
-        (conversation_id, conversation_key, library_id, paper_item_id, session_version, created_at, last_activity_at, user_turn_count, first_user_title, title)
-       VALUES (?, ?, ?, ?, ?, ?, ?, 0, NULL, NULL)`,
+        (conversation_id, conversation_key, library_id, paper_item_id, session_version, created_at, last_activity_at, user_turn_count, first_user_title, title, webchat_session)
+       VALUES (?, ?, ?, ?, ?, ?, ?, 0, NULL, NULL, ?)`,
       [
         conversationID,
         nextConversationKey,
@@ -2657,6 +2811,7 @@ export async function createPaperConversation(
         nextVersion,
         createdAt,
         createdAt,
+        options.webchatSession ? 1 : 0,
       ],
     );
     await registerConversationScope({
@@ -2697,6 +2852,7 @@ export async function listPaperConversations(
      FROM ${PAPER_CONVERSATIONS_TABLE} pc
      WHERE pc.library_id = ?
        AND pc.paper_item_id = ?
+       AND COALESCE(pc.webchat_session, 0) = 0
        ${includeEmpty ? "" : "AND COALESCE(pc.user_turn_count, 0) > 0"}
      ORDER BY lastActivityAt DESC, pc.conversation_key DESC
      LIMIT ?`,
@@ -2778,6 +2934,32 @@ export async function getPaperConversation(
   )) as PaperConversationSummaryRow[] | undefined;
   if (!rows?.length) return null;
   return toPaperConversationSummary(rows[0]);
+}
+
+/**
+ * Most recent webchat session row for a paper, if one exists. Webchat rows
+ * are excluded from every normal listing, so mode entry needs a dedicated
+ * lookup to reuse its session row instead of accumulating one per entry.
+ */
+export async function findWebchatSessionPaperConversationKey(
+  libraryID: number,
+  paperItemID: number,
+): Promise<number | null> {
+  const normalizedLibraryID = normalizeLibraryID(libraryID);
+  const normalizedPaperItemID = normalizePaperItemID(paperItemID);
+  if (!normalizedLibraryID || !normalizedPaperItemID) return null;
+  const rows = (await Zotero.DB.queryAsync(
+    `SELECT conversation_key AS conversationKey
+     FROM ${PAPER_CONVERSATIONS_TABLE}
+     WHERE library_id = ?
+       AND paper_item_id = ?
+       AND COALESCE(webchat_session, 0) = 1
+     ORDER BY COALESCE(last_activity_at, created_at) DESC, conversation_key DESC
+     LIMIT 1`,
+    [normalizedLibraryID, normalizedPaperItemID],
+  )) as Array<{ conversationKey?: unknown }> | undefined;
+  const key = normalizeConversationKey(Number(rows?.[0]?.conversationKey));
+  return key || null;
 }
 
 export async function deletePaperConversation(
@@ -2890,6 +3072,7 @@ export async function ensureGlobalConversationExists(
 
 export async function createGlobalConversation(
   libraryID: number,
+  options: { webchatSession?: boolean } = {},
 ): Promise<number> {
   const normalizedLibraryID = normalizeLibraryID(libraryID);
   if (!normalizedLibraryID) return 0;
@@ -2906,14 +3089,15 @@ export async function createGlobalConversation(
     });
     await Zotero.DB.queryAsync(
       `INSERT INTO ${GLOBAL_CONVERSATIONS_TABLE}
-        (conversation_id, conversation_key, library_id, created_at, last_activity_at, user_turn_count, first_user_title, title)
-       VALUES (?, ?, ?, ?, ?, 0, NULL, NULL)`,
+        (conversation_id, conversation_key, library_id, created_at, last_activity_at, user_turn_count, first_user_title, title, webchat_session)
+       VALUES (?, ?, ?, ?, ?, 0, NULL, NULL, ?)`,
       [
         conversationID,
         nextConversationKey,
         normalizedLibraryID,
         createdAt,
         createdAt,
+        options.webchatSession ? 1 : 0,
       ],
     );
     await registerConversationScope({
@@ -2956,6 +3140,7 @@ export async function listGlobalConversations(
      WHERE gc.library_id = ?
        AND gc.conversation_key >= ?
        AND gc.conversation_key < ?
+       AND COALESCE(gc.webchat_session, 0) = 0
        ${includeEmpty ? "" : "AND COALESCE(gc.user_turn_count, 0) > 0"}
      ORDER BY lastActivityAt DESC, gc.conversation_key DESC
      ${normalizedLimit ? "LIMIT ?" : ""}`,
@@ -3090,7 +3275,8 @@ export async function touchGlobalConversationTitle(
     `UPDATE ${GLOBAL_CONVERSATIONS_TABLE}
      SET title = ?
      WHERE conversation_key = ?
-       AND (title IS NULL OR TRIM(title) = '')`,
+       AND (title IS NULL OR TRIM(title) = '')
+       AND COALESCE(webchat_session, 0) = 0`,
     [title, normalizedKey],
   );
   await refreshUpstreamConversationSearchIndex(normalizedKey);
@@ -3125,7 +3311,8 @@ export async function touchPaperConversationTitle(
     `UPDATE ${PAPER_CONVERSATIONS_TABLE}
      SET title = ?
      WHERE conversation_key = ?
-       AND (title IS NULL OR TRIM(title) = '')`,
+       AND (title IS NULL OR TRIM(title) = '')
+       AND COALESCE(webchat_session, 0) = 0`,
     [title, normalizedKey],
   );
   await refreshUpstreamConversationSearchIndex(normalizedKey);

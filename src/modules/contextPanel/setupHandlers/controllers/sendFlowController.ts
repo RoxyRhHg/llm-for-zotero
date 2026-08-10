@@ -535,7 +535,10 @@ export function createSendFlowController(deps: SendFlowControllerDeps): {
       const titleSeed =
         deps.normalizeConversationTitleSeed(rawSubmittedText) ||
         deps.normalizeConversationTitleSeed(resolvedPromptText);
-      if (titleSeed) {
+      // [webchat] Webchat sessions are ephemeral and hidden from history;
+      // stamping their first message onto the local catalog row would leak
+      // webchat content into the normal history list.
+      if (titleSeed && !isWebChat) {
         const touchTitle = deps.isClaudeConversationSystem()
           ? deps.touchClaudeConversationTitle
           : deps.isCodexConversationSystem()

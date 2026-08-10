@@ -12,6 +12,7 @@ import {
   type ConversationCatalogEntry,
 } from "../../../../core/conversations/repository";
 import { resolveFreshConversationDraft } from "../../freshConversationDraft";
+import { resolveWebChatSessionConversation } from "../../webchatSessionConversation";
 import {
   evaluateConversationForkEligibility,
   type ConversationForkEligibilityReason,
@@ -2438,11 +2439,16 @@ export function createHistoryLifecycleController(
         buildPaperStateKey(libraryID, paperItemID),
         resolvedConversationKey,
       );
-      setLastUsedPaperConversationKey(
-        libraryID,
-        paperItemID,
-        resolvedConversationKey,
-      );
+      // Webchat session rows are swept at the next startup, so persisting
+      // them as the paper's last-used conversation would leave the restore
+      // pref dangling; after a restart the paper resumes its last real chat.
+      if (!isWebChatMode()) {
+        setLastUsedPaperConversationKey(
+          libraryID,
+          paperItemID,
+          resolvedConversationKey,
+        );
+      }
     }
     syncConversationIdentity();
     refreshAutoLoadedPaperContextForCurrentItem();
@@ -3451,6 +3457,47 @@ export function createHistoryLifecycleController(
     return true;
   };
 
+  // [webchat] Entering webchat mode anchors the panel on a dedicated,
+  // catalog-hidden session row instead of a normal draft: webchat transcripts
+  // live on the provider site, so nothing from the session may surface in the
+  // local history list or claim a draft the user created.
+  const ensureWebChatSessionPaperConversation = async (): Promise<boolean> => {
+    if (!item) return false;
+    closeHistoryNewMenu();
+    const paperItem = resolveCurrentPaperBaseItem();
+    if (!paperItem) {
+      if (status) {
+        setStatus(status, t("Open a paper to start a paper chat"), "error");
+      }
+      return false;
+    }
+    setBasePaperItem(paperItem);
+    const libraryID = getCurrentLibraryID();
+    const paperItemID = Number(paperItem.id || 0);
+    if (!libraryID || !Number.isFinite(paperItemID) || paperItemID <= 0) {
+      if (status) {
+        setStatus(status, t("No active paper for paper chat"), "error");
+      }
+      return false;
+    }
+    const session = await resolveWebChatSessionConversation({
+      libraryID,
+      paperItemID,
+    });
+    if (!session?.conversationKey) {
+      if (status) setStatus(status, t("Failed to create paper chat"), "error");
+      return false;
+    }
+    ztoolkit.log("LLM: webchat session conversation", {
+      libraryID,
+      paperItemID,
+      conversationKey: session.conversationKey,
+      action: session.reused ? "reuse" : "create",
+    });
+    await switchPaperConversation(session.conversationKey);
+    return true;
+  };
+
   const runExplicitNewChatAction = async (action: () => Promise<void>) => {
     if (explicitNewChatInFlight) return;
     explicitNewChatInFlight = true;
@@ -4091,6 +4138,10 @@ export function createHistoryLifecycleController(
     createAndSwitchPaperConversation: async (forceFresh = false) => {
       syncStateFromDeps();
       return createAndSwitchPaperConversation(forceFresh);
+    },
+    ensureWebChatSessionPaperConversation: async () => {
+      syncStateFromDeps();
+      return ensureWebChatSessionPaperConversation();
     },
     runExplicitNewChatAction,
     queueTurnDeletion,

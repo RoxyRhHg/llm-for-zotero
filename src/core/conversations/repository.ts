@@ -147,7 +147,14 @@ type EnsureCatalogEntryParams = ConversationCatalogScope & {
   title?: string;
 };
 
-type CreateCatalogEntryParams = ConversationCatalogScope;
+type CreateCatalogEntryParams = ConversationCatalogScope & {
+  /**
+   * Upstream only: create the row as an ephemeral webchat session. Flagged
+   * rows are hidden from catalog listings and swept at startup unless a
+   * persisted message adopts them into a normal conversation.
+   */
+  webchatSession?: boolean;
+};
 
 type ForkConversationParams = ConversationCatalogScope & {
   sourceConversationKey: number;
@@ -670,11 +677,15 @@ export const conversationRepository = {
     if (params.kind === "paper") {
       return fromUpstreamPaperSummary(
         paperItemID
-          ? await createPaperConversation(libraryID, paperItemID)
+          ? await createPaperConversation(libraryID, paperItemID, {
+              webchatSession: params.webchatSession === true,
+            })
           : null,
       );
     }
-    const conversationKey = await createGlobalConversation(libraryID);
+    const conversationKey = await createGlobalConversation(libraryID, {
+      webchatSession: params.webchatSession === true,
+    });
     return conversationKey
       ? fromUpstreamGlobalSummary(await getGlobalConversation(conversationKey))
       : null;

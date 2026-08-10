@@ -1319,6 +1319,9 @@ export function setupHandlers(
   let createAndSwitchPaperConversation: (
     forceFresh?: boolean,
   ) => Promise<boolean | void> = async () => {};
+  let ensureWebChatSessionPaperConversation: () => Promise<
+    boolean | void
+  > = async () => {};
   let queueTurnDeletion: (target: {
     conversationKey: number;
     userTimestamp: number;
@@ -4726,6 +4729,8 @@ export function setupHandlers(
     historyLifecycleController.createAndSwitchGlobalConversation;
   createAndSwitchPaperConversation =
     historyLifecycleController.createAndSwitchPaperConversation;
+  ensureWebChatSessionPaperConversation =
+    historyLifecycleController.ensureWebChatSessionPaperConversation;
   queueTurnDeletion = historyLifecycleController.queueTurnDeletion;
   if (__env__ !== "production") {
     (body as HTMLElement & Record<string, unknown>).__llmQueueTurnDeletion =
@@ -5184,7 +5189,9 @@ export function setupHandlers(
             // Apply webchat UI immediately so model button is disabled during preload
             applyWebChatModeUI();
             void (async () => {
-              await createAndSwitchPaperConversation();
+              // Anchor on the paper's dedicated webchat session row (hidden
+              // from history, swept at startup) — never a normal draft.
+              await ensureWebChatSessionPaperConversation();
               if (!isWebChatMode()) return;
               resetCurrentWebChatConversation();
               refreshChatPreservingScroll();

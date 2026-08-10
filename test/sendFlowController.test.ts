@@ -511,6 +511,46 @@ describe("sendFlowController", function () {
     assert.equal(counts.retainTextCalled, 1);
   });
 
+  it("never seeds local conversation titles from webchat sends", async function () {
+    const touchedTitles: string[] = [];
+    const { controller } = createBaseDeps({
+      getSelectedProfile: () => ({
+        entryId: "webchat-chatgpt",
+        model: "chatgpt.com",
+        authMode: "webchat",
+        providerProtocol: "web_sync",
+        providerLabel: "WebChat",
+      }),
+      touchPaperConversationTitle: async (_key: number, seed: string) => {
+        touchedTitles.push(seed);
+      },
+      touchGlobalConversationTitle: async (_key: number, seed: string) => {
+        touchedTitles.push(seed);
+      },
+    });
+
+    await controller.doSend();
+
+    assert.deepEqual(
+      touchedTitles,
+      [],
+      "webchat sends must not write catalog titles",
+    );
+  });
+
+  it("still seeds local conversation titles for non-webchat sends", async function () {
+    const touchedTitles: string[] = [];
+    const { controller } = createBaseDeps({
+      touchPaperConversationTitle: async (_key: number, seed: string) => {
+        touchedTitles.push(seed);
+      },
+    });
+
+    await controller.doSend();
+
+    assert.isNotEmpty(touchedTitles, "normal sends keep seeding titles");
+  });
+
   it("resolves and forwards canonical selected-text anchors at send time", async function () {
     const context: SelectedTextContext = {
       text: "Late-page selected quote",
