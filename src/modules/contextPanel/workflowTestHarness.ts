@@ -602,7 +602,11 @@ async function waitForPanelConversationChange(params: {
   previousConversationKind?: string;
 }): Promise<WorkflowTestDiagnostics> {
   const startedAt = Date.now();
-  while (Date.now() - startedAt < 5000) {
+  // Generous deadline: the switch path does several DB round-trips, and a
+  // loaded machine has pushed the old 5s budget over the edge (observed as a
+  // flaky deletion-lifecycle failure). Polling exits the moment the key
+  // changes, so a large ceiling costs nothing on the happy path.
+  while (Date.now() - startedAt < 15000) {
     const diagnostics = await getDiagnostics(params.panelId);
     const keyChanged =
       params.previousConversationKey === undefined ||
@@ -1795,6 +1799,113 @@ async function seedStandaloneUserMessage(
   return readStandaloneDiagnostics();
 }
 
+async function seedStandaloneConversation(
+  turns: Array<{ role: "user" | "assistant"; text: string } & Partial<Message>>,
+): Promise<WorkflowTestStandaloneDiagnostics> {
+  assertWorkflowTestEnabled();
+  const doc = await waitForStandaloneReady();
+  const contentArea = doc.querySelector(
+    ".llm-standalone-content",
+  ) as HTMLElement | null;
+  const item = contentArea
+    ? activeContextPanels.get(contentArea)?.() || null
+    : null;
+  if (!contentArea || !item) {
+    throw new Error("Standalone workflow chat panel is not mounted");
+  }
+  const conversationKey = getConversationKey(item);
+  const baseTimestamp = Date.now() - turns.length;
+  const messages: Message[] = turns.map((turn, index) => ({
+    ...turn,
+    timestamp: turn.timestamp ?? baseTimestamp + index,
+  }));
+  const conversationSystem =
+    (contentArea.querySelector("#llm-main") as HTMLElement | null)?.dataset
+      .conversationSystem || "upstream";
+  const storedSystem =
+    conversationSystem === "codex" || conversationSystem === "claude_code"
+      ? conversationSystem
+      : "upstream";
+  for (const message of messages) {
+    // Persist only the plain turn shape; volatile streaming/trace fields are
+    // session-only presentation state and stay in chatHistory.
+    await appendWorkflowStoredMessage(storedSystem, conversationKey, {
+      role: message.role,
+      text: message.text,
+      timestamp: message.timestamp,
+    });
+  }
+  chatHistory.set(conversationKey, messages);
+  loadedConversationKeys.add(conversationKey);
+  refreshChat(contentArea, item);
+  await Zotero.Promise.delay(200);
+  return readStandaloneDiagnostics();
+}
+
+async function resizeStandaloneWindow(
+  width: number,
+  height: number,
+): Promise<{ innerWidth: number; innerHeight: number }> {
+  assertWorkflowTestEnabled();
+  await waitForStandaloneReady();
+  const win = getStandaloneWindowForTest();
+  if (!win) throw new Error("Standalone window is not open");
+  win.resizeBy(width - win.innerWidth, height - win.innerHeight);
+  await Zotero.Promise.delay(400);
+  return { innerWidth: win.innerWidth, innerHeight: win.innerHeight };
+}
+
+async function captureStandaloneScreenshot(filePath: string): Promise<string> {
+  assertWorkflowTestEnabled();
+  await waitForStandaloneReady();
+  const win = getStandaloneWindowForTest();
+  if (!win) throw new Error("Standalone window is not open");
+  const doc = win.document;
+  const width = Math.ceil(win.innerWidth);
+  const height = Math.ceil(win.innerHeight);
+  const scale = Number(win.devicePixelRatio) || 1;
+  const canvas = doc.createElementNS(
+    "http://www.w3.org/1999/xhtml",
+    "canvas",
+  ) as HTMLCanvasElement;
+  canvas.width = Math.ceil(width * scale);
+  canvas.height = Math.ceil(height * scale);
+  const ctx = canvas.getContext("2d") as
+    | (CanvasRenderingContext2D & {
+        drawWindow?: (
+          win: Window,
+          x: number,
+          y: number,
+          w: number,
+          h: number,
+          bg: string,
+        ) => void;
+      })
+    | null;
+  if (!ctx || typeof ctx.drawWindow !== "function") {
+    throw new Error("drawWindow is unavailable in this build");
+  }
+  ctx.scale(scale, scale);
+  ctx.drawWindow(win, 0, 0, width, height, "#1e1e1e");
+  const dataUrl = canvas.toDataURL("image/png");
+  const base64 = dataUrl.split(",")[1] || "";
+  const binary = win.atob(base64);
+  const bytes = new Uint8Array(binary.length);
+  for (let index = 0; index < binary.length; index++) {
+    bytes[index] = binary.charCodeAt(index);
+  }
+  const ioUtils = (
+    globalThis as unknown as {
+      IOUtils?: {
+        write?: (path: string, data: Uint8Array) => Promise<unknown>;
+      };
+    }
+  ).IOUtils;
+  if (!ioUtils?.write) throw new Error("IOUtils.write is unavailable");
+  await ioUtils.write(filePath, bytes);
+  return filePath;
+}
+
 async function notifyStandaloneItemChanged(
   itemId: number | null,
 ): Promise<WorkflowTestStandaloneDiagnostics> {
@@ -2527,14 +2638,29 @@ function disposeWorkflowPanels(): void {
   panels.clear();
 }
 
+function isHistoryMenuPopulated(body: HTMLElement | Element): boolean {
+  const menu = body.querySelector("#llm-history-menu") as HTMLElement | null;
+  if (!menu || menu.style.display === "none") return false;
+  return Boolean(
+    menu.querySelector(".llm-history-item[data-conversation-key]") ||
+    menu.querySelector(".llm-history-menu-empty"),
+  );
+}
+
 async function openPanelHistoryMenu(panelId: string): Promise<HTMLElement> {
   const panel = getPanel(panelId);
   const menu = panel.body.querySelector(
     "#llm-history-menu",
   ) as HTMLElement | null;
-  if (menu && menu.style.display !== "none") return panel.body;
-  dispatchWorkflowClick(panel.body, "#llm-history-toggle", "History toggle");
-  await Zotero.Promise.delay(200);
+  if (!(menu && menu.style.display !== "none")) {
+    dispatchWorkflowClick(panel.body, "#llm-history-toggle", "History toggle");
+  }
+  // The menu renders after several async DB loads; a fixed 200ms delay was
+  // flaky under load. Wait for rows (or the explicit empty marker) instead.
+  const deadline = Date.now() + 8000;
+  while (!isHistoryMenuPopulated(panel.body) && Date.now() < deadline) {
+    await Zotero.Promise.delay(50);
+  }
   return panel.body;
 }
 
@@ -2564,10 +2690,24 @@ async function deletePanelHistoryConversation(
 ): Promise<void> {
   assertWorkflowTestEnabled();
   const body = await openPanelHistoryMenu(panelId);
-  const row = body.querySelector(
-    `.llm-history-item[data-conversation-key="${conversationKey}"]`,
-  ) as HTMLElement | null;
-  if (!row) throw new Error(`History row ${conversationKey} not rendered`);
+  const rowSelector = `.llm-history-item[data-conversation-key="${conversationKey}"]`;
+  // The menu may still be re-rendering after recent conversation changes;
+  // poll for the specific row instead of failing on the first paint.
+  const deadline = Date.now() + 8000;
+  let row = body.querySelector(rowSelector) as HTMLElement | null;
+  while (!row && Date.now() < deadline) {
+    await Zotero.Promise.delay(50);
+    row = body.querySelector(rowSelector) as HTMLElement | null;
+  }
+  if (!row) {
+    const menu = body.querySelector("#llm-history-menu") as HTMLElement | null;
+    const renderedKeys = Array.from(
+      body.querySelectorAll(".llm-history-item[data-conversation-key]"),
+    ).map((el) => (el as HTMLElement).dataset.conversationKey);
+    throw new Error(
+      `History row ${conversationKey} not rendered; menuDisplay=${menu?.style.display}, renderedKeys=[${renderedKeys.join(",")}], menuTextSample=${(menu?.textContent || "").slice(0, 160)}`,
+    );
+  }
   const deleteBtn = row.querySelector(
     ".llm-history-item-delete",
   ) as HTMLElement | null;
@@ -2827,6 +2967,9 @@ export function installWorkflowTestHarness(targetAddon: {
     exerciseStandaloneComposerManualResize,
     askStandalone,
     seedStandaloneUserMessage,
+    seedStandaloneConversation,
+    resizeStandaloneWindow,
+    captureStandaloneScreenshot,
     notifyStandaloneItemChanged,
     notifyStandaloneItemChanges,
     addItemsAsStandaloneContext,

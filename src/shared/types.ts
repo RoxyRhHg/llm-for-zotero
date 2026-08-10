@@ -206,6 +206,8 @@ export type GlobalConversationSummary = {
   title?: string;
   lastActivityAt: number;
   userTurnCount: number;
+  /** Ephemeral webchat session row: hidden from history, swept at startup. */
+  webchatSession?: boolean;
 };
 
 export type PaperConversationSummary = {
@@ -218,6 +220,8 @@ export type PaperConversationSummary = {
   title?: string;
   lastActivityAt: number;
   userTurnCount: number;
+  /** Ephemeral webchat session row: hidden from history, swept at startup. */
+  webchatSession?: boolean;
 };
 
 export type ClaudeConversationKind = "global" | "paper";

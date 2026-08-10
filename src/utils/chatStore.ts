@@ -1595,28 +1595,40 @@ async function cleanupLeakedWebchatGhostTitlesOnce(): Promise<void> {
                WHERE ${messageJoinCondition("m0", tableName)}
              )`;
           const rows = (await Zotero.DB.queryAsync(
-            `SELECT conversation_key AS conversationKey
+            `SELECT conversation_key AS conversationKey,
+                    title
              FROM ${tableName}
              WHERE ${ghostWhereSql}`,
-          )) as Array<{ conversationKey?: unknown }> | undefined;
-          const keys = (rows || [])
-            .map((row) => normalizeConversationKey(Number(row.conversationKey)))
-            .filter((key): key is number => Boolean(key));
-          if (!keys.length) continue;
+          )) as
+            | Array<{ conversationKey?: unknown; title?: unknown }>
+            | undefined;
+          const cleared: Array<{ key: number; title: string }> = [];
+          for (const row of rows || []) {
+            const key = normalizeConversationKey(Number(row.conversationKey));
+            if (!key) continue;
+            cleared.push({
+              key,
+              title: typeof row.title === "string" ? row.title : "",
+            });
+          }
+          if (!cleared.length) continue;
           await Zotero.DB.queryAsync(
             `UPDATE ${tableName}
              SET title = NULL
              WHERE ${ghostWhereSql}`,
           );
-          refreshKeys.push(...keys);
+          // Log every cleared title verbatim: this UPDATE cannot distinguish a
+          // webchat-leaked title from a hand-renamed empty draft, so the old
+          // value must at least be recoverable from the debug log.
+          for (const entry of cleared) {
+            logChatStoreWarning(
+              `Cleared leaked webchat title from message-less conversation ${entry.key}: "${entry.title}"`,
+            );
+          }
+          refreshKeys.push(...cleared.map((entry) => entry.key));
         }
         for (const key of refreshKeys) {
           await refreshUpstreamConversationSearchIndex(key);
-        }
-        if (refreshKeys.length) {
-          logChatStoreWarning(
-            `Cleared leaked webchat titles from ${refreshKeys.length} message-less draft conversation(s).`,
-          );
         }
       },
     );
@@ -2596,6 +2608,7 @@ type GlobalConversationSummaryRow = {
   title?: unknown;
   lastActivityAt?: unknown;
   userTurnCount?: unknown;
+  webchatSession?: unknown;
 };
 
 function toGlobalConversationSummary(
@@ -2631,6 +2644,7 @@ function toGlobalConversationSummary(
     userTurnCount: Number.isFinite(userTurnCount)
       ? Math.max(0, Math.floor(userTurnCount))
       : 0,
+    ...(Number(row.webchatSession) === 1 ? { webchatSession: true } : {}),
   };
 }
 
@@ -2644,6 +2658,7 @@ type PaperConversationSummaryRow = {
   title?: unknown;
   lastActivityAt?: unknown;
   userTurnCount?: unknown;
+  webchatSession?: unknown;
 };
 
 function toPaperConversationSummary(
@@ -2690,6 +2705,7 @@ function toPaperConversationSummary(
     userTurnCount: Number.isFinite(userTurnCount)
       ? Math.max(0, Math.floor(userTurnCount))
       : 0,
+    ...(Number(row.webchatSession) === 1 ? { webchatSession: true } : {}),
   };
 }
 
@@ -2848,7 +2864,8 @@ export async function listPaperConversations(
             pc.created_at AS createdAt,
             COALESCE(NULLIF(TRIM(pc.title), ''), NULLIF(TRIM(pc.first_user_title), '')) AS title,
             COALESCE(pc.last_activity_at, pc.created_at) AS lastActivityAt,
-            COALESCE(pc.user_turn_count, 0) AS userTurnCount
+            COALESCE(pc.user_turn_count, 0) AS userTurnCount,
+            COALESCE(pc.webchat_session, 0) AS webchatSession
      FROM ${PAPER_CONVERSATIONS_TABLE} pc
      WHERE pc.library_id = ?
        AND pc.paper_item_id = ?
@@ -2892,9 +2909,11 @@ export async function listAllPaperConversationsByLibrary(
             pc.created_at AS createdAt,
             COALESCE(NULLIF(TRIM(pc.title), ''), NULLIF(TRIM(pc.first_user_title), '')) AS title,
             COALESCE(pc.last_activity_at, pc.created_at) AS lastActivityAt,
-            COALESCE(pc.user_turn_count, 0) AS userTurnCount
+            COALESCE(pc.user_turn_count, 0) AS userTurnCount,
+            COALESCE(pc.webchat_session, 0) AS webchatSession
      FROM ${PAPER_CONVERSATIONS_TABLE} pc
      WHERE pc.library_id = ?
+       AND COALESCE(pc.webchat_session, 0) = 0
        AND COALESCE(pc.user_turn_count, 0) > 0
      ORDER BY lastActivityAt DESC, pc.conversation_key DESC
      ${normalizedLimit ? "LIMIT ?" : ""}`,
@@ -2926,7 +2945,8 @@ export async function getPaperConversation(
             pc.created_at AS createdAt,
             COALESCE(NULLIF(TRIM(pc.title), ''), NULLIF(TRIM(pc.first_user_title), '')) AS title,
             COALESCE(pc.last_activity_at, pc.created_at) AS lastActivityAt,
-            COALESCE(pc.user_turn_count, 0) AS userTurnCount
+            COALESCE(pc.user_turn_count, 0) AS userTurnCount,
+            COALESCE(pc.webchat_session, 0) AS webchatSession
      FROM ${PAPER_CONVERSATIONS_TABLE} pc
      WHERE pc.conversation_key = ?
      LIMIT 1`,
@@ -3135,7 +3155,8 @@ export async function listGlobalConversations(
             gc.created_at AS createdAt,
             COALESCE(NULLIF(TRIM(gc.title), ''), NULLIF(TRIM(gc.first_user_title), '')) AS title,
             COALESCE(gc.last_activity_at, gc.created_at) AS lastActivityAt,
-            COALESCE(gc.user_turn_count, 0) AS userTurnCount
+            COALESCE(gc.user_turn_count, 0) AS userTurnCount,
+            COALESCE(gc.webchat_session, 0) AS webchatSession
      FROM ${GLOBAL_CONVERSATIONS_TABLE} gc
      WHERE gc.library_id = ?
        AND gc.conversation_key >= ?
@@ -3222,11 +3243,13 @@ export async function getLatestEmptyGlobalConversation(
             gc.created_at AS createdAt,
             COALESCE(NULLIF(TRIM(gc.title), ''), NULLIF(TRIM(gc.first_user_title), '')) AS title,
             COALESCE(gc.last_activity_at, gc.created_at) AS lastActivityAt,
-            COALESCE(gc.user_turn_count, 0) AS userTurnCount
+            COALESCE(gc.user_turn_count, 0) AS userTurnCount,
+            COALESCE(gc.webchat_session, 0) AS webchatSession
      FROM ${GLOBAL_CONVERSATIONS_TABLE} gc
      WHERE gc.library_id = ?
        AND gc.conversation_key >= ?
        AND gc.conversation_key < ?
+       AND COALESCE(gc.webchat_session, 0) = 0
        AND COALESCE(gc.user_turn_count, 0) = 0
      ORDER BY gc.created_at DESC, gc.conversation_key DESC
      LIMIT 1`,
@@ -3253,7 +3276,8 @@ export async function getGlobalConversation(
             gc.created_at AS createdAt,
             COALESCE(NULLIF(TRIM(gc.title), ''), NULLIF(TRIM(gc.first_user_title), '')) AS title,
             COALESCE(gc.last_activity_at, gc.created_at) AS lastActivityAt,
-            COALESCE(gc.user_turn_count, 0) AS userTurnCount
+            COALESCE(gc.user_turn_count, 0) AS userTurnCount,
+            COALESCE(gc.webchat_session, 0) AS webchatSession
      FROM ${GLOBAL_CONVERSATIONS_TABLE} gc
      WHERE gc.conversation_key = ?
      LIMIT 1`,
@@ -3293,7 +3317,8 @@ export async function setGlobalConversationTitle(
   await Zotero.DB.queryAsync(
     `UPDATE ${GLOBAL_CONVERSATIONS_TABLE}
      SET title = ?
-     WHERE conversation_key = ?`,
+     WHERE conversation_key = ?
+       AND COALESCE(webchat_session, 0) = 0`,
     [title, normalizedKey],
   );
   await refreshUpstreamConversationSearchIndex(normalizedKey);
@@ -3329,7 +3354,8 @@ export async function setPaperConversationTitle(
   await Zotero.DB.queryAsync(
     `UPDATE ${PAPER_CONVERSATIONS_TABLE}
      SET title = ?
-     WHERE conversation_key = ?`,
+     WHERE conversation_key = ?
+       AND COALESCE(webchat_session, 0) = 0`,
     [title, normalizedKey],
   );
   await refreshUpstreamConversationSearchIndex(normalizedKey);

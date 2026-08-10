@@ -27,6 +27,7 @@ import {
   messageParagraphSpacingPx,
   messageWordSpacingPx,
   messageFontFamily,
+  webChatIsolatedConversationKeys,
 } from "./state";
 import {
   deriveProviderLabel,
@@ -371,6 +372,11 @@ export function setLastUsedUpstreamGlobalConversationKey(
   if (!Number.isFinite(conversationKey) || conversationKey <= 0) return;
   const normalizedKey = Math.floor(conversationKey);
   if (!isUpstreamGlobalConversationKey(normalizedKey)) return;
+  // Ephemeral webchat session rows are swept at the next startup; persisting
+  // one as the restore target would leave the pref dangling. Guarded here —
+  // the single chokepoint — because several independent callers (conversation
+  // switches, identity sync, history navigation priming) all write this pref.
+  if (webChatIsolatedConversationKeys.has(normalizedKey)) return;
   const map = getLastGlobalConversationMap();
   map[buildLibraryStateKey(libraryID)] = normalizedKey;
   setLastGlobalConversationMap(map);
@@ -416,6 +422,10 @@ export function setLastUsedPaperConversationKey(
   if (!Number.isFinite(libraryID) || libraryID <= 0) return;
   if (!Number.isFinite(paperItemID) || paperItemID <= 0) return;
   if (!Number.isFinite(conversationKey) || conversationKey <= 0) return;
+  // See setLastUsedUpstreamGlobalConversationKey: webchat session rows must
+  // never become restore targets, and this writer is the chokepoint shared by
+  // every caller.
+  if (webChatIsolatedConversationKeys.has(Math.floor(conversationKey))) return;
   const map = getLastPaperConversationMap();
   const key = buildPaperStateKey(libraryID, paperItemID);
   map[key] = Math.floor(conversationKey);

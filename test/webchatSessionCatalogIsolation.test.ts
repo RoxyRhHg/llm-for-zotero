@@ -10,6 +10,7 @@ import {
   listAllPaperConversationsByLibrary,
   listGlobalConversations,
   touchPaperConversationTitle,
+  setPaperConversationTitle,
   appendMessage,
 } from "../src/utils/chatStore";
 import { resolveWebChatSessionConversation } from "../src/modules/contextPanel/webchatSessionConversation";
@@ -36,6 +37,19 @@ function installSqliteZotero(): SqliteHarness {
     (Array.isArray(params) ? params : params === undefined ? [] : [params]).map(
       (value) => (value === undefined ? null : value),
     ) as never[];
+  // Zotero 7's queryAsync wraps rows in a proxy that THROWS when code reads a
+  // column the SELECT did not include (node:sqlite returns undefined). Mimic
+  // that here or the suite silently passes on exactly the row-access bugs
+  // that break the real plugin.
+  const toZoteroRow = (row: Record<string, unknown>) =>
+    new Proxy(row, {
+      get(target, prop, receiver) {
+        if (typeof prop === "string" && !(prop in target)) {
+          throw new Error(`Column '${prop}' not present in this row`);
+        }
+        return Reflect.get(target, prop, receiver);
+      },
+    });
   const queryAsync = async (sql: string, params?: unknown[]) => {
     const head = sql.trimStart().slice(0, 8).toUpperCase();
     const stmt = db.prepare(sql);
@@ -44,7 +58,9 @@ function installSqliteZotero(): SqliteHarness {
       head.startsWith("PRAGMA") ||
       head.startsWith("WITH")
     ) {
-      return stmt.all(...bindable(params));
+      return (stmt.all(...bindable(params)) as Record<string, unknown>[]).map(
+        toZoteroRow,
+      );
     }
     stmt.run(...bindable(params));
     return [];
@@ -329,6 +345,64 @@ describe("webchat session catalog isolation", function () {
       paperRow(harness, userDraft!.conversationKey).webchatSession,
       0,
       "user draft stays a normal draft",
+    );
+  });
+
+  it("coalesces concurrent webchat session resolutions into one row", async function () {
+    const [first, second] = await Promise.all([
+      resolveWebChatSessionConversation({ libraryID: 5, paperItemID: 300 }),
+      resolveWebChatSessionConversation({ libraryID: 5, paperItemID: 300 }),
+    ]);
+    assert.ok(first && second);
+    assert.strictEqual(
+      first!.conversationKey,
+      second!.conversationKey,
+      "racing mode entries must share one session row",
+    );
+    const flaggedRows = harness.all(
+      `SELECT conversation_key FROM ${PAPER_TABLE}
+       WHERE paper_item_id = 300 AND COALESCE(webchat_session, 0) = 1`,
+    );
+    assert.lengthOf(flaggedRows, 1, "exactly one flagged row may exist");
+  });
+
+  it("blocks explicit renames from titling a webchat session row", async function () {
+    const webchat = await createPaperConversation(5, 300, {
+      webchatSession: true,
+    });
+    await setPaperConversationTitle(webchat!.conversationKey, "Renamed");
+    assert.isNull(
+      paperRow(harness, webchat!.conversationKey).title,
+      "rename path must not title a hidden webchat row",
+    );
+  });
+
+  it("excludes flagged rows from the library-wide paper listing even with a corrupted turn count", async function () {
+    const webchat = await createPaperConversation(5, 300, {
+      webchatSession: true,
+    });
+    harness.run(
+      `UPDATE ${PAPER_TABLE} SET user_turn_count = 3 WHERE conversation_key = ?`,
+      [webchat!.conversationKey],
+    );
+    const listed = await listAllPaperConversationsByLibrary(5, null);
+    assert.isFalse(
+      listed.some((row) => row.conversationKey === webchat!.conversationKey),
+      "flag exclusion must not depend on the turn-count coupling",
+    );
+  });
+
+  it("exposes the webchat flag on by-key summaries for switch-time guards", async function () {
+    const webchat = await createPaperConversation(5, 300, {
+      webchatSession: true,
+    });
+    const normal = await createPaperConversation(5, 300);
+    assert.isTrue(
+      (await getPaperConversation(webchat!.conversationKey))?.webchatSession ===
+        true,
+    );
+    assert.notOk(
+      (await getPaperConversation(normal!.conversationKey))?.webchatSession,
     );
   });
 

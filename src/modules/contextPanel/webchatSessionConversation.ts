@@ -20,6 +20,15 @@ function normalizePositiveInt(value: unknown): number {
   return Math.floor(parsed);
 }
 
+// The find-then-create below is not atomic, and webchat-mode entry can fire
+// concurrently (rapid model toggles, the same paper open in two windows).
+// Deduplicating in-flight resolutions per paper keeps one session row per
+// paper instead of racing two creates.
+const inFlightResolutions = new Map<
+  string,
+  Promise<WebChatSessionConversationResult | null>
+>();
+
 /**
  * Resolve the local anchor row for a webchat session on a paper.
  *
@@ -39,12 +48,38 @@ export async function resolveWebChatSessionConversation(params: {
     paperItemID: number,
   ) => Promise<number | null>;
 }): Promise<WebChatSessionConversationResult | null> {
-  const repository = params.repository || conversationRepository;
-  const findExistingSessionKey =
-    params.findExistingSessionKey || findWebchatSessionPaperConversationKey;
   const libraryID = normalizePositiveInt(params.libraryID);
   const paperItemID = normalizePositiveInt(params.paperItemID);
   if (!libraryID || !paperItemID) return null;
+  const inFlightKey = `${libraryID}:${paperItemID}`;
+  const inFlight = inFlightResolutions.get(inFlightKey);
+  if (inFlight) return inFlight;
+  const resolution = resolveWebChatSessionConversationUncoalesced({
+    ...params,
+    libraryID,
+    paperItemID,
+  });
+  inFlightResolutions.set(inFlightKey, resolution);
+  try {
+    return await resolution;
+  } finally {
+    inFlightResolutions.delete(inFlightKey);
+  }
+}
+
+async function resolveWebChatSessionConversationUncoalesced(params: {
+  repository?: WebChatSessionConversationRepository;
+  libraryID: number;
+  paperItemID: number;
+  findExistingSessionKey?: (
+    libraryID: number,
+    paperItemID: number,
+  ) => Promise<number | null>;
+}): Promise<WebChatSessionConversationResult | null> {
+  const repository = params.repository || conversationRepository;
+  const findExistingSessionKey =
+    params.findExistingSessionKey || findWebchatSessionPaperConversationKey;
+  const { libraryID, paperItemID } = params;
 
   try {
     const existingKey = normalizePositiveInt(

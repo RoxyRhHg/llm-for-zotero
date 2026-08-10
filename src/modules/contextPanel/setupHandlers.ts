@@ -5276,8 +5276,14 @@ export function setupHandlers(
       return;
     }
     for (const group of groupedChoices) {
+      // [webchat] Retries never route through the browser-relay pipeline, so
+      // webchat entries must not be offered as retry targets.
+      const retryEntries = group.entries.filter(
+        (entry) => entry.authMode !== "webchat",
+      );
+      if (!retryEntries.length) continue;
       appendModelProviderSection(retryModelMenu, group.providerLabel);
-      for (const entry of group.entries) {
+      for (const entry of retryEntries) {
         const isSelected = latestAssistantModelEntryId
           ? entry.entryId === latestAssistantModelEntryId
           : latestAssistantModelName

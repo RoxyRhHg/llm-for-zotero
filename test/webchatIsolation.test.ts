@@ -455,4 +455,60 @@ describe("webchat isolation", function () {
       "restoreDraftInputForCurrentConversation();",
     );
   });
+
+  it("keeps webchat models out of the retry pipeline at every gate", function () {
+    const setupSource = readFileSync(
+      resolve(here, "../src/modules/contextPanel/setupHandlers.ts"),
+      "utf8",
+    );
+    const menuStart = setupSource.indexOf("const rebuildRetryModelMenu = ");
+    assert.isAtLeast(menuStart, 0);
+    const menuEnd = setupSource.indexOf(
+      "retryModelMenu.appendChild(option);",
+      menuStart,
+    );
+    const menuBlock = setupSource.slice(menuStart, menuEnd);
+    assert.include(
+      menuBlock,
+      'entry.authMode !== "webchat"',
+      "retry model menu must exclude webchat entries",
+    );
+
+    const chatSource = readFileSync(
+      resolve(here, "../src/modules/contextPanel/chat.ts"),
+      "utf8",
+    );
+    const retryStart = chatSource.indexOf(
+      "export async function retryLatestAssistantResponse(",
+    );
+    assert.isAtLeast(retryStart, 0);
+    const retryEnd = chatSource.indexOf(
+      "export async function editUserTurnAndRetry(",
+      retryStart,
+    );
+    const retryBlock = chatSource.slice(retryStart, retryEnd);
+    const resolvedGuard = retryBlock.indexOf(
+      'effectiveRequestConfig.authMode === "webchat" ||',
+    );
+    const guardRestore = retryBlock.indexOf(
+      "restoreRetryUserSnapshot(retryPair.userMessage, userSnapshot);",
+      resolvedGuard,
+    );
+    const streamCall = retryBlock.indexOf("callLLMStream");
+    assert.isAtLeast(
+      resolvedGuard,
+      0,
+      "retry must refuse webchat models on the resolved config",
+    );
+    assert.isAbove(
+      guardRestore,
+      resolvedGuard,
+      "the webchat bail-out must restore the reset turn snapshots",
+    );
+    assert.isAbove(
+      streamCall,
+      resolvedGuard,
+      "the webchat gate must run before any model request is dispatched",
+    );
+  });
 });

@@ -83,7 +83,10 @@ function buildUI(body: Element, item?: Zotero.Item | null) {
     hostBody.style.minWidth = "0";
     hostBody.style.width = "100%";
     hostBody.style.maxWidth = "100%";
-    hostBody.style.overflowX = "hidden";
+    // `clip`, not `hidden`: one-axis `hidden` forces computed overflow-y to
+    // `auto`, making the host a scroll container that can paint a second
+    // scrollbar beside the .llm-messages one.
+    hostBody.style.overflowX = "clip";
     hostBody.style.boxSizing = "border-box";
   }
 

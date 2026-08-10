@@ -2439,10 +2439,16 @@ export function createHistoryLifecycleController(
         buildPaperStateKey(libraryID, paperItemID),
         resolvedConversationKey,
       );
-      // Webchat session rows are swept at the next startup, so persisting
-      // them as the paper's last-used conversation would leave the restore
-      // pref dangling; after a restart the paper resumes its last real chat.
-      if (!isWebChatMode()) {
+      // Ephemeral webchat session rows (flagged in the catalog) are swept at
+      // the next startup, so they must never become the paper's persisted
+      // last-used conversation. Registering the key in the isolation set
+      // BEFORE syncConversationIdentity() runs makes the guard inside
+      // setLastUsedPaperConversationKey hold for every later writer too —
+      // identity sync and history-navigation priming both re-persist the
+      // active key on their own.
+      if (targetSummary.webchatSession === true) {
+        webChatIsolatedConversationKeys.add(resolvedConversationKey);
+      } else {
         setLastUsedPaperConversationKey(
           libraryID,
           paperItemID,
@@ -3488,6 +3494,10 @@ export function createHistoryLifecycleController(
       if (status) setStatus(status, t("Failed to create paper chat"), "error");
       return false;
     }
+    // The resolve is async: if the user already picked a non-webchat model
+    // again, switching now would snap the panel onto the hidden session row
+    // and override the conversation they just navigated back to.
+    if (!isWebChatMode()) return false;
     ztoolkit.log("LLM: webchat session conversation", {
       libraryID,
       paperItemID,

@@ -4111,7 +4111,10 @@
   width: 100%;
   max-width: 100%;
   min-width: 0;
-  overflow-x: hidden;
+  /* `clip`, not `hidden`: one-axis `hidden` forces computed overflow-y to
+     `auto`, turning every assistant turn into a scroll container that paints
+     a second scrollbar beside .llm-messages during streaming reflow. */
+  overflow-x: clip;
 }
 
 .llm-assistant-generated-images {
@@ -6579,7 +6582,8 @@ label.llm-search-results-item:hover {
   .llm-codeblock-shell[data-word-wrap="true"]
   .llm-codeblock-body
   pre {
-  overflow-x: hidden;
+  /* `clip`, not `hidden` — see .llm-bubble.assistant. */
+  overflow-x: clip;
   white-space: pre-wrap;
 }
 

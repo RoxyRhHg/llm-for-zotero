@@ -7064,7 +7064,6 @@ export async function retryLatestAssistantResponse(
     if (ui.status) setStatus(ui.status, "No retryable response found", "error");
     return;
   }
-
   const thisRequestId = nextRequestId();
   setPendingRequestIdAndSync(conversationKey, thisRequestId, body, item);
   setRequestUIBusy(body, ui, conversationKey, "Preparing retry...");
@@ -7128,6 +7127,25 @@ export async function retryLatestAssistantResponse(
       : undefined;
   const { refreshChatSafely, refreshAssistantMessageSafely, setStatusSafely } =
     createPanelUpdateHelpers(body, item, conversationKey, ui);
+  // [webchat] Retries never route through the browser-relay pipeline, so a
+  // webchat model here — passed explicitly by the retry-model menu or picked
+  // up from the selected profile when params were empty — would fire a
+  // generic HTTP request with the rebuilt conversation and persist
+  // webchat-attributed rows into a real, visible conversation. Gate on the
+  // RESOLVED config so both routes are refused; the turn was already reset
+  // for streaming above, so restore both snapshots before bailing.
+  if (
+    effectiveRequestConfig.authMode === "webchat" ||
+    effectiveRequestConfig.providerProtocol === "web_sync"
+  ) {
+    restoreAssistantSnapshot(assistantMessage, assistantSnapshot);
+    restoreRetryUserSnapshot(retryPair.userMessage, userSnapshot);
+    refreshChatSafely();
+    setStatusSafely(t("WebChat models can't retry local turns"), "error");
+    restoreRequestUIIdle(body, conversationKey, thisRequestId);
+    clearPendingRequestIdAndSync(conversationKey, body, item);
+    return;
+  }
 
   const historyForLLM = history.slice(0, retryPair.userIndex);
   const retrySelectedTextContexts = synthesizeSelectedTextContexts({
@@ -7160,9 +7178,9 @@ export async function retryLatestAssistantResponse(
     selectedTagContexts,
   } = reconstructRetryPayload(retryPair.userMessage, {
     resolvedSelectedTextAnchors: retryResolvedSelectedTextAnchors,
-    includeAnchorContext:
-      effectiveRequestConfig.authMode === "webchat" ||
-      effectiveRequestConfig.providerProtocol === "web_sync",
+    // Webchat retries are refused by the gate above, and no other provider
+    // wants inline anchor context in the rebuilt payload.
+    includeAnchorContext: false,
   });
   retryPair.userMessage.paperContexts = paperContexts.length
     ? paperContexts
@@ -7708,13 +7726,12 @@ export async function retryLatestAssistantResponse(
     restoreRequestUIIdle(body, conversationKey, thisRequestId);
     setAbortController(conversationKey, null);
     clearPendingRequestIdAndSync(conversationKey, body, item);
-    if (effectiveRequestConfig.providerProtocol !== "web_sync") {
-      scheduleQueuedInputDrain(body, {
-        conversationSystem:
-          resolveConversationSystemForItem(item) || "upstream",
-        conversationKey,
-      });
-    }
+    // Webchat retries are refused by the gate above, so every retry that
+    // reaches here uses a drainable provider.
+    scheduleQueuedInputDrain(body, {
+      conversationSystem: resolveConversationSystemForItem(item) || "upstream",
+      conversationKey,
+    });
   }
 }
 

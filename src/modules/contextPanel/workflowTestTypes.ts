@@ -360,6 +360,18 @@ export type WorkflowTestApi = {
   seedStandaloneUserMessage: (
     text: string,
   ) => Promise<WorkflowTestStandaloneDiagnostics>;
+  seedStandaloneConversation: (
+    turns: Array<
+      { role: "user" | "assistant"; text: string } & Partial<
+        import("./types").Message
+      >
+    >,
+  ) => Promise<WorkflowTestStandaloneDiagnostics>;
+  resizeStandaloneWindow: (
+    width: number,
+    height: number,
+  ) => Promise<{ innerWidth: number; innerHeight: number }>;
+  captureStandaloneScreenshot: (filePath: string) => Promise<string>;
   notifyStandaloneItemChanged: (
     itemId: number | null,
   ) => Promise<WorkflowTestStandaloneDiagnostics>;

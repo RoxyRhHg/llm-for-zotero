@@ -15,9 +15,11 @@ async function surfacing(fn: () => Promise<void>): Promise<void> {
   try {
     await fn();
   } catch (err) {
-    const detail = String(
-      (err as Error)?.stack || (err as Error)?.message || err,
-    );
+    // Gecko Error#stack does NOT include the message line — surface both, or
+    // diagnostic details thrown by the harness are lost at the boundary.
+    const message = String((err as Error)?.message || err);
+    const stack = String((err as Error)?.stack || "");
+    const detail = message + (stack ? `\n${stack}` : "");
     assert.equal(detail, "OK", "step failed");
   }
 }

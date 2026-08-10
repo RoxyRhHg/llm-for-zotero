@@ -107,6 +107,8 @@ export type ConversationCatalogEntry = {
   cwd?: string;
   model?: string;
   effort?: string;
+  /** Ephemeral webchat session row: hidden from history, swept at startup. */
+  webchatSession?: boolean;
 };
 
 export type ConversationCatalogIdentityWitness = {
@@ -231,6 +233,7 @@ function fromUpstreamGlobalSummary(
     lastActivityAt,
     title: normalizeTitle(summary.title),
     userTurnCount: normalizeUserTurnCount(summary.userTurnCount),
+    ...(summary.webchatSession === true ? { webchatSession: true } : {}),
   };
 }
 
@@ -266,6 +269,7 @@ function fromUpstreamPaperSummary(
     lastActivityAt,
     title: normalizeTitle(summary.title),
     userTurnCount: normalizeUserTurnCount(summary.userTurnCount),
+    ...(summary.webchatSession === true ? { webchatSession: true } : {}),
   };
 }
 
