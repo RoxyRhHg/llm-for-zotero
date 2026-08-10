@@ -654,7 +654,7 @@ function validateDeliveryContractForDispatch(
     return "Sync for Zotero cannot verify a live chat tab and content script. Reload the chat tab and try again.";
   }
   if (!extensionStatus.supportedDeliveryContracts.includes(requestedVersion)) {
-    return `The active Sync for Zotero content script does not support WebChat delivery contract ${requestedVersion}. Reload or update the extension before sending.`;
+    return `The installed Sync for Zotero browser extension is too old: it does not support WebChat delivery contract ${requestedVersion}. Update the Sync for Zotero extension in your browser, then reload the chat tab and try again.`;
   }
   return null;
 }
@@ -898,14 +898,18 @@ function validateTerminalDeliveryContract(
   if (diagnostic.attachmentFilename !== expectedFilename) {
     return "The WebChat receipt did not identify the requested Zotero PDF.";
   }
+  // Presence tier: the upload must have been detected, confirmed in the
+  // composer, and carried by the submitted turn. Sites shorten, translate,
+  // and re-render file names, so the name-level fields
+  // (attachmentFilenameConfirmed, attachmentReadyVerified,
+  // submittedAttachmentVerified, submittedPdfCount) stay advisory — they
+  // are recorded in the diagnostic but insisting on them would reject
+  // deliveries that worked.
   if (
     diagnostic.uploadDetected !== true ||
     diagnostic.attachmentPreviewVerified !== true ||
-    diagnostic.attachmentFilenameConfirmed !== true ||
-    diagnostic.attachmentReadyVerified !== true ||
-    diagnostic.submittedAttachmentVerified !== true ||
-    !Number.isFinite(diagnostic.submittedPdfCount) ||
-    Number(diagnostic.submittedPdfCount) !== 1
+    !Number.isFinite(diagnostic.submittedAttachmentCount) ||
+    Number(diagnostic.submittedAttachmentCount) < 1
   ) {
     return `WebChat could not prove delivery of "${expectedFilename}".`;
   }

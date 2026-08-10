@@ -84,7 +84,7 @@ function describeChatSiteFailure(
       ATTACHMENT_DELIVERY_CONTRACT_VERSION,
     )
   ) {
-    return `The active Sync for Zotero content script does not support WebChat delivery contract ${ATTACHMENT_DELIVERY_CONTRACT_VERSION}; reload or update the extension.`;
+    return `The installed Sync for Zotero browser extension is too old: it does not support WebChat delivery contract ${ATTACHMENT_DELIVERY_CONTRACT_VERSION}. Update the Sync for Zotero extension in your browser, then reload the chat tab.`;
   }
   if (
     status.mainWorldInjected === false ||

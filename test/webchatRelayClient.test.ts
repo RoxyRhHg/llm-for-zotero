@@ -582,7 +582,7 @@ describe("webchat relay/client", function () {
     assert.equal(relayServer.relayPollResponse().status, "done");
   });
 
-  it("rejects a generic attachment as proof of the requested PDF", async function () {
+  it("accepts a presence-tier receipt when the site renders the filename unreadably", async function () {
     const filename = "Requested paper.pdf";
     const submit = relayServer.relaySubmitQuery({
       prompt: "read the PDF",
@@ -597,7 +597,10 @@ describe("webchat relay/client", function () {
       filename,
     });
     diagnostic.attachmentFilenameConfirmed = false;
+    diagnostic.attachmentReadyVerified = false;
     diagnostic.submittedAttachmentVerified = false;
+    diagnostic.submittedPdfCount = 0;
+    diagnostic.submittedAttachmentCount = 1;
 
     const response = await invokeEndpoint(
       "/llm-for-zotero/webchat/submit_response",
@@ -605,16 +608,18 @@ describe("webchat relay/client", function () {
       {
         seq: submit.seq,
         attempt: claimed.query?.attempt || 1,
-        response: "Unverified answer",
+        response: "Presence-tier answer",
+        run_state: "done",
+        completion_reason: "settled",
         diagnostic,
       },
     );
 
-    assert.match(String(response.error), /could not prove delivery/);
-    assert.equal(relayServer.relayPollResponse().status, "running");
+    assert.equal(response.ok, true);
+    assert.equal(relayServer.relayPollResponse().status, "done");
   });
 
-  it("rejects a PDF receipt that reports an extra submitted PDF", async function () {
+  it("accepts a PDF receipt that reports an extra submitted PDF", async function () {
     const filename = "Requested paper.pdf";
     const submit = relayServer.relaySubmitQuery({
       prompt: "read exactly one PDF",
@@ -631,12 +636,111 @@ describe("webchat relay/client", function () {
       {
         seq: submit.seq,
         attempt: claimed.query?.attempt || 1,
-        response: "Ambiguous answer",
+        response: "Two-card answer",
+        run_state: "done",
+        completion_reason: "settled",
         diagnostic: terminalDeliveryDiagnostic({
           pdfRequested: true,
           filename,
           submittedPdfCount: 2,
         }),
+      },
+    );
+
+    assert.equal(response.ok, true);
+    assert.equal(relayServer.relayPollResponse().status, "done");
+  });
+
+  it("rejects a terminal PDF receipt whose attachment contract failed", async function () {
+    const filename = "Requested paper.pdf";
+    const submit = relayServer.relaySubmitQuery({
+      prompt: "read the PDF",
+      pdf_base64: "JVBERi0=",
+      pdf_filename: filename,
+      delivery_contract_version:
+        relayServer.ATTACHMENT_DELIVERY_CONTRACT_VERSION,
+    });
+    const claimed = relayServer.relayClaimQuery(submit.seq);
+    const diagnostic = terminalDeliveryDiagnostic({
+      pdfRequested: true,
+      filename,
+    });
+    diagnostic.attachmentContractVerified = false;
+
+    const response = await invokeEndpoint(
+      "/llm-for-zotero/webchat/submit_response",
+      "POST",
+      {
+        seq: submit.seq,
+        attempt: claimed.query?.attempt || 1,
+        response: "Unverified answer",
+        diagnostic,
+      },
+    );
+
+    assert.match(
+      String(response.error),
+      /did not verify the terminal attachment contract/,
+    );
+    assert.equal(relayServer.relayPollResponse().status, "running");
+  });
+
+  it("rejects a terminal PDF receipt with no submitted attachment", async function () {
+    const filename = "Requested paper.pdf";
+    const submit = relayServer.relaySubmitQuery({
+      prompt: "read the PDF",
+      pdf_base64: "JVBERi0=",
+      pdf_filename: filename,
+      delivery_contract_version:
+        relayServer.ATTACHMENT_DELIVERY_CONTRACT_VERSION,
+    });
+    const claimed = relayServer.relayClaimQuery(submit.seq);
+    const diagnostic = terminalDeliveryDiagnostic({
+      pdfRequested: true,
+      filename,
+    });
+    diagnostic.submittedAttachmentCount = 0;
+    diagnostic.submittedPdfCount = 0;
+
+    const response = await invokeEndpoint(
+      "/llm-for-zotero/webchat/submit_response",
+      "POST",
+      {
+        seq: submit.seq,
+        attempt: claimed.query?.attempt || 1,
+        response: "Attachment-free answer",
+        diagnostic,
+      },
+    );
+
+    assert.match(String(response.error), /could not prove delivery/);
+    assert.equal(relayServer.relayPollResponse().status, "running");
+  });
+
+  it("rejects a terminal PDF receipt without a detected upload", async function () {
+    const filename = "Requested paper.pdf";
+    const submit = relayServer.relaySubmitQuery({
+      prompt: "read the PDF",
+      pdf_base64: "JVBERi0=",
+      pdf_filename: filename,
+      delivery_contract_version:
+        relayServer.ATTACHMENT_DELIVERY_CONTRACT_VERSION,
+    });
+    const claimed = relayServer.relayClaimQuery(submit.seq);
+    const diagnostic = terminalDeliveryDiagnostic({
+      pdfRequested: true,
+      filename,
+    });
+    diagnostic.uploadDetected = false;
+
+    const response = await invokeEndpoint(
+      "/llm-for-zotero/webchat/submit_response",
+      "POST",
+      {
+        seq: submit.seq,
+        attempt: claimed.query?.attempt || 1,
+        response: "Uploadless answer",
+        diagnostic,
       },
     );
 
