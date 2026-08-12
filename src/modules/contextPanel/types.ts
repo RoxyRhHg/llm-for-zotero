@@ -56,6 +56,10 @@ export type QuoteDisplayOverride = {
 };
 
 export interface Message {
+  /** Immutable database row identity when this message came from persistence. */
+  id?: number;
+  /** Internal lifecycle witness; never persisted as conversation content. */
+  conversationGeneration?: number;
   role: "user" | "assistant";
   text: string;
   timestamp: number;

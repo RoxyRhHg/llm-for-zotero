@@ -4,6 +4,15 @@ import type {
   AgentRuntimeRequest,
   ToolSpec,
 } from "../types";
+import {
+  installConversationKeyLedgerAgentTriggers,
+  isConversationKeyRetiredInMemory,
+} from "../../shared/conversationKeyLedger";
+import {
+  areConversationWritesFrozen,
+  getConversationWriteGeneration,
+  isConversationWriteGenerationCurrent,
+} from "../../shared/conversationWriteFence";
 
 type ZoteroDb = {
   queryAsync: (sql: string, params?: unknown[]) => Promise<unknown>;
@@ -181,6 +190,7 @@ async function ensureAgentTranscriptStore(): Promise<boolean> {
         `CREATE INDEX IF NOT EXISTS ${TRANSCRIPT_INDEX}
          ON ${TRANSCRIPT_TABLE} (conversation_key, compatibility_key, sequence)`,
       );
+      await installConversationKeyLedgerAgentTriggers();
       return true;
     } catch (error) {
       initPromise = null;
@@ -228,6 +238,7 @@ async function hydrateTranscriptSegment(params: {
 }): Promise<void> {
   const conversationKey = normalizePositiveInt(params.conversationKey);
   if (!conversationKey) return;
+  const expectedGeneration = getConversationWriteGeneration(conversationKey);
   const key = segmentKey(conversationKey, params.compatibilityKey);
   if (hydratedKeys.has(key)) return;
   const dbReady = await ensureAgentTranscriptStore();
@@ -248,6 +259,13 @@ async function hydrateTranscriptSegment(params: {
           compactedAt?: unknown;
         }>
       | undefined;
+    if (
+      isConversationKeyRetiredInMemory(conversationKey) ||
+      areConversationWritesFrozen(conversationKey) ||
+      !isConversationWriteGenerationCurrent(conversationKey, expectedGeneration)
+    ) {
+      return;
+    }
     if (!rows?.length) {
       hydratedKeys.add(key);
       return;
@@ -335,6 +353,7 @@ async function persistTranscriptSegment(
 export async function replaceAgentTranscriptSegment(
   segment: AgentTranscriptSegment,
 ): Promise<void> {
+  if (isConversationKeyRetiredInMemory(segment.conversationKey)) return;
   const normalized: AgentTranscriptSegment = {
     ...segment,
     messages: normalizeMessages(segment.messages),

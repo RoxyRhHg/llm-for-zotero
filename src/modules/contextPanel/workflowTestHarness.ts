@@ -40,6 +40,7 @@ import type {
   WorkflowTestHistoryRow,
   WorkflowTestHistorySearchResult,
   WorkflowTestSeededTurn,
+  WorkflowTestConversationPersistenceSnapshot,
 } from "./workflowTestTypes";
 import { forcePendingTurnFinalizeFailuresForTests } from "./pendingDeletionWiring";
 import {
@@ -398,6 +399,121 @@ async function trashItemIfPossible(itemId: number): Promise<void> {
   }
 }
 
+const WORKFLOW_CONVERSATION_PERSISTENCE_TABLES = {
+  upstream: {
+    catalogs: [
+      "llm_for_zotero_global_conversations",
+      "llm_for_zotero_paper_conversations",
+    ],
+    messages: "llm_for_zotero_chat_messages",
+  },
+  claude_code: {
+    catalogs: ["llm_for_zotero_claude_conversations"],
+    messages: "llm_for_zotero_claude_messages",
+  },
+  codex: {
+    catalogs: ["llm_for_zotero_codex_conversations"],
+    messages: "llm_for_zotero_codex_messages",
+  },
+} as const;
+
+async function countWorkflowRows(
+  tableName: string,
+  whereSql: string,
+  params: unknown[],
+): Promise<number> {
+  const rows = (await Zotero.DB.queryAsync(
+    `SELECT COUNT(*) AS n FROM ${tableName} WHERE ${whereSql}`,
+    params,
+  )) as Array<{ n?: unknown }>;
+  return Math.max(0, Math.floor(Number(rows?.[0]?.n || 0)));
+}
+
+async function setWorkflowProviderSession(
+  system: ConversationSystem,
+  conversationKey: number,
+  providerSessionId: string,
+): Promise<void> {
+  assertWorkflowTestEnabled();
+  if (system !== "codex" && system !== "claude_code") {
+    throw new Error(`Provider sessions are not supported for ${system}`);
+  }
+  const table =
+    system === "codex"
+      ? "llm_for_zotero_codex_conversations"
+      : "llm_for_zotero_claude_conversations";
+  const normalizedSessionID = String(providerSessionId || "").trim();
+  if (!normalizedSessionID) throw new Error("Provider session ID is required");
+  await Zotero.DB.queryAsync(
+    `UPDATE ${table}
+     SET provider_session_id = ?
+     WHERE conversation_key = ?`,
+    [normalizedSessionID, conversationKey],
+  );
+}
+
+async function getWorkflowConversationPersistenceSnapshot(
+  system: ConversationSystem,
+  conversationKey: number,
+): Promise<WorkflowTestConversationPersistenceSnapshot> {
+  assertWorkflowTestEnabled();
+  const tables = WORKFLOW_CONVERSATION_PERSISTENCE_TABLES[system];
+  const catalogRows = (
+    await Promise.all(
+      tables.catalogs.map((table) =>
+        countWorkflowRows(table, "conversation_key = ?", [conversationKey]),
+      ),
+    )
+  ).reduce((total, count) => total + count, 0);
+  const messageRows = await countWorkflowRows(
+    tables.messages,
+    "conversation_key = ?",
+    [conversationKey],
+  );
+  const searchIndexRows = await countWorkflowRows(
+    "llm_for_zotero_conversation_search_index",
+    "system = ? AND legacy_conversation_key = ?",
+    [system, conversationKey],
+  );
+  const registryRows = await countWorkflowRows(
+    "llm_for_zotero_conversation_registry",
+    "system = ? AND legacy_conversation_key = ?",
+    [system, conversationKey],
+  );
+  const forkSourceRows = await countWorkflowRows(
+    "llm_for_zotero_conversation_fork_links",
+    "source_system = ? AND source_conversation_key = ?",
+    [system, conversationKey],
+  );
+  const forkTargetRows = await countWorkflowRows(
+    "llm_for_zotero_conversation_fork_links",
+    "target_system = ? AND target_conversation_key = ?",
+    [system, conversationKey],
+  );
+  const cleanupJobRows = await countWorkflowRows(
+    "llm_for_zotero_conversation_cleanup_jobs",
+    "system = ? AND conversation_key = ?",
+    [system, conversationKey],
+  );
+  const pendingDeletionRows = await countWorkflowRows(
+    PENDING_DELETIONS_TABLE,
+    "kind = 'conversation' AND conversation_key = ?",
+    [conversationKey],
+  );
+  return {
+    system,
+    conversationKey,
+    catalogRows,
+    messageRows,
+    searchIndexRows,
+    registryRows,
+    forkSourceRows,
+    forkTargetRows,
+    cleanupJobRows,
+    pendingDeletionRows,
+  };
+}
+
 async function waitForLastSend(): Promise<SendQuestionOptions> {
   const startedAt = Date.now();
   while (!lastSend) {
@@ -714,7 +830,14 @@ async function seedPanelStoredUserMessage(
 ): Promise<WorkflowTestDiagnostics> {
   assertWorkflowTestEnabled();
   const panel = getPanel(panelId);
-  const item = activeContextPanels.get(panel.body)?.() || panel.item;
+  let item = activeContextPanels.get(panel.body)?.() || panel.item;
+  // The visible history switch is asynchronous.  Re-run the same provisioning
+  // gate that a real send uses before seeding so a panel that just moved away
+  // from a retired historical key cannot append through its stale WeakMap
+  // binding.  Re-read the active item afterward because provisioning may have
+  // allocated a fresh permanent key for the scope.
+  await ensureConversationLoaded(item);
+  item = activeContextPanels.get(panel.body)?.() || item;
   const conversationKey = getConversationKey(item);
   if (!conversationKey) {
     throw new Error("Workflow panel has no active conversation key");
@@ -727,13 +850,21 @@ async function seedPanelStoredUserMessage(
   const conversationSystem =
     (panel.body.querySelector("#llm-main") as HTMLElement | null)?.dataset
       .conversationSystem || "upstream";
-  await appendWorkflowStoredMessage(
-    conversationSystem === "codex" || conversationSystem === "claude_code"
-      ? conversationSystem
-      : "upstream",
-    conversationKey,
-    message,
-  );
+  try {
+    await appendWorkflowStoredMessage(
+      conversationSystem === "codex" || conversationSystem === "claude_code"
+        ? conversationSystem
+        : "upstream",
+      conversationKey,
+      message,
+    );
+  } catch (error) {
+    throw new Error(
+      `Workflow seed failed (${text}) for key ${conversationKey}: ${String(
+        (error as Error)?.message || error,
+      )}`,
+    );
+  }
   const existing = chatHistory.get(conversationKey) || [];
   chatHistory.set(conversationKey, [...existing, message]);
   loadedConversationKeys.add(conversationKey);
@@ -2619,6 +2750,17 @@ async function reset(): Promise<void> {
     removeLastUsedUpstreamConversationMode(userLibraryID);
     removeLastUsedUpstreamGlobalConversationKey(userLibraryID);
   }
+  // Workflow cases use fresh Zotero items but the isolated runner can retain
+  // the same numeric item IDs across process launches.  Clear persisted
+  // paper-selection maps at the test boundary so a stale preference from an
+  // earlier run cannot steer a new fixture into an unrelated conversation.
+  for (const prefKey of [
+    "lastUsedPaperConversationMap",
+    "claudeCodePaperConversationMap",
+    "codexAppServerPaperConversationMap",
+  ]) {
+    Zotero.Prefs.clear?.(`${config.prefsPrefix}.${prefKey}`, true);
+  }
   setWorkflowTestSendInterceptor((opts) => {
     lastSend = opts;
   });
@@ -2844,7 +2986,12 @@ async function getPendingDeletionState(): Promise<WorkflowTestPendingDeletionSta
 }
 
 async function sweepPendingDeletionsAsRestart(): Promise<void> {
-  await pendingDeletionStore.sweepAllPersisted("workflow-test-restart");
+  // These existing workflow cases intentionally model the post-expiry
+  // checkpoint (the six-second window is not slept through in the harness).
+  // Production startup uses the default and preserves an unexpired Undo row.
+  await pendingDeletionStore.sweepAllPersisted("workflow-test-restart", {
+    forceExpired: true,
+  });
 }
 
 async function searchPanelHistory(
@@ -2938,6 +3085,12 @@ export function installWorkflowTestHarness(targetAddon: {
   targetAddon.api.workflowTest = {
     reset,
     createPaperWithPdfFixture,
+    trashWorkflowItem: async (itemId: number) => {
+      assertWorkflowTestEnabled();
+      await trashItemIfPossible(itemId);
+    },
+    setWorkflowProviderSession,
+    getWorkflowConversationPersistenceSnapshot,
     createStandaloneAttachmentFixture,
     createItemNoteFixture,
     createStandaloneNoteFixture,

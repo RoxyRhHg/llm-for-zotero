@@ -19,6 +19,22 @@ import type {
 import { TTLMap } from "./contexts/ttlMap";
 import { clearMermaidSvgCache } from "./mermaidSvgCache";
 import type { ConversationForkLink } from "../../shared/conversationForkLinks";
+export {
+  areConversationWritesFrozen,
+  bumpConversationWriteGeneration,
+  freezeConversationWrites,
+  getConversationWriteGeneration,
+  isConversationWriteGenerationCurrent,
+  unfreezeConversationWrites,
+} from "../../shared/conversationWriteFence";
+import {
+  areConversationWritesFrozen,
+  bumpConversationWriteGeneration,
+  freezeConversationWrites,
+  getConversationWriteGeneration,
+  isConversationWriteGenerationCurrent,
+  unfreezeConversationWrites,
+} from "../../shared/conversationWriteFence";
 // =============================================================================
 // Module State
 // =============================================================================
@@ -118,7 +134,18 @@ export function resetWebChatConversationSessionState(
 export function getPendingRequestId(conversationKey: number): number {
   return pendingRequestIds.get(conversationKey) || 0;
 }
-export function setPendingRequestId(conversationKey: number, id: number): void {
+export function setPendingRequestId(
+  conversationKey: number,
+  id: number,
+  expectedCurrentId?: number,
+): void {
+  if (
+    id <= 0 &&
+    expectedCurrentId !== undefined &&
+    (pendingRequestIds.get(conversationKey) || 0) !== expectedCurrentId
+  ) {
+    return;
+  }
   if (id <= 0) {
     pendingRequestIds.delete(conversationKey);
   } else {
@@ -144,7 +171,15 @@ export function getAbortController(
 export function setAbortController(
   conversationKey: number,
   value: AbortController | null,
+  expectedRequestId?: number,
 ): void {
+  if (
+    value === null &&
+    expectedRequestId !== undefined &&
+    (pendingRequestIds.get(conversationKey) || 0) !== expectedRequestId
+  ) {
+    return;
+  }
   if (value === null) {
     abortControllers.delete(conversationKey);
   } else {
@@ -163,6 +198,62 @@ export function isAnyRequestPending(): boolean {
     if (id > 0) return true;
   }
   return false;
+}
+
+/**
+ * Drop only state owned by one immutable conversation instance.
+ *
+ * Paper context selections, attachment previews, and model/reasoning
+ * preferences are keyed by Zotero item and intentionally remain intact when a
+ * conversation for that item is deleted.  The maps below are keyed by the
+ * conversation itself, so they can be removed without disturbing a sibling
+ * conversation or a newer instance that reuses the numeric key.
+ */
+export function clearConversationOwnedRuntimeState(
+  conversationKey: number,
+): void {
+  const key = normalizeConversationKey(conversationKey);
+  if (!key) return;
+
+  bumpConversationWriteGeneration(key);
+
+  chatHistory.delete(key);
+  conversationForkLinks.delete(key);
+  loadedConversationKeys.delete(key);
+  loadingConversationTasks.delete(key);
+  webChatIsolatedConversationKeys.delete(key);
+  webChatForceNewChatConversationKeys.delete(key);
+  selectedRuntimeModeCache.delete(key);
+  draftInputCache.delete(key);
+  webChatDraftInputCache.delete(key);
+  pendingRequestIds.delete(key);
+  abortControllers.delete(key);
+  autoLockedGlobalConversationKeys.delete(key);
+
+  for (const [libraryID, activeKey] of activeGlobalConversationByLibrary) {
+    if (normalizeConversationKey(activeKey) === key) {
+      activeGlobalConversationByLibrary.delete(libraryID);
+    }
+  }
+  for (const [stateKey, activeKey] of activePaperConversationByPaper) {
+    if (normalizeConversationKey(activeKey) === key) {
+      activePaperConversationByPaper.delete(stateKey);
+    }
+  }
+
+  if (promptMenuTarget?.conversationKey === key) promptMenuTarget = null;
+  if (responseMenuTarget?.conversationKey === key) responseMenuTarget = null;
+  if (inlineEditTarget?.conversationKey === key) {
+    // The finalizer may run without a mounted panel, so do not invoke the DOM
+    // cleanup callback here.  Releasing the references is enough to prevent a
+    // stale callback from writing the deleted conversation back into the UI.
+    inlineEditCleanup = null;
+    inlineEditTarget = null;
+    inlineEditInputSectionEl = null;
+    inlineEditInputSectionParent = null;
+    inlineEditInputSectionNextSib = null;
+    inlineEditSavedDraft = "";
+  }
 }
 export let panelFontScalePercent = 120; // FONT_SCALE_DEFAULT_PERCENT — overwritten by initFontScale()
 export function setPanelFontScalePercent(value: number) {

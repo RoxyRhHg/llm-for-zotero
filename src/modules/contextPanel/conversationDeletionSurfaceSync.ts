@@ -3,12 +3,14 @@ import type { PendingDeletionEvent } from "../../core/conversations/pendingDelet
 
 export type ConversationDeletionSurfaceSnapshot = {
   conversationKey: number;
+  instanceID?: string;
   kind: "global" | "paper";
   system: ConversationSystem;
 };
 
 export type ConversationDeletionSurfaceEntry = {
   conversationKey: number;
+  instanceID?: string;
   conversationKind: "global" | "paper";
   system: ConversationSystem;
   // Recorded on the persisted entry for the queueing surface's own bookkeeping;
@@ -57,32 +59,44 @@ export function resolveConversationDeletionSurfaceAction(params: {
   dropped?: boolean;
 }): ConversationDeletionSurfaceAction {
   const { entry, surface, surrendered } = params;
-  // A DROPPED outcome means the intent was withdrawn without deleting anything
-  // — the conversation is alive — so it resolves like the other survival
-  // outcomes. Note this applies only when the finalizer explicitly said so; a
-  // stale intent whose conversation is genuinely GONE reports a plain
-  // completion and still resolves as a real deletion.
-  const eventType =
-    (params.eventType === "finalized" ||
-      params.eventType === "finalize-failed") &&
-    params.dropped
-      ? "gave-up"
-      : params.eventType;
+  // A quarantined or retrying intent remains hidden. There is no automatic
+  // survival/restore outcome after the Undo window; only an explicit `undone`
+  // event can return a surface to the conversation.
+  const eventType = params.eventType;
   const showsEntry = Boolean(
     surface &&
     surface.conversationKey === entry.conversationKey &&
+    (!entry.instanceID || surface.instanceID === entry.instanceID) &&
     surface.kind === entry.conversationKind &&
     surface.system === entry.system,
   );
-  if (eventType === "queued" || eventType === "finalize-failed") {
+  // Older persisted rows can still emit a compatibility "dropped" outcome.
+  // It is not a deletion: keep a live surface in place, and return only a
+  // surface that was explicitly moved off the conversation while the intent
+  // was being evaluated. New coordinator paths never emit this outcome.
+  if (params.dropped) {
+    if (surrendered && !showsEntry) return { type: "restore" };
+    return { type: "none" };
+  }
+  if (
+    eventType === "queued" ||
+    eventType === "committing" ||
+    eventType === "quarantined" ||
+    eventType === "finalize-failed"
+  ) {
     return showsEntry ? { type: "leave", remember: true } : { type: "none" };
   }
-  if (eventType === "finalized") {
+  if (
+    eventType === "local-deleted" ||
+    eventType === "cleanup-pending" ||
+    eventType === "completed" ||
+    eventType === "finalized"
+  ) {
     // The chat is gone for good: leave, but there is nothing to return to.
     if (showsEntry) return { type: "leave", remember: false };
     return surrendered ? { type: "forget" } : { type: "none" };
   }
-  // "undone" / "gave-up": the chat survived after all. The gate is
+  // "undone": the chat survived after explicit Undo. The gate is
   // `surrendered` — a property of THIS surface — not entry.wasActive, which
   // describes the surface that QUEUED the deletion. A surface that stepped off
   // the chat in reaction to someone else's deletion (the deleter had it

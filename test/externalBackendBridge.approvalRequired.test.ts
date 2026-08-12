@@ -31,6 +31,145 @@ describe("external bridge action approval handling", function () {
     });
   }
 
+  it("fails closed to a fresh session when cleanup readiness cannot be read", async function () {
+    const originalFetch = globalThis.fetch;
+    const originalZotero = (
+      globalThis as typeof globalThis & { Zotero?: unknown }
+    ).Zotero;
+    let capturedBody: Record<string, any> | null = null;
+
+    (globalThis as typeof globalThis & { Zotero?: unknown }).Zotero = {
+      Prefs: {
+        get(key: string) {
+          if (key.endsWith("enableClaudeCodeMode")) return true;
+          if (key.endsWith("agentClaudeConfigSource")) return "default";
+          if (key.endsWith("agentPermissionMode")) return "safe";
+          if (key.endsWith("conversationSystem")) return "claude_code";
+          if (key.endsWith("codexAppServerZoteroMcpToolsEnabled")) return false;
+          return "";
+        },
+      },
+      Profile: { dir: "/tmp/llm-for-zotero-test-profile" },
+      DB: {
+        queryAsync: async (sql: string) => {
+          if (sql.includes("conversation_cleanup_jobs")) {
+            throw new Error("database is temporarily locked");
+          }
+          return [];
+        },
+      },
+    };
+
+    globalThis.fetch = (async (
+      _input: RequestInfo | URL,
+      init?: RequestInit,
+    ) => {
+      capturedBody = JSON.parse(String(init?.body || "{}"));
+      const stream = new ReadableStream({
+        start(controller) {
+          controller.enqueue(
+            new TextEncoder().encode(
+              '{"type":"outcome","outcome":{"kind":"completed","runId":"r1","text":"ok","usedFallback":false}}\n',
+            ),
+          );
+          controller.close();
+        },
+      });
+      return new Response(stream, { status: 200 }) as Response;
+    }) as typeof fetch;
+
+    try {
+      const runtime = createRuntime();
+      await runtime.runTurn({
+        request: {
+          conversationKey: 99,
+          metadata: { conversationInstanceID: "instance-99" },
+          mode: "agent",
+          userText: "hello",
+          model: "claude-sonnet",
+          authMode: "api_key",
+          apiBase: "",
+          apiKey: "",
+          libraryID: 1,
+        },
+      });
+
+      assert.equal(capturedBody?.metadata?.forceFreshSession, true);
+    } finally {
+      globalThis.fetch = originalFetch;
+      (globalThis as typeof globalThis & { Zotero?: unknown }).Zotero =
+        originalZotero;
+    }
+  });
+
+  it("checks an empty cleanup witness by permanent key when the registry instance is unavailable", async function () {
+    const originalFetch = globalThis.fetch;
+    const originalZotero = (
+      globalThis as typeof globalThis & { Zotero?: unknown }
+    ).Zotero;
+    let capturedBody: Record<string, any> | null = null;
+
+    (globalThis as typeof globalThis & { Zotero?: unknown }).Zotero = {
+      Prefs: {
+        get(key: string) {
+          if (key.endsWith("enableClaudeCodeMode")) return true;
+          if (key.endsWith("agentClaudeConfigSource")) return "default";
+          if (key.endsWith("agentPermissionMode")) return "safe";
+          if (key.endsWith("conversationSystem")) return "claude_code";
+          if (key.endsWith("codexAppServerZoteroMcpToolsEnabled")) return false;
+          return "";
+        },
+      },
+      Profile: { dir: "/tmp/llm-for-zotero-test-profile" },
+      DB: {
+        queryAsync: async (sql: string) =>
+          sql.includes("SELECT 1") && sql.includes("conversation_cleanup_jobs")
+            ? [{ exists: 1 }]
+            : [],
+      },
+    };
+
+    globalThis.fetch = (async (
+      _input: RequestInfo | URL,
+      init?: RequestInit,
+    ) => {
+      capturedBody = JSON.parse(String(init?.body || "{}"));
+      const stream = new ReadableStream({
+        start(controller) {
+          controller.enqueue(
+            new TextEncoder().encode(
+              '{"type":"outcome","outcome":{"kind":"completed","runId":"r2","text":"ok","usedFallback":false}}\n',
+            ),
+          );
+          controller.close();
+        },
+      });
+      return new Response(stream, { status: 200 }) as Response;
+    }) as typeof fetch;
+
+    try {
+      const runtime = createRuntime();
+      await runtime.runTurn({
+        request: {
+          conversationKey: 100,
+          mode: "agent",
+          userText: "hello",
+          model: "claude-sonnet",
+          authMode: "api_key",
+          apiBase: "",
+          apiKey: "",
+          libraryID: 1,
+        },
+      });
+
+      assert.equal(capturedBody?.metadata?.forceFreshSession, true);
+    } finally {
+      globalThis.fetch = originalFetch;
+      (globalThis as typeof globalThis & { Zotero?: unknown }).Zotero =
+        originalZotero;
+    }
+  });
+
   it("shows native confirmation even when cached tool metadata is absent", async function () {
     const originalFetch = globalThis.fetch;
     const originalZotero = (

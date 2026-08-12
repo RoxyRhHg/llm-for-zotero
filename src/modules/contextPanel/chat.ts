@@ -18,13 +18,25 @@ import {
 } from "../../utils/chatStore";
 import { conversationRepository } from "../../core/conversations/repository";
 import { pendingDeletionStore } from "../../core/conversations/pendingDeletionStore";
+import { isConversationKeyRetiredInMemory } from "../../shared/conversationKeyLedger";
 import { filterMessagesInPendingTurns } from "./turnMessageUtils";
 import {
+  clearAgentConversationState,
+  clearPersistedAgentConversationRowsInTransaction,
+} from "./agentConversationCleanup";
+import {
   appendCodexMessage,
+  clearCodexConversationSessionMetadata,
   pruneCodexConversation,
   updateLatestCodexAssistantMessage,
   updateLatestCodexUserMessage,
 } from "../../codexAppServer/store";
+import { archiveCodexAppServerThread } from "../../codexAppServer/nativeClient";
+import {
+  completeConversationCleanupJob,
+  enqueueConversationCleanupJob,
+  failConversationCleanupJob,
+} from "../../core/conversations/conversationCleanupJobs";
 import {
   getClaudeAutoCompactThresholdPercent,
   isClaudeAutoCompactEnabled,
@@ -34,11 +46,13 @@ import {
   buildClaudeScope,
   captureClaudeSessionInfo,
   getClaudeBridgeRuntime,
+  invalidateClaudeConversationSession,
   isClaudeConversationSystemActive,
   updateLatestClaudeConversationAssistantMessage,
   updateLatestClaudeConversationUserMessage,
 } from "../../claudeCode/runtime";
 import { getCodexProfileSignature } from "../../codexAppServer/constants";
+import { clearCodexNativeReadLedgerForConversation } from "../../codexAppServer/nativeContextLedger";
 import { resolveConversationStorageSystem } from "../../shared/conversationStorageRouting";
 import { normalizeForcedSkillIds } from "../../shared/skillIds";
 import {
@@ -172,6 +186,7 @@ import type {
   ResolvedContextSource,
 } from "./types";
 import { resolveTargetedAssistantRerenders } from "./targetedRerender";
+import { withConversationWriteLock } from "../../shared/conversationWriteFence";
 import {
   chatHistory,
   conversationForkLinks,
@@ -191,6 +206,9 @@ import {
   activeContextPanelStateSync,
   getCancelledRequestId,
   getAbortController,
+  getConversationWriteGeneration,
+  isConversationWriteGenerationCurrent,
+  areConversationWritesFrozen,
   setAbortController,
   nextRequestId,
   isRequestPending,
@@ -376,8 +394,10 @@ import {
 } from "./contexts/paperContextState";
 import {
   getConversationScopeValidationDetails,
+  getRegisteredConversationScope,
   type ConversationRegistryScope,
 } from "../../shared/conversationRegistry";
+import { isConversationInstanceRecentlyDeleted } from "../../core/conversations/recentlyDeletedConversations";
 import {
   provisionConversationScopeForItem,
   resolveConversationStorageSystemForItem,
@@ -1605,9 +1625,19 @@ async function loadStoredConversationByKey(
 
 async function loadConversationForkLinkCache(
   conversationKey: number,
+  expectedGeneration = getConversationWriteGeneration(conversationKey),
 ): Promise<void> {
   try {
     const link = await getConversationForkLink(conversationKey);
+    if (
+      pendingDeletionStore.isConversationPendingDeletion(conversationKey) ||
+      isConversationKeyRetiredInMemory(conversationKey) ||
+      areConversationWritesFrozen(conversationKey) ||
+      !isConversationWriteGenerationCurrent(conversationKey, expectedGeneration)
+    ) {
+      conversationForkLinks.delete(conversationKey);
+      return;
+    }
     if (link) {
       conversationForkLinks.set(conversationKey, link);
     } else {
@@ -1619,11 +1649,23 @@ async function loadConversationForkLinkCache(
   }
 }
 
-async function updateStoredLatestUserMessageByConversation(
+async function updateStoredLatestUserMessageByConversationUnlocked(
   conversationKey: number,
-  message: Parameters<typeof updateStoredLatestUserMessage>[1],
+  message: Parameters<typeof updateStoredLatestUserMessage>[1] & {
+    conversationGeneration?: number;
+  },
   conversationSystem?: ConversationSystem | null,
 ): Promise<void> {
+  const expectedGeneration = Number(
+    (message as StoredChatMessage).conversationGeneration,
+  );
+  if (
+    Number.isFinite(expectedGeneration) &&
+    !isConversationWriteGenerationCurrent(conversationKey, expectedGeneration)
+  ) {
+    return;
+  }
+  if (areConversationWritesFrozen(conversationKey)) return;
   const storageSystem = resolveConversationStorageSystem({
     conversationKey,
     conversationSystem,
@@ -1640,11 +1682,23 @@ async function updateStoredLatestUserMessageByConversation(
   await updateStoredLatestUserMessage(conversationKey, message);
 }
 
-async function updateStoredLatestAssistantMessageByConversation(
+async function updateStoredLatestAssistantMessageByConversationUnlocked(
   conversationKey: number,
-  message: Parameters<typeof updateStoredLatestAssistantMessage>[1],
+  message: Parameters<typeof updateStoredLatestAssistantMessage>[1] & {
+    conversationGeneration?: number;
+  },
   conversationSystem?: ConversationSystem | null,
 ): Promise<void> {
+  const expectedGeneration = Number(
+    (message as StoredChatMessage).conversationGeneration,
+  );
+  if (
+    Number.isFinite(expectedGeneration) &&
+    !isConversationWriteGenerationCurrent(conversationKey, expectedGeneration)
+  ) {
+    return;
+  }
+  if (areConversationWritesFrozen(conversationKey)) return;
   const storageSystem = resolveConversationStorageSystem({
     conversationKey,
     conversationSystem,
@@ -1687,38 +1741,95 @@ async function updateStoredLatestAssistantMessageByConversation(
   await updateStoredLatestAssistantMessage(conversationKey, message);
 }
 
+async function updateStoredLatestUserMessageByConversation(
+  conversationKey: number,
+  message: Parameters<typeof updateStoredLatestUserMessage>[1] & {
+    conversationGeneration?: number;
+  },
+  conversationSystem?: ConversationSystem | null,
+): Promise<void> {
+  await withConversationWriteLock(conversationKey, () =>
+    updateStoredLatestUserMessageByConversationUnlocked(
+      conversationKey,
+      message,
+      conversationSystem,
+    ),
+  );
+}
+
+async function updateStoredLatestAssistantMessageByConversation(
+  conversationKey: number,
+  message: Parameters<typeof updateStoredLatestAssistantMessage>[1] & {
+    conversationGeneration?: number;
+  },
+  conversationSystem?: ConversationSystem | null,
+): Promise<void> {
+  await withConversationWriteLock(conversationKey, () =>
+    updateStoredLatestAssistantMessageByConversationUnlocked(
+      conversationKey,
+      message,
+      conversationSystem,
+    ),
+  );
+}
+
 async function persistConversationMessage(
   conversationKey: number,
   message: StoredChatMessage,
   conversationSystem?: ConversationSystem | null,
 ): Promise<void> {
   try {
-    const storageSystem = resolveConversationStorageSystem({
-      conversationKey,
-      conversationSystem,
-    });
-    if (!storageSystem) return;
-    if (storageSystem === "claude_code") {
-      await appendClaudeConversationMessage(conversationKey, message);
-    } else if (storageSystem === "codex") {
-      await appendCodexMessage(conversationKey, message);
-      await pruneCodexConversation(conversationKey, PERSISTED_HISTORY_LIMIT);
-    } else {
-      await appendStoredMessage(conversationKey, message);
-      await pruneConversation(conversationKey, PERSISTED_HISTORY_LIMIT);
+    const expectedGeneration = Number(message.conversationGeneration);
+    if (
+      Number.isFinite(expectedGeneration) &&
+      !isConversationWriteGenerationCurrent(conversationKey, expectedGeneration)
+    ) {
+      return;
     }
-    const storedMessages = await loadStoredConversationByKey(
-      conversationKey,
-      PERSISTED_HISTORY_LIMIT,
-      storageSystem,
-    );
-    const attachmentHashes =
-      collectAttachmentHashesFromStoredMessages(storedMessages);
-    await replaceOwnerAttachmentRefs(
-      "conversation",
-      conversationKey,
-      attachmentHashes,
-    );
+    if (areConversationWritesFrozen(conversationKey)) return;
+    await withConversationWriteLock(conversationKey, async () => {
+      if (
+        (Number.isFinite(expectedGeneration) &&
+          !isConversationWriteGenerationCurrent(
+            conversationKey,
+            expectedGeneration,
+          )) ||
+        areConversationWritesFrozen(conversationKey)
+      ) {
+        return;
+      }
+      const storageSystem = resolveConversationStorageSystem({
+        conversationKey,
+        conversationSystem,
+      });
+      if (!storageSystem) return;
+      if (storageSystem === "claude_code") {
+        await appendClaudeConversationMessage(
+          conversationKey,
+          message,
+          undefined,
+        );
+      } else if (storageSystem === "codex") {
+        await appendCodexMessage(conversationKey, message, undefined);
+        await pruneCodexConversation(conversationKey, PERSISTED_HISTORY_LIMIT);
+      } else {
+        await appendStoredMessage(conversationKey, message, undefined);
+        await pruneConversation(conversationKey, PERSISTED_HISTORY_LIMIT);
+      }
+      const storedMessages = await loadStoredConversationByKey(
+        conversationKey,
+        PERSISTED_HISTORY_LIMIT,
+        storageSystem,
+      );
+      const attachmentHashes =
+        collectAttachmentHashesFromStoredMessages(storedMessages);
+      await replaceOwnerAttachmentRefs(
+        "conversation",
+        conversationKey,
+        attachmentHashes,
+        expectedGeneration,
+      );
+    });
   } catch (err) {
     ztoolkit.log("LLM: Failed to persist chat message", err);
   }
@@ -1822,6 +1933,10 @@ function toPanelMessage(message: StoredChatMessage): Message {
   );
   const selectedTagContexts = normalizeTagContexts(message.selectedTagContexts);
   return {
+    // Preserve the immutable database row identity through the runtime
+    // history model. Turn-deletion intents use this ID as the primary fence;
+    // dropping it here forces every consumer back onto recyclable timestamps.
+    id: message.id,
     role: message.role,
     text: message.text,
     timestamp: message.timestamp,
@@ -1884,8 +1999,29 @@ function toPanelMessage(message: StoredChatMessage): Message {
 export async function ensureConversationLoaded(
   item: Zotero.Item,
 ): Promise<void> {
+  // Provision first.  A paper's historical default key may have been
+  // permanently retired; provisioning then allocates a fresh key and updates
+  // the active scope before this function captures the key used by all load,
+  // append, and identity-fence checks below.
+  await provisionConversationScopeForItem({ item }).catch(() => false);
   const conversationKey = getConversationKey(item);
+  // Provisioning can replace a retired default with a fresh key after the DOM
+  // was initially built. Keep every mounted surface's identity dataset in
+  // lock-step with the item object so reader actions (including Add Text) do
+  // not target the retired key captured during the first render.
+  for (const [body, getItem] of activeContextPanels) {
+    if (getItem() !== item) continue;
+    const root = body.querySelector("#llm-main") as HTMLElement | null;
+    if (root) root.dataset.itemId = String(conversationKey);
+  }
   const conversationSystem = resolveConversationSystemForItem(item);
+  const loadGeneration = getConversationWriteGeneration(conversationKey);
+  if (pendingDeletionStore.isConversationPendingDeletion(conversationKey)) {
+    chatHistory.delete(conversationKey);
+    loadedConversationKeys.delete(conversationKey);
+    conversationForkLinks.delete(conversationKey);
+    return;
+  }
   if (isEffectiveWebChatRequest(item)) {
     isolateWebChatConversationKey(
       conversationKey,
@@ -1908,7 +2044,7 @@ export async function ensureConversationLoaded(
     chatHistory.has(conversationKey) &&
     !blockedConversationLoadKeys.has(conversationKey)
   ) {
-    await loadConversationForkLinkCache(conversationKey);
+    await loadConversationForkLinkCache(conversationKey, loadGeneration);
     loadedConversationKeys.add(conversationKey);
     return;
   }
@@ -1926,7 +2062,29 @@ export async function ensureConversationLoaded(
 
   const task = (async () => {
     let shouldMarkLoaded = false;
+    let instanceID = "";
     try {
+      try {
+        instanceID =
+          (await getRegisteredConversationScope(conversationKey))?.instanceID ||
+          "";
+      } catch {
+        instanceID = "";
+      }
+      const isFrozen = () =>
+        pendingDeletionStore.isConversationPendingDeletion(conversationKey) ||
+        areConversationWritesFrozen(conversationKey) ||
+        !isConversationWriteGenerationCurrent(
+          conversationKey,
+          loadGeneration,
+        ) ||
+        (Boolean(instanceID) &&
+          isConversationInstanceRecentlyDeleted(conversationKey, instanceID));
+      if (isFrozen()) {
+        chatHistory.delete(conversationKey);
+        conversationForkLinks.delete(conversationKey);
+        return;
+      }
       const validScope = await validateConversationScopeForItem({
         item,
         conversationKey,
@@ -1943,6 +2101,11 @@ export async function ensureConversationLoaded(
         PERSISTED_HISTORY_LIMIT,
         conversationSystem,
       );
+      if (isFrozen()) {
+        chatHistory.delete(conversationKey);
+        conversationForkLinks.delete(conversationKey);
+        return;
+      }
       if (
         webChatIsolatedConversationKeys.has(conversationKey) ||
         isEffectiveWebChatRequest(item)
@@ -1981,10 +2144,25 @@ export async function ensureConversationLoaded(
       blockedConversationLoadKeys.delete(conversationKey);
       chatHistory.set(conversationKey, panelMessages);
       validateLoadedConversationQuoteMessages(panelMessages, conversationKey);
-      await loadConversationForkLinkCache(conversationKey);
+      await loadConversationForkLinkCache(conversationKey, loadGeneration);
+      if (isFrozen()) {
+        chatHistory.delete(conversationKey);
+        conversationForkLinks.delete(conversationKey);
+        return;
+      }
       shouldMarkLoaded = true;
     } catch (err) {
       ztoolkit.log("LLM: Failed to load chat history", err);
+      if (
+        pendingDeletionStore.isConversationPendingDeletion(conversationKey) ||
+        (instanceID &&
+          isConversationInstanceRecentlyDeleted(conversationKey, instanceID))
+      ) {
+        chatHistory.delete(conversationKey);
+        conversationForkLinks.delete(conversationKey);
+        shouldMarkLoaded = false;
+        return;
+      }
       if (!chatHistory.has(conversationKey)) {
         chatHistory.set(conversationKey, []);
       }
@@ -2011,6 +2189,29 @@ async function ensureAgentRunTraceLoaded(
 ): Promise<void> {
   const normalizedRunId = (runId || "").trim();
   if (!normalizedRunId || agentRunTraceCache.has(normalizedRunId)) return;
+  const conversationKey = item ? getConversationKey(item) : 0;
+  const expectedGeneration =
+    conversationKey > 0 ? getConversationWriteGeneration(conversationKey) : 0;
+  let instanceID = "";
+  if (conversationKey > 0) {
+    try {
+      instanceID =
+        (await getRegisteredConversationScope(conversationKey))?.instanceID ||
+        "";
+    } catch {
+      instanceID = "";
+    }
+  }
+  const isFrozen = () =>
+    conversationKey > 0 &&
+    (pendingDeletionStore.isConversationPendingDeletion(conversationKey) ||
+      areConversationWritesFrozen(conversationKey) ||
+      !isConversationWriteGenerationCurrent(
+        conversationKey,
+        expectedGeneration,
+      ) ||
+      (Boolean(instanceID) &&
+        isConversationInstanceRecentlyDeleted(conversationKey, instanceID)));
   const existing = agentRunTraceLoadingTasks.get(normalizedRunId);
   if (existing) {
     await existing;
@@ -2019,12 +2220,14 @@ async function ensureAgentRunTraceLoaded(
   const task = (async () => {
     try {
       const trace = await getAgentRunTrace(normalizedRunId);
-      agentRunTraceCache.set(normalizedRunId, trace.events);
+      if (!isFrozen()) {
+        agentRunTraceCache.set(normalizedRunId, trace.events);
+      }
     } catch (err) {
       ztoolkit.log("LLM: Failed to load agent run trace", err);
     } finally {
       agentRunTraceLoadingTasks.delete(normalizedRunId);
-      if (body && item) {
+      if (body && item && !isFrozen()) {
         refreshChat(body, item);
       }
     }
@@ -2647,8 +2850,9 @@ function setPendingRequestIdAndSync(
   requestId: number,
   primaryBody?: Element | null,
   primaryItem?: Zotero.Item | null,
+  expectedCurrentId?: number,
 ): void {
-  setPendingRequestId(conversationKey, requestId);
+  setPendingRequestId(conversationKey, requestId, expectedCurrentId);
   syncRequestUIForConversation(conversationKey, primaryBody, primaryItem);
 }
 
@@ -2656,8 +2860,15 @@ export function clearPendingRequestIdAndSync(
   conversationKey: number,
   primaryBody?: Element | null,
   primaryItem?: Zotero.Item | null,
+  expectedCurrentId?: number,
 ): void {
-  setPendingRequestIdAndSync(conversationKey, 0, primaryBody, primaryItem);
+  setPendingRequestIdAndSync(
+    conversationKey,
+    0,
+    primaryBody,
+    primaryItem,
+    expectedCurrentId,
+  );
 }
 
 function setStatusForConversationPanels(
@@ -2764,10 +2975,21 @@ function createStreamUsageHandler(params: {
   body: Element;
   tokenUsageEl: HTMLElement | null;
   conversationKey: number;
+  conversationGeneration?: number;
   contextCache: Parameters<typeof recordContextCacheTelemetry>[0];
   fallbackContextWindow: number;
 }): (usage: UsageStats) => void {
   return (usage) => {
+    if (
+      areConversationWritesFrozen(params.conversationKey) ||
+      (params.conversationGeneration !== undefined &&
+        !isConversationWriteGenerationCurrent(
+          params.conversationKey,
+          params.conversationGeneration,
+        ))
+    ) {
+      return;
+    }
     recordContextCacheTelemetry(params.contextCache, usage);
     const contextTokens =
       typeof usage.contextTokens === "number" && usage.contextTokens > 0
@@ -2825,6 +3047,8 @@ function buildCodexNativeTurnCallbacks(ctx: {
   handleDelta: (delta: string) => void;
   handleReasoning: (reasoning: ReasoningEvent) => void;
   handleUsage: (usage: UsageStats) => void;
+  conversationKey: number;
+  conversationGeneration: number;
 }): CodexNativeTurnCallbacks {
   const {
     body,
@@ -2836,21 +3060,36 @@ function buildCodexNativeTurnCallbacks(ctx: {
     handleReasoning,
     handleUsage,
   } = ctx;
+  const isLive = () =>
+    !areConversationWritesFrozen(ctx.conversationKey) &&
+    isConversationWriteGenerationCurrent(
+      ctx.conversationKey,
+      ctx.conversationGeneration,
+    );
   return {
     onSkillActivated: (skillId) => {
+      if (!isLive()) return;
       flushResponseStream("event");
       codexActivityTrace?.noteSkillActivated(skillId);
       setStatusSafely(`Codex skill activated: ${skillId}`, "sending");
     },
-    onDelta: handleDelta,
+    onDelta: (delta) => {
+      if (isLive()) handleDelta(delta);
+    },
     onAgentMessageDelta: (event) => {
+      if (!isLive()) return;
       if (!codexActivityTrace?.appendAgentMessageDelta(event)) {
         handleDelta(event.delta);
       }
     },
-    onReasoning: handleReasoning,
-    onUsage: handleUsage,
+    onReasoning: (reasoning) => {
+      if (isLive()) handleReasoning(reasoning);
+    },
+    onUsage: (usage) => {
+      if (isLive()) handleUsage(usage);
+    },
     onItemStarted: (event) => {
+      if (!isLive()) return;
       flushResponseStream("event");
       codexActivityTrace?.appendItemStatus(event, "started");
       const itemType = sanitizeText(event.type || "");
@@ -2859,6 +3098,7 @@ function buildCodexNativeTurnCallbacks(ctx: {
       }
     },
     onItemCompleted: (event) => {
+      if (!isLive()) return;
       flushResponseStream("event");
       codexActivityTrace?.noteAgentMessageCompleted(event);
       codexActivityTrace?.appendItemStatus(event, "completed");
@@ -2868,6 +3108,7 @@ function buildCodexNativeTurnCallbacks(ctx: {
       }
     },
     onMcpToolActivity: (event) => {
+      if (!isLive()) return;
       flushResponseStream("event");
       codexActivityTrace?.noteMcpToolActivity(event);
       assistantMessage.quoteCitations = mergeQuoteCitations(
@@ -2889,6 +3130,8 @@ function buildCodexNativeTurnCallbacks(ctx: {
       }
     },
     onMcpConfirmationRequest: async ({ requestId, action }) => {
+      if (!isLive())
+        return { approved: false, reason: "conversation_not_live" };
       flushResponseStream("event");
       setStatusSafely(
         action.mode === "review"
@@ -2898,14 +3141,18 @@ function buildCodexNativeTurnCallbacks(ctx: {
       );
       codexActivityTrace?.noteMcpConfirmationRequired(requestId, action);
       const resolution = await showNativeMcpActionCard(body, requestId, action);
+      if (!isLive())
+        return { approved: false, reason: "conversation_not_live" };
       codexActivityTrace?.noteMcpConfirmationResolved(requestId, resolution);
       return resolution;
     },
     onMcpSetupWarning: (message) => {
+      if (!isLive()) return;
       flushResponseStream("event");
       setStatusSafely(message, "error");
     },
     onDiagnostics: (diagnostics) => {
+      if (!isLive()) return;
       flushResponseStream("event");
       setStatusSafely(
         formatCodexNativeDiagnosticsStatus(diagnostics),
@@ -2913,6 +3160,8 @@ function buildCodexNativeTurnCallbacks(ctx: {
       );
     },
     onApprovalRequest: async (request) => {
+      if (!isLive())
+        return { approved: false, reason: "conversation_not_live" };
       flushResponseStream("event");
       return resolveCodexNativeApprovalWithOptionalReviewCard({
         body,
@@ -6711,14 +6960,10 @@ export async function editLatestUserMessageAndRetry(
   await awaitPendingTurnFinalize(
     pendingDeletionStore.finalizeTurnsForConversation(conversationKey, "retry"),
   );
-  // Editing a turn means the user wants this chat alive: restore a pending
-  // conversation deletion instead of letting it commit underneath the edit.
-  // An unwithdrawable intent means the visible state cannot be trusted.
-  if (
-    !(await pendingDeletionStore.restoreConversationDeletionsFor(
-      conversationKey,
-    ))
-  ) {
+  // A whole-conversation deletion is an identity fence. Editing/retrying may
+  // not turn user activity into an implicit Undo; only the explicit Undo
+  // action can withdraw the six-second intent.
+  if (pendingDeletionStore.isConversationPendingDeletion(conversationKey)) {
     return "stale";
   }
   const history = filterMessagesInPendingTurns(
@@ -6925,10 +7170,13 @@ export async function editLatestUserMessageAndRetry(
   retryPair.userMessage.attachmentsExpanded = false;
   retryPair.userMessage.attachmentActiveIndex = undefined;
 
+  const conversationGeneration =
+    getConversationWriteGeneration(conversationKey);
   try {
     await updateStoredLatestUserMessageByConversation(
       conversationKey,
       {
+        conversationGeneration,
         text: retryPair.userMessage.text,
         timestamp: retryPair.userMessage.timestamp,
         runMode: retryPair.userMessage.runMode,
@@ -6970,6 +7218,7 @@ export async function editLatestUserMessageAndRetry(
       "conversation",
       conversationKey,
       attachmentHashes,
+      conversationGeneration,
     );
   } catch (err) {
     ztoolkit.log("LLM: Failed to persist edited latest user message", err);
@@ -7043,15 +7292,11 @@ export async function retryLatestAssistantResponse(
   await awaitPendingTurnFinalize(
     pendingDeletionStore.finalizeTurnsForConversation(conversationKey, "retry"),
   );
-  // A retry means the user wants this chat alive: restore a pending
-  // conversation deletion instead of letting it commit underneath the retry.
-  if (
-    !(await pendingDeletionStore.restoreConversationDeletionsFor(
-      conversationKey,
-    ))
-  ) {
+  // Retry cannot cancel a whole-conversation deletion. Only explicit Undo can
+  // withdraw that intent while its own window is still open.
+  if (pendingDeletionStore.isConversationPendingDeletion(conversationKey)) {
     if (ui.status) {
-      setStatus(ui.status, t("Failed to restore. Check logs."), "error");
+      setStatus(ui.status, t("Deletion pending; retrying safely"), "warning");
     }
     return;
   }
@@ -7065,6 +7310,9 @@ export async function retryLatestAssistantResponse(
     return;
   }
   const thisRequestId = nextRequestId();
+  const conversationGeneration = getConversationWriteGeneration(
+    getConversationKey(item),
+  );
   setPendingRequestIdAndSync(conversationKey, thisRequestId, body, item);
   setRequestUIBusy(body, ui, conversationKey, "Preparing retry...");
   const assistantMessage = retryPair.assistantMessage;
@@ -7143,7 +7391,7 @@ export async function retryLatestAssistantResponse(
     refreshChatSafely();
     setStatusSafely(t("WebChat models can't retry local turns"), "error");
     restoreRequestUIIdle(body, conversationKey, thisRequestId);
-    clearPendingRequestIdAndSync(conversationKey, body, item);
+    clearPendingRequestIdAndSync(conversationKey, body, item, thisRequestId);
     return;
   }
 
@@ -7212,7 +7460,7 @@ export async function retryLatestAssistantResponse(
     refreshChatSafely();
     setStatusSafely("Nothing to retry for latest turn", "error");
     restoreRequestUIIdle(body, conversationKey, thisRequestId);
-    clearPendingRequestIdAndSync(conversationKey, body, item);
+    clearPendingRequestIdAndSync(conversationKey, body, item, thisRequestId);
     return;
   }
 
@@ -7237,6 +7485,7 @@ export async function retryLatestAssistantResponse(
     await updateStoredLatestUserMessageByConversation(
       conversationKey,
       {
+        conversationGeneration,
         text: retryPair.userMessage.text,
         timestamp: retryPair.userMessage.timestamp,
         runMode: retryPair.userMessage.runMode,
@@ -7271,6 +7520,7 @@ export async function retryLatestAssistantResponse(
     await updateStoredLatestAssistantMessageByConversation(
       conversationKey,
       {
+        conversationGeneration,
         text: assistantMessage.text,
         timestamp: assistantMessage.timestamp,
         runMode: assistantMessage.runMode,
@@ -7301,7 +7551,7 @@ export async function retryLatestAssistantResponse(
     if (blockedAttachments.length) {
       restoreOriginalTurn();
       restoreRequestUIIdle(body, conversationKey, thisRequestId);
-      clearPendingRequestIdAndSync(conversationKey, body, item);
+      clearPendingRequestIdAndSync(conversationKey, body, item, thisRequestId);
       setStatusSafely(
         buildCodexAppServerNativeAttachmentBlockMessage(blockedAttachments),
         "error",
@@ -7347,7 +7597,7 @@ export async function retryLatestAssistantResponse(
   } catch (err) {
     restoreOriginalTurn();
     restoreRequestUIIdle(body, conversationKey, thisRequestId);
-    clearPendingRequestIdAndSync(conversationKey, body, item);
+    clearPendingRequestIdAndSync(conversationKey, body, item, thisRequestId);
     const message =
       err instanceof Error && err.message.trim()
         ? err.message
@@ -7521,6 +7771,7 @@ export async function retryLatestAssistantResponse(
       body,
       tokenUsageEl: ui.tokenUsageEl,
       conversationKey,
+      conversationGeneration,
       contextCache: contextPlan.contextCache,
       fallbackContextWindow: finalPrepared.inputCap.limitTokens,
     });
@@ -7534,6 +7785,7 @@ export async function retryLatestAssistantResponse(
                 title: question,
               }),
             ),
+            conversationGeneration,
             model: effectiveRequestConfig.model,
             messages: finalPrepared.messages,
             reasoning: effectiveRequestConfig.reasoning,
@@ -7570,6 +7822,8 @@ export async function retryLatestAssistantResponse(
               handleDelta,
               handleReasoning,
               handleUsage,
+              conversationKey,
+              conversationGeneration,
             }),
           })
         ).text
@@ -7627,6 +7881,7 @@ export async function retryLatestAssistantResponse(
     await updateStoredLatestAssistantMessageByConversation(
       conversationKey,
       {
+        conversationGeneration,
         text: assistantMessage.text,
         timestamp: assistantMessage.timestamp,
         runMode: assistantMessage.runMode,
@@ -7693,6 +7948,7 @@ export async function retryLatestAssistantResponse(
       await updateStoredLatestAssistantMessageByConversation(
         conversationKey,
         {
+          conversationGeneration,
           text: assistantMessage.text,
           timestamp: assistantMessage.timestamp,
           runMode: assistantMessage.runMode,
@@ -7724,8 +7980,8 @@ export async function retryLatestAssistantResponse(
     );
   } finally {
     restoreRequestUIIdle(body, conversationKey, thisRequestId);
-    setAbortController(conversationKey, null);
-    clearPendingRequestIdAndSync(conversationKey, body, item);
+    setAbortController(conversationKey, null, thisRequestId);
+    clearPendingRequestIdAndSync(conversationKey, body, item, thisRequestId);
     // Webchat retries are refused by the gate above, so every retry that
     // reaches here uses a drainable provider.
     scheduleQueuedInputDrain(body, {
@@ -7733,6 +7989,88 @@ export async function retryLatestAssistantResponse(
       conversationKey,
     });
   }
+}
+
+/**
+ * Detach provider history before an edit truncates local turns. Provider
+ * threads/sessions contain the deleted trailing turns even after their local
+ * rows are gone; retrying on the old session would silently reintroduce that
+ * context. The cleanup obligation is persisted before the provider call so an
+ * outage cannot turn the edit into an untracked provider leak.
+ */
+async function detachProviderForEdit(
+  conversationKey: number,
+  catalog: Awaited<ReturnType<typeof conversationRepository.getCatalogEntry>>,
+): Promise<boolean> {
+  if (!catalog) return false;
+  const providerSessionId = String(catalog.providerSessionId || "").trim();
+  if (catalog.system === "codex") {
+    if (!providerSessionId) return true;
+    const job = await enqueueConversationCleanupJob({
+      operation: "codex_archive",
+      system: "codex",
+      conversationKey,
+      instanceID: catalog.instanceID,
+      conversationKind: catalog.kind,
+      libraryID: catalog.libraryID,
+      paperItemID: catalog.paperItemID,
+      providerSessionId,
+    });
+    if (!job) return false;
+    try {
+      await archiveCodexAppServerThread({ threadId: providerSessionId });
+      await completeConversationCleanupJob(job.id);
+    } catch (error) {
+      if (!/not found|unknown thread|does not exist/i.test(String(error))) {
+        await failConversationCleanupJob(job, error);
+        return false;
+      }
+      await completeConversationCleanupJob(job.id);
+    }
+    await clearCodexConversationSessionMetadata(
+      conversationKey,
+      providerSessionId,
+      catalog.instanceID,
+    );
+    return true;
+  }
+  if (catalog.system === "claude_code") {
+    const scope = buildClaudeScope({
+      libraryID: catalog.libraryID,
+      kind: catalog.kind,
+      paperItemID: catalog.paperItemID,
+    });
+    if (!catalog.instanceID || (!providerSessionId && !scope.scopeId)) {
+      return !providerSessionId;
+    }
+    const job = await enqueueConversationCleanupJob({
+      operation: "claude_invalidate",
+      system: "claude_code",
+      conversationKey,
+      instanceID: catalog.instanceID,
+      conversationKind: catalog.kind,
+      libraryID: catalog.libraryID,
+      paperItemID: catalog.paperItemID,
+      providerScope: scope,
+      providerSessionId,
+    });
+    if (!job) return false;
+    try {
+      await invalidateClaudeConversationSession(await initAgentSubsystem(), {
+        conversationKey,
+        scope,
+        metadata: {
+          ...(providerSessionId ? { providerSessionId } : {}),
+          instanceID: catalog.instanceID,
+        },
+      });
+      await completeConversationCleanupJob(job.id);
+    } catch (error) {
+      await failConversationCleanupJob(job, error);
+      return false;
+    }
+  }
+  return true;
 }
 
 /**
@@ -7820,19 +8158,17 @@ export async function editUserTurnAndRetry(opts: {
   await awaitPendingTurnFinalize(
     pendingDeletionStore.finalizeTurnsForConversation(conversationKey, "edit"),
   );
-  // An edit means the user wants this chat alive: restore a pending
-  // conversation deletion instead of letting it commit underneath the edit.
-  if (
-    !(await pendingDeletionStore.restoreConversationDeletionsFor(
-      conversationKey,
-    ))
-  ) {
+  // An edit cannot cancel a whole-conversation deletion. Only explicit Undo
+  // can withdraw that intent during its own window.
+  if (pendingDeletionStore.isConversationPendingDeletion(conversationKey)) {
     ztoolkit.log(
-      "LLM: editUserTurnAndRetry — pending conversation deletion could not be restored",
+      "LLM: editUserTurnAndRetry — conversation is frozen by pending deletion",
     );
     return false;
   }
   const history = chatHistory.get(conversationKey) || [];
+  const conversationGeneration =
+    getConversationWriteGeneration(conversationKey);
 
   const userIndex = history.findIndex(
     (m) => m.role === "user" && m.timestamp === userTimestamp,
@@ -7895,27 +8231,132 @@ export async function editUserTurnAndRetry(opts: {
     }
   }
 
+  if (
+    !isConversationWriteGenerationCurrent(
+      conversationKey,
+      conversationGeneration,
+    ) ||
+    areConversationWritesFrozen(conversationKey)
+  ) {
+    return false;
+  }
+
+  if (subsequentPairs.length) {
+    const providerReset = await withConversationWriteLock(
+      conversationKey,
+      async () => {
+        if (
+          areConversationWritesFrozen(conversationKey) ||
+          !isConversationWriteGenerationCurrent(
+            conversationKey,
+            conversationGeneration,
+          )
+        ) {
+          return false;
+        }
+        const catalog = await conversationRepository.getCatalogEntry({
+          system: retryStorageSystem,
+          kind:
+            resolveDisplayConversationKind(item) === "paper"
+              ? "paper"
+              : "global",
+          conversationKey,
+        });
+        const detached = await detachProviderForEdit(conversationKey, catalog);
+        if (!detached) return false;
+        if (retryStorageSystem === "codex") {
+          clearCodexNativeReadLedgerForConversation({
+            conversationKey,
+            instanceID: catalog?.instanceID,
+          });
+        }
+        return isConversationWriteGenerationCurrent(
+          conversationKey,
+          conversationGeneration,
+        );
+      },
+    );
+    if (!providerReset) {
+      ztoolkit.log(
+        "LLM: editUserTurnAndRetry — provider history could not be detached",
+      );
+      return false;
+    }
+  }
+
   // Truncate in-memory history to this pair
   history.splice(assistantIndex + 1);
 
   // Delete persisted subsequent turns
+  let trailingDeleteFailed = false;
   for (const p of subsequentPairs) {
     try {
-      const storageSystem = resolveConversationStorageSystem({
+      const deleted = await withConversationWriteLock(
         conversationKey,
-        conversationSystem: retryStorageSystem,
-      });
-      if (!storageSystem) {
-        continue;
+        async () => {
+          if (
+            !isConversationWriteGenerationCurrent(
+              conversationKey,
+              conversationGeneration,
+            ) ||
+            areConversationWritesFrozen(conversationKey)
+          ) {
+            return false;
+          }
+          const storageSystem = resolveConversationStorageSystem({
+            conversationKey,
+            conversationSystem: retryStorageSystem,
+          });
+          if (!storageSystem) return false;
+          await conversationRepository.deleteTurnMessages({
+            system: storageSystem,
+            conversationKey,
+            userTimestamp: p.userTs,
+            assistantTimestamp: p.assistantTs,
+            onBeforeCommit: () =>
+              clearPersistedAgentConversationRowsInTransaction(conversationKey),
+          });
+          return true;
+        },
+      );
+      if (!deleted) {
+        trailingDeleteFailed = true;
+        break;
       }
-      await conversationRepository.deleteTurnMessages({
-        system: storageSystem,
-        conversationKey,
-        userTimestamp: p.userTs,
-        assistantTimestamp: p.assistantTs,
-      });
     } catch (err) {
       ztoolkit.log("LLM: Failed to delete subsequent stored turn", err);
+      trailingDeleteFailed = true;
+      break;
+    }
+  }
+  if (trailingDeleteFailed) {
+    try {
+      const restored = await loadStoredConversationByKey(
+        conversationKey,
+        PERSISTED_HISTORY_LIMIT,
+        retryStorageSystem,
+      );
+      chatHistory.set(
+        conversationKey,
+        restored.map((message) => toPanelMessage(message)),
+      );
+    } catch (err) {
+      ztoolkit.log("LLM: Failed to restore history after edit truncation", err);
+    }
+    return false;
+  }
+  // The edit path deletes trailing message rows directly rather than through
+  // the queued-turn coordinator.  Persistent agent state is conversation-key
+  // scoped, so clear its in-memory/trace participants after the atomic row
+  // purge before the edited retry can build a prompt.
+  if (subsequentPairs.length) {
+    try {
+      await clearAgentConversationState(conversationKey);
+    } catch (err) {
+      ztoolkit.log(
+        "LLM: Failed to clear agent state after edit truncation",
+        err,
+      );
     }
   }
 
@@ -8049,6 +8490,7 @@ export async function editUserTurnAndRetry(opts: {
     await updateStoredLatestUserMessageByConversation(
       conversationKey,
       {
+        conversationGeneration,
         text: userMsg.text,
         timestamp: userMsg.timestamp,
         runMode: userMsg.runMode,
@@ -8077,6 +8519,40 @@ export async function editUserTurnAndRetry(opts: {
     );
   } catch (err) {
     ztoolkit.log("LLM: Failed to persist edited user message", err);
+    try {
+      const restored = await loadStoredConversationByKey(
+        conversationKey,
+        PERSISTED_HISTORY_LIMIT,
+        retryStorageSystem,
+      );
+      chatHistory.set(
+        conversationKey,
+        restored.map((message) => toPanelMessage(message)),
+      );
+    } catch (restoreError) {
+      ztoolkit.log(
+        "LLM: Failed to restore history after edit persistence failure",
+        restoreError,
+      );
+    }
+    return false;
+  }
+
+  try {
+    const storedAfterEdit = await loadStoredConversationByKey(
+      conversationKey,
+      PERSISTED_HISTORY_LIMIT,
+      retryStorageSystem,
+    );
+    await replaceOwnerAttachmentRefs(
+      "conversation",
+      conversationKey,
+      collectAttachmentHashesFromStoredMessages(storedAfterEdit),
+      conversationGeneration,
+    );
+  } catch (err) {
+    ztoolkit.log("LLM: Failed to reconcile edit attachment refs", err);
+    return false;
   }
 
   // Route agent-mode retries through the agent runtime so tools are available
@@ -8117,6 +8593,7 @@ export async function editUserTurnAndRetry(opts: {
 
 export type BuildAgentRuntimeRequestParams = {
   conversationKey: number;
+  conversationGeneration?: number;
   item: Zotero.Item;
   userText: string;
   selectedTextContexts?: SelectedTextContext[];
@@ -8458,8 +8935,22 @@ async function buildAgentRuntimeRequest(
     activeNoteSession?.conversationKind ||
     resolveDisplayConversationKind(params.item) ||
     undefined;
+  let registeredConversation: Awaited<
+    ReturnType<typeof getRegisteredConversationScope>
+  > = null;
+  try {
+    registeredConversation = await getRegisteredConversationScope(
+      params.conversationKey,
+    );
+  } catch {
+    // The instance witness is an adapter-safety hint; a provider turn can
+    // still proceed through the existing request identity when the registry
+    // is temporarily unavailable.
+  }
+  const conversationInstanceID = registeredConversation?.instanceID;
   return {
     conversationKey: params.conversationKey,
+    conversationGeneration: params.conversationGeneration,
     mode: "agent",
     userText: params.userText,
     conversationKind,
@@ -8526,6 +9017,7 @@ async function buildAgentRuntimeRequest(
           : undefined,
       claudeHistoryLength: params.history.length,
       notesDirectoryConfig: getNotesDirectoryConfig() || undefined,
+      conversationInstanceID,
     },
   };
 }
@@ -8535,6 +9027,7 @@ export const buildAgentRuntimeRequestForTests = buildAgentRuntimeRequest;
 function buildAgentEngineDeps(
   currentItem?: Zotero.Item,
   conversationSystem?: ConversationSystem,
+  conversationGeneration?: number,
 ): AgentEngineDeps {
   const getEffectiveConversationSystem = (): ConversationSystem =>
     conversationSystem ||
@@ -8542,16 +9035,20 @@ function buildAgentEngineDeps(
       ? resolveEffectiveConversationSystem({ item: currentItem })
       : "upstream");
   return {
+    conversationGeneration,
     chatHistory,
     agentRunTraceCache,
     cancelledRequestId: (ck: number) => getCancelledRequestId(ck),
     currentAbortController: (ck: number) => getAbortController(ck),
-    setCurrentAbortController: (ck: number, ctrl: AbortController | null) =>
-      setAbortController(ck, ctrl),
+    setCurrentAbortController: (
+      ck: number,
+      ctrl: AbortController | null,
+      expectedRequestId?: number,
+    ) => setAbortController(ck, ctrl, expectedRequestId),
     getAbortControllerCtor,
     nextRequestId,
-    setPendingRequestId: (ck: number, id: number) =>
-      setPendingRequestIdAndSync(ck, id),
+    setPendingRequestId: (ck: number, id: number, expectedCurrentId?: number) =>
+      setPendingRequestIdAndSync(ck, id, null, null, expectedCurrentId),
     getPanelRequestUI,
     setRequestUIBusy,
     restoreRequestUIIdle,
@@ -8612,6 +9109,11 @@ function buildAgentEngineDeps(
     },
     appendReasoningPart,
     persistConversationMessage: async (conversationKey, message) => {
+      const guardedMessage = {
+        ...message,
+        conversationGeneration:
+          message.conversationGeneration ?? conversationGeneration,
+      };
       const system = getEffectiveConversationSystem();
       const storageSystem = currentItem
         ? resolveConversationStorageSystemForItem({
@@ -8629,9 +9131,18 @@ function buildAgentEngineDeps(
       ) {
         return;
       }
-      await persistConversationMessage(conversationKey, message, storageSystem);
+      await persistConversationMessage(
+        conversationKey,
+        guardedMessage,
+        storageSystem,
+      );
     },
     updateStoredLatestUserMessage: async (conversationKey, data) => {
+      const guardedData = {
+        ...data,
+        conversationGeneration:
+          data.conversationGeneration ?? conversationGeneration,
+      };
       const system = getEffectiveConversationSystem();
       const storageSystem = currentItem
         ? resolveConversationStorageSystemForItem({
@@ -8651,13 +9162,18 @@ function buildAgentEngineDeps(
       }
       await updateStoredLatestUserMessageByConversation(
         conversationKey,
-        data as Parameters<
+        guardedData as Parameters<
           typeof updateStoredLatestUserMessageByConversation
         >[1],
         storageSystem,
       );
     },
     updateStoredLatestAssistantMessage: async (conversationKey, data) => {
+      const guardedData = {
+        ...data,
+        conversationGeneration:
+          data.conversationGeneration ?? conversationGeneration,
+      };
       const system = getEffectiveConversationSystem();
       const storageSystem = currentItem
         ? resolveConversationStorageSystemForItem({
@@ -8677,7 +9193,7 @@ function buildAgentEngineDeps(
       }
       await updateStoredLatestAssistantMessageByConversation(
         conversationKey,
-        data as Parameters<
+        guardedData as Parameters<
           typeof updateStoredLatestAssistantMessageByConversation
         >[1],
         storageSystem,
@@ -8752,7 +9268,11 @@ async function retryLatestAgentResponse(
     reasoning,
     advanced,
     modelAttachmentsOverride,
-    buildAgentEngineDeps(item, conversationSystem),
+    buildAgentEngineDeps(
+      item,
+      conversationSystem,
+      getConversationWriteGeneration(getConversationKey(item)),
+    ),
   );
   return true;
 }
@@ -8819,7 +9339,11 @@ async function sendAgentQuestion(opts: {
   await initAgentSubsystem();
   await sendAgentTurn(
     opts,
-    buildAgentEngineDeps(opts.item, opts.conversationSystem),
+    buildAgentEngineDeps(
+      opts.item,
+      opts.conversationSystem,
+      getConversationWriteGeneration(getConversationKey(opts.item)),
+    ),
   );
 }
 
@@ -8864,19 +9388,16 @@ export async function sendQuestion(
       await awaitPendingTurnFinalize(
         pendingDeletionStore.finalizeTurnsForConversation(pendingKey, "send"),
       );
-      // A send also means the user is actively continuing THIS chat: a still-
-      // undoable conversation deletion (queued from another mount of the same
-      // chat) is restored, never committed as a side effect. If its durable
-      // intent cannot be withdrawn, abort rather than write into a chat whose
-      // deletion row survives.
-      if (
-        !(await pendingDeletionStore.restoreConversationDeletionsFor(
-          pendingKey,
-        ))
-      ) {
+      // A send cannot become an implicit Undo. Freeze the exact instance until
+      // the user explicitly withdraws the intent from the Undo control.
+      if (pendingDeletionStore.isConversationPendingDeletion(pendingKey)) {
         const ui = getPanelRequestUI(body);
         if (ui.status) {
-          setStatus(ui.status, t("Failed to restore. Check logs."), "error");
+          setStatus(
+            ui.status,
+            t("Deletion pending; retrying safely"),
+            "warning",
+          );
         }
         return;
       }
@@ -9004,6 +9525,8 @@ export async function sendQuestion(
   optimisticHelpers.refreshChatSafely();
 
   const conversationKey = getConversationKey(item);
+  const conversationGeneration =
+    getConversationWriteGeneration(conversationKey);
   if (conversationKey !== initialConversationKey) {
     clearPendingRequestIdAndSync(initialConversationKey, body, item);
     setPendingRequestIdAndSync(conversationKey, thisRequestId, body, item);
@@ -9022,7 +9545,7 @@ export async function sendQuestion(
       "error",
     );
     restoreRequestUIIdle(body, conversationKey, thisRequestId);
-    clearPendingRequestIdAndSync(conversationKey, body, item);
+    clearPendingRequestIdAndSync(conversationKey, body, item, thisRequestId);
     return;
   }
 
@@ -9190,8 +9713,8 @@ export async function sendQuestion(
       setStatusSafely(`Error: ${errMsg.slice(0, 40)}`, "error");
     } finally {
       restoreRequestUIIdle(body, conversationKey, thisRequestId);
-      setAbortController(conversationKey, null);
-      clearPendingRequestIdAndSync(conversationKey, body, item);
+      setAbortController(conversationKey, null, thisRequestId);
+      clearPendingRequestIdAndSync(conversationKey, body, item, thisRequestId);
       scheduleQueuedInputDrain(body, {
         conversationSystem:
           resolveConversationSystemForItem(item) || "upstream",
@@ -9287,6 +9810,7 @@ export async function sendQuestion(
   const imageCount = screenshotImagesForMessage.length;
   const userMessageText = shownQuestion;
   const userMessage: Message = {
+    conversationGeneration,
     role: "user",
     text: userMessageText,
     timestamp: optimisticUserMessage.timestamp,
@@ -9358,6 +9882,7 @@ export async function sendQuestion(
     void persistConversationMessage(
       conversationKey,
       {
+        conversationGeneration,
         role: "user",
         text: userMessage.text,
         timestamp: userMessage.timestamp,
@@ -9388,6 +9913,7 @@ export async function sendQuestion(
   }
 
   const assistantMessage: Message = {
+    conversationGeneration,
     ...optimisticAssistantMessage,
     timestamp: optimisticAssistantMessage.timestamp,
     runMode: isCodexNativeTurn ? "agent" : effectiveRuntimeMode,
@@ -9422,6 +9948,7 @@ export async function sendQuestion(
     await persistConversationMessage(
       conversationKey,
       {
+        conversationGeneration,
         role: "assistant",
         text: assistantMessage.text,
         timestamp: assistantMessage.timestamp,
@@ -9583,8 +10110,8 @@ export async function sendQuestion(
       setStatusSafely(errMsg, "error");
       reportWebChatSendOutcome("failed");
     } finally {
-      setAbortController(conversationKey, null);
-      clearPendingRequestIdAndSync(conversationKey, body, item);
+      setAbortController(conversationKey, null, thisRequestId);
+      clearPendingRequestIdAndSync(conversationKey, body, item, thisRequestId);
     }
     return;
   }
@@ -9649,6 +10176,7 @@ export async function sendQuestion(
     await updateStoredLatestUserMessageByConversation(
       conversationKey,
       {
+        conversationGeneration,
         text: userMessage.text,
         timestamp: userMessage.timestamp,
         runMode: userMessage.runMode,
@@ -9764,6 +10292,7 @@ export async function sendQuestion(
       body,
       tokenUsageEl: ui.tokenUsageEl,
       conversationKey,
+      conversationGeneration,
       contextCache: contextPlan.contextCache,
       fallbackContextWindow: finalPrepared.inputCap.limitTokens,
     });
@@ -9778,6 +10307,7 @@ export async function sendQuestion(
                 title: shownQuestion,
               }),
             ),
+            conversationGeneration,
             model: effectiveRequestConfig.model,
             messages: finalPrepared.messages,
             reasoning: effectiveRequestConfig.reasoning,
@@ -9812,6 +10342,8 @@ export async function sendQuestion(
               handleDelta,
               handleReasoning,
               handleUsage,
+              conversationKey,
+              conversationGeneration,
             }),
           })
         ).text
@@ -9881,6 +10413,7 @@ export async function sendQuestion(
               ? String(baseItem?.getField?.("title") || "").trim() || undefined
               : undefined,
         }),
+        conversationGeneration,
       ).catch(() => null);
     }
 
@@ -9928,8 +10461,8 @@ export async function sendQuestion(
     setStatusSafely(`Error: ${`${errMsg}${retryHint}`.slice(0, 40)}`, "error");
   } finally {
     restoreRequestUIIdle(body, conversationKey, thisRequestId);
-    setAbortController(conversationKey, null);
-    clearPendingRequestIdAndSync(conversationKey, body, item);
+    setAbortController(conversationKey, null, thisRequestId);
+    clearPendingRequestIdAndSync(conversationKey, body, item, thisRequestId);
     scheduleQueuedInputDrain(body, {
       conversationSystem: resolveConversationSystemForItem(item) || "upstream",
       conversationKey,
@@ -11530,7 +12063,13 @@ export function refreshChat(
               msg.webchatChatUrl || null,
               msg.webchatChatId || null,
             );
-            if (scraped.length > 0) {
+            if (
+              scraped.length > 0 &&
+              !pendingDeletionStore.isConversationPendingDeletion(
+                conversationKey,
+              ) &&
+              !isConversationKeyRetiredInMemory(conversationKey)
+            ) {
               const refreshed: Message[] = scraped.map((m) => ({
                 role: (m.kind === "user" ? "user" : "assistant") as
                   | "user"

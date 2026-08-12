@@ -6,7 +6,6 @@ import {
   resetPendingDeletionStoreForTests,
   DELETION_UNDO_WINDOW_MS,
   FINALIZE_RETRY_DELAY_MS,
-  MAX_FINALIZE_ATTEMPTS,
   PENDING_DELETIONS_TABLE,
 } from "../src/core/conversations/pendingDeletionStore";
 import { resolveFreshConversationDraft } from "../src/modules/contextPanel/freshConversationDraft";
@@ -14,6 +13,10 @@ import {
   markConversationRecentlyDeleted,
   resetRecentlyDeletedConversationsForTests,
 } from "../src/core/conversations/recentlyDeletedConversations";
+import {
+  areConversationWritesFrozen,
+  resetConversationWriteFenceForTests,
+} from "../src/shared/conversationWriteFence";
 
 const globalScope = globalThis as typeof globalThis & {
   Zotero?: Record<string, unknown>;
@@ -74,7 +77,8 @@ function conversationInput(
   return {
     conversationKind: "global" as const,
     conversationID: `lfz:test:upstream:global:lib-1:paper-0:legacy-${key}`,
-    // Identity witness captured at queue time; queueing is refused without one.
+    instanceID: `instance-${key}`,
+    // Identity witness captured at queue time when the catalog can provide it.
     catalogCreatedAt: 1_700_000_000_000,
     conversationKey: key,
     libraryID: 1,
@@ -89,11 +93,13 @@ describe("pendingDeletionStore", function () {
   beforeEach(function () {
     resetPendingDeletionStoreForTests();
     resetRecentlyDeletedConversationsForTests();
+    resetConversationWriteFenceForTests();
   });
 
   afterEach(function () {
     resetPendingDeletionStoreForTests();
     resetRecentlyDeletedConversationsForTests();
+    resetConversationWriteFenceForTests();
     globalScope.Zotero = originalZotero;
   });
 
@@ -173,7 +179,7 @@ describe("pendingDeletionStore", function () {
     );
   });
 
-  it("queueing a different conversation supersedes (finalizes) the previous pending", async function () {
+  it("queueing a different conversation preserves both independent undo windows", async function () {
     installFakeEnv();
     const finalizedKeys: number[] = [];
     configurePendingDeletionFinalizers({
@@ -185,8 +191,8 @@ describe("pendingDeletionStore", function () {
     });
     await pendingDeletionStore.queueConversationDeletion(conversationInput(1));
     await pendingDeletionStore.queueConversationDeletion(conversationInput(2));
-    assert.deepEqual(finalizedKeys, [1]);
-    assert.isFalse(pendingDeletionStore.isConversationPendingDeletion(1));
+    assert.deepEqual(finalizedKeys, []);
+    assert.isTrue(pendingDeletionStore.isConversationPendingDeletion(1));
     assert.isTrue(pendingDeletionStore.isConversationPendingDeletion(2));
   });
 
@@ -241,12 +247,51 @@ describe("pendingDeletionStore", function () {
       assistantTimestamp: 222,
     });
     assert.isOk(entry);
+    assert.isTrue(
+      areConversationWritesFrozen(5),
+      "an undoable turn deletion must fence the owning conversation",
+    );
     assert.isTrue(pendingDeletionStore.isMessageInPendingTurn(5, 111));
     assert.isTrue(pendingDeletionStore.isMessageInPendingTurn(5, 222.9));
     assert.isFalse(pendingDeletionStore.isMessageInPendingTurn(5, 333));
     assert.isFalse(pendingDeletionStore.isMessageInPendingTurn(6, 111));
     assert.isOk(pendingDeletionStore.findPendingTurn(5, 111, 222));
     assert.isFalse(pendingDeletionStore.isConversationPendingDeletion(5));
+    await pendingDeletionStore.undo(entry!.id);
+    assert.isFalse(
+      areConversationWritesFrozen(5),
+      "explicit Undo must release the turn fence",
+    );
+  });
+
+  it("keeps the fence while multiple turn intents remain", async function () {
+    installFakeEnv();
+    configurePendingDeletionFinalizers({
+      finalizeConversation: async () => true,
+      finalizeTurn: async () => true,
+    });
+    const first = await pendingDeletionStore.queueTurnDeletion({
+      conversationKey: 6,
+      system: "upstream",
+      userTimestamp: 101,
+      assistantTimestamp: 102,
+    });
+    const second = await pendingDeletionStore.queueTurnDeletion({
+      conversationKey: 6,
+      system: "upstream",
+      userTimestamp: 201,
+      assistantTimestamp: 202,
+    });
+    assert.isOk(first);
+    assert.isOk(second);
+    assert.isTrue(areConversationWritesFrozen(6));
+    await pendingDeletionStore.undo(first!.id);
+    assert.isTrue(
+      areConversationWritesFrozen(6),
+      "undoing one turn cannot reopen a conversation with another pending turn",
+    );
+    await pendingDeletionStore.undo(second!.id);
+    assert.isFalse(areConversationWritesFrozen(6));
   });
 
   it("finalize is idempotent for unknown ids", async function () {
@@ -258,7 +303,7 @@ describe("pendingDeletionStore", function () {
     assert.isTrue(await pendingDeletionStore.finalize("nope", "test"));
   });
 
-  it("failed finalize retries with attempts, then gives up at the cap and restores visibility", async function () {
+  it("failed finalize retries indefinitely without restoring visibility", async function () {
     const env = installFakeEnv();
     let calls = 0;
     const events: string[] = [];
@@ -273,14 +318,16 @@ describe("pendingDeletionStore", function () {
       conversationInput(42),
     );
     const stop = pendingDeletionStore.subscribe((e) => events.push(e.type));
-    for (let round = 0; round < MAX_FINALIZE_ATTEMPTS; round++) {
+    for (let round = 0; round < 3; round++) {
       env.fireLastTimer();
+      await new Promise((resolve) => setTimeout(resolve, 0));
       await pendingDeletionStore.finalize("flush-barrier", "noop");
     }
     stop();
-    assert.equal(calls, MAX_FINALIZE_ATTEMPTS);
-    assert.isFalse(pendingDeletionStore.isConversationPendingDeletion(42));
-    assert.equal(events[events.length - 1], "gave-up");
+    assert.equal(calls, 3);
+    assert.isTrue(pendingDeletionStore.isConversationPendingDeletion(42));
+    assert.notInclude(events, "gave-up");
+    assert.include(events, "finalize-failed");
     assert.isTrue(env.queries.some((q) => q.sql.includes("SET attempts = ?")));
     assert.isOk(entry);
   });
@@ -331,10 +378,88 @@ describe("pendingDeletionStore", function () {
       },
     });
     await pendingDeletionStore.sweepAllPersisted("startup");
-    assert.deepEqual(finalized, ["conversation:11", "turn:12"]);
+    assert.sameMembers(finalized, ["conversation:11", "turn:12"]);
     assert.isNull(pendingDeletionStore.getLatestPending());
     assert.isTrue(
       env.queries.filter((q) => q.sql.includes("DELETE FROM")).length >= 2,
+    );
+  });
+
+  it("restart preserves an unexpired Undo authorization", async function () {
+    const env = installFakeEnv();
+    env.rows.push({
+      id: "pd-unexpired",
+      kind: "conversation",
+      conversation_id: "lfz:test:upstream:global:lib-1:paper-0:legacy-13",
+      conversation_key: 13,
+      system: "upstream",
+      payload: JSON.stringify({
+        conversationKind: "global",
+        instanceID: "instance-13",
+        catalogCreatedAt: 1_700_000_000_000,
+        conversationID: "lfz:test:upstream:global:lib-1:paper-0:legacy-13",
+        libraryID: 1,
+        title: "Unexpired chat",
+        wasActive: false,
+        state: "undoable",
+      }),
+      queued_at: env.timers.length + 1_000_000 - 1,
+      expires_at: 1_000_000 + DELETION_UNDO_WINDOW_MS,
+      attempts: 0,
+      state: "undoable",
+    });
+    let finalized = 0;
+    configurePendingDeletionFinalizers({
+      finalizeConversation: async () => {
+        finalized += 1;
+        return true;
+      },
+      finalizeTurn: async () => true,
+    });
+
+    await pendingDeletionStore.sweepAllPersisted("startup");
+
+    assert.equal(finalized, 0);
+    assert.isTrue(pendingDeletionStore.isConversationPendingDeletion(13));
+    assert.isTrue(
+      env.timers.some((timer) => !timer.cleared),
+      "restart must re-arm the remaining Undo timer",
+    );
+  });
+
+  it("restart restores the write fence for an unexpired turn intent", async function () {
+    const env = installFakeEnv();
+    env.rows.push({
+      id: "pd-turn-unexpired",
+      kind: "turn",
+      conversation_id: null,
+      conversation_key: 14,
+      system: "codex",
+      payload: JSON.stringify({
+        conversationKind: "global",
+        instanceID: "instance-14",
+        userTimestamp: 101,
+        assistantTimestamp: 102,
+      }),
+      queued_at: env.timers.length + 1_000_000 - 1,
+      expires_at: 1_000_000 + DELETION_UNDO_WINDOW_MS,
+      attempts: 0,
+      state: "undoable",
+    });
+    configurePendingDeletionFinalizers({
+      finalizeConversation: async () => true,
+      finalizeTurn: async () => true,
+    });
+
+    await pendingDeletionStore.sweepAllPersisted("startup");
+
+    assert.isTrue(
+      areConversationWritesFrozen(14),
+      "a durable turn intent must fence writes immediately after restart",
+    );
+    assert.isTrue(
+      pendingDeletionStore.isMessageInPendingTurn(14, 101),
+      "the restarted turn remains hidden during its Undo window",
     );
   });
 
@@ -433,8 +558,8 @@ describe("pendingDeletionStore", function () {
     assert.lengthOf(pendingDeletionStore.getPendingTurnsForConversation(5), 0);
   });
 
-  it("restoreConversationDeletionsFor withdraws the row and restores visibility without finalizing", async function () {
-    const env = installFakeEnv();
+  it("restoreConversationDeletionsFor never withdraws a pending intent", async function () {
+    installFakeEnv();
     let finalized = 0;
     configurePendingDeletionFinalizers({
       finalizeConversation: async () => {
@@ -444,27 +569,16 @@ describe("pendingDeletionStore", function () {
       finalizeTurn: async () => true,
     });
     await pendingDeletionStore.queueConversationDeletion(conversationInput(42));
-    const events: string[] = [];
-    const stop = pendingDeletionStore.subscribe((e) => events.push(e.type));
-    assert.isTrue(
+    assert.isFalse(
       await pendingDeletionStore.restoreConversationDeletionsFor(42),
     );
-    stop();
-    assert.deepEqual(events, ["undone"]);
     assert.equal(finalized, 0, "restore must never run the finalizer");
-    assert.isFalse(pendingDeletionStore.isConversationPendingDeletion(42));
-    assert.isTrue(
-      env.queries.some((q) =>
-        q.sql.includes(`DELETE FROM ${PENDING_DELETIONS_TABLE}`),
+    assert.isTrue(pendingDeletionStore.isConversationPendingDeletion(42));
+    assert.isOk(
+      await pendingDeletionStore.undo(
+        pendingDeletionStore.getLatestPending()!.id,
       ),
-    );
-    assert.lengthOf(
-      env.timers.filter((t) => !t.cleared),
-      0,
-    );
-    assert.isTrue(
-      await pendingDeletionStore.restoreConversationDeletionsFor(42),
-      "no matching entries counts as restored",
+      "only the explicit Undo action may withdraw the intent",
     );
   });
 
@@ -607,7 +721,7 @@ describe("pendingDeletionStore hardening", function () {
     );
   });
 
-  it("gave-up withdraws the row strictly; a failed withdraw keeps the entry hidden and retries", async function () {
+  it("never gives up when the write-ahead row cannot be withdrawn", async function () {
     const env = installFakeEnv();
     const events: string[] = [];
     configurePendingDeletionFinalizers({
@@ -618,7 +732,7 @@ describe("pendingDeletionStore hardening", function () {
       conversationInput(42),
     );
     assert.isOk(entry);
-    let deleteFails = true;
+    const deleteFails = true;
     (globalScope.Zotero as { DB: { queryAsync: unknown } }).DB.queryAsync =
       async (sql: string) => {
         env.queries.push({ sql });
@@ -627,8 +741,9 @@ describe("pendingDeletionStore hardening", function () {
         return [];
       };
     const stop = pendingDeletionStore.subscribe((e) => events.push(e.type));
-    for (let round = 0; round < MAX_FINALIZE_ATTEMPTS; round++) {
+    for (let round = 0; round < 3; round++) {
       env.fireLastTimer();
+      await new Promise((resolve) => setTimeout(resolve, 0));
       await pendingDeletionStore.finalize("flush-barrier", "noop");
     }
     assert.notInclude(
@@ -645,16 +760,9 @@ describe("pendingDeletionStore hardening", function () {
       1,
       "a retry timer must stay armed so the entry cannot strand",
     );
-    deleteFails = false;
-    env.fireLastTimer();
-    await pendingDeletionStore.finalize("flush-barrier", "noop");
     stop();
-    assert.include(
-      events,
-      "gave-up",
-      "give-up completes once the row is withdrawn",
-    );
-    assert.isFalse(pendingDeletionStore.isConversationPendingDeletion(42));
+    assert.notInclude(events, "gave-up");
+    assert.isTrue(pendingDeletionStore.isConversationPendingDeletion(42));
   });
 
   it("role-aware turn hiding does not hide the other role on a timestamp collision", async function () {
@@ -719,17 +827,17 @@ describe("pendingDeletionStore identity witness and undo integrity", function ()
     return env;
   }
 
-  it("refuses to queue a conversation deletion with no catalog identity witness", async function () {
+  it("persists an unverifiable deletion for later identity quarantine", async function () {
     const env = installEnv();
     const queued = await pendingDeletionStore.queueConversationDeletion(
       conversationInput(42, { catalogCreatedAt: 0 }),
     );
-    assert.isNull(queued, "an unverifiable delete intent must not be queued");
-    assert.isFalse(pendingDeletionStore.isConversationPendingDeletion(42));
-    assert.isEmpty(
-      env.queries.filter((q) => q.sql.includes("INSERT INTO")),
-      "nothing may be written ahead for an unverifiable intent",
-    );
+    assert.isOk(queued, "the user decision must be durable before hiding");
+    assert.isTrue(pendingDeletionStore.isConversationPendingDeletion(42));
+    const insert = env.queries.find((q) => q.sql.includes("INSERT INTO"));
+    assert.isOk(insert, "the write-ahead intent must be persisted");
+    const payload = JSON.parse(String(insert!.params?.[5] ?? "{}"));
+    assert.equal(payload.catalogCreatedAt, 0);
   });
 
   it("round-trips the identity witness through the persisted payload", async function () {
@@ -818,7 +926,7 @@ describe("pendingDeletionStore identity witness and undo integrity", function ()
         if (sql.includes("DELETE FROM")) throw new Error("disk error");
         return [];
       };
-    for (let i = 0; i < MAX_FINALIZE_ATTEMPTS + 2; i++) {
+    for (let i = 0; i < 3; i++) {
       await pendingDeletionStore.finalize(entry!.id, "retry");
     }
     assert.notInclude(
@@ -859,8 +967,7 @@ describe("pendingDeletionStore identity witness and undo integrity", function ()
     assert.isOk(env.queries.length);
   });
 
-  it("still supersedes an older pending deletion of the same kind", async function () {
-    // The single-slot-per-kind policy is deliberate and must be preserved.
+  it("retains an older pending deletion when another same-kind intent is queued", async function () {
     let conversationFinalized = 0;
     installEnv({
       finalizeConversation: async () => {
@@ -870,12 +977,8 @@ describe("pendingDeletionStore identity witness and undo integrity", function ()
     });
     await pendingDeletionStore.queueConversationDeletion(conversationInput(42));
     await pendingDeletionStore.queueConversationDeletion(conversationInput(43));
-    assert.equal(
-      conversationFinalized,
-      1,
-      "a second conversation deletion commits the first",
-    );
-    assert.isFalse(pendingDeletionStore.isConversationPendingDeletion(42));
+    assert.equal(conversationFinalized, 0);
+    assert.isTrue(pendingDeletionStore.isConversationPendingDeletion(42));
     assert.isTrue(pendingDeletionStore.isConversationPendingDeletion(43));
   });
 
@@ -928,7 +1031,7 @@ describe("pendingDeletionStore identity witness and undo integrity", function ()
     env.advance(DELETION_UNDO_WINDOW_MS + 1);
     await pendingDeletionStore.finalize(entry!.id, "timeout");
     assert.equal(attempts, 1, "the scheduled attempt runs");
-    for (let i = 0; i < MAX_FINALIZE_ATTEMPTS + 3; i++) {
+    for (let i = 0; i < 8; i++) {
       await pendingDeletionStore.sweepExpired("panel-init");
     }
     assert.equal(
@@ -987,6 +1090,7 @@ describe("pendingDeletionStore key-scoped ops do not inherit unrelated latency",
     );
     // Start the slow finalize but do NOT await it: it now occupies the chain.
     const slow = pendingDeletionStore.finalize(entry!.id, "timeout");
+    await new Promise((resolve) => setTimeout(resolve, 0));
     let slowDone = false;
     void slow.then(() => {
       slowDone = true;
@@ -1004,10 +1108,7 @@ describe("pendingDeletionStore key-scoped ops do not inherit unrelated latency",
     assert.isOk(env.queries.length);
   });
 
-  it("restoreConversationDeletionsFor still withdraws an intent that is queued but not yet recorded", async function () {
-    // The race guard: a queue op requested but still waiting on the chain is
-    // not visible in memory, so a naive short-circuit would answer "nothing to
-    // withdraw" and the user would type into a chat deleted 6s later.
+  it("restoreConversationDeletionsFor cannot cancel an intent queued but not yet recorded", async function () {
     installFakeEnv();
     configurePendingDeletionFinalizers({
       finalizeConversation: async () => true,
@@ -1020,10 +1121,10 @@ describe("pendingDeletionStore key-scoped ops do not inherit unrelated latency",
     const restored =
       await pendingDeletionStore.restoreConversationDeletionsFor(42);
     await queuePromise;
-    assert.isTrue(restored, "the withdraw must report success");
-    assert.isFalse(
+    assert.isFalse(restored, "only explicit Undo may withdraw an intent");
+    assert.isTrue(
       pendingDeletionStore.isConversationPendingDeletion(42),
-      "the racing deletion intent must have been withdrawn, not missed",
+      "the racing deletion intent must remain durable",
     );
   });
 
@@ -1044,6 +1145,7 @@ describe("pendingDeletionStore key-scoped ops do not inherit unrelated latency",
     );
     // Occupy the shared chain with an unrelated slow finalize.
     const slow = pendingDeletionStore.finalize(entry!.id, "timeout");
+    await new Promise((resolve) => setTimeout(resolve, 0));
     let slowDone = false;
     void slow.then(() => {
       slowDone = true;
@@ -1060,7 +1162,7 @@ describe("pendingDeletionStore key-scoped ops do not inherit unrelated latency",
     await slow;
   });
 
-  it("restores a pending conversation without waiting for an unrelated finalizer", async function () {
+  it("does not cancel a pending conversation while an unrelated finalizer runs", async function () {
     installFakeEnv();
     let releaseSlowFinalize: (() => void) | undefined;
     let markSlowFinalizeStarted: (() => void) | undefined;
@@ -1090,16 +1192,17 @@ describe("pendingDeletionStore key-scoped ops do not inherit unrelated latency",
     const slow = pendingDeletionStore.finalize(turn!.id, "timeout");
     await slowFinalizeStarted;
 
-    assert.isTrue(
+    assert.isFalse(
       await pendingDeletionStore.restoreConversationDeletionsFor(2),
-      "the current chat must restore without joining the unrelated finalizer",
+      "user activity is not an implicit Undo",
     );
-    assert.isFalse(pendingDeletionStore.isConversationPendingDeletion(2));
+    assert.isTrue(pendingDeletionStore.isConversationPendingDeletion(2));
+    assert.isOk(conversation);
+    assert.isOk(await pendingDeletionStore.undo(conversation!.id));
 
     releaseSlowFinalize?.();
     await slow;
     assert.isFalse(pendingDeletionStore.isConversationPendingDeletion(1));
-    assert.isOk(conversation);
   });
 
   it("fails restore when finalization is already destroying the same conversation", async function () {

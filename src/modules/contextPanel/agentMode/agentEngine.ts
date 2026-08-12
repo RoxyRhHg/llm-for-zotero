@@ -641,6 +641,7 @@ async function finalizeAgentTurnOutcome(ctx: {
             ? String(baseItem?.getField?.("title") || "").trim() || undefined
             : undefined,
       }),
+      runtimeRequest.conversationGeneration,
     ).catch(() => null);
   }
   if (!uiRelease.isReleased()) {
@@ -927,6 +928,7 @@ type EffectiveRequestConfigShape = {
 
 type BuildAgentRuntimeRequestParamsShape = {
   conversationKey: number;
+  conversationGeneration?: number;
   item: Zotero.Item;
   userText: string;
   selectedTextContexts?: SelectedTextContext[];
@@ -971,6 +973,8 @@ type ReconstructedRetryPayload = {
 // ---------------------------------------------------------------------------
 
 export type AgentEngineDeps = {
+  /** Captured before the turn starts; Clear bumps this generation. */
+  conversationGeneration?: number;
   // Chat history (mutable Map reference; push() on the retrieved array mutates state)
   chatHistory: Map<number, Message[]>;
 
@@ -983,10 +987,15 @@ export type AgentEngineDeps = {
   setCurrentAbortController: (
     conversationKey: number,
     ctrl: AbortController | null,
+    expectedRequestId?: number,
   ) => void;
   getAbortControllerCtor: () => new () => AbortController;
   nextRequestId: () => number;
-  setPendingRequestId: (conversationKey: number, id: number) => void;
+  setPendingRequestId: (
+    conversationKey: number,
+    id: number,
+    expectedCurrentId?: number,
+  ) => void;
 
   // UI helpers
   getPanelRequestUI: (body: Element) => PanelRequestUIShape;
@@ -1186,13 +1195,21 @@ function createRequestUiReleaseController(params: {
   const releaseReady = () => {
     if (released) return;
     released = true;
-    params.deps.setPendingRequestId(params.conversationKey, 0);
+    params.deps.setCurrentAbortController(
+      params.conversationKey,
+      null,
+      params.requestId,
+    );
+    params.deps.setPendingRequestId(
+      params.conversationKey,
+      0,
+      params.requestId,
+    );
     params.deps.restoreRequestUIIdle(
       params.body,
       params.conversationKey,
       params.requestId,
     );
-    params.deps.setCurrentAbortController(params.conversationKey, null);
     params.setStatusSafely("Ready", "ready");
     params.scheduleQueueDrain();
   };
@@ -1573,6 +1590,7 @@ export async function sendAgentTurn(
   }
   const runtimeRequest = await deps.buildAgentRuntimeRequest({
     conversationKey,
+    conversationGeneration: deps.conversationGeneration,
     item,
     userText: question,
     selectedTextContexts: selectedTextContextsForMessage,
@@ -1761,9 +1779,9 @@ export async function sendAgentTurn(
     });
   } finally {
     if (!uiRelease.isReleased()) {
-      deps.setPendingRequestId(conversationKey, 0);
+      deps.setPendingRequestId(conversationKey, 0, thisRequestId);
       deps.restoreRequestUIIdle(body, conversationKey, thisRequestId);
-      deps.setCurrentAbortController(conversationKey, null);
+      deps.setCurrentAbortController(conversationKey, null, thisRequestId);
       scheduleQueueDrain();
     }
   }
@@ -1987,7 +2005,7 @@ export async function retryAgentTurn(
     restoreRetryUserSnapshot(retryPair.userMessage, userSnapshot);
     refreshChatSafely();
     setStatusSafely("Nothing to retry for latest turn", "error");
-    deps.setPendingRequestId(conversationKey, 0);
+    deps.setPendingRequestId(conversationKey, 0, thisRequestId);
     deps.restoreRequestUIIdle(body, conversationKey, thisRequestId);
     return;
   }
@@ -2051,6 +2069,7 @@ export async function retryAgentTurn(
 
   const runtimeRequest = await deps.buildAgentRuntimeRequest({
     conversationKey,
+    conversationGeneration: deps.conversationGeneration,
     item,
     userText: question,
     selectedTextContexts: selectedTextContextsRaw,
@@ -2192,9 +2211,9 @@ export async function retryAgentTurn(
     });
   } finally {
     if (!uiRelease.isReleased()) {
-      deps.setPendingRequestId(conversationKey, 0);
+      deps.setPendingRequestId(conversationKey, 0, thisRequestId);
       deps.restoreRequestUIIdle(body, conversationKey, thisRequestId);
-      deps.setCurrentAbortController(conversationKey, null);
+      deps.setCurrentAbortController(conversationKey, null, thisRequestId);
       scheduleQueueDrain();
     }
   }

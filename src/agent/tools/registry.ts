@@ -155,35 +155,55 @@ export class AgentToolRegistry {
     }
 
     const runWithInput = async (resolvedInput: typeof validation.value) => {
-      try {
-        const executionOutput = normalizeExecutionOutput(
-          await tool.execute(resolvedInput, context),
-        );
-        return {
-          tool,
-          input: resolvedInput,
-          result: {
-            callId: call.id,
-            name: call.name,
-            ok: true,
-            content: executionOutput.content,
-            artifacts: executionOutput.artifacts,
-          },
-        };
-      } catch (error) {
-        return {
-          tool,
-          input: resolvedInput,
-          result: {
-            callId: call.id,
-            name: call.name,
-            ok: false,
-            content: {
-              error: error instanceof Error ? error.message : String(error),
+      const execute = async () => {
+        if (options.isExecutionAllowed && !options.isExecutionAllowed()) {
+          return {
+            tool,
+            input: resolvedInput,
+            result: {
+              callId: call.id,
+              name: call.name,
+              ok: false,
+              content: {
+                error:
+                  "Conversation lifecycle changed before this tool could execute.",
+              },
             },
-          },
-        };
-      }
+          };
+        }
+        try {
+          const executionOutput = normalizeExecutionOutput(
+            await tool.execute(resolvedInput, context),
+          );
+          return {
+            tool,
+            input: resolvedInput,
+            result: {
+              callId: call.id,
+              name: call.name,
+              ok: true,
+              content: executionOutput.content,
+              artifacts: executionOutput.artifacts,
+            },
+          };
+        } catch (error) {
+          return {
+            tool,
+            input: resolvedInput,
+            result: {
+              callId: call.id,
+              name: call.name,
+              ok: false,
+              content: {
+                error: error instanceof Error ? error.message : String(error),
+              },
+            },
+          };
+        }
+      };
+      return options.executeWithLock
+        ? options.executeWithLock(execute)
+        : execute();
     };
 
     const runConfirmedExecution = async (resolutionData?: unknown) => {

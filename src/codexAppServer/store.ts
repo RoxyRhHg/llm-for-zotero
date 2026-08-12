@@ -39,6 +39,7 @@ import {
   CODEX_HISTORY_LIMIT,
   buildDefaultCodexGlobalConversationKey,
   buildDefaultCodexPaperConversationKey,
+  getCodexProfileSignature,
   getCodexAllocatedConversationKeyRange,
   getCodexGlobalConversationKeyRange,
   getCodexPaperConversationKeyRange,
@@ -60,9 +61,12 @@ import {
   getConversationScopeValidationDetails,
   getPaperContextOwnershipEvidenceFromRows,
   getRegisteredConversationScope,
+  generateConversationInstanceID,
   initConversationRegistryStore,
+  deleteRegisteredConversationScopeInTransaction,
   registerConversationScope,
   repairRegisteredConversationScope,
+  syncCatalogInstanceID,
   type ConversationRegistryRow,
   type PaperContextJsonColumns,
 } from "../shared/conversationRegistry";
@@ -72,12 +76,54 @@ import {
 } from "../shared/conversationMessageIdentityRepair";
 import {
   deleteConversationSearchIndexRow,
+  deleteConversationSearchIndexRowInTransaction,
+  initConversationSearchIndexStore,
   refreshConversationSearchIndexForConversation,
 } from "../shared/conversationSearchIndex";
 import {
+  CONVERSATION_INSTANCE_ID_MIGRATION_IDS,
   CONVERSATION_ID_TRANSITION_MIGRATION_ID,
+  CONVERSATION_KEY_LEDGER_MIGRATION_ID,
   hasConversationSchemaMigration,
+  rekeyConversationOwnedRowsInTransaction,
+  runConversationSchemaMigrationOnce,
 } from "../shared/conversationSchemaMigrations";
+import {
+  allocateConversationKeyInTransaction,
+  assertConversationKeyLiveInTransaction,
+  ConversationRetiredError,
+  ensureConversationKeyLedgerEntry,
+  ensureConversationKeyLedgerEntryInTransaction,
+  getConversationKeyLedgerEntry,
+  initializeConversationKeyCounterInTransaction,
+  initConversationKeyLedgerStore,
+  isConversationKeyLedgerStoreInitialized,
+  installConversationKeyLedgerCatalogTriggers,
+  installConversationKeyLedgerMessageTriggers,
+  retireConversationKeyInTransaction,
+  seedConversationKeyLedgerFromCatalogs,
+  reserveOrphanConversationMessageKeys,
+  seedConversationKeyLedgerFromTombstones,
+  retireOrphanedConversationLedgerEntries,
+  rememberConversationKeyRetired,
+  updateConversationKeyLedgerConversationIDInTransaction,
+} from "../shared/conversationKeyLedger";
+import { pendingDeletionStore } from "../core/conversations/pendingDeletionStore";
+import {
+  initRecentlyDeletedConversationTombstones,
+  persistConversationInstanceTombstoneInTransaction,
+} from "../core/conversations/recentlyDeletedConversations";
+import {
+  deleteConversationForkLinksForInstanceInTransaction,
+  initConversationForkLinksStore,
+} from "../shared/conversationForkLinks";
+import {
+  areConversationWritesFrozen,
+  isConversationWriteGenerationCurrent,
+  withConversationWriteLock,
+} from "../shared/conversationWriteFence";
+import { clearPersistedAgentConversationRowsInTransaction } from "../modules/contextPanel/agentConversationCleanup";
+import { clearOwnerAttachmentRefsInTransaction } from "../utils/attachmentRefStore";
 
 const CODEX_MESSAGES_TABLE = "llm_for_zotero_codex_messages";
 const CODEX_MESSAGES_INDEX = "llm_for_zotero_codex_messages_conversation_idx";
@@ -212,6 +258,84 @@ async function resolveRegisteredConversationID(
   return registered?.conversationID || null;
 }
 
+async function resolveRegisteredConversationInstanceID(
+  conversationKey: number,
+): Promise<string | null> {
+  const registered = await getRegisteredConversationScope(conversationKey);
+  if (registered?.instanceID) return registered.instanceID;
+  const ledger = await getConversationKeyLedgerEntry(conversationKey);
+  return ledger?.instanceID || null;
+}
+
+async function assertCodexForkSourceLive(params: {
+  conversationKey: number;
+  instanceID?: string;
+  conversationID?: string;
+}): Promise<void> {
+  const key = normalizeConversationKey(params.conversationKey);
+  if (!key) throw new ConversationRetiredError(0, params.instanceID || "");
+  const ledger = await getConversationKeyLedgerEntry(key);
+  if (!ledger && !params.instanceID) return;
+  const instanceID = params.instanceID?.trim() || ledger?.instanceID || "";
+  if (!ledger || ledger.retiredAt || ledger.instanceID !== instanceID) {
+    throw new ConversationRetiredError(key, instanceID);
+  }
+  const rows = (await Zotero.DB.queryAsync(
+    `SELECT conversation_id AS conversationID
+     FROM ${CODEX_CONVERSATIONS_TABLE}
+     WHERE conversation_key = ?
+       AND conversation_instance_id = ?
+       AND (? = '' OR conversation_id = ?)
+     LIMIT 1`,
+    [
+      key,
+      instanceID,
+      params.conversationID?.trim() || "",
+      params.conversationID?.trim() || "",
+    ],
+  )) as Array<{ conversationID?: unknown }> | undefined;
+  if (!rows?.length) throw new ConversationRetiredError(key, instanceID);
+}
+
+async function resolveCodexAppendIdentity(
+  conversationKey: number,
+  requestedInstanceID?: string,
+): Promise<{
+  instanceID: string | null;
+  conversationID: string | null;
+  ledgerAvailable: boolean;
+}> {
+  const registered = await getRegisteredConversationScope(conversationKey);
+  let ledger;
+  const ledgerAvailable = isConversationKeyLedgerStoreInitialized();
+  if (ledgerAvailable) {
+    ledger = await getConversationKeyLedgerEntry(conversationKey);
+  }
+  if (ledgerAvailable) {
+    if (!ledger || ledger.retiredAt) {
+      throw new ConversationRetiredError(
+        conversationKey,
+        requestedInstanceID || registered?.instanceID || "",
+      );
+    }
+    if (requestedInstanceID && requestedInstanceID !== ledger.instanceID) {
+      throw new Error(
+        `Conversation ${conversationKey} instance identity mismatch`,
+      );
+    }
+  }
+  return {
+    instanceID:
+      ledger?.instanceID ||
+      requestedInstanceID ||
+      registered?.instanceID ||
+      null,
+    conversationID:
+      ledger?.conversationID || registered?.conversationID || null,
+    ledgerAvailable,
+  };
+}
+
 type MessageConversationSelector = {
   whereSql: string;
   params: unknown[];
@@ -231,8 +355,8 @@ async function resolveMessageConversationSelector(
         registered,
       }
     : {
-        whereSql: "conversation_key = ?",
-        params: [conversationKey],
+        whereSql: "1 = 0",
+        params: [],
         registered,
       };
 }
@@ -289,6 +413,11 @@ async function touchCodexConversationActivity(
 ): Promise<void> {
   const normalizedKey = normalizeConversationKey(conversationKey);
   if (!normalizedKey || !isCodexStoreConversationKey(normalizedKey)) return;
+  if (pendingDeletionStore.isConversationPendingDeletion(normalizedKey)) {
+    throw new Error(
+      `Conversation ${normalizedKey} is frozen by a pending deletion`,
+    );
+  }
   const normalizedTimestamp = normalizeCatalogTimestamp(timestamp);
   await Zotero.DB.queryAsync(
     `UPDATE ${CODEX_CONVERSATIONS_TABLE}
@@ -330,7 +459,17 @@ function remapLegacyConversationKey(
   return buildDefaultCodexGlobalConversationKey(normalizedLibraryID);
 }
 
-async function migrateLegacyCodexConversationKeys(): Promise<void> {
+type CodexConversationKeyRemap = {
+  legacyKey: number;
+  targetKey: number;
+  /** A retired key may contain an older owner's rows; never adopt them. */
+  preserveLegacyRows?: boolean;
+};
+
+async function migrateLegacyCodexConversationKeys(): Promise<
+  CodexConversationKeyRemap[]
+> {
+  const remaps: CodexConversationKeyRemap[] = [];
   const rows = (await Zotero.DB.queryAsync(
     `SELECT conversation_key AS conversationKey,
             library_id AS libraryID,
@@ -348,7 +487,7 @@ async function migrateLegacyCodexConversationKeys(): Promise<void> {
         updatedAt?: unknown;
       }>
     | undefined;
-  if (!rows?.length) return;
+  if (!rows?.length) return remaps;
 
   const claimedKeys = new Set<number>(
     rows
@@ -373,6 +512,10 @@ async function migrateLegacyCodexConversationKeys(): Promise<void> {
   const latestModeByLibrary = new Set<number>();
   const latestGlobalByLibrary = new Set<number>();
   const latestPaperByState = new Set<string>();
+  const isUnavailable = async (key: number): Promise<boolean> =>
+    Boolean(await getConversationKeyLedgerEntry(key));
+  const isRetired = async (key: number): Promise<boolean> =>
+    Boolean((await getConversationKeyLedgerEntry(key))?.retiredAt);
   for (const row of rows) {
     const kind =
       row.kind === "paper" ? "paper" : row.kind === "global" ? "global" : null;
@@ -383,6 +526,15 @@ async function migrateLegacyCodexConversationKeys(): Promise<void> {
     const paperItemID = normalizePaperItemID(Number(row.paperItemID));
     if (!kind || !legacyConversationKey || !libraryID) continue;
 
+    // A tombstone/retired ledger witness means this numeric key belonged to a
+    // prior immutable instance. If an old catalog row was later reused before
+    // the permanent-key migration ran, its key-only messages and agent rows
+    // are ambiguous and must remain quarantined rather than being moved into
+    // the replacement catalog below.
+    const legacyKeyWasRetired = Boolean(
+      (await getConversationKeyLedgerEntry(legacyConversationKey))?.retiredAt,
+    );
+
     let targetConversationKey = remapLegacyConversationKey(
       legacyConversationKey,
       kind,
@@ -390,7 +542,14 @@ async function migrateLegacyCodexConversationKeys(): Promise<void> {
       paperItemID || undefined,
     );
     if (!targetConversationKey) continue;
+    if (await isRetired(targetConversationKey)) {
+      targetConversationKey = null;
+    }
+    if (targetConversationKey === null) {
+      // Fall through to the monotonic fallback below.
+    }
     if (
+      targetConversationKey !== null &&
       claimedKeys.has(targetConversationKey) &&
       targetConversationKey !== legacyConversationKey
     ) {
@@ -403,29 +562,37 @@ async function migrateLegacyCodexConversationKeys(): Promise<void> {
           : getLastAllocatedCodexGlobalConversationKey()) || 0) + 1,
         (await getMaxCodexConversationKey(kind)) + 1,
       );
+      while (await isUnavailable(targetConversationKey))
+        targetConversationKey += 1;
     }
 
     claimedKeys.add(targetConversationKey);
     if (targetConversationKey !== legacyConversationKey) {
       await Zotero.DB.queryAsync(
         `UPDATE ${CODEX_CONVERSATIONS_TABLE}
-         SET conversation_key = ?,
-             provider_session_id = NULL,
-             provider_session_path_state = NULL,
-             scoped_conversation_key = NULL,
-             scope_type = NULL,
-             scope_id = NULL,
-             scope_label = NULL,
-             cwd = NULL
-         WHERE conversation_key = ?`,
-        [targetConversationKey, legacyConversationKey],
+           SET conversation_key = ?,
+               scoped_conversation_key = REPLACE(scoped_conversation_key, ?, ?)
+           WHERE conversation_key = ?`,
+        [
+          targetConversationKey,
+          String(legacyConversationKey),
+          String(targetConversationKey),
+          legacyConversationKey,
+        ],
       );
-      await Zotero.DB.queryAsync(
-        `UPDATE ${CODEX_MESSAGES_TABLE}
-         SET conversation_key = ?
-         WHERE conversation_key = ?`,
-        [targetConversationKey, legacyConversationKey],
-      );
+      if (!legacyKeyWasRetired) {
+        await Zotero.DB.queryAsync(
+          `UPDATE ${CODEX_MESSAGES_TABLE}
+           SET conversation_key = ?
+           WHERE conversation_key = ?`,
+          [targetConversationKey, legacyConversationKey],
+        );
+      }
+      remaps.push({
+        legacyKey: legacyConversationKey,
+        targetKey: targetConversationKey,
+        preserveLegacyRows: legacyKeyWasRetired,
+      });
     }
 
     if (!latestModeByLibrary.has(libraryID)) {
@@ -454,6 +621,7 @@ async function migrateLegacyCodexConversationKeys(): Promise<void> {
     }
     setLastAllocatedCodexGlobalConversationKey(targetConversationKey);
   }
+  return remaps;
 }
 
 const CONVERSATION_TRANSFER_COLUMNS = [
@@ -586,6 +754,7 @@ async function ensureCodexConversationCatalogColumns(
 ): Promise<void> {
   const requiredColumns: Array<[string, string]> = [
     ["conversation_id", "conversation_id TEXT"],
+    ["conversation_instance_id", "conversation_instance_id TEXT"],
     ["library_id", "library_id INTEGER"],
     ["kind", "kind TEXT"],
     ["paper_item_id", "paper_item_id INTEGER"],
@@ -946,7 +1115,51 @@ async function backfillCodexConversationIDs(): Promise<void> {
   }
 }
 
-export async function repairCodexConversationIdentityRegistry(): Promise<void> {
+async function backfillCodexConversationInstanceIDs(): Promise<void> {
+  await Zotero.DB.queryAsync(
+    `UPDATE ${CODEX_CONVERSATIONS_TABLE}
+     SET conversation_instance_id = (
+       SELECT r.instance_id
+       FROM llm_for_zotero_conversation_registry r
+       WHERE r.conversation_id = ${CODEX_CONVERSATIONS_TABLE}.conversation_id
+         AND r.instance_id IS NOT NULL
+         AND TRIM(r.instance_id) <> ''
+       LIMIT 1
+     )
+     WHERE (conversation_instance_id IS NULL OR TRIM(conversation_instance_id) = '')
+       AND conversation_id IS NOT NULL
+       AND EXISTS (
+         SELECT 1
+         FROM llm_for_zotero_conversation_registry r
+         WHERE r.conversation_id = ${CODEX_CONVERSATIONS_TABLE}.conversation_id
+           AND r.instance_id IS NOT NULL
+           AND TRIM(r.instance_id) <> ''
+       )`,
+  );
+  const rows = (await Zotero.DB.queryAsync(
+    `SELECT conversation_key AS conversationKey
+     FROM ${CODEX_CONVERSATIONS_TABLE}
+     WHERE conversation_instance_id IS NULL
+        OR TRIM(conversation_instance_id) = ''`,
+  )) as Array<{ conversationKey?: unknown }> | undefined;
+  for (const row of rows || []) {
+    const conversationKey = normalizeConversationKey(
+      Number(row.conversationKey),
+    );
+    if (!conversationKey) continue;
+    await Zotero.DB.queryAsync(
+      `UPDATE ${CODEX_CONVERSATIONS_TABLE}
+       SET conversation_instance_id = ?
+       WHERE conversation_key = ?
+         AND (conversation_instance_id IS NULL OR TRIM(conversation_instance_id) = '')`,
+      [generateConversationInstanceID(), conversationKey],
+    );
+  }
+}
+
+export async function repairCodexConversationIdentityRegistry(
+  options: { inTransaction?: boolean } = {},
+): Promise<void> {
   const rows = (await Zotero.DB.queryAsync(
     `SELECT c.conversation_id AS conversationID,
             c.conversation_key AS conversationKey,
@@ -988,17 +1201,20 @@ export async function repairCodexConversationIdentityRegistry(): Promise<void> {
           paperItemID: summary.paperItemID,
         })
       ) {
-        await repairRegisteredConversationScope({
-          conversationID: summary.conversationID,
-          conversationKey: summary.conversationKey,
-          system: "codex",
-          kind: "paper",
-          libraryID: summary.libraryID,
-          paperItemID: summary.paperItemID,
-          createdAt: summary.createdAt,
-          updatedAt: summary.updatedAt,
-          title: summary.title,
-        });
+        await repairRegisteredConversationScope(
+          {
+            conversationID: summary.conversationID,
+            conversationKey: summary.conversationKey,
+            system: "codex",
+            kind: "paper",
+            libraryID: summary.libraryID,
+            paperItemID: summary.paperItemID,
+            createdAt: summary.createdAt,
+            updatedAt: summary.updatedAt,
+            title: summary.title,
+          },
+          options,
+        );
         logCodexScopeWarning(
           `Migrated Codex conversation ${summary.conversationKey} from legacy ${AMBIGUOUS_PAPER_CONTEXT_INVALID_REASON} invalidation to primary paper ${summary.paperItemID}.`,
         );
@@ -1038,33 +1254,39 @@ export async function repairCodexConversationIdentityRegistry(): Promise<void> {
           inferredPaperItemID,
           summary.conversationKey,
         );
-        await repairRegisteredConversationScope({
-          conversationKey: summary.conversationKey,
-          system: "codex",
-          kind: "paper",
-          libraryID: summary.libraryID,
-          paperItemID: inferredPaperItemID,
-          createdAt: summary.createdAt,
-          updatedAt: summary.updatedAt,
-          title: summary.title,
-        });
+        await repairRegisteredConversationScope(
+          {
+            conversationKey: summary.conversationKey,
+            system: "codex",
+            kind: "paper",
+            libraryID: summary.libraryID,
+            paperItemID: inferredPaperItemID,
+            createdAt: summary.createdAt,
+            updatedAt: summary.updatedAt,
+            title: summary.title,
+          },
+          options,
+        );
         logCodexScopeWarning(
           `Repaired Codex conversation ${summary.conversationKey} to paper ${inferredPaperItemID} based on stored paper contexts.`,
         );
         continue;
       }
     }
-    await registerConversationScope({
-      conversationID: summary.conversationID,
-      conversationKey: summary.conversationKey,
-      system: "codex",
-      kind: summary.kind,
-      libraryID: summary.libraryID,
-      paperItemID: summary.paperItemID,
-      createdAt: summary.createdAt,
-      updatedAt: summary.updatedAt,
-      title: summary.title,
-    });
+    await registerConversationScope(
+      {
+        conversationID: summary.conversationID,
+        conversationKey: summary.conversationKey,
+        system: "codex",
+        kind: summary.kind,
+        libraryID: summary.libraryID,
+        paperItemID: summary.paperItemID,
+        createdAt: summary.createdAt,
+        updatedAt: summary.updatedAt,
+        title: summary.title,
+      },
+      options,
+    );
   }
 }
 
@@ -1079,6 +1301,7 @@ export async function initCodexAppServerStore(): Promise<void> {
       `CREATE TABLE IF NOT EXISTS ${CODEX_MESSAGES_TABLE} (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         conversation_id TEXT,
+        conversation_instance_id TEXT,
         conversation_key INTEGER NOT NULL,
         role TEXT NOT NULL CHECK(role IN ('user', 'assistant')),
         text TEXT NOT NULL,
@@ -1121,6 +1344,12 @@ export async function initCodexAppServerStore(): Promise<void> {
       columns,
       "conversation_id",
       "conversation_id TEXT",
+    );
+    await ensureColumn(
+      CODEX_MESSAGES_TABLE,
+      columns,
+      "conversation_instance_id",
+      "conversation_instance_id TEXT",
     );
     await ensureColumn(
       CODEX_MESSAGES_TABLE,
@@ -1214,6 +1443,7 @@ export async function initCodexAppServerStore(): Promise<void> {
     await Zotero.DB.queryAsync(
       `CREATE TABLE IF NOT EXISTS ${CODEX_CONVERSATIONS_TABLE} (
         conversation_id TEXT,
+        conversation_instance_id TEXT,
         conversation_key INTEGER PRIMARY KEY,
         library_id INTEGER NOT NULL,
         kind TEXT NOT NULL CHECK(kind IN ('global', 'paper')),
@@ -1239,6 +1469,7 @@ export async function initCodexAppServerStore(): Promise<void> {
       `PRAGMA table_info(${CODEX_CONVERSATIONS_TABLE})`,
     )) as Array<{ name?: unknown }> | undefined;
     await ensureCodexConversationCatalogColumns(conversationColumns);
+    let migratedKeyRemaps: CodexConversationKeyRemap[] = [];
     if (!conversationIDTransitionAlreadyApplied) {
       await backfillCodexConversationTimestamps();
     }
@@ -1255,12 +1486,174 @@ export async function initCodexAppServerStore(): Promise<void> {
        ON ${CODEX_CONVERSATIONS_TABLE} (conversation_id)`,
     );
     if (!conversationIDTransitionAlreadyApplied) {
+      await initConversationKeyLedgerStore();
+      await initRecentlyDeletedConversationTombstones();
+      await seedConversationKeyLedgerFromTombstones();
+      await reserveOrphanConversationMessageKeys({
+        messageTable: CODEX_MESSAGES_TABLE,
+        catalogTables: [CODEX_CONVERSATIONS_TABLE],
+        system: "codex",
+        sourceTables: [
+          { table: "llm_for_zotero_agent_memory" },
+          { table: "llm_for_zotero_agent_transcript" },
+          { table: "llm_for_zotero_agent_tool_result_handles" },
+          { table: "llm_for_zotero_agent_evidence" },
+          { table: "llm_for_zotero_agent_runs" },
+          {
+            table: "llm_for_zotero_agent_coverage",
+            column: "origin_conversation_key",
+          },
+          {
+            table: "llm_for_zotero_attachment_refs",
+            column: "owner_id",
+            whereSql: "s.owner_type = 'conversation'",
+          },
+        ],
+      });
       await repairMisroutedCodexConversationRows();
-      await migrateLegacyCodexConversationKeys();
+      migratedKeyRemaps = await migrateLegacyCodexConversationKeys();
       await backfillCodexConversationIDs();
-      await repairCodexConversationIdentityRegistry();
+      await repairCodexConversationIdentityRegistry({ inTransaction: true });
       await refreshCodexConversationCatalogSummary();
     }
+    await runConversationSchemaMigrationOnce(
+      CONVERSATION_INSTANCE_ID_MIGRATION_IDS.codex,
+      "Backfill immutable conversation instance identities for Codex catalogs and registry rows.",
+      async () => {
+        await backfillCodexConversationIDs();
+        await backfillCodexConversationInstanceIDs();
+        await repairCodexConversationIdentityRegistry({ inTransaction: true });
+      },
+    );
+    await initConversationKeyLedgerStore();
+    await initRecentlyDeletedConversationTombstones();
+    await runConversationSchemaMigrationOnce(
+      CONVERSATION_KEY_LEDGER_MIGRATION_ID,
+      "Reserve every existing Codex conversation key permanently and initialize the monotonic allocator.",
+      async () => {
+        await seedConversationKeyLedgerFromCatalogs([
+          {
+            table: CODEX_CONVERSATIONS_TABLE,
+            system: "codex",
+            kind: "global",
+            kindColumn: true,
+          },
+          {
+            table: CODEX_CONVERSATIONS_TABLE,
+            system: "codex",
+            kind: "paper",
+            kindColumn: true,
+          },
+        ]);
+      },
+    );
+    await seedConversationKeyLedgerFromCatalogs([
+      {
+        table: CODEX_CONVERSATIONS_TABLE,
+        system: "codex",
+        kind: "global",
+        kindColumn: true,
+      },
+      {
+        table: CODEX_CONVERSATIONS_TABLE,
+        system: "codex",
+        kind: "paper",
+        kindColumn: true,
+      },
+    ]);
+    for (const remap of migratedKeyRemaps) {
+      if (remap.preserveLegacyRows) continue;
+      await rekeyConversationOwnedRowsInTransaction(
+        remap.legacyKey,
+        remap.targetKey,
+      );
+    }
+    await seedConversationKeyLedgerFromTombstones();
+    await reserveOrphanConversationMessageKeys({
+      messageTable: CODEX_MESSAGES_TABLE,
+      catalogTables: [CODEX_CONVERSATIONS_TABLE],
+      system: "codex",
+      sourceTables: [
+        { table: "llm_for_zotero_agent_memory" },
+        { table: "llm_for_zotero_agent_transcript" },
+        { table: "llm_for_zotero_agent_tool_result_handles" },
+        { table: "llm_for_zotero_agent_evidence" },
+        { table: "llm_for_zotero_agent_runs" },
+        {
+          table: "llm_for_zotero_agent_coverage",
+          column: "origin_conversation_key",
+        },
+        {
+          table: "llm_for_zotero_attachment_refs",
+          column: "owner_id",
+          whereSql: "s.owner_type = 'conversation'",
+        },
+        {
+          table: "llm_for_zotero_conversation_registry",
+          column: "legacy_conversation_key",
+        },
+        {
+          table: "llm_for_zotero_conversation_search_index",
+          column: "legacy_conversation_key",
+        },
+        { table: "llm_for_zotero_conversation_cleanup_jobs" },
+        { table: "llm_for_zotero_pending_deletions" },
+        { table: "llm_for_zotero_agent_trace_exports" },
+        { table: "llm_for_zotero_agent_trace_file_cleanup" },
+        {
+          table: "llm_for_zotero_conversation_fork_links",
+          column: "source_conversation_key",
+        },
+        {
+          table: "llm_for_zotero_conversation_fork_links",
+          column: "target_conversation_key",
+        },
+      ],
+    });
+    await retireOrphanedConversationLedgerEntries({
+      system: "codex",
+      kind: "global",
+      catalogTables: [CODEX_CONVERSATIONS_TABLE],
+    });
+    await retireOrphanedConversationLedgerEntries({
+      system: "codex",
+      kind: "paper",
+      catalogTables: [CODEX_CONVERSATIONS_TABLE],
+    });
+    const codexGlobalRange = getCodexAllocatedConversationKeyRange("global");
+    const codexPaperRange = getCodexAllocatedConversationKeyRange("paper");
+    await initializeConversationKeyCounterInTransaction({
+      system: "codex",
+      kind: "global",
+      start: codexGlobalRange.start,
+      endExclusive: codexGlobalRange.endExclusive,
+      profileSignature: getCodexProfileSignature(),
+    });
+    await initializeConversationKeyCounterInTransaction({
+      system: "codex",
+      kind: "paper",
+      start: codexPaperRange.start,
+      endExclusive: codexPaperRange.endExclusive,
+      profileSignature: getCodexProfileSignature(),
+    });
+    await Zotero.DB.queryAsync(
+      `UPDATE ${CODEX_MESSAGES_TABLE}
+       SET conversation_instance_id = (
+         SELECT c.conversation_instance_id
+         FROM ${CODEX_CONVERSATIONS_TABLE} c
+         WHERE c.conversation_key = ${CODEX_MESSAGES_TABLE}.conversation_key
+       )
+       WHERE conversation_instance_id IS NULL
+          OR TRIM(conversation_instance_id) = ''`,
+    );
+    await installConversationKeyLedgerCatalogTriggers([
+      CODEX_CONVERSATIONS_TABLE,
+    ]);
+    await installConversationKeyLedgerMessageTriggers({
+      messageTable: CODEX_MESSAGES_TABLE,
+      system: "codex",
+      catalogTables: [CODEX_CONVERSATIONS_TABLE],
+    });
   });
   cleanupRememberedConversationKeyPrefs();
 }
@@ -1270,9 +1663,15 @@ export const initCodexCodeStore = initCodexAppServerStore;
 export async function appendCodexMessage(
   conversationKey: number,
   message: StoredChatMessage,
+  instanceID?: string,
 ): Promise<void> {
   const normalizedKey = normalizeConversationKey(conversationKey);
   if (!normalizedKey || !isCodexStoreConversationKey(normalizedKey)) return;
+  if (pendingDeletionStore.isConversationPendingDeletion(normalizedKey)) {
+    throw new Error(
+      `Conversation ${normalizedKey} is frozen by a pending deletion`,
+    );
+  }
 
   const selectedTextContexts = synthesizeSelectedTextContexts({
     selectedTextContexts: message.selectedTextContexts,
@@ -1318,13 +1717,43 @@ export async function appendCodexMessage(
   const messageTimestamp = Number.isFinite(message.timestamp)
     ? Math.floor(message.timestamp)
     : Date.now();
-  const conversationID = await resolveRegisteredConversationID(normalizedKey);
+  const appendIdentity = await resolveCodexAppendIdentity(
+    normalizedKey,
+    instanceID,
+  );
+  const conversationID = appendIdentity.conversationID;
 
   await Zotero.DB.executeTransaction(async () => {
+    if (appendIdentity.ledgerAvailable) {
+      await assertConversationKeyLiveInTransaction({
+        conversationKey: normalizedKey,
+        instanceID: appendIdentity.instanceID || "",
+      });
+      const catalogRows = (await Zotero.DB.queryAsync(
+        `SELECT conversation_id AS conversationID
+         FROM ${CODEX_CONVERSATIONS_TABLE}
+         WHERE conversation_key = ?
+           AND conversation_instance_id = ?
+         LIMIT 1`,
+        [normalizedKey, appendIdentity.instanceID],
+      )) as Array<{ conversationID?: unknown }> | undefined;
+      if (!catalogRows?.length) {
+        throw new ConversationRetiredError(
+          normalizedKey,
+          appendIdentity.instanceID || "",
+        );
+      }
+    }
+    const identityAvailable =
+      appendIdentity.ledgerAvailable || Boolean(appendIdentity.instanceID);
+    const identityColumn = identityAvailable
+      ? ", conversation_instance_id"
+      : "";
+    const identityPlaceholder = identityAvailable ? ", ?" : "";
     await Zotero.DB.queryAsync(
       `INSERT INTO ${CODEX_MESSAGES_TABLE}
-        (conversation_id, conversation_key, role, text, timestamp, run_mode, agent_run_id, selected_text, selected_text_contexts_json, selected_texts_json, selected_text_sources_json, selected_text_paper_contexts_json, selected_text_note_contexts_json, forced_skill_ids_json, paper_contexts_json, pdf_paper_contexts_json, full_text_paper_contexts_json, citation_paper_contexts_json, quote_citations_json, screenshot_images, attachments_json, generated_images_json, model_name, model_entry_id, model_provider_label, interrupted, webchat_run_state, webchat_completion_reason, reasoning_summary, reasoning_details, compact_marker, context_tokens, context_window)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        (conversation_id, conversation_key, role, text, timestamp, run_mode, agent_run_id, selected_text, selected_text_contexts_json, selected_texts_json, selected_text_sources_json, selected_text_paper_contexts_json, selected_text_note_contexts_json, forced_skill_ids_json, paper_contexts_json, pdf_paper_contexts_json, full_text_paper_contexts_json, citation_paper_contexts_json, quote_citations_json, screenshot_images, attachments_json, generated_images_json, model_name, model_entry_id, model_provider_label, interrupted, webchat_run_state, webchat_completion_reason, reasoning_summary, reasoning_details, compact_marker, context_tokens, context_window${identityColumn})
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?${identityPlaceholder})`,
       [
         conversationID,
         normalizedKey,
@@ -1375,6 +1804,7 @@ export async function appendCodexMessage(
         Number.isFinite(Number(message.contextWindow))
           ? Math.floor(Number(message.contextWindow))
           : null,
+        ...(identityAvailable ? [appendIdentity.instanceID] : []),
       ],
     );
     await touchCodexConversationActivity(normalizedKey, messageTimestamp);
@@ -1385,6 +1815,8 @@ export async function appendCodexMessage(
 
 export async function forkCodexConversationMessages(params: {
   sourceConversationKey: number;
+  sourceInstanceID?: string;
+  sourceConversationID?: string;
   targetConversationKey: number;
   throughAssistantTimestamp: number;
   timestampBase?: number;
@@ -1396,6 +1828,8 @@ export async function forkCodexConversationMessages(params: {
       isValidConversationKey: isCodexStoreConversationKey,
       resolveSourceSelector: resolveRepairingMessageConversationSelector,
       resolveTargetConversationID: resolveRegisteredConversationID,
+      resolveTargetInstanceID: resolveRegisteredConversationInstanceID,
+      assertSourceConversationLive: assertCodexForkSourceLive,
       refreshCatalogSummary: refreshCodexConversationCatalogSummary,
       refreshSearchIndex: refreshCodexConversationSearchIndex,
       afterCopy: touchCodexConversationActivity,
@@ -1677,6 +2111,10 @@ export async function loadCodexConversation(
     const forcedSkillIds = parseForcedSkillIdsJson(row.forcedSkillIdsJson);
 
     messages.push({
+      id:
+        Number.isFinite(Number(row.id)) && Number(row.id) > 0
+          ? Math.floor(Number(row.id))
+          : undefined,
       role,
       text: typeof row.text === "string" ? row.text : "",
       timestamp: Number.isFinite(Number(row.timestamp))
@@ -1763,21 +2201,83 @@ export async function loadCodexConversation(
 
 export async function clearCodexConversation(
   conversationKey: number,
+  identity?: { instanceID?: string; conversationID?: string },
+  onBeforeCommit?: () => Promise<void>,
 ): Promise<void> {
   const normalizedKey = normalizeConversationKey(conversationKey);
   if (!normalizedKey || !isCodexStoreConversationKey(normalizedKey)) return;
+  const catalogIdentityClause = identity?.instanceID
+    ? `AND conversation_instance_id = ?`
+    : "";
+  const catalogIdentityParams = identity?.instanceID
+    ? [identity.instanceID]
+    : [];
+  const messageIdentityClause = identity?.instanceID
+    ? `AND EXISTS (
+         SELECT 1
+         FROM ${CODEX_CONVERSATIONS_TABLE} c
+         WHERE c.conversation_key = ?
+           ${catalogIdentityClause.replaceAll(
+             "conversation_instance_id",
+             "c.conversation_instance_id",
+           )}
+       )`
+    : "";
+  const messageIdentityParams = identity?.instanceID
+    ? [normalizedKey, ...catalogIdentityParams]
+    : [];
   const selector = await resolveRepairingMessageConversationSelector(
     normalizedKey,
     {
       destructive: true,
     },
   );
+  // Remove the old indexed body in the same transaction as pruning.  The
+  // post-commit refresh is best-effort, but it must never leave deleted text
+  // searchable if that refresh is interrupted or the database is transiently
+  // unavailable.
+  const searchIndexReady = await initConversationSearchIndexStore();
   await Zotero.DB.executeTransaction(async () => {
+    if (identity?.instanceID) {
+      const witnessRows = (await Zotero.DB.queryAsync(
+        `SELECT 1 AS present
+         FROM ${CODEX_CONVERSATIONS_TABLE}
+         WHERE conversation_key = ?
+           ${catalogIdentityClause}
+         LIMIT 1`,
+        [normalizedKey, ...catalogIdentityParams],
+      )) as Array<{ present?: unknown }> | undefined;
+      if (!witnessRows?.length) {
+        throw new Error(
+          `Refused to clear Codex conversation ${normalizedKey}: catalog identity changed`,
+        );
+      }
+    }
     await Zotero.DB.queryAsync(
-      `DELETE FROM ${CODEX_MESSAGES_TABLE} WHERE ${selector.whereSql}`,
-      selector.params,
+      `DELETE FROM ${CODEX_MESSAGES_TABLE}
+       WHERE ${selector.whereSql}
+         ${messageIdentityClause}`,
+      [...selector.params, ...messageIdentityParams],
     );
     await refreshCodexConversationCatalogSummary(normalizedKey);
+    // Clear is content-authoritative.  Detach the exact native session in the
+    // same transaction so a provider-resume path cannot reintroduce the
+    // cleared turns if the app-server is unavailable after commit.
+    await Zotero.DB.queryAsync(
+      `UPDATE ${CODEX_CONVERSATIONS_TABLE}
+       SET provider_session_id = NULL,
+           provider_session_path_state = NULL,
+           scoped_conversation_key = NULL,
+           scope_type = NULL,
+           scope_id = NULL,
+           scope_label = NULL,
+           cwd = NULL,
+           updated_at = ?
+       WHERE conversation_key = ?
+         ${catalogIdentityClause}`,
+      [Date.now(), normalizedKey, ...catalogIdentityParams],
+    );
+    await onBeforeCommit?.();
   });
   await refreshCodexConversationSearchIndex(normalizedKey);
 }
@@ -1786,6 +2286,9 @@ export async function deleteCodexTurnMessages(
   conversationKey: number,
   userTimestamp: number,
   assistantTimestamp: number,
+  userMessageID?: number,
+  assistantMessageID?: number,
+  onBeforeCommit?: () => Promise<void>,
 ): Promise<void> {
   const normalizedKey = normalizeConversationKey(conversationKey);
   if (!normalizedKey || !isCodexStoreConversationKey(normalizedKey)) return;
@@ -1796,6 +2299,15 @@ export async function deleteCodexTurnMessages(
     ? Math.floor(assistantTimestamp)
     : 0;
   if (normalizedUserTimestamp <= 0 || normalizedAssistantTimestamp <= 0) return;
+  const normalizedUserMessageID =
+    Number.isFinite(Number(userMessageID)) && Number(userMessageID) > 0
+      ? Math.floor(Number(userMessageID))
+      : 0;
+  const normalizedAssistantMessageID =
+    Number.isFinite(Number(assistantMessageID)) &&
+    Number(assistantMessageID) > 0
+      ? Math.floor(Number(assistantMessageID))
+      : 0;
 
   const selector = await resolveRepairingMessageConversationSelector(
     normalizedKey,
@@ -1803,34 +2315,58 @@ export async function deleteCodexTurnMessages(
       destructive: true,
     },
   );
+  const searchIndexReady = await initConversationSearchIndexStore();
   await Zotero.DB.executeTransaction(async () => {
-    await Zotero.DB.queryAsync(
-      `DELETE FROM ${CODEX_MESSAGES_TABLE}
-       WHERE id = (
-         SELECT id
-         FROM ${CODEX_MESSAGES_TABLE}
-         WHERE ${selector.whereSql}
-           AND role = 'user'
-           AND timestamp = ?
-         ORDER BY id DESC
-         LIMIT 1
-       )`,
-      [...selector.params, normalizedUserTimestamp],
-    );
-    await Zotero.DB.queryAsync(
-      `DELETE FROM ${CODEX_MESSAGES_TABLE}
-       WHERE id = (
-         SELECT id
-         FROM ${CODEX_MESSAGES_TABLE}
-         WHERE ${selector.whereSql}
-           AND role = 'assistant'
-           AND timestamp = ?
-         ORDER BY id DESC
-         LIMIT 1
-       )`,
-      [...selector.params, normalizedAssistantTimestamp],
-    );
+    if (normalizedUserMessageID > 0) {
+      await Zotero.DB.queryAsync(
+        `DELETE FROM ${CODEX_MESSAGES_TABLE}
+         WHERE id = ? AND ${selector.whereSql} AND role = 'user'`,
+        [normalizedUserMessageID, ...selector.params],
+      );
+    } else {
+      await Zotero.DB.queryAsync(
+        `DELETE FROM ${CODEX_MESSAGES_TABLE}
+         WHERE id = (
+           SELECT id
+           FROM ${CODEX_MESSAGES_TABLE}
+           WHERE ${selector.whereSql}
+             AND role = 'user'
+             AND timestamp = ?
+           ORDER BY id DESC
+           LIMIT 1
+         )`,
+        [...selector.params, normalizedUserTimestamp],
+      );
+    }
+    if (normalizedAssistantMessageID > 0) {
+      await Zotero.DB.queryAsync(
+        `DELETE FROM ${CODEX_MESSAGES_TABLE}
+         WHERE id = ? AND ${selector.whereSql} AND role = 'assistant'`,
+        [normalizedAssistantMessageID, ...selector.params],
+      );
+    } else {
+      await Zotero.DB.queryAsync(
+        `DELETE FROM ${CODEX_MESSAGES_TABLE}
+         WHERE id = (
+           SELECT id
+           FROM ${CODEX_MESSAGES_TABLE}
+           WHERE ${selector.whereSql}
+             AND role = 'assistant'
+             AND timestamp = ?
+           ORDER BY id DESC
+           LIMIT 1
+         )`,
+        [...selector.params, normalizedAssistantTimestamp],
+      );
+    }
     await refreshCodexConversationCatalogSummary(normalizedKey);
+    if (searchIndexReady) {
+      await deleteConversationSearchIndexRowInTransaction({
+        system: "codex",
+        conversationKey: normalizedKey,
+      });
+    }
+    await onBeforeCommit?.();
   });
   await refreshCodexConversationSearchIndex(normalizedKey);
 }
@@ -1847,6 +2383,7 @@ export async function pruneCodexConversation(
       destructive: true,
     },
   );
+  const searchIndexReady = await initConversationSearchIndexStore();
   await Zotero.DB.executeTransaction(async () => {
     await Zotero.DB.queryAsync(
       `DELETE FROM ${CODEX_MESSAGES_TABLE}
@@ -1860,6 +2397,12 @@ export async function pruneCodexConversation(
       [...selector.params, normalizeLimit(keep, CODEX_HISTORY_LIMIT)],
     );
     await refreshCodexConversationCatalogSummary(normalizedKey);
+    if (searchIndexReady) {
+      await deleteConversationSearchIndexRowInTransaction({
+        system: "codex",
+        conversationKey: normalizedKey,
+      });
+    }
   });
   await refreshCodexConversationSearchIndex(normalizedKey);
 }
@@ -2088,6 +2631,7 @@ export async function updateLatestCodexAssistantMessage(
 }
 
 type CodexConversationRow = {
+  instanceID?: unknown;
   conversationID?: unknown;
   conversationKey?: unknown;
   libraryID?: unknown;
@@ -2126,7 +2670,17 @@ function toCodexConversationSummary(
   }
   const paperItemID = normalizePaperItemID(Number(row.paperItemID));
   const userTurnCount = Number(row.userTurnCount);
+  let instanceID: string | undefined;
+  try {
+    instanceID =
+      typeof row.instanceID === "string" && row.instanceID.trim()
+        ? row.instanceID.trim()
+        : undefined;
+  } catch {
+    // Legacy test/upgrade rows may not expose the new identity column.
+  }
   return {
+    instanceID,
     conversationID:
       typeof row.conversationID === "string" && row.conversationID.trim()
         ? row.conversationID.trim()
@@ -2235,16 +2789,10 @@ async function refreshCodexConversationSearchIndex(
 async function deleteCodexConversationSearchIndex(
   conversationKey: number,
 ): Promise<void> {
-  try {
-    await deleteConversationSearchIndexRow({
-      system: "codex",
-      conversationKey,
-    });
-  } catch (error) {
-    logCodexScopeWarning(
-      `Failed to delete Codex conversation search index row for ${conversationKey}: ${formatSearchIndexError(error)}`,
-    );
-  }
+  await deleteConversationSearchIndexRow({
+    system: "codex",
+    conversationKey,
+  });
 }
 
 async function filterValidCodexConversationSummaries(
@@ -2403,6 +2951,7 @@ export async function getCodexConversationSummary(
     return null;
   const rows = (await Zotero.DB.queryAsync(
     `SELECT c.conversation_id AS conversationID,
+            c.conversation_instance_id AS instanceID,
             c.conversation_key AS conversationKey,
             c.library_id AS libraryID,
             c.kind AS kind,
@@ -2429,6 +2978,8 @@ export async function getCodexConversationSummary(
 
 export async function upsertCodexConversationSummary(params: {
   conversationKey: number;
+  instanceID?: string;
+  conversationID?: string;
   libraryID: number;
   kind: CodexConversationKind;
   paperItemID?: number;
@@ -2443,6 +2994,7 @@ export async function upsertCodexConversationSummary(params: {
   cwd?: string;
   model?: string;
   effort?: string;
+  inTransaction?: boolean;
 }): Promise<boolean> {
   const conversationKey = normalizeConversationKey(params.conversationKey);
   const libraryID = normalizeLibraryID(params.libraryID);
@@ -2457,12 +3009,14 @@ export async function upsertCodexConversationSummary(params: {
   const updatedAt = normalizeCatalogTimestamp(params.updatedAt);
   const paperItemID = normalizePaperItemID(Number(params.paperItemID));
   const title = normalizeConversationTitleSeed(params.title || "") || null;
-  const conversationID = buildCodexConversationID({
-    conversationKey,
-    kind: params.kind,
-    libraryID,
-    paperItemID,
-  });
+  const conversationID =
+    params.conversationID?.trim() ||
+    buildCodexConversationID({
+      conversationKey,
+      kind: params.kind,
+      libraryID,
+      paperItemID,
+    });
   const existing = await getCodexConversationSummary(conversationKey);
   if (
     existing &&
@@ -2477,23 +3031,52 @@ export async function upsertCodexConversationSummary(params: {
     );
     return false;
   }
-  const registryOk = await registerConversationScope({
-    conversationID,
-    conversationKey,
-    system: "codex",
-    kind: params.kind,
-    libraryID,
-    paperItemID,
-    createdAt,
-    updatedAt,
-    title,
-  });
+  let instanceID = params.instanceID?.trim() || "";
+  if (!instanceID) {
+    const registered = await getRegisteredConversationScope(conversationKey);
+    instanceID = registered?.instanceID || "";
+  }
+  if (!instanceID) instanceID = generateConversationInstanceID();
+  try {
+    const ensureLedgerEntry = params.inTransaction
+      ? ensureConversationKeyLedgerEntryInTransaction
+      : ensureConversationKeyLedgerEntry;
+    await ensureLedgerEntry({
+      conversationKey,
+      instanceID,
+      conversationID,
+      system: "codex",
+      kind: params.kind,
+      profileSignature: getCodexProfileSignature(),
+      libraryID,
+      paperItemID: paperItemID || undefined,
+      issuedAt: createdAt,
+    });
+  } catch (error) {
+    logCodexScopeWarning(String(error));
+    return false;
+  }
+  const registryOk = await registerConversationScope(
+    {
+      conversationID,
+      instanceID,
+      conversationKey,
+      system: "codex",
+      kind: params.kind,
+      libraryID,
+      paperItemID,
+      createdAt,
+      updatedAt,
+      title,
+    },
+    { inTransaction: params.inTransaction },
+  );
   if (!registryOk) return false;
-  await Zotero.DB.executeTransaction(async () => {
+  const writeCatalog = async () => {
     await Zotero.DB.queryAsync(
       `INSERT INTO ${CODEX_CONVERSATIONS_TABLE}
-        (conversation_id, conversation_key, library_id, kind, paper_item_id, created_at, updated_at, last_activity_at, user_turn_count, first_user_title, title, provider_session_id, scoped_conversation_key, scope_type, scope_id, scope_label, cwd, model_name, effort)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        (conversation_id, conversation_instance_id, conversation_key, library_id, kind, paper_item_id, created_at, updated_at, last_activity_at, user_turn_count, first_user_title, title, provider_session_id, scoped_conversation_key, scope_type, scope_id, scope_label, cwd, model_name, effort)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?)
        ON CONFLICT(conversation_key) DO UPDATE SET
          conversation_id = excluded.conversation_id,
          library_id = excluded.library_id,
@@ -2513,6 +3096,7 @@ export async function upsertCodexConversationSummary(params: {
          effort = COALESCE(excluded.effort, ${CODEX_CONVERSATIONS_TABLE}.effort)`,
       [
         conversationID,
+        instanceID,
         conversationKey,
         libraryID,
         params.kind,
@@ -2532,8 +3116,17 @@ export async function upsertCodexConversationSummary(params: {
       ],
     );
     await refreshCodexConversationCatalogSummary(conversationKey);
-  });
-  await refreshCodexConversationSearchIndex(conversationKey);
+  };
+  if (params.inTransaction) {
+    await writeCatalog();
+  } else {
+    await Zotero.DB.executeTransaction(writeCatalog);
+  }
+  if (!params.inTransaction) {
+    const registered = await getRegisteredConversationScope(conversationKey);
+    if (registered) await syncCatalogInstanceID(registered);
+    await refreshCodexConversationSearchIndex(conversationKey);
+  }
   return true;
 }
 
@@ -2681,49 +3274,43 @@ export async function listAllCodexPaperConversationsByLibrary(
 
 export async function ensureCodexGlobalConversation(
   libraryID: number,
+  preferredConversationKey?: number,
 ): Promise<CodexConversationSummary | null> {
   const normalizedLibraryID = normalizeLibraryID(libraryID);
   if (!normalizedLibraryID) return null;
-  const conversationKey =
-    buildDefaultCodexGlobalConversationKey(normalizedLibraryID);
-  const stored = await upsertCodexConversationSummary({
-    conversationKey,
+  const existing = await listCodexConversations({
     libraryID: normalizedLibraryID,
     kind: "global",
-    createdAt: Date.now(),
-    updatedAt: Date.now(),
+    limit: 1,
   });
-  if (!stored) {
-    return createCodexGlobalConversation(normalizedLibraryID);
-  }
-  return getCodexConversationSummary(conversationKey);
+  return (
+    existing[0] ||
+    createCodexGlobalConversation(normalizedLibraryID, {
+      conversationKey: preferredConversationKey,
+    })
+  );
 }
 
 export async function ensureCodexPaperConversation(
   libraryID: number,
   paperItemID: number,
+  preferredConversationKey?: number,
 ): Promise<CodexConversationSummary | null> {
   const normalizedLibraryID = normalizeLibraryID(libraryID);
   const normalizedPaperItemID = normalizePaperItemID(paperItemID);
   if (!normalizedLibraryID || !normalizedPaperItemID) return null;
-  const conversationKey = buildDefaultCodexPaperConversationKey(
-    normalizedPaperItemID,
-  );
-  const stored = await upsertCodexConversationSummary({
-    conversationKey,
+  const existing = await listCodexConversations({
     libraryID: normalizedLibraryID,
     kind: "paper",
     paperItemID: normalizedPaperItemID,
-    createdAt: Date.now(),
-    updatedAt: Date.now(),
+    limit: 1,
   });
-  if (!stored) {
-    return createCodexPaperConversation(
-      normalizedLibraryID,
-      normalizedPaperItemID,
-    );
-  }
-  return getCodexConversationSummary(conversationKey);
+  return (
+    existing[0] ||
+    createCodexPaperConversation(normalizedLibraryID, normalizedPaperItemID, {
+      conversationKey: preferredConversationKey,
+    })
+  );
 }
 
 async function getMaxCodexConversationKey(
@@ -2745,76 +3332,223 @@ async function getMaxCodexConversationKey(
   return Math.floor(maxConversationKey);
 }
 
+async function allocateCodexConversationKey(params: {
+  libraryID: number;
+  kind: CodexConversationKind;
+  paperItemID?: number;
+  issuedAt: number;
+  preferredConversationKey?: number;
+  inTransaction?: boolean;
+}): Promise<{
+  conversationKey: number;
+  instanceID: string;
+  conversationID: string;
+}> {
+  await initConversationKeyLedgerStore();
+  const preferredKey = normalizeConversationKey(
+    params.preferredConversationKey || 0,
+  );
+  if (
+    preferredKey &&
+    !isConversationKeyForKind("codex", params.kind, preferredKey)
+  ) {
+    throw new Error("Preferred Codex conversation key is outside its range");
+  }
+  const range = getCodexAllocatedConversationKeyRange(params.kind);
+  const allocate = async () => {
+    if (preferredKey) {
+      const instanceID = generateConversationInstanceID();
+      const conversationID = buildCodexConversationID({
+        conversationKey: preferredKey,
+        kind: params.kind,
+        libraryID: params.libraryID,
+        paperItemID: params.paperItemID,
+      });
+      await ensureConversationKeyLedgerEntryInTransaction({
+        conversationKey: preferredKey,
+        instanceID,
+        conversationID,
+        system: "codex",
+        kind: params.kind,
+        profileSignature: getCodexProfileSignature(),
+        libraryID: params.libraryID,
+        paperItemID: params.paperItemID,
+        issuedAt: params.issuedAt,
+      });
+      return { conversationKey: preferredKey, instanceID, conversationID };
+    }
+    const issued = await allocateConversationKeyInTransaction({
+      range: {
+        system: "codex",
+        kind: params.kind,
+        start: range.start,
+        endExclusive: range.endExclusive,
+        profileSignature: getCodexProfileSignature(),
+      },
+      libraryID: params.libraryID,
+      paperItemID: params.paperItemID,
+      issuedAt: params.issuedAt,
+    });
+    const conversationID = buildCodexConversationID({
+      conversationKey: issued.conversationKey,
+      kind: params.kind,
+      libraryID: params.libraryID,
+      paperItemID: params.paperItemID,
+    });
+    await updateConversationKeyLedgerConversationIDInTransaction({
+      conversationKey: issued.conversationKey,
+      instanceID: issued.instanceID,
+      conversationID,
+    });
+    return {
+      conversationKey: issued.conversationKey,
+      instanceID: issued.instanceID,
+      conversationID,
+    };
+  };
+  const allocated = params.inTransaction
+    ? await allocate()
+    : await Zotero.DB.executeTransaction(allocate);
+  return {
+    conversationKey: allocated.conversationKey,
+    instanceID: allocated.instanceID,
+    conversationID: allocated.conversationID,
+  };
+}
+
+async function retireCodexAllocationAfterCreateFailure(params: {
+  conversationKey: number;
+  instanceID: string;
+  conversationID: string;
+}): Promise<void> {
+  await Zotero.DB.executeTransaction(async () => {
+    await deleteRegisteredConversationScopeInTransaction(
+      params.instanceID,
+      params.conversationKey,
+      params.conversationID,
+      "codex",
+    );
+    await retireConversationKeyInTransaction({
+      conversationKey: params.conversationKey,
+      instanceID: params.instanceID,
+      reason: "conversation-create-failed",
+    });
+  });
+  rememberConversationKeyRetired(params.conversationKey);
+}
+
 export async function createCodexGlobalConversation(
   libraryID: number,
+  options: { conversationKey?: number } = {},
 ): Promise<CodexConversationSummary | null> {
   const normalizedLibraryID = normalizeLibraryID(libraryID);
   if (!normalizedLibraryID) return null;
-  const nextKey = Math.max(
-    getCodexAllocatedConversationKeyRange("global").start,
-    (getLastAllocatedCodexGlobalConversationKey() || 0) + 1,
-    (await getMaxCodexConversationKey("global")) + 1,
-  );
-  const stored = await upsertCodexConversationSummary({
-    conversationKey: nextKey,
-    libraryID: normalizedLibraryID,
-    kind: "global",
-    createdAt: Date.now(),
-    updatedAt: Date.now(),
+  const allocated = await Zotero.DB.executeTransaction(async () => {
+    const issued = await allocateCodexConversationKey({
+      libraryID: normalizedLibraryID,
+      kind: "global",
+      issuedAt: Date.now(),
+      preferredConversationKey: options.conversationKey,
+      inTransaction: true,
+    });
+    const stored = await upsertCodexConversationSummary({
+      conversationKey: issued.conversationKey,
+      instanceID: issued.instanceID,
+      conversationID: issued.conversationID,
+      libraryID: normalizedLibraryID,
+      kind: "global",
+      createdAt: Date.now(),
+      updatedAt: Date.now(),
+      inTransaction: true,
+    });
+    if (!stored) throw new Error("Codex conversation creation was refused");
+    return issued;
   });
-  if (!stored) return null;
-  setLastAllocatedCodexGlobalConversationKey(nextKey);
-  return getCodexConversationSummary(nextKey);
+  await refreshCodexConversationSearchIndex(allocated.conversationKey);
+  setLastAllocatedCodexGlobalConversationKey(allocated.conversationKey);
+  return getCodexConversationSummary(allocated.conversationKey);
 }
 
 export async function createCodexPaperConversation(
   libraryID: number,
   paperItemID: number,
+  options: { conversationKey?: number } = {},
 ): Promise<CodexConversationSummary | null> {
   const normalizedLibraryID = normalizeLibraryID(libraryID);
   const normalizedPaperItemID = normalizePaperItemID(paperItemID);
   if (!normalizedLibraryID || !normalizedPaperItemID) return null;
-  const nextKey = Math.max(
-    getCodexAllocatedConversationKeyRange("paper").start,
-    (getLastAllocatedCodexPaperConversationKey() || 0) + 1,
-    (await getMaxCodexConversationKey("paper")) + 1,
-  );
-  const stored = await upsertCodexConversationSummary({
-    conversationKey: nextKey,
-    libraryID: normalizedLibraryID,
-    kind: "paper",
-    paperItemID: normalizedPaperItemID,
-    createdAt: Date.now(),
-    updatedAt: Date.now(),
+  const allocated = await Zotero.DB.executeTransaction(async () => {
+    const issued = await allocateCodexConversationKey({
+      libraryID: normalizedLibraryID,
+      kind: "paper",
+      paperItemID: normalizedPaperItemID,
+      issuedAt: Date.now(),
+      preferredConversationKey: options.conversationKey,
+      inTransaction: true,
+    });
+    const stored = await upsertCodexConversationSummary({
+      conversationKey: issued.conversationKey,
+      instanceID: issued.instanceID,
+      conversationID: issued.conversationID,
+      libraryID: normalizedLibraryID,
+      kind: "paper",
+      paperItemID: normalizedPaperItemID,
+      createdAt: Date.now(),
+      updatedAt: Date.now(),
+      inTransaction: true,
+    });
+    if (!stored) throw new Error("Codex conversation creation was refused");
+    return issued;
   });
-  if (!stored) return null;
-  setLastAllocatedCodexPaperConversationKey(nextKey);
-  return getCodexConversationSummary(nextKey);
+  await refreshCodexConversationSearchIndex(allocated.conversationKey);
+  setLastAllocatedCodexPaperConversationKey(allocated.conversationKey);
+  return getCodexConversationSummary(allocated.conversationKey);
 }
 
 export async function touchCodexConversationTitle(
   conversationKey: number,
   titleSeed: string,
+  expectedGeneration?: number,
 ): Promise<void> {
   const normalizedKey = normalizeConversationKey(conversationKey);
   if (!normalizedKey || !isCodexStoreConversationKey(normalizedKey)) return;
   const title = normalizeConversationTitleSeed(titleSeed);
   if (!title) return;
-  await Zotero.DB.queryAsync(
-    `UPDATE ${CODEX_CONVERSATIONS_TABLE}
+  await withConversationWriteLock(normalizedKey, async () => {
+    if (
+      areConversationWritesFrozen(normalizedKey) ||
+      (expectedGeneration !== undefined &&
+        !isConversationWriteGenerationCurrent(
+          normalizedKey,
+          expectedGeneration,
+        ))
+    )
+      return;
+    await Zotero.DB.queryAsync(
+      `UPDATE ${CODEX_CONVERSATIONS_TABLE}
      SET title = ?
      WHERE conversation_key = ?
        AND (title IS NULL OR TRIM(title) = '')`,
-    [title, normalizedKey],
-  );
+      [title, normalizedKey],
+    );
+  });
   await refreshCodexConversationSearchIndex(normalizedKey);
 }
 
 export async function clearCodexConversationSessionMetadata(
   conversationKey: number,
+  expectedProviderSessionId?: string,
+  expectedInstanceID?: string,
 ): Promise<void> {
   const normalizedKey = normalizeConversationKey(conversationKey);
   if (!normalizedKey || !isCodexStoreConversationKey(normalizedKey)) return;
+  const normalizedSessionId = String(expectedProviderSessionId || "").trim();
+  const sessionPredicate = normalizedSessionId
+    ? "AND provider_session_id = ?"
+    : "";
+  const instancePredicate = expectedInstanceID?.trim()
+    ? "AND conversation_instance_id = ?"
+    : "";
   await Zotero.DB.queryAsync(
     `UPDATE ${CODEX_CONVERSATIONS_TABLE}
      SET provider_session_id = NULL,
@@ -2825,8 +3559,15 @@ export async function clearCodexConversationSessionMetadata(
          scope_label = NULL,
          cwd = NULL,
          updated_at = ?
-     WHERE conversation_key = ?`,
-    [Date.now(), normalizedKey],
+     WHERE conversation_key = ?
+       ${sessionPredicate}
+       ${instancePredicate}`,
+    [
+      Date.now(),
+      normalizedKey,
+      ...(normalizedSessionId ? [normalizedSessionId] : []),
+      ...(expectedInstanceID?.trim() ? [expectedInstanceID.trim()] : []),
+    ],
   );
   await refreshCodexConversationSearchIndex(normalizedKey);
 }
@@ -2834,16 +3575,32 @@ export async function clearCodexConversationSessionMetadata(
 export async function setCodexConversationTitle(
   conversationKey: number,
   titleSeed: string,
+  identity?: {
+    instanceID?: string;
+    conversationID?: string;
+    inTransaction?: boolean;
+  },
 ): Promise<void> {
   const normalizedKey = normalizeConversationKey(conversationKey);
   if (!normalizedKey || !isCodexStoreConversationKey(normalizedKey)) return;
+  const identityClause = identity?.instanceID
+    ? `AND conversation_instance_id = ?`
+    : "";
+  const identityParams = identity?.instanceID ? [identity.instanceID] : [];
   await Zotero.DB.queryAsync(
     `UPDATE ${CODEX_CONVERSATIONS_TABLE}
      SET title = ?
-     WHERE conversation_key = ?`,
-    [normalizeConversationTitleSeed(titleSeed) || null, normalizedKey],
+     WHERE conversation_key = ?
+       ${identityClause}`,
+    [
+      normalizeConversationTitleSeed(titleSeed) || null,
+      normalizedKey,
+      ...identityParams,
+    ],
   );
-  await refreshCodexConversationSearchIndex(normalizedKey);
+  if (!identity?.inTransaction) {
+    await refreshCodexConversationSearchIndex(normalizedKey);
+  }
 }
 
 export async function deleteCodexConversation(
@@ -2878,9 +3635,52 @@ export async function preflightDeleteCodexConversationLocalRows(
 
 export async function deleteCodexConversationLocalRows(
   conversationKey: number,
+  identity?: {
+    instanceID?: string;
+    conversationID?: string;
+    onBeforeCommit?: () => Promise<void>;
+    onCommit?: () => Promise<void>;
+  },
 ): Promise<void> {
   const normalizedKey = normalizeConversationKey(conversationKey);
   if (!normalizedKey || !isCodexStoreConversationKey(normalizedKey)) return;
+  let ledgerAvailable = isConversationKeyLedgerStoreInitialized();
+  let ledgerEntry;
+  if (ledgerAvailable) {
+    try {
+      ledgerEntry = await getConversationKeyLedgerEntry(normalizedKey);
+    } catch (error) {
+      if (!/no such table|no table/i.test(String(error))) throw error;
+      ledgerAvailable = false;
+    }
+  }
+  if (ledgerAvailable && !ledgerEntry) {
+    throw new ConversationRetiredError(
+      normalizedKey,
+      identity?.instanceID || "",
+    );
+  }
+  if (
+    ledgerEntry?.retiredAt &&
+    identity?.instanceID !== ledgerEntry.instanceID
+  ) {
+    throw new ConversationRetiredError(
+      normalizedKey,
+      identity?.instanceID || "",
+    );
+  }
+  if (
+    ledgerEntry &&
+    identity?.instanceID &&
+    identity.instanceID !== ledgerEntry.instanceID
+  ) {
+    throw new Error(
+      `Refused to delete Codex conversation ${normalizedKey}: identity mismatch`,
+    );
+  }
+  const deletionIdentity = ledgerEntry
+    ? { ...(identity || {}), instanceID: ledgerEntry.instanceID }
+    : identity;
   await preflightDeleteCodexConversationLocalRows(normalizedKey);
   const selector = await resolveRepairingMessageConversationSelector(
     normalizedKey,
@@ -2888,17 +3688,98 @@ export async function deleteCodexConversationLocalRows(
       destructive: true,
     },
   );
+  const catalogIdentityClause = deletionIdentity?.instanceID
+    ? `AND conversation_instance_id = ?`
+    : "";
+  const catalogIdentityParams = deletionIdentity?.instanceID
+    ? [deletionIdentity.instanceID]
+    : [];
+  const messageIdentityClause = deletionIdentity?.instanceID
+    ? `AND EXISTS (
+         SELECT 1
+         FROM ${CODEX_CONVERSATIONS_TABLE} c
+         WHERE c.conversation_key = ?
+           AND c.conversation_instance_id = ?
+       )`
+    : "";
+  const messageIdentityParams = deletionIdentity?.instanceID
+    ? [normalizedKey, deletionIdentity.instanceID]
+    : [];
+  await initConversationForkLinksStore();
+  await initConversationRegistryStore();
+  await initConversationSearchIndexStore();
+  await initRecentlyDeletedConversationTombstones();
   await Zotero.DB.executeTransaction(async () => {
+    if (deletionIdentity?.instanceID) {
+      const witnessRows = (await Zotero.DB.queryAsync(
+        `SELECT 1 AS present
+         FROM ${CODEX_CONVERSATIONS_TABLE}
+         WHERE conversation_key = ?
+           ${catalogIdentityClause}
+         LIMIT 1`,
+        [normalizedKey, ...catalogIdentityParams],
+      )) as Array<{ present?: unknown }> | undefined;
+      if (!witnessRows?.length) {
+        throw new Error(
+          `Refused to delete Codex conversation ${normalizedKey}: catalog identity changed`,
+        );
+      }
+    }
     await Zotero.DB.queryAsync(
       `DELETE FROM ${CODEX_MESSAGES_TABLE}
-       WHERE ${selector.whereSql}`,
-      selector.params,
+       WHERE ${selector.whereSql}
+         ${messageIdentityClause}
+         ${deletionIdentity?.conversationID ? "AND conversation_id = ?" : ""}`,
+      deletionIdentity?.conversationID
+        ? [
+            ...selector.params,
+            ...messageIdentityParams,
+            deletionIdentity.conversationID,
+          ]
+        : [...selector.params, ...messageIdentityParams],
     );
+    await clearPersistedAgentConversationRowsInTransaction(normalizedKey);
+    await clearOwnerAttachmentRefsInTransaction("conversation", normalizedKey);
     await Zotero.DB.queryAsync(
       `DELETE FROM ${CODEX_CONVERSATIONS_TABLE}
-       WHERE conversation_key = ?`,
-      [normalizedKey],
+       WHERE conversation_key = ?
+         ${catalogIdentityClause}`,
+      [normalizedKey, ...catalogIdentityParams],
     );
+    await deleteConversationForkLinksForInstanceInTransaction({
+      conversationKey: normalizedKey,
+      conversationID: deletionIdentity?.conversationID,
+      system: "codex",
+    });
+    if (deletionIdentity?.instanceID) {
+      await deleteRegisteredConversationScopeInTransaction(
+        deletionIdentity.instanceID,
+        normalizedKey,
+        deletionIdentity.conversationID,
+        "codex",
+      );
+    }
+    if (deletionIdentity?.instanceID) {
+      await persistConversationInstanceTombstoneInTransaction({
+        conversationKey: normalizedKey,
+        instanceID: deletionIdentity.instanceID,
+        conversationID: deletionIdentity.conversationID,
+      });
+    }
+    await deleteConversationSearchIndexRowInTransaction({
+      system: "codex",
+      conversationKey: normalizedKey,
+    });
+    if (ledgerAvailable && deletionIdentity?.instanceID) {
+      await retireConversationKeyInTransaction({
+        conversationKey: normalizedKey,
+        instanceID: deletionIdentity.instanceID,
+      });
+    }
+    await deletionIdentity?.onBeforeCommit?.();
+    await deletionIdentity?.onCommit?.();
   });
-  await deleteCodexConversationSearchIndex(normalizedKey);
+  if (deletionIdentity?.instanceID) {
+    rememberConversationKeyRetired(normalizedKey);
+  }
 }

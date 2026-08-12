@@ -17,10 +17,6 @@ describe("clearConversationController", function () {
         calls.push(`turns:${conversationKey}`);
         return true;
       },
-      restorePendingConversationDeletionsFor: async (conversationKey) => {
-        calls.push(`restore:${conversationKey}`);
-        return true;
-      },
       clearTransientComposeStateForItem: (itemId) => {
         clearedComposeItemID = itemId;
         calls.push(`compose:${itemId}`);
@@ -72,12 +68,11 @@ describe("clearConversationController", function () {
     assert.equal(statusLevel, "ready");
     assert.deepEqual(calls, [
       "turns:7001",
-      "restore:7001",
+      "stored:7001",
       "compose:7001",
       "history:7001",
       "loaded:7001",
       "preview",
-      "stored:7001",
       "title:7001",
       "refs:7001",
       "files:7001",
@@ -87,10 +82,47 @@ describe("clearConversationController", function () {
     ]);
   });
 
-  it("withdraws a pending conversation deletion instead of committing it", async function () {
-    // Blocker: Clear used to run the kind-agnostic finalize, which committed a
-    // conversation deletion queued from another surface and destroyed the
-    // catalog row Clear exists to preserve.
+  it("preserves mounted and provider state when the local clear commit fails", async function () {
+    const calls: string[] = [];
+    let statusMessage = "";
+    let statusLevel = "";
+    const { clearCurrentConversation } = createClearConversationController({
+      getConversationKey: () => 7001,
+      getCurrentItemID: () => 7001,
+      clearTransientComposeStateForItem: () => calls.push("compose"),
+      resetComposePreviewUI: () => calls.push("preview"),
+      resetConversationHistory: () => calls.push("history"),
+      markConversationLoaded: () => calls.push("loaded"),
+      clearStoredConversation: async () => {
+        calls.push("stored");
+        throw new Error("database locked");
+      },
+      invalidateConversationSession: async () => calls.push("provider"),
+      resetConversationTitle: async () => calls.push("title"),
+      clearOwnerAttachmentRefs: async () => calls.push("refs"),
+      removeConversationAttachmentFiles: async () => calls.push("files"),
+      refreshChatPreservingScroll: () => calls.push("refresh"),
+      refreshGlobalHistoryHeader: async () => calls.push("history-header"),
+      scheduleAttachmentGc: () => calls.push("gc"),
+      setStatusMessage: (message, level) => {
+        statusMessage = message;
+        statusLevel = level;
+      },
+    });
+
+    await clearCurrentConversation();
+
+    assert.deepEqual(calls, ["stored"]);
+    assert.equal(
+      statusMessage,
+      "Clear failed; content preserved. Please retry.",
+    );
+    assert.equal(statusLevel, "warning");
+  });
+
+  it("blocks while a pending conversation deletion owns the identity", async function () {
+    // Clear must not implicitly cancel or commit a whole-conversation intent.
+    // Only the explicit Undo action may withdraw that intent.
     const calls: string[] = [];
     const { clearCurrentConversation } = createClearConversationController({
       getConversationKey: () => 7001,
@@ -99,10 +131,7 @@ describe("clearConversationController", function () {
         calls.push(`turns:${conversationKey}`);
         return true;
       },
-      restorePendingConversationDeletionsFor: async (conversationKey) => {
-        calls.push(`restore:${conversationKey}`);
-        return true;
-      },
+      isConversationPendingDeletion: () => true,
       clearTransientComposeStateForItem: () => {},
       resetComposePreviewUI: () => {},
       resetConversationHistory: () => {},
@@ -121,14 +150,19 @@ describe("clearConversationController", function () {
 
     await clearCurrentConversation();
 
-    assert.include(calls, "restore:7001", "the deletion must be withdrawn");
-    assert.include(calls, "turns:7001", "hidden turns are still committed");
-    assert.include(calls, "stored", "the clear itself still runs");
+    assert.notInclude(
+      calls,
+      "turns:7001",
+      "whole deletion must stay untouched",
+    );
+    assert.notInclude(
+      calls,
+      "stored",
+      "clear must not mutate a frozen identity",
+    );
   });
 
-  it("aborts the clear when a pending conversation deletion cannot be withdrawn", async function () {
-    // If the durable intent survives, the next startup sweep would delete the
-    // chat anyway — reporting "Cleared" would be a lie.
+  it("reports the pending deletion without offering an implicit cancel", async function () {
     const calls: string[] = [];
     let statusMessage = "";
     let statusLevel = "";
@@ -136,7 +170,7 @@ describe("clearConversationController", function () {
       getConversationKey: () => 7001,
       getCurrentItemID: () => 7001,
       finalizePendingTurnDeletionsForConversation: async () => true,
-      restorePendingConversationDeletionsFor: async () => false,
+      isConversationPendingDeletion: () => true,
       clearTransientComposeStateForItem: () => {
         calls.push("compose");
       },
@@ -162,8 +196,8 @@ describe("clearConversationController", function () {
 
     assert.notInclude(calls, "stored", "nothing destructive may run");
     assert.notInclude(calls, "compose", "the clear must abort early");
-    assert.equal(statusMessage, "Failed to restore. Check logs.");
-    assert.equal(statusLevel, "error");
+    assert.equal(statusMessage, "Deletion pending; retrying safely");
+    assert.equal(statusLevel, "warning");
   });
 
   it("does nothing when there is no active conversation", async function () {

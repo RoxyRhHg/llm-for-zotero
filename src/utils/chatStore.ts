@@ -33,7 +33,10 @@ import {
 import {
   buildConversationID,
   getRegisteredConversationScope,
+  getCurrentProfileSignature,
+  generateConversationInstanceID,
   initConversationRegistryStore,
+  deleteRegisteredConversationScopeInTransaction,
   repairRegisteredConversationScope,
   registerConversationScope,
   type ConversationRegistryRow,
@@ -45,13 +48,37 @@ import {
 } from "../shared/conversationMessageIdentityRepair";
 import {
   deleteConversationSearchIndexRow,
+  deleteConversationSearchIndexRowInTransaction,
+  initConversationSearchIndexStore,
   refreshConversationSearchIndexForConversation,
 } from "../shared/conversationSearchIndex";
 import {
   CONVERSATION_ID_TRANSITION_MIGRATION_ID,
+  CONVERSATION_INSTANCE_ID_MIGRATION_IDS,
+  CONVERSATION_KEY_LEDGER_MIGRATION_ID,
   hasConversationSchemaMigration,
+  rekeyConversationOwnedRowsInTransaction,
   runConversationSchemaMigrationOnce,
 } from "../shared/conversationSchemaMigrations";
+import {
+  allocateConversationKeyInTransaction,
+  assertConversationKeyLiveInTransaction,
+  ConversationRetiredError,
+  ensureConversationKeyLedgerEntryInTransaction,
+  getConversationKeyLedgerEntry,
+  initializeConversationKeyCounterInTransaction,
+  initConversationKeyLedgerStore,
+  isConversationKeyLedgerStoreInitialized,
+  installConversationKeyLedgerCatalogTriggers,
+  installConversationKeyLedgerMessageTriggers,
+  retireConversationKeyInTransaction,
+  seedConversationKeyLedgerFromCatalogs,
+  seedConversationKeyLedgerFromTombstones,
+  reserveOrphanConversationMessageKeys,
+  retireOrphanedConversationLedgerEntries,
+  rememberConversationKeyRetired,
+  updateConversationKeyLedgerConversationIDInTransaction,
+} from "../shared/conversationKeyLedger";
 import {
   parseForcedSkillIdsJson,
   serializeForcedSkillIds,
@@ -66,6 +93,22 @@ import {
   normalizeTagContextRefs,
 } from "../modules/contextPanel/normalizers";
 import { normalizeQuoteCitations } from "../modules/contextPanel/quoteCitations";
+import { pendingDeletionStore } from "../core/conversations/pendingDeletionStore";
+import {
+  initRecentlyDeletedConversationTombstones,
+  persistConversationInstanceTombstoneInTransaction,
+} from "../core/conversations/recentlyDeletedConversations";
+import {
+  deleteConversationForkLinksForInstanceInTransaction,
+  initConversationForkLinksStore,
+} from "../shared/conversationForkLinks";
+import { clearPersistedAgentConversationRowsInTransaction } from "../modules/contextPanel/agentConversationCleanup";
+import { clearOwnerAttachmentRefsInTransaction } from "./attachmentRefStore";
+import {
+  areConversationWritesFrozen,
+  isConversationWriteGenerationCurrent,
+  withConversationWriteLock,
+} from "../shared/conversationWriteFence";
 
 export type StoredChatAttachment = {
   id: string;
@@ -80,6 +123,10 @@ export type StoredChatAttachment = {
 };
 
 export type StoredChatMessage = {
+  /** Immutable database row identity used by turn-deletion intents. */
+  id?: number;
+  /** Internal lifecycle witness; never written to a database column. */
+  conversationGeneration?: number;
   role: "user" | "assistant";
   text: string;
   timestamp: number;
@@ -150,6 +197,13 @@ const PAPER_CONVERSATIONS_ID_INDEX =
   "llm_for_zotero_paper_conversations_id_idx";
 const LEGACY_CHAT_MESSAGES_TABLE = "zoterollm_chat_messages";
 const LEGACY_CHAT_MESSAGES_INDEX = "zoterollm_chat_messages_conversation_idx";
+
+async function runChatStoreTransaction<T>(task: () => Promise<T>): Promise<T> {
+  const db = Zotero?.DB;
+  return typeof db?.executeTransaction === "function"
+    ? db.executeTransaction(task)
+    : task();
+}
 const CHAT_MESSAGE_SELECT_COLUMNS_SQL = `id,
             role,
             text,
@@ -466,6 +520,88 @@ async function resolveRegisteredConversationID(
   return registered?.conversationID || null;
 }
 
+async function resolveRegisteredConversationInstanceID(
+  conversationKey: number,
+): Promise<string | null> {
+  const registered = await getRegisteredConversationScope(conversationKey);
+  if (registered?.instanceID) return registered.instanceID;
+  const ledger = await getConversationKeyLedgerEntry(conversationKey);
+  return ledger?.instanceID || null;
+}
+
+async function assertUpstreamForkSourceLive(params: {
+  conversationKey: number;
+  instanceID?: string;
+  conversationID?: string;
+}): Promise<void> {
+  const key = normalizeConversationKey(params.conversationKey);
+  if (!key) throw new ConversationRetiredError(0, params.instanceID || "");
+  const ledger = await getConversationKeyLedgerEntry(key);
+  // A legacy catalog with no immutable witness cannot be strengthened by this
+  // helper; its migration path will quarantine it. Preserve the pre-ledger
+  // repository behavior until that migration has supplied an instance ID.
+  if (!ledger && !params.instanceID) return;
+  const instanceID = params.instanceID?.trim() || ledger?.instanceID || "";
+  if (!ledger || ledger.retiredAt || ledger.instanceID !== instanceID) {
+    throw new ConversationRetiredError(key, instanceID);
+  }
+  const table = isUpstreamPaperConversationKey(key)
+    ? PAPER_CONVERSATIONS_TABLE
+    : GLOBAL_CONVERSATIONS_TABLE;
+  const rows = (await Zotero.DB.queryAsync(
+    `SELECT conversation_id AS conversationID
+     FROM ${table}
+     WHERE conversation_key = ?
+       AND conversation_instance_id = ?
+       AND (? = '' OR conversation_id = ?)
+     LIMIT 1`,
+    [
+      key,
+      instanceID,
+      params.conversationID?.trim() || "",
+      params.conversationID?.trim() || "",
+    ],
+  )) as Array<{ conversationID?: unknown }> | undefined;
+  if (!rows?.length) throw new ConversationRetiredError(key, instanceID);
+}
+
+async function resolveUpstreamAppendIdentity(
+  conversationKey: number,
+  requestedInstanceID?: string,
+): Promise<{
+  instanceID: string | null;
+  conversationID: string | null;
+  ledgerAvailable: boolean;
+}> {
+  const registered = await getRegisteredConversationScope(conversationKey);
+  let ledger;
+  const ledgerAvailable = isConversationKeyLedgerStoreInitialized();
+  if (ledgerAvailable) {
+    ledger = await getConversationKeyLedgerEntry(conversationKey);
+  }
+  if (ledgerAvailable) {
+    if (!ledger || ledger.retiredAt) {
+      throw new ConversationRetiredError(
+        conversationKey,
+        requestedInstanceID || registered?.instanceID || "",
+      );
+    }
+    if (requestedInstanceID && requestedInstanceID !== ledger.instanceID) {
+      throw new Error(
+        `Conversation ${conversationKey} instance identity mismatch`,
+      );
+    }
+  }
+  const instanceID =
+    ledger?.instanceID || requestedInstanceID || registered?.instanceID || null;
+  return {
+    instanceID,
+    conversationID:
+      ledger?.conversationID || registered?.conversationID || null,
+    ledgerAvailable,
+  };
+}
+
 type MessageConversationSelector = {
   whereSql: string;
   params: unknown[];
@@ -485,8 +621,8 @@ async function resolveMessageConversationSelector(
         registered,
       }
     : {
-        whereSql: "conversation_key = ?",
-        params: [conversationKey],
+        whereSql: "1 = 0",
+        params: [],
         registered,
       };
 }
@@ -568,16 +704,10 @@ async function refreshUpstreamConversationSearchIndex(
 async function deleteUpstreamConversationSearchIndex(
   conversationKey: number,
 ): Promise<void> {
-  try {
-    await deleteConversationSearchIndexRow({
-      system: "upstream",
-      conversationKey,
-    });
-  } catch (error) {
-    logChatStoreWarning(
-      `Failed to delete upstream conversation search index row for ${conversationKey}: ${formatSearchIndexError(error)}`,
-    );
-  }
+  await deleteConversationSearchIndexRow({
+    system: "upstream",
+    conversationKey,
+  });
 }
 
 async function getUpstreamMessagePaperContextRows(
@@ -754,6 +884,7 @@ async function purgeInvalidGlobalConversationCatalog(): Promise<void> {
 }
 
 async function reconcileGlobalConversationCatalog(): Promise<void> {
+  if (isConversationKeyLedgerStoreInitialized()) return;
   const libraryID = resolveUserLibraryID();
   const rows = (await Zotero.DB.queryAsync(
     `SELECT m.conversation_key AS conversationKey,
@@ -776,7 +907,6 @@ async function reconcileGlobalConversationCatalog(): Promise<void> {
      ORDER BY m.conversation_key ASC`,
     [GLOBAL_CONVERSATION_KEY_BASE, UPSTREAM_RUNTIME_CONVERSATION_KEY_END],
   )) as ConversationCatalogSeedRow[] | undefined;
-
   for (const row of rows || []) {
     const conversationKey = normalizeConversationKey(
       Number(row.conversationKey),
@@ -806,6 +936,7 @@ async function reconcileGlobalConversationCatalog(): Promise<void> {
 }
 
 async function reconcileLegacyPaperV1ConversationCatalog(): Promise<void> {
+  if (isConversationKeyLedgerStoreInitialized()) return;
   const rows = (await Zotero.DB.queryAsync(
     `SELECT m.conversation_key AS conversationKey,
             MIN(m.timestamp) AS createdAt,
@@ -827,7 +958,6 @@ async function reconcileLegacyPaperV1ConversationCatalog(): Promise<void> {
      ORDER BY m.conversation_key ASC`,
     [PAPER_CONVERSATION_KEY_BASE],
   )) as ConversationCatalogSeedRow[] | undefined;
-
   for (const row of rows || []) {
     const conversationKey = normalizeConversationKey(
       Number(row.conversationKey),
@@ -890,7 +1020,8 @@ async function getNextAvailableGlobalConversationKey(
     normalizedPreferred &&
     normalizedPreferred !== currentKey &&
     isUpstreamGlobalConversationKey(normalizedPreferred) &&
-    !(await getGlobalConversationKeyInUse(normalizedPreferred))
+    !(await getGlobalConversationKeyInUse(normalizedPreferred)) &&
+    !(await getConversationKeyLedgerEntry(normalizedPreferred))
   ) {
     return normalizedPreferred;
   }
@@ -904,16 +1035,27 @@ async function getNextAvailableGlobalConversationKey(
       UPSTREAM_RUNTIME_CONVERSATION_KEY_END,
     ],
   )) as Array<{ maxConversationKey?: unknown }> | undefined;
-  const maxConversationKey = Number(rows?.[0]?.maxConversationKey);
-  return Number.isFinite(maxConversationKey)
+  let candidate = Number.isFinite(Number(rows?.[0]?.maxConversationKey))
     ? Math.max(
         UPSTREAM_GLOBAL_ALLOCATED_CONVERSATION_KEY_BASE,
-        Math.floor(maxConversationKey) + 1,
+        Math.floor(Number(rows?.[0]?.maxConversationKey)) + 1,
       )
     : UPSTREAM_GLOBAL_ALLOCATED_CONVERSATION_KEY_BASE;
+  while (await getConversationKeyLedgerEntry(candidate)) candidate += 1;
+  return candidate;
 }
 
-async function migrateSharedGlobalDefaultConversationKey(): Promise<void> {
+type ConversationKeyRemap = {
+  legacyKey: number;
+  targetKey: number;
+  /** A retired key may contain an older owner's rows; never adopt them. */
+  preserveLegacyRows?: boolean;
+};
+
+async function migrateSharedGlobalDefaultConversationKey(): Promise<
+  ConversationKeyRemap[]
+> {
+  const remaps: ConversationKeyRemap[] = [];
   const rows = (await Zotero.DB.queryAsync(
     `SELECT conversation_key AS conversationKey,
             library_id AS libraryID
@@ -922,26 +1064,42 @@ async function migrateSharedGlobalDefaultConversationKey(): Promise<void> {
     [GLOBAL_CONVERSATION_KEY_BASE],
   )) as Array<{ conversationKey?: unknown; libraryID?: unknown }> | undefined;
   const row = rows?.[0];
-  if (!row) return;
+  if (!row) return remaps;
   const libraryID = normalizeLibraryID(Number(row.libraryID));
-  if (!libraryID) return;
+  if (!libraryID) return remaps;
+  // The sentinel key may have been reused after a pre-ledger deletion. Its
+  // key-only messages and agent rows are then ambiguous, so leave them under
+  // the retired key for quarantine instead of adopting them into the new
+  // catalog instance.
+  const legacyKeyWasRetired = Boolean(
+    (await getConversationKeyLedgerEntry(GLOBAL_CONVERSATION_KEY_BASE))
+      ?.retiredAt,
+  );
   const targetKey = await getNextAvailableGlobalConversationKey(
     buildDefaultUpstreamGlobalConversationKey(libraryID),
     GLOBAL_CONVERSATION_KEY_BASE,
   );
-  if (targetKey === GLOBAL_CONVERSATION_KEY_BASE) return;
+  if (targetKey === GLOBAL_CONVERSATION_KEY_BASE) return remaps;
   await Zotero.DB.queryAsync(
     `UPDATE ${GLOBAL_CONVERSATIONS_TABLE}
-     SET conversation_key = ?
-     WHERE conversation_key = ?`,
+       SET conversation_key = ?
+       WHERE conversation_key = ?`,
     [targetKey, GLOBAL_CONVERSATION_KEY_BASE],
   );
-  await Zotero.DB.queryAsync(
-    `UPDATE ${CHAT_MESSAGES_TABLE}
-     SET conversation_key = ?
-     WHERE conversation_key = ?`,
-    [targetKey, GLOBAL_CONVERSATION_KEY_BASE],
-  );
+  if (!legacyKeyWasRetired) {
+    await Zotero.DB.queryAsync(
+      `UPDATE ${CHAT_MESSAGES_TABLE}
+         SET conversation_key = ?
+         WHERE conversation_key = ?`,
+      [targetKey, GLOBAL_CONVERSATION_KEY_BASE],
+    );
+  }
+  remaps.push({
+    legacyKey: GLOBAL_CONVERSATION_KEY_BASE,
+    targetKey,
+    preserveLegacyRows: legacyKeyWasRetired,
+  });
+  return remaps;
 }
 
 async function backfillUpstreamConversationIDs(): Promise<void> {
@@ -1019,7 +1177,9 @@ async function backfillUpstreamConversationIDs(): Promise<void> {
   }
 }
 
-async function backfillUpstreamConversationRegistry(): Promise<void> {
+async function backfillUpstreamConversationRegistry(
+  options: { inTransaction?: boolean } = {},
+): Promise<void> {
   const globalRows = (await Zotero.DB.queryAsync(
     `SELECT conversation_id AS conversationID,
             conversation_key AS conversationKey,
@@ -1042,17 +1202,22 @@ async function backfillUpstreamConversationRegistry(): Promise<void> {
     );
     const libraryID = normalizeLibraryID(Number(row.libraryID));
     if (!conversationKey || !libraryID) continue;
-    await registerConversationScope({
-      conversationID:
-        typeof row.conversationID === "string" ? row.conversationID : undefined,
-      conversationKey,
-      system: "upstream",
-      kind: "global",
-      libraryID,
-      createdAt: normalizeCatalogTimestamp(row.createdAt),
-      updatedAt: normalizeCatalogTimestamp(row.createdAt),
-      title: typeof row.title === "string" ? row.title : undefined,
-    });
+    await registerConversationScope(
+      {
+        conversationID:
+          typeof row.conversationID === "string"
+            ? row.conversationID
+            : undefined,
+        conversationKey,
+        system: "upstream",
+        kind: "global",
+        libraryID,
+        createdAt: normalizeCatalogTimestamp(row.createdAt),
+        updatedAt: normalizeCatalogTimestamp(row.createdAt),
+        title: typeof row.title === "string" ? row.title : undefined,
+      },
+      options,
+    );
   }
 
   const paperRows = (await Zotero.DB.queryAsync(
@@ -1080,18 +1245,70 @@ async function backfillUpstreamConversationRegistry(): Promise<void> {
     const libraryID = normalizeLibraryID(Number(row.libraryID));
     const paperItemID = normalizePaperItemID(Number(row.paperItemID));
     if (!conversationKey || !libraryID || !paperItemID) continue;
-    await registerConversationScope({
-      conversationID:
-        typeof row.conversationID === "string" ? row.conversationID : undefined,
-      conversationKey,
-      system: "upstream",
-      kind: "paper",
-      libraryID,
-      paperItemID,
-      createdAt: normalizeCatalogTimestamp(row.createdAt),
-      updatedAt: normalizeCatalogTimestamp(row.createdAt),
-      title: typeof row.title === "string" ? row.title : undefined,
-    });
+    await registerConversationScope(
+      {
+        conversationID:
+          typeof row.conversationID === "string"
+            ? row.conversationID
+            : undefined,
+        conversationKey,
+        system: "upstream",
+        kind: "paper",
+        libraryID,
+        paperItemID,
+        createdAt: normalizeCatalogTimestamp(row.createdAt),
+        updatedAt: normalizeCatalogTimestamp(row.createdAt),
+        title: typeof row.title === "string" ? row.title : undefined,
+      },
+      options,
+    );
+  }
+}
+
+async function backfillUpstreamConversationInstanceIDs(): Promise<void> {
+  for (const table of [GLOBAL_CONVERSATIONS_TABLE, PAPER_CONVERSATIONS_TABLE]) {
+    // Prefer an already-registered identity when a legacy catalog row has no
+    // instance column yet. This binds the two witnesses to the same existing
+    // instance instead of minting a second identity during migration.
+    await Zotero.DB.queryAsync(
+      `UPDATE ${table}
+       SET conversation_instance_id = (
+         SELECT r.instance_id
+         FROM llm_for_zotero_conversation_registry r
+         WHERE r.conversation_id = ${table}.conversation_id
+           AND r.instance_id IS NOT NULL
+           AND TRIM(r.instance_id) <> ''
+         LIMIT 1
+       )
+       WHERE (conversation_instance_id IS NULL OR TRIM(conversation_instance_id) = '')
+         AND conversation_id IS NOT NULL
+         AND EXISTS (
+           SELECT 1
+           FROM llm_for_zotero_conversation_registry r
+           WHERE r.conversation_id = ${table}.conversation_id
+             AND r.instance_id IS NOT NULL
+             AND TRIM(r.instance_id) <> ''
+         )`,
+    );
+    const rows = (await Zotero.DB.queryAsync(
+      `SELECT conversation_key AS conversationKey
+       FROM ${table}
+       WHERE conversation_instance_id IS NULL
+          OR TRIM(conversation_instance_id) = ''`,
+    )) as Array<{ conversationKey?: unknown }> | undefined;
+    for (const row of rows || []) {
+      const conversationKey = normalizeConversationKey(
+        Number(row.conversationKey),
+      );
+      if (!conversationKey) continue;
+      await Zotero.DB.queryAsync(
+        `UPDATE ${table}
+         SET conversation_instance_id = ?
+         WHERE conversation_key = ?
+           AND (conversation_instance_id IS NULL OR TRIM(conversation_instance_id) = '')`,
+        [generateConversationInstanceID(), conversationKey],
+      );
+    }
   }
 }
 
@@ -1108,6 +1325,7 @@ export async function initChatStore(): Promise<void> {
       `CREATE TABLE IF NOT EXISTS ${CHAT_MESSAGES_TABLE} (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         conversation_id TEXT,
+        conversation_instance_id TEXT,
         conversation_key INTEGER NOT NULL,
         role TEXT NOT NULL CHECK(role IN ('user', 'assistant')),
         text TEXT NOT NULL,
@@ -1148,10 +1366,16 @@ export async function initChatStore(): Promise<void> {
     const columns = (await Zotero.DB.queryAsync(
       `PRAGMA table_info(${CHAT_MESSAGES_TABLE})`,
     )) as Array<{ name?: unknown }> | undefined;
-    const messageColumns = new Set(
+    const messageColumns = new Set<string>(
       (columns || [])
         .map((column) => (typeof column?.name === "string" ? column.name : ""))
         .filter(Boolean),
+    );
+    await ensureColumn(
+      CHAT_MESSAGES_TABLE,
+      messageColumns,
+      "conversation_instance_id",
+      "conversation_instance_id TEXT",
     );
     await ensureColumn(
       CHAT_MESSAGES_TABLE,
@@ -1417,6 +1641,7 @@ export async function initChatStore(): Promise<void> {
     await Zotero.DB.queryAsync(
       `CREATE TABLE IF NOT EXISTS ${GLOBAL_CONVERSATIONS_TABLE} (
         conversation_id TEXT,
+        conversation_instance_id TEXT,
         conversation_key INTEGER PRIMARY KEY,
         library_id INTEGER NOT NULL,
         created_at INTEGER NOT NULL,
@@ -1438,6 +1663,12 @@ export async function initChatStore(): Promise<void> {
       globalColumns,
       "conversation_id",
       "conversation_id TEXT",
+    );
+    await ensureColumn(
+      GLOBAL_CONVERSATIONS_TABLE,
+      globalColumns,
+      "conversation_instance_id",
+      "conversation_instance_id TEXT",
     );
     await ensureColumn(
       GLOBAL_CONVERSATIONS_TABLE,
@@ -1475,6 +1706,7 @@ export async function initChatStore(): Promise<void> {
     await Zotero.DB.queryAsync(
       `CREATE TABLE IF NOT EXISTS ${PAPER_CONVERSATIONS_TABLE} (
         conversation_id TEXT,
+        conversation_instance_id TEXT,
         conversation_key INTEGER PRIMARY KEY,
         library_id INTEGER NOT NULL,
         paper_item_id INTEGER NOT NULL,
@@ -1520,6 +1752,12 @@ export async function initChatStore(): Promise<void> {
     await ensureColumn(
       PAPER_CONVERSATIONS_TABLE,
       paperColumnSet,
+      "conversation_instance_id",
+      "conversation_instance_id TEXT",
+    );
+    await ensureColumn(
+      PAPER_CONVERSATIONS_TABLE,
+      paperColumnSet,
       "last_activity_at",
       "last_activity_at INTEGER",
     );
@@ -1553,14 +1791,159 @@ export async function initChatStore(): Promise<void> {
       `CREATE UNIQUE INDEX IF NOT EXISTS ${PAPER_CONVERSATIONS_ID_INDEX}
        ON ${PAPER_CONVERSATIONS_TABLE} (conversation_id)`,
     );
+    // Establish the permanent-key boundary before any legacy reconciliation;
+    // reconciliation must never be able to rebuild a catalog from orphaned
+    // message rows.
+    await initConversationKeyLedgerStore();
 
     if (!conversationIDTransitionAlreadyApplied) {
       await reconcileConversationCatalogs();
-      await migrateSharedGlobalDefaultConversationKey();
       await backfillUpstreamConversationIDs();
-      await backfillUpstreamConversationRegistry();
+      await backfillUpstreamConversationRegistry({ inTransaction: true });
       await refreshUpstreamConversationCatalogSummary();
     }
+    await runConversationSchemaMigrationOnce(
+      CONVERSATION_INSTANCE_ID_MIGRATION_IDS.upstream,
+      "Backfill immutable conversation instance identities for upstream catalogs and registry rows.",
+      async () => {
+        await backfillUpstreamConversationIDs();
+        await backfillUpstreamConversationInstanceIDs();
+        await backfillUpstreamConversationRegistry({ inTransaction: true });
+      },
+    );
+    await initConversationKeyLedgerStore();
+    await initRecentlyDeletedConversationTombstones();
+    // Tombstone-only keys must be burned before legacy migration chooses a
+    // target.  Otherwise a pre-ledger tombstone can be mistaken for an
+    // available numeric key and later quarantine a newly live catalog row.
+    await seedConversationKeyLedgerFromTombstones();
+    await reserveOrphanConversationMessageKeys({
+      messageTable: CHAT_MESSAGES_TABLE,
+      catalogTables: [GLOBAL_CONVERSATIONS_TABLE, PAPER_CONVERSATIONS_TABLE],
+      system: "upstream",
+      sourceTables: [
+        { table: "llm_for_zotero_agent_memory" },
+        { table: "llm_for_zotero_agent_transcript" },
+        { table: "llm_for_zotero_agent_tool_result_handles" },
+        { table: "llm_for_zotero_agent_evidence" },
+        { table: "llm_for_zotero_agent_runs" },
+        {
+          table: "llm_for_zotero_agent_coverage",
+          column: "origin_conversation_key",
+        },
+        {
+          table: "llm_for_zotero_attachment_refs",
+          column: "owner_id",
+          whereSql: "s.owner_type = 'conversation'",
+        },
+        {
+          table: "llm_for_zotero_conversation_registry",
+          column: "legacy_conversation_key",
+        },
+        {
+          table: "llm_for_zotero_conversation_search_index",
+          column: "legacy_conversation_key",
+        },
+        { table: "llm_for_zotero_conversation_cleanup_jobs" },
+        { table: "llm_for_zotero_pending_deletions" },
+        { table: "llm_for_zotero_agent_trace_exports" },
+        { table: "llm_for_zotero_agent_trace_file_cleanup" },
+        {
+          table: "llm_for_zotero_conversation_fork_links",
+          column: "source_conversation_key",
+        },
+        {
+          table: "llm_for_zotero_conversation_fork_links",
+          column: "target_conversation_key",
+        },
+      ],
+    });
+    let migratedKeyRemaps: ConversationKeyRemap[] = [];
+    if (!conversationIDTransitionAlreadyApplied) {
+      migratedKeyRemaps = await migrateSharedGlobalDefaultConversationKey();
+    }
+    await runConversationSchemaMigrationOnce(
+      CONVERSATION_KEY_LEDGER_MIGRATION_ID,
+      "Reserve every existing upstream conversation key permanently and initialize the monotonic allocator.",
+      async () => {
+        await seedConversationKeyLedgerFromCatalogs([
+          {
+            table: GLOBAL_CONVERSATIONS_TABLE,
+            system: "upstream",
+            kind: "global",
+          },
+          {
+            table: PAPER_CONVERSATIONS_TABLE,
+            system: "upstream",
+            kind: "paper",
+          },
+        ]);
+      },
+    );
+    await seedConversationKeyLedgerFromCatalogs([
+      {
+        table: GLOBAL_CONVERSATIONS_TABLE,
+        system: "upstream",
+        kind: "global",
+      },
+      {
+        table: PAPER_CONVERSATIONS_TABLE,
+        system: "upstream",
+        kind: "paper",
+      },
+    ]);
+    for (const remap of migratedKeyRemaps) {
+      if (remap.preserveLegacyRows) continue;
+      await rekeyConversationOwnedRowsInTransaction(
+        remap.legacyKey,
+        remap.targetKey,
+      );
+    }
+    await seedConversationKeyLedgerFromTombstones();
+    await retireOrphanedConversationLedgerEntries({
+      system: "upstream",
+      kind: "global",
+      catalogTables: [GLOBAL_CONVERSATIONS_TABLE, PAPER_CONVERSATIONS_TABLE],
+    });
+    await retireOrphanedConversationLedgerEntries({
+      system: "upstream",
+      kind: "paper",
+      catalogTables: [GLOBAL_CONVERSATIONS_TABLE, PAPER_CONVERSATIONS_TABLE],
+    });
+    await initializeConversationKeyCounterInTransaction({
+      system: "upstream",
+      kind: "paper",
+      start: PAPER_CONVERSATION_KEY_BASE,
+      endExclusive: GLOBAL_CONVERSATION_KEY_BASE,
+    });
+    await initializeConversationKeyCounterInTransaction({
+      system: "upstream",
+      kind: "global",
+      start: UPSTREAM_GLOBAL_ALLOCATED_CONVERSATION_KEY_BASE,
+      endExclusive: UPSTREAM_RUNTIME_CONVERSATION_KEY_END,
+    });
+    await Zotero.DB.queryAsync(
+      `UPDATE ${CHAT_MESSAGES_TABLE}
+       SET conversation_instance_id = COALESCE(
+         (SELECT g.conversation_instance_id
+          FROM ${GLOBAL_CONVERSATIONS_TABLE} g
+          WHERE g.conversation_key = ${CHAT_MESSAGES_TABLE}.conversation_key),
+         (SELECT p.conversation_instance_id
+          FROM ${PAPER_CONVERSATIONS_TABLE} p
+          WHERE p.conversation_key = ${CHAT_MESSAGES_TABLE}.conversation_key)
+       )
+       WHERE conversation_instance_id IS NULL
+          OR TRIM(conversation_instance_id) = ''`,
+    );
+    await installConversationKeyLedgerCatalogTriggers([
+      GLOBAL_CONVERSATIONS_TABLE,
+      PAPER_CONVERSATIONS_TABLE,
+    ]);
+    await installConversationKeyLedgerMessageTriggers({
+      messageTable: CHAT_MESSAGES_TABLE,
+      system: "upstream",
+      catalogTables: [GLOBAL_CONVERSATIONS_TABLE, PAPER_CONVERSATIONS_TABLE],
+    });
   });
   await cleanupLeakedWebchatGhostTitlesOnce();
   await sweepWebchatSessionConversations();
@@ -1648,12 +2031,11 @@ async function cleanupLeakedWebchatGhostTitlesOnce(): Promise<void> {
  * cleared) instead of deleted — the sweep must never destroy transcripts.
  */
 async function sweepWebchatSessionConversations(): Promise<void> {
-  const sweepTable = async (
-    tableName: string,
-    deleteConversation: (conversationKey: number) => Promise<void>,
-  ) => {
+  const sweepTable = async (tableName: string, kind: "global" | "paper") => {
     const rows = (await Zotero.DB.queryAsync(
       `SELECT conversation_key AS conversationKey,
+              conversation_id AS conversationID,
+              conversation_instance_id AS instanceID,
               EXISTS (
                 SELECT 1
                 FROM ${CHAT_MESSAGES_TABLE} m0
@@ -1662,7 +2044,12 @@ async function sweepWebchatSessionConversations(): Promise<void> {
        FROM ${tableName}
        WHERE COALESCE(${tableName}.webchat_session, 0) = 1`,
     )) as
-      | Array<{ conversationKey?: unknown; hasMessages?: unknown }>
+      | Array<{
+          conversationKey?: unknown;
+          conversationID?: unknown;
+          instanceID?: unknown;
+          hasMessages?: unknown;
+        }>
       | undefined;
     for (const row of rows || []) {
       const conversationKey = normalizeConversationKey(
@@ -1682,12 +2069,30 @@ async function sweepWebchatSessionConversations(): Promise<void> {
         );
         continue;
       }
-      await deleteConversation(conversationKey);
+      const instanceID =
+        typeof row.instanceID === "string" ? row.instanceID.trim() : "";
+      const conversationID =
+        typeof row.conversationID === "string" ? row.conversationID.trim() : "";
+      if (!instanceID || !conversationID) continue;
+      try {
+        await deleteUpstreamConversationLocalRows(conversationKey, kind, {
+          instanceID,
+          conversationID,
+        });
+      } catch (error) {
+        // One malformed/locked ephemeral row must not prevent the rest of the
+        // startup sweep from adopting or deleting other sessions.  The row
+        // remains visible only to this maintenance pass and is retried on the
+        // next startup after the underlying local failure is repaired.
+        logChatStoreWarning(
+          `Failed to sweep webchat session ${conversationKey}: ${String(error)}`,
+        );
+      }
     }
   };
   try {
-    await sweepTable(PAPER_CONVERSATIONS_TABLE, deletePaperConversation);
-    await sweepTable(GLOBAL_CONVERSATIONS_TABLE, deleteGlobalConversation);
+    await sweepTable(PAPER_CONVERSATIONS_TABLE, "paper");
+    await sweepTable(GLOBAL_CONVERSATIONS_TABLE, "global");
   } catch (err) {
     logChatStoreWarning(
       `Failed to sweep webchat session conversations: ${String(err)}`,
@@ -1716,6 +2121,7 @@ export async function loadConversation(
   )) as
     | Array<{
         role: unknown;
+        id?: unknown;
         text: unknown;
         timestamp: unknown;
         selectedText?: unknown;
@@ -2003,6 +2409,10 @@ export async function loadConversation(
     }
     const forcedSkillIds = parseForcedSkillIdsJson(row.forcedSkillIdsJson);
     messages.push({
+      id:
+        Number.isFinite(Number(row.id)) && Number(row.id) > 0
+          ? Math.floor(Number(row.id))
+          : undefined,
       role,
       text: typeof row.text === "string" ? row.text : "",
       timestamp: Number.isFinite(timestamp) ? timestamp : Date.now(),
@@ -2090,6 +2500,8 @@ export async function loadConversation(
 
 export async function forkUpstreamConversationMessages(params: {
   sourceConversationKey: number;
+  sourceInstanceID?: string;
+  sourceConversationID?: string;
   targetConversationKey: number;
   throughAssistantTimestamp: number;
   timestampBase?: number;
@@ -2101,6 +2513,8 @@ export async function forkUpstreamConversationMessages(params: {
       isValidConversationKey: isUpstreamStoreConversationKey,
       resolveSourceSelector: resolveRepairingMessageConversationSelector,
       resolveTargetConversationID: resolveRegisteredConversationID,
+      resolveTargetInstanceID: resolveRegisteredConversationInstanceID,
+      assertSourceConversationLive: assertUpstreamForkSourceLive,
       refreshCatalogSummary: refreshUpstreamConversationCatalogSummary,
       refreshSearchIndex: refreshUpstreamConversationSearchIndex,
     },
@@ -2111,9 +2525,15 @@ export async function forkUpstreamConversationMessages(params: {
 export async function appendMessage(
   conversationKey: number,
   message: StoredChatMessage,
+  instanceID?: string,
 ): Promise<void> {
   const normalizedKey = normalizeConversationKey(conversationKey);
   if (!normalizedKey || !isUpstreamStoreConversationKey(normalizedKey)) return;
+  if (pendingDeletionStore.isConversationPendingDeletion(normalizedKey)) {
+    throw new Error(
+      `Conversation ${normalizedKey} is frozen by a pending deletion`,
+    );
+  }
 
   const timestamp = Number(message.timestamp);
   const selectedTextContexts = synthesizeSelectedTextContexts({
@@ -2161,12 +2581,45 @@ export async function appendMessage(
   );
   const modelAttachments = normalizeStoredAttachments(message.modelAttachments);
   const generatedImages = normalizeGeneratedChatImages(message.generatedImages);
-  const conversationID = await resolveRegisteredConversationID(normalizedKey);
+  const appendIdentity = await resolveUpstreamAppendIdentity(
+    normalizedKey,
+    instanceID,
+  );
+  const conversationID = appendIdentity.conversationID;
   await Zotero.DB.executeTransaction(async () => {
+    if (appendIdentity.ledgerAvailable) {
+      await assertConversationKeyLiveInTransaction({
+        conversationKey: normalizedKey,
+        instanceID: appendIdentity.instanceID || "",
+      });
+      const catalogTable = isUpstreamPaperConversationKey(normalizedKey)
+        ? PAPER_CONVERSATIONS_TABLE
+        : GLOBAL_CONVERSATIONS_TABLE;
+      const catalogRows = (await Zotero.DB.queryAsync(
+        `SELECT conversation_id AS conversationID
+         FROM ${catalogTable}
+         WHERE conversation_key = ?
+           AND conversation_instance_id = ?
+         LIMIT 1`,
+        [normalizedKey, appendIdentity.instanceID],
+      )) as Array<{ conversationID?: unknown }> | undefined;
+      if (!catalogRows?.length) {
+        throw new ConversationRetiredError(
+          normalizedKey,
+          appendIdentity.instanceID || "",
+        );
+      }
+    }
+    const identityAvailable =
+      appendIdentity.ledgerAvailable || Boolean(appendIdentity.instanceID);
+    const identityColumn = identityAvailable
+      ? ", conversation_instance_id"
+      : "";
+    const identityPlaceholder = identityAvailable ? ", ?" : "";
     await Zotero.DB.queryAsync(
       `INSERT INTO ${CHAT_MESSAGES_TABLE}
-        (conversation_id, conversation_key, role, text, timestamp, run_mode, agent_run_id, selected_text, selected_text_contexts_json, selected_texts_json, selected_text_sources_json, selected_text_paper_contexts_json, selected_text_note_contexts_json, forced_skill_ids_json, paper_contexts_json, pdf_paper_contexts_json, full_text_paper_contexts_json, citation_paper_contexts_json, quote_citations_json, collection_contexts_json, tag_contexts_json, screenshot_images, attachments_json, model_attachments_json, generated_images_json, model_name, model_entry_id, model_provider_label, interrupted, webchat_run_state, webchat_completion_reason, reasoning_summary, reasoning_details, context_tokens, context_window)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        (conversation_id, conversation_key, role, text, timestamp, run_mode, agent_run_id, selected_text, selected_text_contexts_json, selected_texts_json, selected_text_sources_json, selected_text_paper_contexts_json, selected_text_note_contexts_json, forced_skill_ids_json, paper_contexts_json, pdf_paper_contexts_json, full_text_paper_contexts_json, citation_paper_contexts_json, quote_citations_json, collection_contexts_json, tag_contexts_json, screenshot_images, attachments_json, model_attachments_json, generated_images_json, model_name, model_entry_id, model_provider_label, interrupted, webchat_run_state, webchat_completion_reason, reasoning_summary, reasoning_details, context_tokens, context_window${identityColumn})
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?${identityPlaceholder})`,
       [
         conversationID,
         normalizedKey,
@@ -2221,6 +2674,7 @@ export async function appendMessage(
         Number.isFinite(Number(message.contextWindow))
           ? Math.floor(Number(message.contextWindow))
           : null,
+        ...(identityAvailable ? [appendIdentity.instanceID] : []),
       ],
     );
     // Adoption: once a real message is persisted into a webchat-flagged row
@@ -2490,9 +2944,35 @@ export async function updateLatestAssistantMessage(
 
 export async function clearConversation(
   conversationKey: number,
+  identity?: { instanceID?: string; conversationID?: string },
+  onBeforeCommit?: () => Promise<void>,
 ): Promise<void> {
   const normalizedKey = normalizeConversationKey(conversationKey);
   if (!normalizedKey || !isUpstreamStoreConversationKey(normalizedKey)) return;
+
+  const catalogTable = isUpstreamPaperConversationKey(normalizedKey)
+    ? PAPER_CONVERSATIONS_TABLE
+    : GLOBAL_CONVERSATIONS_TABLE;
+  const catalogIdentityClause = identity?.instanceID
+    ? `AND conversation_instance_id = ?`
+    : "";
+  const catalogIdentityParams = identity?.instanceID
+    ? [identity.instanceID]
+    : [];
+  const messageIdentityClause = identity?.instanceID
+    ? `AND EXISTS (
+         SELECT 1
+         FROM ${catalogTable} c
+         WHERE c.conversation_key = ?
+           ${catalogIdentityClause.replaceAll(
+             "conversation_instance_id",
+             "c.conversation_instance_id",
+           )}
+       )`
+    : "";
+  const messageIdentityParams = identity?.instanceID
+    ? [normalizedKey, ...catalogIdentityParams]
+    : [];
 
   const selector = await resolveRepairingMessageConversationSelector(
     normalizedKey,
@@ -2500,13 +2980,35 @@ export async function clearConversation(
       destructive: true,
     },
   );
+  // Remove the old indexed body in the same transaction as pruning.  The
+  // post-commit refresh is best-effort, but it must never leave deleted text
+  // searchable if that refresh is interrupted or the database is transiently
+  // unavailable.
+  const searchIndexReady = await initConversationSearchIndexStore();
   await Zotero.DB.executeTransaction(async () => {
+    if (identity?.instanceID) {
+      const witnessRows = (await Zotero.DB.queryAsync(
+        `SELECT 1 AS present
+         FROM ${catalogTable}
+         WHERE conversation_key = ?
+           ${catalogIdentityClause}
+         LIMIT 1`,
+        [normalizedKey, ...catalogIdentityParams],
+      )) as Array<{ present?: unknown }> | undefined;
+      if (!witnessRows?.length) {
+        throw new Error(
+          `Refused to clear upstream conversation ${normalizedKey}: catalog identity changed`,
+        );
+      }
+    }
     await Zotero.DB.queryAsync(
       `DELETE FROM ${CHAT_MESSAGES_TABLE}
-       WHERE ${selector.whereSql}`,
-      selector.params,
+       WHERE ${selector.whereSql}
+         ${messageIdentityClause}`,
+      [...selector.params, ...messageIdentityParams],
     );
     await refreshUpstreamConversationCatalogSummary(normalizedKey);
+    await onBeforeCommit?.();
   });
   await refreshUpstreamConversationSearchIndex(normalizedKey);
 }
@@ -2515,6 +3017,9 @@ export async function deleteTurnMessages(
   conversationKey: number,
   userTimestamp: number,
   assistantTimestamp: number,
+  userMessageID?: number,
+  assistantMessageID?: number,
+  onBeforeCommit?: () => Promise<void>,
 ): Promise<void> {
   const normalizedKey = normalizeConversationKey(conversationKey);
   if (!normalizedKey || !isUpstreamStoreConversationKey(normalizedKey)) return;
@@ -2525,6 +3030,15 @@ export async function deleteTurnMessages(
     ? Math.floor(assistantTimestamp)
     : 0;
   if (normalizedUserTimestamp <= 0 || normalizedAssistantTimestamp <= 0) return;
+  const normalizedUserMessageID =
+    Number.isFinite(Number(userMessageID)) && Number(userMessageID) > 0
+      ? Math.floor(Number(userMessageID))
+      : 0;
+  const normalizedAssistantMessageID =
+    Number.isFinite(Number(assistantMessageID)) &&
+    Number(assistantMessageID) > 0
+      ? Math.floor(Number(assistantMessageID))
+      : 0;
 
   const selector = await resolveRepairingMessageConversationSelector(
     normalizedKey,
@@ -2532,34 +3046,58 @@ export async function deleteTurnMessages(
       destructive: true,
     },
   );
+  const searchIndexReady = await initConversationSearchIndexStore();
   await Zotero.DB.executeTransaction(async () => {
-    await Zotero.DB.queryAsync(
-      `DELETE FROM ${CHAT_MESSAGES_TABLE}
-       WHERE id = (
-         SELECT id
-         FROM ${CHAT_MESSAGES_TABLE}
-         WHERE ${selector.whereSql}
-           AND role = 'user'
-           AND timestamp = ?
-         ORDER BY id DESC
-         LIMIT 1
-       )`,
-      [...selector.params, normalizedUserTimestamp],
-    );
-    await Zotero.DB.queryAsync(
-      `DELETE FROM ${CHAT_MESSAGES_TABLE}
-       WHERE id = (
-         SELECT id
-         FROM ${CHAT_MESSAGES_TABLE}
-         WHERE ${selector.whereSql}
-           AND role = 'assistant'
-           AND timestamp = ?
-         ORDER BY id DESC
-         LIMIT 1
-       )`,
-      [...selector.params, normalizedAssistantTimestamp],
-    );
+    if (normalizedUserMessageID > 0) {
+      await Zotero.DB.queryAsync(
+        `DELETE FROM ${CHAT_MESSAGES_TABLE}
+         WHERE id = ? AND ${selector.whereSql} AND role = 'user'`,
+        [normalizedUserMessageID, ...selector.params],
+      );
+    } else {
+      await Zotero.DB.queryAsync(
+        `DELETE FROM ${CHAT_MESSAGES_TABLE}
+         WHERE id = (
+           SELECT id
+           FROM ${CHAT_MESSAGES_TABLE}
+           WHERE ${selector.whereSql}
+             AND role = 'user'
+             AND timestamp = ?
+           ORDER BY id DESC
+           LIMIT 1
+         )`,
+        [...selector.params, normalizedUserTimestamp],
+      );
+    }
+    if (normalizedAssistantMessageID > 0) {
+      await Zotero.DB.queryAsync(
+        `DELETE FROM ${CHAT_MESSAGES_TABLE}
+         WHERE id = ? AND ${selector.whereSql} AND role = 'assistant'`,
+        [normalizedAssistantMessageID, ...selector.params],
+      );
+    } else {
+      await Zotero.DB.queryAsync(
+        `DELETE FROM ${CHAT_MESSAGES_TABLE}
+         WHERE id = (
+           SELECT id
+           FROM ${CHAT_MESSAGES_TABLE}
+           WHERE ${selector.whereSql}
+             AND role = 'assistant'
+             AND timestamp = ?
+           ORDER BY id DESC
+           LIMIT 1
+         )`,
+        [...selector.params, normalizedAssistantTimestamp],
+      );
+    }
     await refreshUpstreamConversationCatalogSummary(normalizedKey);
+    if (searchIndexReady) {
+      await deleteConversationSearchIndexRowInTransaction({
+        system: "upstream",
+        conversationKey: normalizedKey,
+      });
+    }
+    await onBeforeCommit?.();
   });
   await refreshUpstreamConversationSearchIndex(normalizedKey);
 }
@@ -2583,6 +3121,7 @@ export async function pruneConversation(
       destructive: true,
     },
   );
+  const searchIndexReady = await initConversationSearchIndexStore();
   await Zotero.DB.executeTransaction(async () => {
     await Zotero.DB.queryAsync(
       `DELETE FROM ${CHAT_MESSAGES_TABLE}
@@ -2596,6 +3135,12 @@ export async function pruneConversation(
       [...selector.params, normalizedKeep],
     );
     await refreshUpstreamConversationCatalogSummary(normalizedKey);
+    if (searchIndexReady) {
+      await deleteConversationSearchIndexRowInTransaction({
+        system: "upstream",
+        conversationKey: normalizedKey,
+      });
+    }
   });
   await refreshUpstreamConversationSearchIndex(normalizedKey);
 }
@@ -2755,72 +3300,127 @@ export async function ensurePaperV1Conversation(
   const normalizedLibraryID = normalizeLibraryID(libraryID);
   const normalizedPaperItemID = normalizePaperItemID(paperItemID);
   if (!normalizedLibraryID || !normalizedPaperItemID) return null;
-  const createdAt = Date.now();
-  const conversationID = buildUpstreamConversationID({
-    conversationKey: normalizedPaperItemID,
-    kind: "paper",
-    libraryID: normalizedLibraryID,
-    paperItemID: normalizedPaperItemID,
-  });
-  await Zotero.DB.queryAsync(
-    `INSERT OR IGNORE INTO ${PAPER_CONVERSATIONS_TABLE}
-      (conversation_id, conversation_key, library_id, paper_item_id, session_version, created_at, last_activity_at, user_turn_count, first_user_title, title)
-     VALUES (?, ?, ?, ?, 1, ?, ?, 0, NULL, NULL)`,
-    [
-      conversationID,
-      normalizedPaperItemID,
-      normalizedLibraryID,
-      normalizedPaperItemID,
-      createdAt,
-      createdAt,
-    ],
+  await initConversationKeyLedgerStore();
+  const rows = (await Zotero.DB.queryAsync(
+    `SELECT conversation_key AS conversationKey
+     FROM ${PAPER_CONVERSATIONS_TABLE}
+     WHERE library_id = ?
+       AND paper_item_id = ?
+       AND session_version = 1
+     ORDER BY created_at ASC, conversation_key ASC
+     LIMIT 1`,
+    [normalizedLibraryID, normalizedPaperItemID],
+  )) as Array<{ conversationKey?: unknown }> | undefined;
+  const existingKey = normalizeConversationKey(
+    Number(rows?.[0]?.conversationKey),
   );
-  await registerConversationScope({
-    conversationID,
-    conversationKey: normalizedPaperItemID,
-    system: "upstream",
-    kind: "paper",
-    libraryID: normalizedLibraryID,
-    paperItemID: normalizedPaperItemID,
-    createdAt,
-    updatedAt: createdAt,
-  });
-  return await getPaperConversation(normalizedPaperItemID);
+  if (existingKey) {
+    const existingLedger = await getConversationKeyLedgerEntry(existingKey);
+    if (!existingLedger?.retiredAt) {
+      return await getPaperConversation(existingKey);
+    }
+    // The historical item-ID key is permanently retired.  Keep the old
+    // catalog witness immutable and allocate a fresh paper instance instead
+    // of returning it to the new-chat/navigation path.
+  }
+  // The historical paper item ID is only a preferred key for a never-issued
+  // conversation.  A key ledger row means that number has already belonged to
+  // an instance (live or retired), so a keyless history/restore request must
+  // allocate through the monotonic range instead of racing the active-scope
+  // provisioner into creating a duplicate deterministic row.
+  const defaultLedger = await getConversationKeyLedgerEntry(
+    normalizedPaperItemID,
+  );
+  return await createPaperConversation(
+    normalizedLibraryID,
+    normalizedPaperItemID,
+    defaultLedger ? {} : { conversationKey: normalizedPaperItemID },
+  );
 }
 
 export async function createPaperConversation(
   libraryID: number,
   paperItemID: number,
-  options: { webchatSession?: boolean } = {},
+  options: { webchatSession?: boolean; conversationKey?: number } = {},
 ): Promise<PaperConversationSummary | null> {
   const normalizedLibraryID = normalizeLibraryID(libraryID);
   const normalizedPaperItemID = normalizePaperItemID(paperItemID);
   if (!normalizedLibraryID || !normalizedPaperItemID) return null;
-  return await Zotero.DB.executeTransaction(async () => {
-    // Webchat sessions must never claim the paper's v1 identity: version 1 is
-    // keyed by the paper item id itself, and that key doubles as the paper's
-    // default conversation everywhere else.
+  await initConversationKeyLedgerStore();
+  return await runChatStoreTransaction(async () => {
     const nextVersion = await findLowestMissingPaperSessionVersion(
       normalizedPaperItemID,
       options.webchatSession ? 2 : 1,
     );
     const createdAt = Date.now();
-    const nextConversationKey =
-      nextVersion === 1
-        ? normalizedPaperItemID
-        : await resolveNextPaperConversationKey();
+    const preferredKey = normalizeConversationKey(options.conversationKey || 0);
+    if (
+      preferredKey &&
+      !isConversationKeyForKind("upstream", "paper", preferredKey)
+    ) {
+      throw new Error(
+        "Preferred upstream paper conversation key is outside its range",
+      );
+    }
+    const allocated = preferredKey
+      ? {
+          conversationKey: preferredKey,
+          instanceID: generateConversationInstanceID(),
+          conversationID: buildUpstreamConversationID({
+            conversationKey: preferredKey,
+            kind: "paper",
+            libraryID: normalizedLibraryID,
+            paperItemID: normalizedPaperItemID,
+          }),
+        }
+      : await allocateConversationKeyInTransaction({
+          range: {
+            system: "upstream",
+            kind: "paper",
+            start: PAPER_CONVERSATION_KEY_BASE,
+            endExclusive: GLOBAL_CONVERSATION_KEY_BASE,
+          },
+          libraryID: normalizedLibraryID,
+          paperItemID: normalizedPaperItemID,
+          issuedAt: createdAt,
+        });
+    if (preferredKey) {
+      await ensureConversationKeyLedgerEntryInTransaction({
+        conversationKey: preferredKey,
+        instanceID: allocated.instanceID,
+        conversationID: allocated.conversationID,
+        system: "upstream",
+        kind: "paper",
+        profileSignature: getCurrentProfileSignature(),
+        libraryID: normalizedLibraryID,
+        paperItemID: normalizedPaperItemID,
+        issuedAt: createdAt,
+      });
+    }
+    const nextConversationKey = allocated.conversationKey;
+    // The allocator uses a temporary identity while it reserves the key.
+    // Once the immutable key is known, bind the canonical conversation ID
+    // before any catalog or registry row is written.
     const conversationID = buildUpstreamConversationID({
       conversationKey: nextConversationKey,
       kind: "paper",
       libraryID: normalizedLibraryID,
       paperItemID: normalizedPaperItemID,
     });
+    if (!preferredKey) {
+      await updateConversationKeyLedgerConversationIDInTransaction({
+        conversationKey: nextConversationKey,
+        instanceID: allocated.instanceID,
+        conversationID,
+      });
+    }
     await Zotero.DB.queryAsync(
       `INSERT INTO ${PAPER_CONVERSATIONS_TABLE}
-        (conversation_id, conversation_key, library_id, paper_item_id, session_version, created_at, last_activity_at, user_turn_count, first_user_title, title, webchat_session)
-       VALUES (?, ?, ?, ?, ?, ?, ?, 0, NULL, NULL, ?)`,
+        (conversation_id, conversation_instance_id, conversation_key, library_id, paper_item_id, session_version, created_at, last_activity_at, user_turn_count, first_user_title, title, webchat_session)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, NULL, NULL, ?)`,
       [
         conversationID,
+        allocated.instanceID,
         nextConversationKey,
         normalizedLibraryID,
         normalizedPaperItemID,
@@ -2830,16 +3430,20 @@ export async function createPaperConversation(
         options.webchatSession ? 1 : 0,
       ],
     );
-    await registerConversationScope({
-      conversationID,
-      conversationKey: nextConversationKey,
-      system: "upstream",
-      kind: "paper",
-      libraryID: normalizedLibraryID,
-      paperItemID: normalizedPaperItemID,
-      createdAt,
-      updatedAt: createdAt,
-    });
+    await registerConversationScope(
+      {
+        conversationID,
+        instanceID: allocated.instanceID,
+        conversationKey: nextConversationKey,
+        system: "upstream",
+        kind: "paper",
+        libraryID: normalizedLibraryID,
+        paperItemID: normalizedPaperItemID,
+        createdAt,
+        updatedAt: createdAt,
+      },
+      { inTransaction: true },
+    );
     return await getPaperConversation(nextConversationKey);
   });
 }
@@ -3067,52 +3671,84 @@ export async function ensureGlobalConversationExists(
       title: existing.title,
     });
   }
-  const conversationID = buildUpstreamConversationID({
-    conversationKey: normalizedKey,
-    kind: "global",
-    libraryID: normalizedLibraryID,
-  });
-  const createdAt = Date.now();
-  await Zotero.DB.queryAsync(
-    `INSERT OR IGNORE INTO ${GLOBAL_CONVERSATIONS_TABLE}
-      (conversation_id, conversation_key, library_id, created_at, last_activity_at, user_turn_count, first_user_title, title)
-     VALUES (?, ?, ?, ?, ?, 0, NULL, NULL)`,
-    [conversationID, normalizedKey, normalizedLibraryID, createdAt, createdAt],
-  );
-  return await registerConversationScope({
-    conversationID,
-    conversationKey: normalizedKey,
-    system: "upstream",
-    kind: "global",
-    libraryID: normalizedLibraryID,
-    createdAt,
-    updatedAt: createdAt,
-  });
+  // An explicit key is a lookup identity, never a creation request. Creating
+  // a missing key here would allow a stale history read or callback to
+  // resurrect a retired conversation. New conversations must use
+  // createGlobalConversation(), which allocates a permanently fresh key.
+  return false;
 }
 
 export async function createGlobalConversation(
   libraryID: number,
-  options: { webchatSession?: boolean } = {},
+  options: { webchatSession?: boolean; conversationKey?: number } = {},
 ): Promise<number> {
   const normalizedLibraryID = normalizeLibraryID(libraryID);
   if (!normalizedLibraryID) return 0;
 
+  await initConversationKeyLedgerStore();
   const createdAt = Date.now();
-  return await Zotero.DB.executeTransaction(async () => {
-    const nextConversationKey = await getNextAvailableGlobalConversationKey(
-      buildDefaultUpstreamGlobalConversationKey(normalizedLibraryID),
-    );
+  return await runChatStoreTransaction(async () => {
+    const preferredKey = normalizeConversationKey(options.conversationKey || 0);
+    if (
+      preferredKey &&
+      !isConversationKeyForKind("upstream", "global", preferredKey)
+    ) {
+      throw new Error(
+        "Preferred upstream global conversation key is outside its range",
+      );
+    }
+    const allocated = preferredKey
+      ? {
+          conversationKey: preferredKey,
+          instanceID: generateConversationInstanceID(),
+          conversationID: buildUpstreamConversationID({
+            conversationKey: preferredKey,
+            kind: "global",
+            libraryID: normalizedLibraryID,
+          }),
+        }
+      : await allocateConversationKeyInTransaction({
+          range: {
+            system: "upstream",
+            kind: "global",
+            start: UPSTREAM_GLOBAL_ALLOCATED_CONVERSATION_KEY_BASE,
+            endExclusive: UPSTREAM_RUNTIME_CONVERSATION_KEY_END,
+          },
+          libraryID: normalizedLibraryID,
+          issuedAt: createdAt,
+        });
+    if (preferredKey) {
+      await ensureConversationKeyLedgerEntryInTransaction({
+        conversationKey: preferredKey,
+        instanceID: allocated.instanceID,
+        conversationID: allocated.conversationID,
+        system: "upstream",
+        kind: "global",
+        profileSignature: getCurrentProfileSignature(),
+        libraryID: normalizedLibraryID,
+        issuedAt: createdAt,
+      });
+    }
+    const nextConversationKey = allocated.conversationKey;
     const conversationID = buildUpstreamConversationID({
       conversationKey: nextConversationKey,
       kind: "global",
       libraryID: normalizedLibraryID,
     });
+    if (!preferredKey) {
+      await updateConversationKeyLedgerConversationIDInTransaction({
+        conversationKey: nextConversationKey,
+        instanceID: allocated.instanceID,
+        conversationID,
+      });
+    }
     await Zotero.DB.queryAsync(
       `INSERT INTO ${GLOBAL_CONVERSATIONS_TABLE}
-        (conversation_id, conversation_key, library_id, created_at, last_activity_at, user_turn_count, first_user_title, title, webchat_session)
-       VALUES (?, ?, ?, ?, ?, 0, NULL, NULL, ?)`,
+        (conversation_id, conversation_instance_id, conversation_key, library_id, created_at, last_activity_at, user_turn_count, first_user_title, title, webchat_session)
+       VALUES (?, ?, ?, ?, ?, ?, 0, NULL, NULL, ?)`,
       [
         conversationID,
+        allocated.instanceID,
         nextConversationKey,
         normalizedLibraryID,
         createdAt,
@@ -3120,15 +3756,19 @@ export async function createGlobalConversation(
         options.webchatSession ? 1 : 0,
       ],
     );
-    await registerConversationScope({
-      conversationID,
-      conversationKey: nextConversationKey,
-      system: "upstream",
-      kind: "global",
-      libraryID: normalizedLibraryID,
-      createdAt,
-      updatedAt: createdAt,
-    });
+    await registerConversationScope(
+      {
+        conversationID,
+        instanceID: allocated.instanceID,
+        conversationKey: nextConversationKey,
+        system: "upstream",
+        kind: "global",
+        libraryID: normalizedLibraryID,
+        createdAt,
+        updatedAt: createdAt,
+      },
+      { inTransaction: true },
+    );
     return nextConversationKey;
   });
 }
@@ -3290,19 +3930,31 @@ export async function getGlobalConversation(
 export async function touchGlobalConversationTitle(
   conversationKey: number,
   titleSeed: string,
+  expectedGeneration?: number,
 ): Promise<void> {
   const normalizedKey = normalizeConversationKey(conversationKey);
   if (!normalizedKey || !isUpstreamGlobalConversationKey(normalizedKey)) return;
   const title = normalizeConversationTitleSeed(titleSeed);
   if (!title) return;
-  await Zotero.DB.queryAsync(
-    `UPDATE ${GLOBAL_CONVERSATIONS_TABLE}
+  await withConversationWriteLock(normalizedKey, async () => {
+    if (
+      areConversationWritesFrozen(normalizedKey) ||
+      (expectedGeneration !== undefined &&
+        !isConversationWriteGenerationCurrent(
+          normalizedKey,
+          expectedGeneration,
+        ))
+    )
+      return;
+    await Zotero.DB.queryAsync(
+      `UPDATE ${GLOBAL_CONVERSATIONS_TABLE}
      SET title = ?
      WHERE conversation_key = ?
        AND (title IS NULL OR TRIM(title) = '')
        AND COALESCE(webchat_session, 0) = 0`,
-    [title, normalizedKey],
-  );
+      [title, normalizedKey],
+    );
+  });
   await refreshUpstreamConversationSearchIndex(normalizedKey);
 }
 
@@ -3327,19 +3979,31 @@ export async function setGlobalConversationTitle(
 export async function touchPaperConversationTitle(
   conversationKey: number,
   titleSeed: string,
+  expectedGeneration?: number,
 ): Promise<void> {
   const normalizedKey = normalizeConversationKey(conversationKey);
   if (!normalizedKey || !isUpstreamPaperConversationKey(normalizedKey)) return;
   const title = normalizeConversationTitleSeed(titleSeed);
   if (!title) return;
-  await Zotero.DB.queryAsync(
-    `UPDATE ${PAPER_CONVERSATIONS_TABLE}
+  await withConversationWriteLock(normalizedKey, async () => {
+    if (
+      areConversationWritesFrozen(normalizedKey) ||
+      (expectedGeneration !== undefined &&
+        !isConversationWriteGenerationCurrent(
+          normalizedKey,
+          expectedGeneration,
+        ))
+    )
+      return;
+    await Zotero.DB.queryAsync(
+      `UPDATE ${PAPER_CONVERSATIONS_TABLE}
      SET title = ?
      WHERE conversation_key = ?
        AND (title IS NULL OR TRIM(title) = '')
        AND COALESCE(webchat_session, 0) = 0`,
-    [title, normalizedKey],
-  );
+      [title, normalizedKey],
+    );
+  });
   await refreshUpstreamConversationSearchIndex(normalizedKey);
 }
 
@@ -3363,24 +4027,38 @@ export async function setPaperConversationTitle(
 
 export async function clearConversationTitle(
   conversationKey: number,
+  identity?: {
+    instanceID?: string;
+    conversationID?: string;
+    inTransaction?: boolean;
+  },
 ): Promise<void> {
   const normalizedKey = normalizeConversationKey(conversationKey);
   if (!normalizedKey || !isUpstreamStoreConversationKey(normalizedKey)) return;
-  await Zotero.DB.executeTransaction(async () => {
+  const catalogTable = isUpstreamPaperConversationKey(normalizedKey)
+    ? PAPER_CONVERSATIONS_TABLE
+    : GLOBAL_CONVERSATIONS_TABLE;
+  const identityClause = identity?.instanceID
+    ? `AND conversation_instance_id = ?`
+    : "";
+  const identityParams = identity?.instanceID ? [identity.instanceID] : [];
+  const clearTitle = async () => {
     await Zotero.DB.queryAsync(
-      `UPDATE ${GLOBAL_CONVERSATIONS_TABLE}
+      `UPDATE ${catalogTable}
        SET title = NULL
-       WHERE conversation_key = ?`,
-      [normalizedKey],
+       WHERE conversation_key = ?
+         ${identityClause}`,
+      [normalizedKey, ...identityParams],
     );
-    await Zotero.DB.queryAsync(
-      `UPDATE ${PAPER_CONVERSATIONS_TABLE}
-       SET title = NULL
-       WHERE conversation_key = ?`,
-      [normalizedKey],
-    );
-  });
-  await refreshUpstreamConversationSearchIndex(normalizedKey);
+  };
+  if (identity?.inTransaction) {
+    await clearTitle();
+  } else {
+    await Zotero.DB.executeTransaction(clearTitle);
+  }
+  if (!identity?.inTransaction) {
+    await refreshUpstreamConversationSearchIndex(normalizedKey);
+  }
 }
 
 export async function deleteGlobalConversation(
@@ -3416,9 +4094,52 @@ export async function preflightDeleteUpstreamConversationLocalRows(
 export async function deleteUpstreamConversationLocalRows(
   conversationKey: number,
   kind?: "global" | "paper",
+  identity?: {
+    instanceID?: string;
+    conversationID?: string;
+    onBeforeCommit?: () => Promise<void>;
+    onCommit?: () => Promise<void>;
+  },
 ): Promise<void> {
   const normalizedKey = normalizeConversationKey(conversationKey);
   if (!normalizedKey || !isUpstreamStoreConversationKey(normalizedKey)) return;
+  let ledgerAvailable = isConversationKeyLedgerStoreInitialized();
+  let ledgerEntry;
+  if (ledgerAvailable) {
+    try {
+      ledgerEntry = await getConversationKeyLedgerEntry(normalizedKey);
+    } catch (error) {
+      if (!/no such table|no table/i.test(String(error))) throw error;
+      ledgerAvailable = false;
+    }
+  }
+  if (ledgerAvailable && !ledgerEntry) {
+    throw new ConversationRetiredError(
+      normalizedKey,
+      identity?.instanceID || "",
+    );
+  }
+  if (
+    ledgerEntry?.retiredAt &&
+    identity?.instanceID !== ledgerEntry.instanceID
+  ) {
+    throw new ConversationRetiredError(
+      normalizedKey,
+      identity?.instanceID || "",
+    );
+  }
+  if (
+    ledgerEntry &&
+    identity?.instanceID &&
+    identity.instanceID !== ledgerEntry.instanceID
+  ) {
+    throw new Error(
+      `Refused to delete upstream conversation ${normalizedKey}: identity mismatch`,
+    );
+  }
+  const deletionIdentity = ledgerEntry
+    ? { ...(identity || {}), instanceID: ledgerEntry.instanceID }
+    : identity;
   await preflightDeleteUpstreamConversationLocalRows(normalizedKey);
   const catalogKind =
     kind === "paper" || isUpstreamPaperConversationKey(normalizedKey)
@@ -3434,17 +4155,98 @@ export async function deleteUpstreamConversationLocalRows(
       destructive: true,
     },
   );
+  const catalogIdentityClause = deletionIdentity?.instanceID
+    ? `AND conversation_instance_id = ?`
+    : "";
+  const catalogIdentityParams = deletionIdentity?.instanceID
+    ? [deletionIdentity.instanceID]
+    : [];
+  const messageIdentityClause = deletionIdentity?.instanceID
+    ? `AND EXISTS (
+         SELECT 1
+         FROM ${catalogTable} c
+         WHERE c.conversation_key = ?
+           AND c.conversation_instance_id = ?
+       )`
+    : "";
+  const messageIdentityParams = deletionIdentity?.instanceID
+    ? [normalizedKey, deletionIdentity.instanceID]
+    : [];
+  await initConversationForkLinksStore();
+  await initConversationRegistryStore();
+  await initConversationSearchIndexStore();
+  await initRecentlyDeletedConversationTombstones();
   await Zotero.DB.executeTransaction(async () => {
+    if (deletionIdentity?.instanceID) {
+      const witnessRows = (await Zotero.DB.queryAsync(
+        `SELECT 1 AS present
+         FROM ${catalogTable}
+         WHERE conversation_key = ?
+           ${catalogIdentityClause}
+         LIMIT 1`,
+        [normalizedKey, ...catalogIdentityParams],
+      )) as Array<{ present?: unknown }> | undefined;
+      if (!witnessRows?.length) {
+        throw new Error(
+          `Refused to delete upstream conversation ${normalizedKey}: catalog identity changed`,
+        );
+      }
+    }
     await Zotero.DB.queryAsync(
       `DELETE FROM ${CHAT_MESSAGES_TABLE}
-       WHERE ${selector.whereSql}`,
-      selector.params,
+       WHERE ${selector.whereSql}
+         ${messageIdentityClause}
+         ${deletionIdentity?.conversationID ? "AND conversation_id = ?" : ""}`,
+      deletionIdentity?.conversationID
+        ? [
+            ...selector.params,
+            ...messageIdentityParams,
+            deletionIdentity.conversationID,
+          ]
+        : [...selector.params, ...messageIdentityParams],
     );
+    await clearPersistedAgentConversationRowsInTransaction(normalizedKey);
+    await clearOwnerAttachmentRefsInTransaction("conversation", normalizedKey);
     await Zotero.DB.queryAsync(
       `DELETE FROM ${catalogTable}
-       WHERE conversation_key = ?`,
-      [normalizedKey],
+       WHERE conversation_key = ?
+         ${catalogIdentityClause}`,
+      [normalizedKey, ...catalogIdentityParams],
     );
+    await deleteConversationForkLinksForInstanceInTransaction({
+      conversationKey: normalizedKey,
+      conversationID: deletionIdentity?.conversationID,
+      system: "upstream",
+    });
+    if (deletionIdentity?.instanceID) {
+      await deleteRegisteredConversationScopeInTransaction(
+        deletionIdentity.instanceID,
+        normalizedKey,
+        deletionIdentity.conversationID,
+        "upstream",
+      );
+    }
+    if (deletionIdentity?.instanceID) {
+      await persistConversationInstanceTombstoneInTransaction({
+        conversationKey: normalizedKey,
+        instanceID: deletionIdentity.instanceID,
+        conversationID: deletionIdentity.conversationID,
+      });
+    }
+    await deleteConversationSearchIndexRowInTransaction({
+      system: "upstream",
+      conversationKey: normalizedKey,
+    });
+    if (ledgerAvailable && deletionIdentity?.instanceID) {
+      await retireConversationKeyInTransaction({
+        conversationKey: normalizedKey,
+        instanceID: deletionIdentity.instanceID,
+      });
+    }
+    await deletionIdentity?.onBeforeCommit?.();
+    await deletionIdentity?.onCommit?.();
   });
-  await deleteUpstreamConversationSearchIndex(normalizedKey);
+  if (deletionIdentity?.instanceID) {
+    rememberConversationKeyRetired(normalizedKey);
+  }
 }

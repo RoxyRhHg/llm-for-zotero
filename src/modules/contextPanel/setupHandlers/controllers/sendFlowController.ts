@@ -146,21 +146,26 @@ type SendFlowControllerDeps = {
   isCodexConversationSystem: () => boolean;
   normalizeConversationTitleSeed: (raw: unknown) => string;
   getConversationKey: (item: Zotero.Item) => number;
+  getConversationWriteGeneration?: (conversationKey: number) => number;
   touchClaudeConversationTitle: (
     conversationKey: number,
     title: string,
+    generation?: number,
   ) => Promise<void>;
   touchCodexConversationTitle: (
     conversationKey: number,
     title: string,
+    generation?: number,
   ) => Promise<void>;
   touchGlobalConversationTitle: (
     conversationKey: number,
     title: string,
+    generation?: number,
   ) => Promise<void>;
   touchPaperConversationTitle: (
     conversationKey: number,
     title: string,
+    generation?: number,
   ) => Promise<void>;
   getSelectedProfile: () => SelectedProfile | null;
   getCurrentModelName: () => string;
@@ -539,6 +544,9 @@ export function createSendFlowController(deps: SendFlowControllerDeps): {
       // stamping their first message onto the local catalog row would leak
       // webchat content into the normal history list.
       if (titleSeed && !isWebChat) {
+        const titleGeneration = deps.getConversationWriteGeneration?.(
+          deps.getConversationKey(item),
+        );
         const touchTitle = deps.isClaudeConversationSystem()
           ? deps.touchClaudeConversationTitle
           : deps.isCodexConversationSystem()
@@ -546,11 +554,13 @@ export function createSendFlowController(deps: SendFlowControllerDeps): {
             : deps.isGlobalMode()
               ? deps.touchGlobalConversationTitle
               : deps.touchPaperConversationTitle;
-        void touchTitle(deps.getConversationKey(item), titleSeed).catch(
-          (err) => {
-            ztoolkit.log("LLM: Failed to touch conversation title", err);
-          },
-        );
+        void touchTitle(
+          deps.getConversationKey(item),
+          titleSeed,
+          titleGeneration,
+        ).catch((err) => {
+          ztoolkit.log("LLM: Failed to touch conversation title", err);
+        });
       }
 
       const selectedProfile = deps.getSelectedProfile();

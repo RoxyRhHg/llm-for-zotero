@@ -1,6 +1,28 @@
 import { assert } from "chai";
 import type { WorkflowTestApi } from "../src/modules/contextPanel/workflowTestTypes";
 
+const PREF_PREFIX = "extensions.zotero.llmforzotero";
+
+async function withPrefs<T>(
+  prefs: Record<string, unknown>,
+  task: () => Promise<T>,
+): Promise<T> {
+  const previous = new Map<string, unknown>();
+  for (const [key, value] of Object.entries(prefs)) {
+    const fullKey = `${PREF_PREFIX}.${key}`;
+    previous.set(fullKey, Zotero.Prefs.get(fullKey, true));
+    Zotero.Prefs.set(fullKey, value, true);
+  }
+  try {
+    return await task();
+  } finally {
+    for (const [fullKey, value] of previous) {
+      if (value === undefined) Zotero.Prefs.clear?.(fullKey, true);
+      else Zotero.Prefs.set(fullKey, value, true);
+    }
+  }
+}
+
 declare const Zotero: any;
 
 function getWorkflowTestApi(): WorkflowTestApi {
@@ -25,7 +47,7 @@ async function surfacing(fn: () => Promise<void>): Promise<void> {
 }
 
 describe("deletion lifecycle", function () {
-  this.timeout(30000);
+  this.timeout(45000);
 
   it("delete → remount (user switches) → undo from the new panel restores the chat", async function () {
     await surfacing(async () => {
@@ -130,6 +152,97 @@ describe("deletion lifecycle", function () {
         await api.cleanupFixture(fixture);
       }
     });
+  });
+
+  it("issue #356: an orphaned Codex conversation with a missing native thread stays deleted", async function () {
+    await withPrefs(
+      {
+        enableCodexAppServerMode: true,
+        enableClaudeCodeMode: false,
+        conversationSystem: "codex",
+      },
+      async () =>
+        surfacing(async () => {
+          const api = getWorkflowTestApi();
+          await api.reset();
+          const fixture = await api.createPaperWithPdfFixture({
+            title: "Issue 356 orphaned Codex paper",
+            pdfTitle: "issue-356-orphan.pdf",
+          });
+          try {
+            const panel = await api.renderPanelForItem(fixture.parentItemId);
+            const initial = await api.getDiagnostics(panel.panelId);
+            assert.equal(initial.conversationSystem, "codex");
+
+            await api.seedPanelStoredUserMessage(
+              panel.panelId,
+              "ISSUE-356-DOOMED-CONTENT",
+            );
+            const doomedKey = (await api.getDiagnostics(panel.panelId))
+              .conversationKey!;
+
+            await api.startNewPanelConversation(panel.panelId);
+            await api.seedPanelStoredUserMessage(
+              panel.panelId,
+              "ISSUE-356-SURVIVOR-CONTENT",
+            );
+            const survivorKey = (await api.getDiagnostics(panel.panelId))
+              .conversationKey!;
+            assert.notEqual(doomedKey, survivorKey);
+            const survivorBefore =
+              await api.getWorkflowConversationPersistenceSnapshot(
+                "codex",
+                survivorKey,
+              );
+
+            // Reproduce the orphan: the Zotero source is gone, while the
+            // catalog still carries a native thread ID that cannot be found.
+            await api.setWorkflowProviderSession(
+              "codex",
+              doomedKey,
+              "workflow-issue-356-native-thread-does-not-exist",
+            );
+            await api.trashWorkflowItem(fixture.parentItemId);
+
+            await api.deletePanelHistoryConversation(panel.panelId, doomedKey);
+            const queued = await api.getPendingDeletionState();
+            assert.include(queued.pendingConversationKeys, doomedKey);
+            assert.equal(queued.persistedRowCount, 1);
+
+            // The restart sweep stands in for the expired timer, and the
+            // second sweep/remount exercises the old retry-and-resurrection
+            // path that used to recreate an empty conversation.
+            await api.sweepPendingDeletionsAsRestart();
+            const remounted = await api.remountPanel(panel.panelId);
+            await api.sweepPendingDeletionsAsRestart();
+
+            const history = await api.listPanelHistory(remounted.panelId);
+            const historyKeys = history.map((row) => row.conversationKey);
+            assert.notInclude(historyKeys, doomedKey);
+            assert.include(historyKeys, survivorKey);
+            const doomedRows =
+              await api.getWorkflowConversationPersistenceSnapshot(
+                "codex",
+                doomedKey,
+              );
+            assert.equal(doomedRows.catalogRows, 0);
+            assert.equal(doomedRows.messageRows, 0);
+            assert.equal(doomedRows.searchIndexRows, 0);
+            assert.equal(doomedRows.registryRows, 0);
+            assert.equal(doomedRows.forkSourceRows, 0);
+            assert.equal(doomedRows.forkTargetRows, 0);
+            assert.equal(doomedRows.pendingDeletionRows, 0);
+            const survivorAfter =
+              await api.getWorkflowConversationPersistenceSnapshot(
+                "codex",
+                survivorKey,
+              );
+            assert.deepEqual(survivorAfter, survivorBefore);
+          } finally {
+            await api.cleanupFixture(fixture);
+          }
+        }),
+    );
   });
 
   it("turn delete → undo restores the turn; turn delete → sweep removes only that turn", async function () {

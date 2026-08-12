@@ -6,10 +6,9 @@ import { assert } from "chai";
 const here = dirname(fileURLToPath(import.meta.url));
 
 // User actions (send/retry/edit) run against a conversation that can still be
-// mounted in another panel while an undoable conversation deletion is pending.
-// Those paths may only commit hidden TURN deletions; the conversation deletion
-// itself must be restored (the action proves the user wants the chat alive),
-// and the action must abort when the durable intent cannot be withdrawn.
+// mounted in another panel while a conversation deletion is pending.  Those
+// paths may only commit hidden TURN deletions; the conversation deletion is an
+// identity fence and can be withdrawn only by the explicit Undo action.
 describe("chat user actions vs pending deletions", function () {
   const chatSource = () =>
     readFileSync(resolve(here, "../src/modules/contextPanel/chat.ts"), "utf8");
@@ -23,7 +22,7 @@ describe("chat user actions vs pending deletions", function () {
     );
   });
 
-  it("send finalizes turns only, restores pending conversation deletions, and aborts when restore fails", function () {
+  it("send finalizes turns only and refuses to act while the conversation is pending deletion", function () {
     const source = chatSource();
     const send = source.indexOf("export async function sendQuestion");
     assert.isAtLeast(send, 0);
@@ -34,14 +33,19 @@ describe("chat user actions vs pending deletions", function () {
       /pendingDeletionStore\.finalizeTurnsForConversation\(\s*pendingKey,\s*"send",?\s*\)/,
       "send must commit hidden turns",
     );
-    assert.match(
+    assert.include(
       body,
-      /!\(await pendingDeletionStore\.restoreConversationDeletionsFor\(\s*pendingKey,?\s*\)\)/,
-      "send must restore a pending conversation deletion and abort on failure",
+      "pendingDeletionStore.isConversationPendingDeletion(pendingKey)",
+      "send must treat the pending deletion as an identity fence",
+    );
+    assert.notInclude(
+      body,
+      "pendingDeletionStore.restoreConversationDeletionsFor(",
+      "send must not turn user activity into an implicit Undo",
     );
   });
 
-  it("retry and edit paths restore pending conversation deletions before acting", function () {
+  it("retry and edit paths refuse to act while the conversation is pending deletion", function () {
     const source = chatSource();
     for (const fn of [
       "export async function editLatestUserMessageAndRetry",
@@ -62,8 +66,13 @@ describe("chat user actions vs pending deletions", function () {
       );
       assert.include(
         body,
+        "pendingDeletionStore.isConversationPendingDeletion(conversationKey)",
+        `${fn} must enforce the pending-deletion identity fence`,
+      );
+      assert.notInclude(
+        body,
         "pendingDeletionStore.restoreConversationDeletionsFor(",
-        `${fn} must restore a pending conversation deletion, not commit it`,
+        `${fn} must not turn user activity into an implicit Undo`,
       );
     }
   });

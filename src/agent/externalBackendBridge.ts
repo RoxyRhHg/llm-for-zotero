@@ -15,6 +15,7 @@ import {
 } from "../claudeCode/modelCatalog";
 import { getClaudeProfileSignature } from "../claudeCode/projectSkills";
 import { getClaudeConversationSummary } from "../claudeCode/store";
+import { hasPendingEmptyClaudeCleanupJob } from "../core/conversations/conversationCleanupJobs";
 import { isNativeZoteroMcpToolsEnabled } from "../codexAppServer/prefs";
 import {
   normalizeAgentPermissionMode,
@@ -43,6 +44,12 @@ import {
   createAgentRun,
   finishAgentRun,
 } from "./store/traceStore";
+import {
+  areConversationWritesFrozen,
+  getConversationWriteGeneration,
+  isConversationWriteGenerationCurrent,
+  withConversationWriteLock,
+} from "../shared/conversationWriteFence";
 import { AGENT_PERSONA_INSTRUCTIONS } from "./model/agentPersona";
 import { buildAgentModelCapabilities } from "./model/contentCapabilities";
 import type {
@@ -2631,8 +2638,11 @@ export function createExternalBackendBridgeRuntime(options: {
     invalidateSession: async ({ conversationKey, scope, metadata }) => {
       const bridgeUrl = normalizeBaseUrl(getBridgeUrl());
       if (!bridgeUrl) {
-        clearLastRunBridgeContext(conversationKey);
-        conversationScopeByKey.delete(conversationKey);
+        await withConversationWriteLock(conversationKey, async () => {
+          clearLastRunBridgeContext(conversationKey);
+          conversationScopeByKey.delete(conversationKey);
+          conversationContextSignature.delete(conversationKey);
+        });
         return null;
       }
       const outcome = await invalidateExternalBridgeSession({
@@ -2641,9 +2651,11 @@ export function createExternalBackendBridgeRuntime(options: {
         scope,
         metadata,
       });
-      clearLastRunBridgeContext(conversationKey);
-      conversationScopeByKey.delete(conversationKey);
-      conversationContextSignature.delete(conversationKey);
+      await withConversationWriteLock(conversationKey, async () => {
+        clearLastRunBridgeContext(conversationKey);
+        conversationScopeByKey.delete(conversationKey);
+        conversationContextSignature.delete(conversationKey);
+      });
       return outcome;
     },
     invalidateAllHotRuntimes: async () => {
@@ -2686,6 +2698,10 @@ export function createExternalBackendBridgeRuntime(options: {
         Number.isFinite(opts.conversationKey)
           ? Math.floor(opts.conversationKey)
           : Date.now();
+      const actionGeneration =
+        actionConversationKey > 0
+          ? getConversationWriteGeneration(actionConversationKey)
+          : 0;
       const actionScope = conversationScopeByKey.get(actionConversationKey);
 
       onProgress({
@@ -2697,34 +2713,61 @@ export function createExternalBackendBridgeRuntime(options: {
       const doRun = async (
         approved = false,
       ): Promise<ActionResult<unknown>> => {
+        if (
+          actionConversationKey > 0 &&
+          (areConversationWritesFrozen(actionConversationKey) ||
+            !isConversationWriteGenerationCurrent(
+              actionConversationKey,
+              actionGeneration,
+            ))
+        ) {
+          return {
+            ok: false,
+            error:
+              "Conversation lifecycle changed before this action could execute",
+          };
+        }
         const providerIdentityStack = await buildClaudeProviderIdentityStack();
         const providerIdentity = hashProviderIdentityStack(
           providerIdentityStack,
         );
-        const outcome = await runExternalBridgeAction(bridgeUrl, {
-          conversationKey: actionConversationKey,
-          toolName,
-          args: input,
-          libraryID: opts.libraryID,
-          approved,
-          metadata: {
-            runType: "action",
-            claudeConfigSource: getClaudeConfigSourcePref(),
-            claudeSettingSources: getClaudeSettingSourcesByPref(),
-            settingSources: getClaudeSettingSourcesCsvByPref(),
-            ...buildAgentPermissionMetadata(),
-            providerIdentity,
-            providerIdentityStack,
-            scopeType: actionScope?.scopeType,
-            scopeId: actionScope?.scopeId,
-            scopeLabel: actionScope?.scopeLabel,
-          },
-          onEvent: async (event) => {
-            if (event.type === "status") {
-              onProgress({ type: "status", message: event.text });
-            }
-          },
-        });
+        const run = () =>
+          runExternalBridgeAction(bridgeUrl, {
+            conversationKey: actionConversationKey,
+            toolName,
+            args: input,
+            libraryID: opts.libraryID,
+            approved,
+            metadata: {
+              runType: "action",
+              claudeConfigSource: getClaudeConfigSourcePref(),
+              claudeSettingSources: getClaudeSettingSourcesByPref(),
+              settingSources: getClaudeSettingSourcesCsvByPref(),
+              ...buildAgentPermissionMetadata(),
+              providerIdentity,
+              providerIdentityStack,
+              scopeType: actionScope?.scopeType,
+              scopeId: actionScope?.scopeId,
+              scopeLabel: actionScope?.scopeLabel,
+            },
+            onEvent: async (event) => {
+              if (event.type === "status") {
+                onProgress({ type: "status", message: event.text });
+              }
+            },
+          });
+        // A provider action that is already approved (or has no separate
+        // confirmation phase) is serialized with Clear/deletion.  An
+        // unapproved action that is expected to return `approval_required`
+        // must not hold the conversation lock while the UI confirmation card
+        // is waiting, otherwise Clear could never acquire the lock to cancel
+        // it.
+        const holdLifecycleLock =
+          actionConversationKey > 0 &&
+          (approved || tool?.requiresConfirmation !== true);
+        const outcome = holdLifecycleLock
+          ? await withConversationWriteLock(actionConversationKey, run)
+          : await run();
 
         if (
           outcome.kind === "fallback" &&
@@ -2759,6 +2802,19 @@ export function createExternalBackendBridgeRuntime(options: {
               requestId,
               pendingAction,
             );
+            if (
+              actionConversationKey > 0 &&
+              (areConversationWritesFrozen(actionConversationKey) ||
+                !isConversationWriteGenerationCurrent(
+                  actionConversationKey,
+                  actionGeneration,
+                ))
+            ) {
+              return {
+                ok: false,
+                error: "Conversation lifecycle changed before action approval",
+              };
+            }
             if (!resolution.approved) {
               return { ok: false, error: "User denied action" };
             }
@@ -2782,6 +2838,50 @@ export function createExternalBackendBridgeRuntime(options: {
       return result;
     },
     runTurn: async (params: RunTurnParams): Promise<AgentRuntimeOutcome> => {
+      const requestMetadata =
+        params.request.metadata && typeof params.request.metadata === "object"
+          ? params.request.metadata
+          : {};
+      const conversationInstanceID =
+        typeof requestMetadata.conversationInstanceID === "string"
+          ? requestMetadata.conversationInstanceID.trim()
+          : "";
+      if (params.request.conversationKey > 0) {
+        try {
+          if (
+            await hasPendingEmptyClaudeCleanupJob({
+              conversationKey: params.request.conversationKey,
+              ...(conversationInstanceID
+                ? { instanceID: conversationInstanceID }
+                : {}),
+            })
+          ) {
+            // Clear may have had to defer an empty-session invalidation while
+            // the catalog had no provider ID. Do not resume the old bridge
+            // mapping; the adapter will invalidate it before starting fresh.
+            params.request = {
+              ...params.request,
+              metadata: {
+                ...requestMetadata,
+                forceFreshSession: true,
+              },
+            };
+          }
+        } catch {
+          // A pending empty-session cleanup is a deletion boundary, not an
+          // advisory hint. If the cleanup table cannot be read, fail closed
+          // by forcing a fresh provider session; reusing a hot mapping here
+          // could resurrect the pre-Clear runtime while the durable worker
+          // is still waiting to invalidate it.
+          params.request = {
+            ...params.request,
+            metadata: {
+              ...requestMetadata,
+              forceFreshSession: true,
+            },
+          };
+        }
+      }
       validateLocalPdfDocumentBatch({
         pdfPaperContexts: params.request.pdfPaperContexts,
         localDocuments: params.request.localDocuments,
@@ -2800,6 +2900,26 @@ export function createExternalBackendBridgeRuntime(options: {
         if (params.request.localDocuments?.length) {
           await assertClaudeBridgeLocalPdfCapability(bridgeUrl);
         }
+        const writeAllowed = () =>
+          !areConversationWritesFrozen(params.request.conversationKey) &&
+          (params.request.conversationGeneration === undefined ||
+            isConversationWriteGenerationCurrent(
+              params.request.conversationKey,
+              params.request.conversationGeneration,
+            ));
+        const persistIfLive = async <T>(task: () => Promise<T>) => {
+          if (!writeAllowed()) return undefined;
+          return withConversationWriteLock(
+            params.request.conversationKey,
+            async () => {
+              if (!writeAllowed()) return undefined;
+              return task();
+            },
+          );
+        };
+        const notifyIfLive = async (event: AgentEvent): Promise<void> => {
+          if (writeAllowed()) await params.onEvent?.(event);
+        };
         let persistedRunId = "";
         let persistedRunCreated = false;
         let persistedSeq = 0;
@@ -2813,22 +2933,28 @@ export function createExternalBackendBridgeRuntime(options: {
         const ensurePersistedRun = async (runId: string): Promise<void> => {
           const normalized = (runId || "").trim();
           if (!normalized) return;
+          if (!writeAllowed()) return;
           if (!persistedRunCreated || persistedRunId !== normalized) {
             persistedRunId = normalized;
             persistedSeq = 0;
-            await createAgentRun({
-              runId: persistedRunId,
-              conversationKey: params.request.conversationKey,
-              mode: "agent",
-              model: params.request.model,
-              status: "running",
-              createdAt: Date.now(),
-            });
-            persistedRunCreated = true;
+            await persistIfLive(() =>
+              createAgentRun({
+                runId: persistedRunId,
+                conversationKey: params.request.conversationKey,
+                mode: "agent",
+                model: params.request.model,
+                status: "running",
+                createdAt: Date.now(),
+              }),
+            );
+            persistedRunCreated = writeAllowed();
+            if (!persistedRunCreated) return;
             if (pendingEventsBeforeRunId.length) {
               for (const event of pendingEventsBeforeRunId.splice(0)) {
                 persistedSeq += 1;
-                await appendAgentRunEvent(persistedRunId, persistedSeq, event);
+                await persistIfLive(() =>
+                  appendAgentRunEvent(persistedRunId, persistedSeq, event),
+                );
               }
             }
           }
@@ -2842,54 +2968,61 @@ export function createExternalBackendBridgeRuntime(options: {
             return;
           }
           persistedSeq += 1;
-          await appendAgentRunEvent(
-            persistedRunId,
-            persistedSeq,
-            redactedEvent,
+          await persistIfLive(() =>
+            appendAgentRunEvent(persistedRunId, persistedSeq, redactedEvent),
           );
         };
         await appendPersistedEvent(
           makeProfilingEvent("frontend.run_turn.enter"),
         );
-        await params.onEvent?.(makeProfilingEvent("frontend.run_turn.enter"));
+        await notifyIfLive(makeProfilingEvent("frontend.run_turn.enter"));
         const contextEnvelope = buildContextEnvelope(params.request);
         await appendPersistedEvent(
           makeProfilingEvent("frontend.context_envelope.ready"),
         );
-        await params.onEvent?.(
+        await notifyIfLive(
           makeProfilingEvent("frontend.context_envelope.ready"),
         );
         const runtimeRequest = await buildBridgeRuntimeRequest(params.request);
         await appendPersistedEvent(
           makeProfilingEvent("frontend.bridge_runtime_request.ready"),
         );
-        await params.onEvent?.(
+        await notifyIfLive(
           makeProfilingEvent("frontend.bridge_runtime_request.ready"),
         );
         const scope = resolveBridgeScope(params.request);
-        rememberLastRunBridgeContext(params.request.conversationKey, scope);
-        if (isBridgeDebugEnabled()) {
-          dbg("run-turn scope snapshot", {
-            conversationKey: params.request.conversationKey,
-            scopeType: scope.scopeType,
-            scopeId: scope.scopeId,
-            scopeLabel: scope.scopeLabel,
-            scopedConversationKey: buildScopedConversationKey(
-              params.request.conversationKey,
-              scope,
-            ),
-          });
-        }
-        conversationScopeByKey.set(params.request.conversationKey, scope);
-        const currentSignature = signatureForContextEnvelope(contextEnvelope);
-        conversationContextSignature.set(
+        await withConversationWriteLock(
           params.request.conversationKey,
-          currentSignature,
+          async () => {
+            if (!writeAllowed()) {
+              throw new Error("Conversation write generation changed");
+            }
+            rememberLastRunBridgeContext(params.request.conversationKey, scope);
+            if (isBridgeDebugEnabled()) {
+              dbg("run-turn scope snapshot", {
+                conversationKey: params.request.conversationKey,
+                scopeType: scope.scopeType,
+                scopeId: scope.scopeId,
+                scopeLabel: scope.scopeLabel,
+                scopedConversationKey: buildScopedConversationKey(
+                  params.request.conversationKey,
+                  scope,
+                ),
+              });
+            }
+            conversationScopeByKey.set(params.request.conversationKey, scope);
+            const currentSignature =
+              signatureForContextEnvelope(contextEnvelope);
+            conversationContextSignature.set(
+              params.request.conversationKey,
+              currentSignature,
+            );
+          },
         );
         const emitTurnEvent = async (event: AgentEvent): Promise<void> => {
           for (const redactedEvent of eventStreamRedactor.process(event)) {
             await appendPersistedEvent(redactedEvent);
-            await params.onEvent?.(redactedEvent);
+            await notifyIfLive(redactedEvent);
           }
         };
         let mcpServers: ClaudeMcpServersConfig | undefined;
@@ -2977,7 +3110,7 @@ export function createExternalBackendBridgeRuntime(options: {
             ...params,
             onStart: async (runId) => {
               await ensurePersistedRun(runId);
-              await params.onStart?.(runId);
+              if (writeAllowed()) await params.onStart?.(runId);
             },
             onEvent: emitTurnEvent,
             contextEnvelope,
@@ -3038,7 +3171,7 @@ export function createExternalBackendBridgeRuntime(options: {
           });
           for (const redactedEvent of eventStreamRedactor.flush()) {
             await appendPersistedEvent(redactedEvent);
-            await params.onEvent?.(redactedEvent);
+            await notifyIfLive(redactedEvent);
           }
           const safeOutcome: AgentRuntimeOutcome =
             outcome.kind === "completed"
@@ -3053,22 +3186,26 @@ export function createExternalBackendBridgeRuntime(options: {
           const finalRunId = persistedRunId || safeOutcome.runId;
           if (finalRunId) {
             await ensurePersistedRun(finalRunId);
-            await finishAgentRun(
-              finalRunId,
-              safeOutcome.kind === "completed" ? "completed" : "failed",
-              safeOutcome.kind === "completed"
-                ? safeOutcome.text
-                : safeOutcome.reason,
+            await persistIfLive(() =>
+              finishAgentRun(
+                finalRunId,
+                safeOutcome.kind === "completed" ? "completed" : "failed",
+                safeOutcome.kind === "completed"
+                  ? safeOutcome.text
+                  : safeOutcome.reason,
+              ),
             );
           }
           return safeOutcome;
         } catch (error) {
           if (persistedRunId) {
-            await finishAgentRun(
-              persistedRunId,
-              "failed",
-              turnPathRedactor.redactTerminalText(
-                error instanceof Error ? error.message : String(error),
+            await persistIfLive(() =>
+              finishAgentRun(
+                persistedRunId,
+                "failed",
+                turnPathRedactor.redactTerminalText(
+                  error instanceof Error ? error.message : String(error),
+                ),
               ),
             );
           }
@@ -3090,21 +3227,23 @@ export function createExternalBackendBridgeRuntime(options: {
           const fallbackRunId = persistedRunId || `bridge-error-${Date.now()}`;
           if (!persistedRunCreated) {
             await ensurePersistedRun(fallbackRunId);
-            await params.onStart?.(fallbackRunId);
+            if (writeAllowed()) await params.onStart?.(fallbackRunId);
           }
           const statusEvent: AgentEvent = {
             type: "status",
             text: message,
           };
           await appendPersistedEvent(statusEvent);
-          await params.onEvent?.(statusEvent);
+          await notifyIfLive(statusEvent);
           const fallbackEvent: AgentEvent = {
             type: "fallback",
             reason: message,
           };
           await appendPersistedEvent(fallbackEvent);
-          await params.onEvent?.(fallbackEvent);
-          await finishAgentRun(fallbackRunId, "failed", message);
+          await notifyIfLive(fallbackEvent);
+          await persistIfLive(() =>
+            finishAgentRun(fallbackRunId, "failed", message),
+          );
           if (
             typeof ztoolkit !== "undefined" &&
             typeof ztoolkit.log === "function"

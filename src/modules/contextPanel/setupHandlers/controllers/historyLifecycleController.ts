@@ -134,14 +134,17 @@ import {
 } from "../../conversationDeletionSurfaceSync";
 import {
   forgetRecentlyDeletedConversation,
-  isConversationRecentlyDeleted,
-  markConversationRecentlyDeleted,
+  hasConversationDeletionTombstoneForKey,
+  isConversationInstanceRecentlyDeleted,
+  markConversationInstanceRecentlyDeleted,
 } from "../../../../core/conversations/recentlyDeletedConversations";
 import {
   pendingDeletionStore,
   type PendingConversationDeletionEntry,
   type PendingDeletionEvent,
 } from "../../../../core/conversations/pendingDeletionStore";
+import { getConversationWriteGeneration } from "../../../../shared/conversationWriteFence";
+import { getRegisteredConversationScope } from "../../../../shared/conversationRegistry";
 import {
   formatGlobalHistoryTimestamp,
   formatHistoryRowDisplayTitle,
@@ -266,6 +269,8 @@ type ForkTurnTarget = {
   conversationKey: number;
   userTimestamp: number;
   assistantTimestamp: number;
+  userMessageID?: number;
+  assistantMessageID?: number;
 };
 
 export { clearDeletedAgentConversationState } from "../../agentConversationCleanup";
@@ -553,10 +558,24 @@ export function createHistoryLifecycleController(
     paperItemID?: number;
   }) => {
     if (
-      pendingDeletionStore.isConversationPendingDeletion(
+      pendingDeletionStore.isConversationPendingDeletion(params.conversationKey)
+    ) {
+      return null;
+    }
+    const identityWitness =
+      await conversationRepository.getCatalogIdentityWitness(params);
+    if (
+      identityWitness?.instanceID &&
+      isConversationInstanceRecentlyDeleted(
         params.conversationKey,
-      ) ||
-      isConversationRecentlyDeleted(params.conversationKey)
+        identityWitness.instanceID,
+      )
+    ) {
+      return null;
+    }
+    if (
+      !identityWitness &&
+      (await hasConversationDeletionTombstoneForKey(params.conversationKey))
     ) {
       return null;
     }
@@ -622,11 +641,9 @@ export function createHistoryLifecycleController(
     if (historyUndoText) historyUndoText.textContent = "";
   };
 
-  const showHistoryUndoToast = (title: string) => {
+  const showHistoryUndoToast = () => {
     if (!historyUndo || !historyUndoText) return;
-    const displayTitle =
-      normalizeHistoryTitle(title) || normalizeHistoryTitle("Untitled chat");
-    historyUndoText.textContent = `Deleted "${displayTitle}"`;
+    historyUndoText.textContent = `Conversation deleted — Undo`;
     historyUndo.style.display = "flex";
   };
 
@@ -2195,6 +2212,16 @@ export function createHistoryLifecycleController(
       ? Math.floor(nextConversationKey)
       : 0;
     if (normalizedConversationKey <= 0) return false;
+    if (
+      pendingDeletionStore.isConversationPendingDeletion(
+        normalizedConversationKey,
+      )
+    ) {
+      if (status) {
+        setStatus(status, t("Deletion pending; retrying safely"), "warning");
+      }
+      return false;
+    }
     const system = getConversationSystem();
     // Deliberate navigation: the user wants this key alive again, so a stale
     // just-deleted tombstone must not keep its catalog row suppressed. It also
@@ -2317,6 +2344,13 @@ export function createHistoryLifecycleController(
         return null;
       }
       const normalizedConversationKey = Math.floor(conversationKey);
+      if (
+        pendingDeletionStore.isConversationPendingDeletion(
+          normalizedConversationKey,
+        )
+      ) {
+        return null;
+      }
       const entry =
         system === "upstream"
           ? await conversationRepository.ensureCatalogEntry({
@@ -2388,7 +2422,19 @@ export function createHistoryLifecycleController(
     if (!targetSummary) return false;
 
     const resolvedConversationKey = Math.floor(targetSummary.conversationKey);
-    // Deliberate navigation: see switchGlobalConversation.
+    if (
+      pendingDeletionStore.isConversationPendingDeletion(
+        resolvedConversationKey,
+      )
+    ) {
+      if (status) {
+        setStatus(status, t("Deletion pending; retrying safely"), "warning");
+      }
+      return false;
+    }
+    // Deliberate navigation to a different instance may clear only the
+    // legacy key-only compatibility tombstone; it never cancels a pending
+    // deletion intent.
     forgetRecentlyDeletedConversation(resolvedConversationKey);
     if (!noteFocusItem) {
       if (system === "claude_code") {
@@ -2870,6 +2916,7 @@ export function createHistoryLifecycleController(
         "conversation",
         nextConversationKey,
         collectAttachmentHashesFromMessages(forkedHistory),
+        getConversationWriteGeneration(nextConversationKey),
       );
     } catch (err) {
       ztoolkit.log("LLM: Failed to refresh fork attachment refs", err);
@@ -2932,6 +2979,8 @@ export function createHistoryLifecycleController(
     conversationKey: number;
     userTimestamp: number;
     assistantTimestamp: number;
+    userMessageID?: number;
+    assistantMessageID?: number;
   }) => {
     if (!item) return;
     if (isRequestPending(target.conversationKey)) {
@@ -2961,12 +3010,31 @@ export function createHistoryLifecycleController(
       return;
     }
 
-    const queued = await pendingDeletionStore.queueTurnDeletion({
+    const catalog = await conversationRepository.getCatalogEntry({
+      system: getConversationSystem(),
+      kind:
+        resolveDisplayConversationKind(item) === "paper" ? "paper" : "global",
+      conversationKey: target.conversationKey,
+    });
+    const turnDeletionInput = {
       conversationKey: target.conversationKey,
       system: getConversationSystem(),
+      ...(catalog?.instanceID ? { instanceID: catalog.instanceID } : {}),
+      ...(catalog?.kind ? { conversationKind: catalog.kind } : {}),
+      ...(catalog?.libraryID ? { libraryID: catalog.libraryID } : {}),
+      ...(catalog?.paperItemID ? { paperItemID: catalog.paperItemID } : {}),
       userTimestamp: Math.floor(target.userTimestamp),
       assistantTimestamp: Math.floor(target.assistantTimestamp),
-    });
+      ...(pair.userMessage.id ? { userMessageID: pair.userMessage.id } : {}),
+      ...(pair.assistantMessage.id
+        ? { assistantMessageID: pair.assistantMessage.id }
+        : {}),
+      ...(catalog?.providerSessionId
+        ? { providerSessionId: catalog.providerSessionId }
+        : {}),
+    };
+    const queued =
+      await pendingDeletionStore.queueTurnDeletion(turnDeletionInput);
     if (!queued) {
       if (status) {
         setStatus(status, t("Failed to queue deletion. Check logs."), "error");
@@ -3072,6 +3140,9 @@ export function createHistoryLifecycleController(
       return;
     }
     const target = getHistoryEntryRenameIdentity(entry);
+    const renameGeneration = getConversationWriteGeneration(
+      target.conversationKey,
+    );
     const nextTitle = await promptConversationRename(entry);
     if (!nextTitle) return;
     try {
@@ -3119,6 +3190,7 @@ export function createHistoryLifecycleController(
       }
       await conversationRepository.setCatalogTitle({
         ...target,
+        expectedGeneration: renameGeneration,
         title: nextTitle,
       });
       invalidateHistorySearchDocument(target.conversationKey);
@@ -3185,38 +3257,10 @@ export function createHistoryLifecycleController(
     }
 
     const wasActive = isHistoryEntryActive(targetEntry);
-    if (wasActive) {
-      const didClearActiveConversation =
-        await clearActiveConversationForPendingDeletion(targetEntry.kind, {
-          createFreshGlobalConversation: () =>
-            createAndSwitchGlobalConversation({
-              forceFresh: true,
-              excludeConversationKey: targetEntry.conversationKey,
-            }),
-          createFreshPaperConversation: () =>
-            createAndSwitchPaperConversation({
-              forceFresh: true,
-              excludeConversationKey: targetEntry.conversationKey,
-            }),
-          log: (message, ...args) => ztoolkit.log(message, ...args),
-        });
-      if (!didClearActiveConversation) {
-        if (status) {
-          setStatus(
-            status,
-            t("Cannot delete active conversation right now"),
-            "error",
-          );
-        }
-        return;
-      }
-    }
-
-    invalidateHistorySearchDocument(targetEntry.conversationKey);
     // Capture the catalog row's identity witness BEFORE queueing: keys are
     // recycled, so this is the only value that lets the finalizer prove it is
-    // still deleting this conversation. A missing witness makes
-    // queueConversationDeletion refuse, which surfaces below as a queue error.
+    // still deleting this conversation. A missing witness is persisted as a
+    // durable intent and moves to identity quarantine after the Undo window.
     const identityWitness =
       await conversationRepository.getCatalogIdentityWitness({
         system: getConversationSystem(),
@@ -3225,6 +3269,7 @@ export function createHistoryLifecycleController(
       });
     const queued = await pendingDeletionStore.queueConversationDeletion({
       conversationKind: targetEntry.kind,
+      instanceID: identityWitness?.instanceID || "",
       conversationID:
         identityWitness?.conversationID || targetEntry.conversationID,
       catalogCreatedAt: identityWitness?.catalogCreatedAt || 0,
@@ -3243,6 +3288,12 @@ export function createHistoryLifecycleController(
       await refreshGlobalHistoryHeader();
       return;
     }
+
+    // The intent is durable now.  Only after the write-ahead row exists may
+    // the local search surface hide the conversation; a crash before this
+    // point must not lose the user's deletion decision or leave a silently
+    // filtered but otherwise live conversation.
+    invalidateHistorySearchDocument(targetEntry.conversationKey);
 
     ztoolkit.log("LLM: Queued history deletion", {
       kind: targetEntry.kind,
@@ -3655,7 +3706,7 @@ export function createHistoryLifecycleController(
 
   const renderPendingDeletionToast = () => {
     const latest = pendingDeletionStore.getLatestPending();
-    if (!latest) {
+    if (!latest || latest.expiresAt <= Date.now()) {
       hideHistoryUndoToast();
       return;
     }
@@ -3663,7 +3714,7 @@ export function createHistoryLifecycleController(
       showTurnUndoToast();
       return;
     }
-    showHistoryUndoToast(latest.title);
+    showHistoryUndoToast();
   };
 
   const getSurrenderedDeletionTargets = (): Map<
@@ -3679,7 +3730,7 @@ export function createHistoryLifecycleController(
   };
 
   const getConversationDeletionSurfaceSnapshot =
-    (): ConversationDeletionSurfaceSnapshot | null => {
+    async (): Promise<ConversationDeletionSurfaceSnapshot | null> => {
       if (!item) return null;
       const activeConversationKey = Number(getConversationKey(item) || 0);
       if (
@@ -3688,8 +3739,12 @@ export function createHistoryLifecycleController(
       ) {
         return null;
       }
+      const registered = await getRegisteredConversationScope(
+        Math.floor(activeConversationKey),
+      );
       return {
         conversationKey: Math.floor(activeConversationKey),
+        instanceID: registered?.instanceID || undefined,
         kind: isGlobalMode() ? "global" : "paper",
         system: getConversationSystem(),
       };
@@ -3730,7 +3785,7 @@ export function createHistoryLifecycleController(
     const action = resolveConversationDeletionSurfaceAction({
       eventType,
       entry,
-      surface: getConversationDeletionSurfaceSnapshot(),
+      surface: await getConversationDeletionSurfaceSnapshot(),
       surrendered: surrendered.has(entry.id),
       dropped,
     });
@@ -3788,15 +3843,18 @@ export function createHistoryLifecycleController(
       // Record it before any refresh runs.
       // Only a REAL deletion tombstones the key; a dropped intent leaves the
       // conversation alive and it must stay seedable.
-      if (event.type === "finalized" && !event.dropped) {
-        markConversationRecentlyDeleted(entry.conversationKey);
-      }
-      if (event.type === "gave-up" && status) {
-        setStatus(
-          status,
-          t("Failed to fully delete conversation. Check logs."),
-          "error",
-        );
+      if (
+        (event.type === "completed" || event.type === "finalized") &&
+        !event.dropped
+      ) {
+        if (entry.instanceID) {
+          markConversationInstanceRecentlyDeleted(
+            entry.conversationKey,
+            entry.instanceID,
+            Date.now(),
+            entry.identityDigest,
+          );
+        }
       }
       void enqueueConversationDeletionEvent(() =>
         handleConversationPendingDeletionEvent(
@@ -3811,7 +3869,8 @@ export function createHistoryLifecycleController(
     if (
       (event.type === "undone" ||
         event.type === "finalized" ||
-        event.type === "gave-up") &&
+        event.type === "completed" ||
+        event.type === "local-deleted") &&
       item &&
       getConversationKey(item) === event.entry.conversationKey
     ) {
@@ -4165,8 +4224,8 @@ export function createHistoryLifecycleController(
           "clear-conversation",
         ),
       ),
-    restorePendingConversationDeletionsFor: (conversationKey: number) =>
-      pendingDeletionStore.restoreConversationDeletionsFor(conversationKey),
+    isConversationPendingDeletion: (conversationKey: number) =>
+      pendingDeletionStore.isConversationPendingDeletion(conversationKey),
     resetHistorySearchState,
     hasPendingTurnDeletionForConversation: (conversationKey: number) =>
       pendingDeletionStore.getPendingTurnsForConversation(conversationKey)

@@ -33,6 +33,7 @@ type ConversationStoreReadiness = {
   chatStoreReady: boolean;
   claudeStoreReady: boolean;
   codexStoreReady: boolean;
+  pendingDeletionReady: boolean;
 };
 
 let startupUserSkillsLoadTask: Promise<void> | null = null;
@@ -99,6 +100,7 @@ async function initializeConversationStoresForStartup(): Promise<ConversationSto
     chatStoreReady: false,
     claudeStoreReady: false,
     codexStoreReady: false,
+    pendingDeletionReady: false,
   };
 
   try {
@@ -126,6 +128,12 @@ async function initializeConversationStoresForStartup(): Promise<ConversationSto
     await measureStartupPhase("pending deletion store", async () => {
       configurePendingDeletionSubsystem();
       await pendingDeletionStore.init();
+      // Load durable deletion intents before any panel/window can mount. This
+      // re-establishes the process-local write fence synchronously on restart,
+      // so a user cannot send into a conversation while its persisted delete
+      // intent is still waiting for the deferred startup sweep.
+      await pendingDeletionStore.sweepAllPersisted("startup-sweep");
+      readiness.pendingDeletionReady = true;
     });
   } catch (err) {
     ztoolkit.log("LLM: Failed to initialize pending deletion store", err);
@@ -140,7 +148,8 @@ function allConversationStoresReady(
   return (
     readiness.chatStoreReady &&
     readiness.claudeStoreReady &&
-    readiness.codexStoreReady
+    readiness.codexStoreReady &&
+    readiness.pendingDeletionReady
   );
 }
 
@@ -252,9 +261,6 @@ function scheduleDeferredStartupWork(
     "legacy cache migrations",
     runDeferredLegacyMigrations,
   );
-  runDeferredStartupTask("pending deletion sweep", async () => {
-    await pendingDeletionStore.sweepAllPersisted("startup-sweep");
-  });
   scheduleConversationMaintenance(readiness);
   scheduleConversationIntegrityAudit();
   scheduleClaudeProjectBootstrapIfEnabled();
@@ -289,6 +295,16 @@ async function onStartup() {
 
   const conversationStoreReadiness =
     await initializeConversationStoresForStartup();
+
+  // A durable deletion intent that was not loaded is an active write fence,
+  // not an optional maintenance warning.  Do not mount any panel or window
+  // that could accept writes until the pending-deletion store has reloaded
+  // and swept those intents successfully.
+  if (!conversationStoreReadiness.pendingDeletionReady) {
+    throw new Error(
+      "Pending deletion state could not be loaded; refusing to mount conversation UI",
+    );
+  }
 
   registerPrefsPane();
 

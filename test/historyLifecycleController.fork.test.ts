@@ -543,14 +543,13 @@ describe("historyLifecycleController fork behavior", function () {
     );
 
     assert.deepEqual(events, ["deleteTurnMessages", "forkConversation"]);
-    assert.deepEqual(deleteCalls, [
-      {
-        system: "upstream",
-        conversationKey: SOURCE_CONVERSATION_KEY,
-        userTimestamp: 300,
-        assistantTimestamp: 400,
-      },
-    ]);
+    assert.lengthOf(deleteCalls, 1);
+    assert.deepInclude(deleteCalls[0], {
+      system: "upstream",
+      conversationKey: SOURCE_CONVERSATION_KEY,
+      userTimestamp: 300,
+      assistantTimestamp: 400,
+    });
     assert.deepEqual(forkCalls, [
       {
         system: "upstream",
