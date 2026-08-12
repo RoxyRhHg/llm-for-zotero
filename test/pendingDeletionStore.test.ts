@@ -385,6 +385,107 @@ describe("pendingDeletionStore", function () {
     );
   });
 
+  // Startup must not block on finalization: it does destructive local work and
+  // provider cleanup, and an outage there used to abort onStartup entirely,
+  // leaving the user with no panel and no preferences pane.
+  it("loadPersistedFence freezes deleted conversations without finalizing them", async function () {
+    const env = installFakeEnv();
+    env.rows.push({
+      id: "pd-fence-1",
+      kind: "conversation",
+      conversation_id: "lfz:x:upstream:global:lib-1:paper-0:legacy-21",
+      conversation_key: 21,
+      system: "upstream",
+      payload: JSON.stringify({
+        conversationKind: "global",
+        libraryID: 1,
+        title: "Deleted before restart",
+        wasActive: false,
+      }),
+      queued_at: 1,
+      expires_at: 2,
+      attempts: 0,
+    });
+    const finalized: string[] = [];
+    configurePendingDeletionFinalizers({
+      finalizeConversation: async (entry) => {
+        finalized.push(`conversation:${entry.conversationKey}`);
+        return true;
+      },
+      finalizeTurn: async () => true,
+    });
+
+    assert.isFalse(pendingDeletionStore.isPersistedFenceLoaded());
+    await pendingDeletionStore.loadPersistedFence();
+
+    assert.isTrue(pendingDeletionStore.isPersistedFenceLoaded());
+    assert.isTrue(areConversationWritesFrozen(21));
+    assert.isTrue(pendingDeletionStore.isConversationPendingDeletion(21));
+    assert.deepEqual(finalized, [], "fence load must not finalize");
+    assert.equal(
+      env.queries.filter((q) => q.sql.includes("DELETE FROM")).length,
+      0,
+      "fence load must not perform destructive work",
+    );
+
+    // The deferred sweep still completes the elapsed intent.
+    await pendingDeletionStore.sweepAllPersisted("startup-sweep");
+    assert.deepEqual(finalized, ["conversation:21"]);
+  });
+
+  it("ensurePersistedFenceLoaded retries after a failed startup load", async function () {
+    const env = installFakeEnv();
+    let failNextSelect = true;
+    const realQuery = (globalScope.Zotero as any).DB.queryAsync;
+    (globalScope.Zotero as any).DB.queryAsync = async (
+      sql: string,
+      params?: unknown[],
+    ) => {
+      if (
+        failNextSelect &&
+        sql.trimStart().toUpperCase().startsWith("SELECT")
+      ) {
+        throw new Error("database is locked");
+      }
+      return realQuery(sql, params);
+    };
+    env.rows.push({
+      id: "pd-retry-1",
+      kind: "conversation",
+      conversation_id: "lfz:x:upstream:global:lib-1:paper-0:legacy-31",
+      conversation_key: 31,
+      system: "upstream",
+      payload: JSON.stringify({
+        conversationKind: "global",
+        libraryID: 1,
+        title: "Deleted before restart",
+        wasActive: false,
+      }),
+      queued_at: 1,
+      expires_at: 2,
+      attempts: 0,
+    });
+
+    // Startup fails the way a locked database would.
+    let startupFailed = false;
+    try {
+      await pendingDeletionStore.loadPersistedFence();
+    } catch {
+      startupFailed = true;
+    }
+    assert.isTrue(startupFailed);
+    assert.isFalse(pendingDeletionStore.isPersistedFenceLoaded());
+    // A write attempted now must be refused rather than bypass the fence.
+    assert.isFalse(await pendingDeletionStore.ensurePersistedFenceLoaded());
+    assert.isFalse(areConversationWritesFrozen(31));
+
+    // The transient failure clears; the next write attempt self-heals.
+    failNextSelect = false;
+    assert.isTrue(await pendingDeletionStore.ensurePersistedFenceLoaded());
+    assert.isTrue(areConversationWritesFrozen(31));
+    assert.isTrue(pendingDeletionStore.isConversationPendingDeletion(31));
+  });
+
   it("restart preserves an unexpired Undo authorization", async function () {
     const env = installFakeEnv();
     env.rows.push({

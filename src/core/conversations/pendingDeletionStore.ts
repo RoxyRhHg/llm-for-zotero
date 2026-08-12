@@ -23,6 +23,10 @@ const FINALIZE_RETRY_MAX_DELAY_MS = 15 * 60 * 1_000;
 // Quarantine is deliberately conservative: exposing the conversation would
 // allow the user's delete decision to be silently lost.
 const quarantinedConversationKeys = new Set<number>();
+// Whether the durable intents have been reloaded into the process-local
+// freeze set. Until they have, the fence is incomplete and conversation
+// writes must not proceed.
+let persistedFenceLoaded = false;
 
 export type DeletionState =
   | "undoable"
@@ -399,6 +403,7 @@ export function resetPendingDeletionStoreForTests(): void {
   activeFinalizationIds.clear();
   destructivelyFinalizedIds.clear();
   quarantinedConversationKeys.clear();
+  persistedFenceLoaded = false;
   unrecordedQueueIntents.clear();
   unrecordedConversationQueueIntents.clear();
   resetConversationWriteFenceForTests();
@@ -1647,88 +1652,150 @@ export const pendingDeletionStore = {
     });
   },
 
+  /**
+   * Reload every durable deletion intent and re-establish the process-local
+   * half of the write-ahead boundary, without finalizing anything.
+   *
+   * This is the part startup genuinely cannot proceed without: until these
+   * rows are loaded, a conversation the user already deleted is not frozen and
+   * a send could write into it.  Finalization -- which does destructive local
+   * work and provider cleanup -- is deliberately NOT part of it, so a slow or
+   * failing provider cannot delay mounting the UI.
+   */
+  loadPersistedFence(): Promise<void> {
+    return enqueueOp(async () => {
+      await loadPersistedIntentsUnlocked({ forceExpired: false });
+      persistedFenceLoaded = true;
+    });
+  },
+
+  /**
+   * True once the durable intents have been reloaded in this process. Until
+   * then the process-local freeze set is incomplete, so a conversation the
+   * user deleted in an earlier session may not be frozen yet.
+   */
+  isPersistedFenceLoaded(): boolean {
+    return persistedFenceLoaded;
+  },
+
+  /**
+   * Retry the fence load if startup could not complete it. Callers about to
+   * perform a conversation write use this so a transient database error at
+   * launch self-heals on first use instead of either silently dropping the
+   * fence or permanently disabling sending.
+   *
+   * Returns false only when the intents still cannot be read, in which case
+   * the caller must refuse the write.
+   */
+  async ensurePersistedFenceLoaded(): Promise<boolean> {
+    if (persistedFenceLoaded) return true;
+    try {
+      await pendingDeletionStore.loadPersistedFence();
+    } catch (error) {
+      env.log("LLM: pending deletion fence reload failed", { error });
+    }
+    return persistedFenceLoaded;
+  },
+
   sweepAllPersisted(
     reason: string,
     options: { forceExpired?: boolean } = {},
   ): Promise<void> {
     return enqueueOp(async () => {
-      const db = getZoteroDb();
-      if (!db) return;
-      await pendingDeletionStore.init();
-      const now = options.forceExpired ? Number.MAX_SAFE_INTEGER : env.now();
-      const rows = (await db.queryAsync(
-        `SELECT id, kind, conversation_id, conversation_key, system, payload, queued_at, expires_at, attempts,
-                state, provider_cleanup_state, identity_digest, next_retry_at,
-                last_error_code, manifest_version, user_message_id, assistant_message_id
-         FROM ${PENDING_DELETIONS_TABLE}`,
-      )) as Array<Record<string, unknown>> | undefined;
-      const finalizations: Promise<boolean>[] = [];
-      for (const row of rows || []) {
-        const entry = rowToEntry(row);
-        if (!entry) {
-          const rowId = typeof row.id === "string" ? row.id : "";
-          const quarantinedKey = Math.floor(Number(row.conversation_key || 0));
-          if (quarantinedKey > 0) {
-            quarantinedConversationKeys.add(quarantinedKey);
-            freezeConversationWrites(quarantinedKey);
-            bumpConversationWriteGeneration(quarantinedKey);
-          }
-          env.log("LLM: quarantining unreadable pending-deletion row", {
-            rowId,
-          });
-          // Never drop a durable user deletion because an old manifest cannot
-          // be decoded. Persist the quarantine marker for a repair/migration
-          // pass rather than allowing the row to become visible again.
-          if (rowId) {
-            try {
-              await db.queryAsync(
-                `UPDATE ${PENDING_DELETIONS_TABLE}
-                 SET state = 'quarantined_identity',
-                     provider_cleanup_state = 'attention_required',
-                     last_error_code = 'manifest_unreadable'
-                 WHERE id = ?`,
-                [rowId],
-              );
-            } catch (error) {
-              env.log(
-                "LLM: failed to mark unreadable deletion as quarantined",
-                {
-                  rowId,
-                  error,
-                },
-              );
-            }
-          }
-          continue;
-        }
-        const alreadyLoaded = entries.has(entry.id);
-        if (!alreadyLoaded) {
-          entries.set(entry.id, entry);
-          queueOrder.push(entry.id);
-          // Re-establish the process-local half of the durable write-ahead
-          // boundary after a restart for BOTH whole-conversation and turn
-          // intents.  A turn row is independently undoable, so allowing writes
-          // during its six-second window would let a late callback recreate the
-          // very turn that the durable intent is about to remove.
-          freezeConversationWrites(entry.conversationKey);
-          bumpConversationWriteGeneration(entry.conversationKey);
-        }
-        // A real restart must preserve an unexpired Undo authorization. The
-        // durable row is reloaded and its own timer is re-armed; only an
-        // expired intent (or an already-committing/retrying state) is eligible
-        // for the startup finalizer. Test harnesses that explicitly model an
-        // exhausted six-second window may opt into forceExpired.
-        if (
-          !options.forceExpired &&
-          entry.expiresAt > now &&
-          (entry.state === undefined || entry.state === "undoable")
-        ) {
-          armTimer(entry.id, entry.expiresAt - now);
-          continue;
-        }
-        finalizations.push(pendingDeletionStore.finalize(entry.id, reason));
-      }
-      await Promise.all(finalizations);
+      const eligible = await loadPersistedIntentsUnlocked(options);
+      persistedFenceLoaded = true;
+      // finalize() serializes per conversation, not on the global op chain,
+      // so awaiting it from inside enqueueOp cannot deadlock.
+      await Promise.all(
+        eligible.map((id) => pendingDeletionStore.finalize(id, reason)),
+      );
     });
   },
 };
+
+/**
+ * Shared loader for both the blocking fence load and the deferred sweep.
+ * Deliberately not wrapped in enqueueOp: both callers already hold the global
+ * op chain, and re-entering it here would deadlock.
+ *
+ * Returns the IDs whose Undo window has elapsed, i.e. those the sweep should
+ * finalize.
+ */
+async function loadPersistedIntentsUnlocked(
+  options: { forceExpired?: boolean } = {},
+): Promise<string[]> {
+  const db = getZoteroDb();
+  if (!db) return [];
+  await pendingDeletionStore.init();
+  const now = options.forceExpired ? Number.MAX_SAFE_INTEGER : env.now();
+  const rows = (await db.queryAsync(
+    `SELECT id, kind, conversation_id, conversation_key, system, payload, queued_at, expires_at, attempts,
+            state, provider_cleanup_state, identity_digest, next_retry_at,
+            last_error_code, manifest_version, user_message_id, assistant_message_id
+     FROM ${PENDING_DELETIONS_TABLE}`,
+  )) as Array<Record<string, unknown>> | undefined;
+  const eligibleForFinalize: string[] = [];
+  for (const row of rows || []) {
+    const entry = rowToEntry(row);
+    if (!entry) {
+      const rowId = typeof row.id === "string" ? row.id : "";
+      const quarantinedKey = Math.floor(Number(row.conversation_key || 0));
+      if (quarantinedKey > 0) {
+        quarantinedConversationKeys.add(quarantinedKey);
+        freezeConversationWrites(quarantinedKey);
+        bumpConversationWriteGeneration(quarantinedKey);
+      }
+      env.log("LLM: quarantining unreadable pending-deletion row", {
+        rowId,
+      });
+      // Never drop a durable user deletion because an old manifest cannot
+      // be decoded. Persist the quarantine marker for a repair/migration
+      // pass rather than allowing the row to become visible again.
+      if (rowId) {
+        try {
+          await db.queryAsync(
+            `UPDATE ${PENDING_DELETIONS_TABLE}
+             SET state = 'quarantined_identity',
+                 provider_cleanup_state = 'attention_required',
+                 last_error_code = 'manifest_unreadable'
+             WHERE id = ?`,
+            [rowId],
+          );
+        } catch (error) {
+          env.log("LLM: failed to mark unreadable deletion as quarantined", {
+            rowId,
+            error,
+          });
+        }
+      }
+      continue;
+    }
+    const alreadyLoaded = entries.has(entry.id);
+    if (!alreadyLoaded) {
+      entries.set(entry.id, entry);
+      queueOrder.push(entry.id);
+      // Re-establish the process-local half of the durable write-ahead
+      // boundary after a restart for BOTH whole-conversation and turn
+      // intents.  A turn row is independently undoable, so allowing writes
+      // during its six-second window would let a late callback recreate the
+      // very turn that the durable intent is about to remove.
+      freezeConversationWrites(entry.conversationKey);
+      bumpConversationWriteGeneration(entry.conversationKey);
+    }
+    // A real restart must preserve an unexpired Undo authorization. The
+    // durable row is reloaded and its own timer is re-armed; only an
+    // expired intent (or an already-committing/retrying state) is eligible
+    // for the startup finalizer. Test harnesses that explicitly model an
+    // exhausted six-second window may opt into forceExpired.
+    if (
+      !options.forceExpired &&
+      entry.expiresAt > now &&
+      (entry.state === undefined || entry.state === "undoable")
+    ) {
+      armTimer(entry.id, entry.expiresAt - now);
+      continue;
+    }
+    eligibleForFinalize.push(entry.id);
+  }
+  return eligibleForFinalize;
+}

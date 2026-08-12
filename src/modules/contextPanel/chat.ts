@@ -6957,6 +6957,8 @@ export async function editLatestUserMessageAndRetry(
   // deletion first so the hidden turn cannot be the retry target. finalize is
   // best-effort and time-boxed — on failure or timeout the turn stays queued,
   // so select the target from the filtered (user-visible) view.
+  if (!(await pendingDeletionStore.ensurePersistedFenceLoaded()))
+    return "stale";
   await awaitPendingTurnFinalize(
     pendingDeletionStore.finalizeTurnsForConversation(conversationKey, "retry"),
   );
@@ -7289,6 +7291,8 @@ export async function retryLatestAssistantResponse(
   // best-effort and time-boxed — on failure or timeout the turn stays queued,
   // so select the target and build the prompt from the filtered
   // (user-visible) view.
+  if (!(await pendingDeletionStore.ensurePersistedFenceLoaded()))
+    return "stale";
   await awaitPendingTurnFinalize(
     pendingDeletionStore.finalizeTurnsForConversation(conversationKey, "retry"),
   );
@@ -8155,6 +8159,7 @@ export async function editUserTurnAndRetry(opts: {
   // first. history stays RAW below on purpose — truncation after the edited
   // pair must also purge hidden trailing pairs and their rows; a preceding
   // hidden pair is excluded from the prompt by the delegated retry path.
+  if (!(await pendingDeletionStore.ensurePersistedFenceLoaded())) return false;
   await awaitPendingTurnFinalize(
     pendingDeletionStore.finalizeTurnsForConversation(conversationKey, "edit"),
   );
@@ -9381,6 +9386,21 @@ export async function sendQuestion(
     skipAgentDispatch = false,
   } = opts;
   {
+    // The durable deletion intents must be loaded before any write. If startup
+    // could not read them, retry now: a transient database error at launch
+    // then self-heals instead of silently dropping the fence and writing into
+    // a conversation the user already deleted in an earlier session.
+    if (!(await pendingDeletionStore.ensurePersistedFenceLoaded())) {
+      const ui = getPanelRequestUI(body);
+      if (ui.status) {
+        setStatus(
+          ui.status,
+          t("Chat storage is unavailable; check the log"),
+          "error",
+        );
+      }
+      return;
+    }
     // A new send is the user moving on: complete any pending turn deletion so
     // the hidden turn is neither included in the prompt nor resurrected later.
     const pendingKey = getConversationKey(item);

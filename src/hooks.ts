@@ -131,8 +131,10 @@ async function initializeConversationStoresForStartup(): Promise<ConversationSto
       // Load durable deletion intents before any panel/window can mount. This
       // re-establishes the process-local write fence synchronously on restart,
       // so a user cannot send into a conversation while its persisted delete
-      // intent is still waiting for the deferred startup sweep.
-      await pendingDeletionStore.sweepAllPersisted("startup-sweep");
+      // intent is still waiting for the deferred startup sweep.  Finalization
+      // stays deferred: it does destructive local work and provider cleanup,
+      // and must not be able to delay or block the UI.
+      await pendingDeletionStore.loadPersistedFence();
       readiness.pendingDeletionReady = true;
     });
   } catch (err) {
@@ -261,6 +263,12 @@ function scheduleDeferredStartupWork(
     "legacy cache migrations",
     runDeferredLegacyMigrations,
   );
+  // Finalize intents whose Undo window elapsed while Zotero was closed. The
+  // fence itself was already re-established during blocking startup; this is
+  // only the destructive/provider half, so it stays off the critical path.
+  runDeferredStartupTask("pending deletion sweep", async () => {
+    await pendingDeletionStore.sweepAllPersisted("startup-sweep");
+  });
   scheduleConversationMaintenance(readiness);
   scheduleConversationIntegrityAudit();
   scheduleClaudeProjectBootstrapIfEnabled();
@@ -297,12 +305,15 @@ async function onStartup() {
     await initializeConversationStoresForStartup();
 
   // A durable deletion intent that was not loaded is an active write fence,
-  // not an optional maintenance warning.  Do not mount any panel or window
-  // that could accept writes until the pending-deletion store has reloaded
-  // and swept those intents successfully.
+  // but it must NOT abort startup. Throwing here skipped the preferences pane
+  // and every window, leaving the user with no plugin at all and no way to
+  // recover from the UI, over a failure in the least essential subsystem. The
+  // three conversation stores above already degrade rather than abort; this
+  // one now behaves the same way. The store retries the load on first write,
+  // so a transient database error self-heals instead of persisting.
   if (!conversationStoreReadiness.pendingDeletionReady) {
-    throw new Error(
-      "Pending deletion state could not be loaded; refusing to mount conversation UI",
+    ztoolkit.log(
+      "LLM: pending deletion fence not loaded at startup; will retry before the next conversation write",
     );
   }
 

@@ -150,6 +150,7 @@ const zhCN: Record<string, string> = {
   "Failed to fully delete turn. Check logs.":
     "未能完全删除对话轮次，请查看日志。",
   "Failed to queue deletion. Check logs.": "无法排入删除队列，请查看日志。",
+  "Chat storage is unavailable; check the log": "聊天存储不可用，请查看日志。",
   "Failed to restore. Check logs.": "恢复失败，请查看日志。",
   "Turn deleted": "已删除对话轮次",
   "Turn restored": "已恢复对话轮次",
