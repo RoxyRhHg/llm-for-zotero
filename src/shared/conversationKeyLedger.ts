@@ -701,101 +701,175 @@ export async function assertConversationKeyLiveInTransaction(params: {
   }
 }
 
+/**
+ * Version of the database fence.  The version is part of every trigger name
+ * whose predicate this module has changed, so a bump installs the new rules
+ * and `dropSupersededConversationFenceTriggers` removes the old ones.  Without
+ * that teardown the fence would be permanent and unrepairable: triggers live
+ * in the Zotero database, not in the plugin, so uninstalling or downgrading
+ * never removes them.
+ */
+export const CONVERSATION_FENCE_VERSION = 2;
+
+/**
+ * The fence rejects writes to a permanently retired conversation key.  That is
+ * the invariant deletion actually depends on, and it is expressible against
+ * `conversation_key` alone -- which is `INTEGER PRIMARY KEY` on the ledger, so
+ * the check is a rowid seek rather than a scan of the catalogs.
+ *
+ * It deliberately does NOT require `conversation_instance_id`.  Exact identity
+ * matching is enforced in application code (see `resolveUpstreamAppendIdentity`
+ * and the equivalents in the Claude and Codex stores).  Requiring the column
+ * here would reject writes from any build that predates it, which -- because
+ * triggers outlive the plugin -- would make downgrading permanently break chat
+ * storage with no in-app recovery.
+ */
+function retiredKeyPredicate(keyColumn: string): string {
+  return `EXISTS (
+         SELECT 1
+         FROM ${KEY_LEDGER_TABLE} l
+         WHERE l.conversation_key = NEW.${keyColumn}
+           AND l.retired_at IS NOT NULL
+       )`;
+}
+
+const RETIRED_KEY_ABORT_MESSAGE = "conversation key is permanently retired";
+
+/**
+ * True when an error is this module's own trigger rejecting a retired key, so
+ * callers can rethrow it as `ConversationRetiredError` and keep the typed
+ * error their existing handling expects.
+ */
+export function isRetiredKeyAbort(error: unknown): boolean {
+  return new RegExp(RETIRED_KEY_ABORT_MESSAGE, "i").test(String(error));
+}
+
+/**
+ * Run a conversation-owned write and translate the database fence's rejection
+ * into the typed error callers already handle.  The fence is authoritative, so
+ * a rejection also teaches the process-local retired set something it did not
+ * know -- which is how a second surface in the same process learns that a key
+ * was retired underneath it.
+ */
+export async function withRetiredKeyErrorMapping<T>(
+  conversationKey: number,
+  instanceID: string,
+  task: () => Promise<T>,
+): Promise<T> {
+  try {
+    return await task();
+  } catch (error) {
+    if (error instanceof ConversationRetiredError) throw error;
+    if (!isRetiredKeyAbort(error)) throw error;
+    const key = normalizePositiveInt(conversationKey);
+    if (key) rememberConversationKeyRetired(key);
+    throw new ConversationRetiredError(
+      key || 0,
+      normalizeText(instanceID, 128),
+    );
+  }
+}
+
+/**
+ * Remove fence triggers from superseded versions.  `DROP TRIGGER IF EXISTS` is
+ * a no-op when the trigger is absent, so this is safe to run unconditionally
+ * on every store initialization and repairs a profile that already ran an
+ * earlier fence.
+ */
+async function dropSupersededConversationFenceTriggers(
+  tables: readonly string[],
+): Promise<void> {
+  const db = getDb();
+  if (!db?.queryAsync) return;
+  for (const table of tables) {
+    const safe = table.replace(/[^A-Za-z0-9_]/g, "");
+    if (!safe) continue;
+    for (const legacy of [
+      // v1 catalog fence: required a live (key, instance) pair.
+      `${safe}_conversation_key_ledger_insert`,
+      `${safe}_conversation_key_ledger_update`,
+      // v1 message fence: joined both catalogs through a UNION ALL subquery.
+      `${safe}_conversation_identity_insert`,
+      `${safe}_conversation_identity_update`,
+      // v1 attachment fence: the "_live_" pair was subsumed by "_issued_".
+      `${safe}_issued_conversation_insert`,
+      `${safe}_issued_conversation_update`,
+      `${safe}_live_conversation_insert`,
+      `${safe}_live_conversation_update`,
+    ]) {
+      try {
+        await db.queryAsync(`DROP TRIGGER IF EXISTS ${legacy}`);
+      } catch (error) {
+        // A test double without trigger support must not block store startup.
+        if (!/no such table|not authorized|syntax error/i.test(String(error))) {
+          throw error;
+        }
+      }
+    }
+  }
+}
+
 export async function installConversationKeyLedgerCatalogTriggers(
   catalogTables: readonly string[],
 ): Promise<void> {
   const db = getDb();
   if (!db?.queryAsync)
     throw new Error("Conversation key ledger DB is unavailable");
+  await dropSupersededConversationFenceTriggers(catalogTables);
   for (const table of catalogTables) {
     const safeTable = table.replace(/[^A-Za-z0-9_]/g, "");
-    const insertTrigger = `${safeTable}_conversation_key_ledger_insert`;
-    const updateTrigger = `${safeTable}_conversation_key_ledger_update`;
+    const insertTrigger = `${safeTable}_conversation_fence_v${CONVERSATION_FENCE_VERSION}_insert`;
+    const updateTrigger = `${safeTable}_conversation_fence_v${CONVERSATION_FENCE_VERSION}_update`;
     await db.queryAsync(
       `CREATE TRIGGER IF NOT EXISTS ${insertTrigger}
        BEFORE INSERT ON ${safeTable}
-       WHEN NOT EXISTS (
-         SELECT 1
-         FROM ${KEY_LEDGER_TABLE} l
-         WHERE l.conversation_key = NEW.conversation_key
-           AND l.instance_id = NEW.conversation_instance_id
-           AND l.retired_at IS NULL
-       )
+       WHEN ${retiredKeyPredicate("conversation_key")}
        BEGIN
-         SELECT RAISE(ABORT, 'conversation key is not issued and live');
+         SELECT RAISE(ABORT, '${RETIRED_KEY_ABORT_MESSAGE}');
        END`,
     );
     await db.queryAsync(
       `CREATE TRIGGER IF NOT EXISTS ${updateTrigger}
-       BEFORE UPDATE OF conversation_key, conversation_instance_id ON ${safeTable}
-       WHEN NOT EXISTS (
-         SELECT 1
-         FROM ${KEY_LEDGER_TABLE} l
-         WHERE l.conversation_key = NEW.conversation_key
-           AND l.instance_id = NEW.conversation_instance_id
-           AND l.retired_at IS NULL
-       )
+       BEFORE UPDATE OF conversation_key ON ${safeTable}
+       WHEN ${retiredKeyPredicate("conversation_key")}
        BEGIN
-         SELECT RAISE(ABORT, 'conversation key identity cannot be changed');
+         SELECT RAISE(ABORT, '${RETIRED_KEY_ABORT_MESSAGE}');
        END`,
     );
   }
 }
 
 /**
- * Prevent message rows from outliving (or bypassing) their exact catalog
- * identity.  These triggers are deliberately database-level guards: runtime
- * fences protect normal code paths, while the trigger also protects repair
- * scripts, stale callbacks, and direct SQL writes.
+ * Prevent message rows from being written into a permanently retired
+ * conversation.  Runtime fences protect normal code paths; this trigger also
+ * covers repair scripts, stale callbacks and direct SQL writes.
  */
 export async function installConversationKeyLedgerMessageTriggers(params: {
   messageTable: string;
-  system: ConversationSystem;
-  catalogTables: readonly string[];
 }): Promise<void> {
   const db = getDb();
   if (!db?.queryAsync) {
     throw new Error("Conversation key ledger DB is unavailable");
   }
   const messageTable = params.messageTable.replace(/[^A-Za-z0-9_]/g, "");
-  const catalogTables = params.catalogTables.map((table) =>
-    table.replace(/[^A-Za-z0-9_]/g, ""),
-  );
-  if (!messageTable || !catalogTables.length) return;
-  const catalogWitness = catalogTables
-    .map(
-      (table) =>
-        `SELECT conversation_key, conversation_instance_id FROM ${table}`,
-    )
-    .join(" UNION ALL ");
-  const predicate = `
-    EXISTS (
-      SELECT 1
-      FROM ${KEY_LEDGER_TABLE} l
-      JOIN (${catalogWitness}) c
-        ON c.conversation_key = NEW.conversation_key
-       AND c.conversation_instance_id = NEW.conversation_instance_id
-      WHERE l.conversation_key = NEW.conversation_key
-        AND l.instance_id = NEW.conversation_instance_id
-        AND l.system = '${params.system}'
-        AND l.retired_at IS NULL
-    )`;
-  const insertTrigger = `${messageTable}_conversation_identity_insert`;
-  const updateTrigger = `${messageTable}_conversation_identity_update`;
+  if (!messageTable) return;
+  await dropSupersededConversationFenceTriggers([messageTable]);
+  const insertTrigger = `${messageTable}_conversation_fence_v${CONVERSATION_FENCE_VERSION}_insert`;
+  const updateTrigger = `${messageTable}_conversation_fence_v${CONVERSATION_FENCE_VERSION}_update`;
   await db.queryAsync(
     `CREATE TRIGGER IF NOT EXISTS ${insertTrigger}
      BEFORE INSERT ON ${messageTable}
-     WHEN NOT ${predicate}
+     WHEN ${retiredKeyPredicate("conversation_key")}
      BEGIN
-       SELECT RAISE(ABORT, 'message conversation identity is not live');
+       SELECT RAISE(ABORT, '${RETIRED_KEY_ABORT_MESSAGE}');
      END`,
   );
   await db.queryAsync(
     `CREATE TRIGGER IF NOT EXISTS ${updateTrigger}
-     BEFORE UPDATE OF conversation_key, conversation_instance_id ON ${messageTable}
-     WHEN NOT ${predicate}
+     BEFORE UPDATE OF conversation_key ON ${messageTable}
+     WHEN ${retiredKeyPredicate("conversation_key")}
      BEGIN
-       SELECT RAISE(ABORT, 'message conversation identity cannot be changed');
+       SELECT RAISE(ABORT, '${RETIRED_KEY_ABORT_MESSAGE}');
      END`,
   );
 }
@@ -947,62 +1021,31 @@ export async function installConversationKeyLedgerAgentTriggers(): Promise<void>
 
   const refsTable = "llm_for_zotero_attachment_refs";
   if (tables.has(refsTable)) {
+    await dropSupersededConversationFenceTriggers([refsTable]);
     try {
-      // Attachment references predate immutable instance IDs, but a numeric
-      // owner key is still unsafe when it has never been issued.  The legacy
-      // retired-key trigger below protects only one half of that boundary;
-      // this v2 fence rejects both unknown and retired conversation owners so
-      // an orphan ref cannot be adopted by a future allocation.
+      // Attachment references predate immutable instance IDs and key their
+      // owner by the numeric conversation key.  Retirement is the boundary
+      // that matters: a ref must not attach to a conversation the user
+      // deleted.  Requiring the owner to be *issued* (the superseded rule)
+      // additionally rejected any owner the ledger had not seen yet, which
+      // turned a lazily-initialized store racing the seeding pass into a hard
+      // SQL failure rather than a soft skip.
       await db.queryAsync(
-        `CREATE TRIGGER IF NOT EXISTS ${refsTable}_issued_conversation_insert
+        `CREATE TRIGGER IF NOT EXISTS ${refsTable}_conversation_fence_v${CONVERSATION_FENCE_VERSION}_insert
          BEFORE INSERT ON ${refsTable}
          WHEN NEW.owner_type = 'conversation'
-          AND NOT EXISTS (
-            SELECT 1 FROM ${KEY_LEDGER_TABLE} l
-            WHERE l.conversation_key = NEW.owner_id
-              AND l.retired_at IS NULL
-          )
+          AND ${retiredKeyPredicate("owner_id")}
          BEGIN
-           SELECT RAISE(ABORT, 'conversation attachment owner is not live');
+           SELECT RAISE(ABORT, '${RETIRED_KEY_ABORT_MESSAGE}');
          END`,
       );
       await db.queryAsync(
-        `CREATE TRIGGER IF NOT EXISTS ${refsTable}_issued_conversation_update
+        `CREATE TRIGGER IF NOT EXISTS ${refsTable}_conversation_fence_v${CONVERSATION_FENCE_VERSION}_update
          BEFORE UPDATE OF owner_type, owner_id ON ${refsTable}
          WHEN NEW.owner_type = 'conversation'
-          AND NOT EXISTS (
-            SELECT 1 FROM ${KEY_LEDGER_TABLE} l
-            WHERE l.conversation_key = NEW.owner_id
-              AND l.retired_at IS NULL
-          )
+          AND ${retiredKeyPredicate("owner_id")}
          BEGIN
-           SELECT RAISE(ABORT, 'conversation attachment owner is not live');
-         END`,
-      );
-      await db.queryAsync(
-        `CREATE TRIGGER IF NOT EXISTS ${refsTable}_live_conversation_insert
-         BEFORE INSERT ON ${refsTable}
-         WHEN NEW.owner_type = 'conversation'
-          AND EXISTS (
-            SELECT 1 FROM ${KEY_LEDGER_TABLE} l
-            WHERE l.conversation_key = NEW.owner_id
-              AND l.retired_at IS NOT NULL
-          )
-         BEGIN
-           SELECT RAISE(ABORT, 'conversation key is permanently retired');
-         END`,
-      );
-      await db.queryAsync(
-        `CREATE TRIGGER IF NOT EXISTS ${refsTable}_live_conversation_update
-         BEFORE UPDATE OF owner_type, owner_id ON ${refsTable}
-         WHEN NEW.owner_type = 'conversation'
-          AND EXISTS (
-            SELECT 1 FROM ${KEY_LEDGER_TABLE} l
-            WHERE l.conversation_key = NEW.owner_id
-              AND l.retired_at IS NOT NULL
-          )
-         BEGIN
-           SELECT RAISE(ABORT, 'conversation key is permanently retired');
+           SELECT RAISE(ABORT, '${RETIRED_KEY_ABORT_MESSAGE}');
          END`,
       );
     } catch (error) {

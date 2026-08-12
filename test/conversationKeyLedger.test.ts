@@ -134,8 +134,6 @@ describe("permanent conversation key ledger", function () {
     await installConversationKeyLedgerCatalogTriggers(["test_catalog"]);
     await installConversationKeyLedgerMessageTriggers({
       messageTable: "test_messages",
-      system: "upstream",
-      catalogTables: ["test_catalog"],
     });
     const instanceID = "instance-a";
     await zotero.DB.executeTransaction(() =>
@@ -177,7 +175,7 @@ describe("permanent conversation key ledger", function () {
            VALUES (?, ?, ?)`,
           )
           .run(2000, instanceID, "conversation-a"),
-      /conversation key is not issued and live/,
+      /conversation key is permanently retired/,
     );
     assert.throws(
       () =>
@@ -188,8 +186,117 @@ describe("permanent conversation key ledger", function () {
            VALUES (?, ?, ?, ?)`,
           )
           .run(2000, instanceID, "conversation-a", "after"),
-      /message conversation identity is not live/,
+      /conversation key is permanently retired/,
     );
+  });
+
+  // The database fence outlives the plugin: triggers live in zotero.sqlite and
+  // no version removes them.  If it required conversation_instance_id, every
+  // build predating that column -- i.e. every earlier release -- would have its
+  // writes rejected forever, with no in-app recovery.  Exact identity matching
+  // belongs in application code; the fence only guards retirement.
+  it("accepts writes that omit the instance fingerprint while the key is live", async function () {
+    await initConversationKeyLedgerStore();
+    const zotero = globalScope.Zotero as any;
+    await zotero.DB.queryAsync(
+      `CREATE TABLE legacy_catalog (
+        conversation_key INTEGER PRIMARY KEY,
+        conversation_instance_id TEXT,
+        conversation_id TEXT NOT NULL
+      )`,
+    );
+    await zotero.DB.queryAsync(
+      `CREATE TABLE legacy_messages (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        conversation_key INTEGER NOT NULL,
+        conversation_instance_id TEXT,
+        conversation_id TEXT NOT NULL,
+        text TEXT NOT NULL
+      )`,
+    );
+    await installConversationKeyLedgerCatalogTriggers(["legacy_catalog"]);
+    await installConversationKeyLedgerMessageTriggers({
+      messageTable: "legacy_messages",
+    });
+    await zotero.DB.executeTransaction(() =>
+      ensureConversationKeyLedgerEntryInTransaction({
+        conversationKey: 2100,
+        instanceID: "instance-live",
+        conversationID: "conversation-live",
+        system: "upstream",
+        kind: "global",
+        profileSignature: "profile-test",
+        libraryID: 1,
+        issuedAt: 1,
+      }),
+    );
+
+    // An older build writes neither the fingerprint nor a matching ledger
+    // lookup key; both must still succeed while the conversation is live.
+    db.prepare(
+      `INSERT INTO legacy_catalog (conversation_key, conversation_id)
+       VALUES (?, ?)`,
+    ).run(2100, "conversation-live");
+    db.prepare(
+      `INSERT INTO legacy_messages (conversation_key, conversation_id, text)
+       VALUES (?, ?, ?)`,
+    ).run(2100, "conversation-live", "written by an older build");
+    assert.equal(
+      (
+        db.prepare(`SELECT COUNT(*) AS n FROM legacy_messages`).get() as {
+          n: number;
+        }
+      ).n,
+      1,
+    );
+
+    // Retirement still closes the door, fingerprint or not.
+    await zotero.DB.executeTransaction(() =>
+      retireConversationKeyInTransaction({
+        conversationKey: 2100,
+        instanceID: "instance-live",
+      }),
+    );
+    assert.throws(
+      () =>
+        db
+          .prepare(
+            `INSERT INTO legacy_messages (conversation_key, conversation_id, text)
+             VALUES (?, ?, ?)`,
+          )
+          .run(2100, "conversation-live", "after retirement"),
+      /conversation key is permanently retired/,
+    );
+  });
+
+  it("removes superseded fence triggers so the fence stays repairable", async function () {
+    await initConversationKeyLedgerStore();
+    const zotero = globalScope.Zotero as any;
+    await zotero.DB.queryAsync(
+      `CREATE TABLE upgrade_catalog (
+        conversation_key INTEGER PRIMARY KEY,
+        conversation_instance_id TEXT,
+        conversation_id TEXT NOT NULL
+      )`,
+    );
+    // Simulate a profile that already ran the superseded fence.
+    await zotero.DB.queryAsync(
+      `CREATE TRIGGER upgrade_catalog_conversation_key_ledger_insert
+       BEFORE INSERT ON upgrade_catalog
+       BEGIN SELECT RAISE(ABORT, 'conversation key is not issued and live'); END`,
+    );
+    await installConversationKeyLedgerCatalogTriggers(["upgrade_catalog"]);
+    const triggers = db
+      .prepare(`SELECT name FROM sqlite_master WHERE type = 'trigger'`)
+      .all() as Array<{ name: string }>;
+    const names = triggers.map((row) => row.name);
+    assert.notInclude(names, "upgrade_catalog_conversation_key_ledger_insert");
+    assert.include(names, "upgrade_catalog_conversation_fence_v2_insert");
+    // The superseded rule aborted unconditionally; a live write must now pass.
+    db.prepare(
+      `INSERT INTO upgrade_catalog (conversation_key, conversation_id)
+       VALUES (?, ?)`,
+    ).run(2200, "conversation-upgraded");
   });
 
   it("restarts cleanly when a tombstone already has a real ledger witness", async function () {
@@ -317,16 +424,26 @@ describe("permanent conversation key ledger", function () {
           .run("conversation", 4000, "a".repeat(64), 1),
       /conversation key is permanently retired/,
     );
-    assert.throws(
-      () =>
+    // An owner the ledger has never seen is NOT rejected. Requiring the owner
+    // to be issued turned an ordinary ordering race -- a lazily-initialized
+    // attachment store running before the ledger seeding pass -- into an
+    // unrecoverable SQL abort. Retirement is the boundary that matters, and
+    // application code skips unknown owners on its own.
+    db.prepare(
+      `INSERT INTO llm_for_zotero_attachment_refs
+       (owner_type, owner_id, blob_hash, updated_at)
+       VALUES (?, ?, ?, ?)`,
+    ).run("conversation", 4999, "b".repeat(64), 1);
+    assert.equal(
+      (
         db
           .prepare(
-            `INSERT INTO llm_for_zotero_attachment_refs
-             (owner_type, owner_id, blob_hash, updated_at)
-             VALUES (?, ?, ?, ?)`,
+            `SELECT COUNT(*) AS n FROM llm_for_zotero_attachment_refs
+             WHERE owner_id = 4999`,
           )
-          .run("conversation", 4999, "b".repeat(64), 1),
-      /conversation attachment owner is not live/,
+          .get() as { n: number }
+      ).n,
+      1,
     );
   });
 

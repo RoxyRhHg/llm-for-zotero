@@ -1324,8 +1324,6 @@ export async function initClaudeCodeStore(): Promise<void> {
     ]);
     await installConversationKeyLedgerMessageTriggers({
       messageTable: CLAUDE_MESSAGES_TABLE,
-      system: "claude_code",
-      catalogTables: [CLAUDE_CONVERSATIONS_TABLE],
     });
   });
 }

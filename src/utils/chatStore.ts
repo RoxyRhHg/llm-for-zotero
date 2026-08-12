@@ -1941,8 +1941,6 @@ export async function initChatStore(): Promise<void> {
     ]);
     await installConversationKeyLedgerMessageTriggers({
       messageTable: CHAT_MESSAGES_TABLE,
-      system: "upstream",
-      catalogTables: [GLOBAL_CONVERSATIONS_TABLE, PAPER_CONVERSATIONS_TABLE],
     });
   });
   await cleanupLeakedWebchatGhostTitlesOnce();

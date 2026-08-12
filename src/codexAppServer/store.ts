@@ -1651,8 +1651,6 @@ export async function initCodexAppServerStore(): Promise<void> {
     ]);
     await installConversationKeyLedgerMessageTriggers({
       messageTable: CODEX_MESSAGES_TABLE,
-      system: "codex",
-      catalogTables: [CODEX_CONVERSATIONS_TABLE],
     });
   });
   cleanupRememberedConversationKeyPrefs();
