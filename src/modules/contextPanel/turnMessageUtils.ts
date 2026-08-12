@@ -11,7 +11,7 @@ import { pendingDeletionStore } from "../../core/conversations/pendingDeletionSt
 // Role-aware matching keeps a same-millisecond timestamp collision on the
 // other role visible. Returns the input array unchanged when nothing matches.
 export const filterMessagesInPendingTurns = <
-  T extends { role?: unknown; timestamp?: unknown },
+  T extends { id?: unknown; role?: unknown; timestamp?: unknown },
 >(
   conversationKey: number,
   messages: T[],
@@ -23,6 +23,7 @@ export const filterMessagesInPendingTurns = <
       conversationKey,
       timestamp,
       message.role === "assistant" ? "assistant" : "user",
+      Number.isFinite(Number(message.id)) ? Number(message.id) : undefined,
     );
   };
   return messages.some(isHiddenPendingMessage)

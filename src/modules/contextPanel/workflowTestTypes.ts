@@ -1,5 +1,5 @@
 import type { ResolvedContextSource, SendQuestionOptions } from "./types";
-import type { QuoteCitation } from "../../shared/types";
+import type { ConversationSystem, QuoteCitation } from "../../shared/types";
 import type { WorkflowTestFinalRequestSnapshot } from "./workflowTestHooks";
 import type { RuntimeConversationSystem } from "./runtimeSystemControls";
 
@@ -261,6 +261,19 @@ export type WorkflowTestHistorySearchResult = {
   previews: string[];
 };
 
+export type WorkflowTestConversationPersistenceSnapshot = {
+  system: ConversationSystem;
+  conversationKey: number;
+  catalogRows: number;
+  messageRows: number;
+  searchIndexRows: number;
+  registryRows: number;
+  forkSourceRows: number;
+  forkTargetRows: number;
+  cleanupJobRows: number;
+  pendingDeletionRows: number;
+};
+
 export type WorkflowTestApi = {
   reset: () => Promise<void>;
   createPaperWithPdfFixture: (input: {
@@ -268,6 +281,16 @@ export type WorkflowTestApi = {
     pdfTitle: string;
     pages?: string[];
   }) => Promise<WorkflowTestFixture>;
+  trashWorkflowItem: (itemId: number) => Promise<void>;
+  setWorkflowProviderSession: (
+    system: ConversationSystem,
+    conversationKey: number,
+    providerSessionId: string,
+  ) => Promise<void>;
+  getWorkflowConversationPersistenceSnapshot: (
+    system: ConversationSystem,
+    conversationKey: number,
+  ) => Promise<WorkflowTestConversationPersistenceSnapshot>;
   createStandaloneAttachmentFixture: (input: {
     title: string;
     filename: string;

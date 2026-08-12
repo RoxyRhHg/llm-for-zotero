@@ -97,6 +97,8 @@ type MenuActionControllerDeps = {
     conversationKey: number;
     userTimestamp: number;
     assistantTimestamp: number;
+    userMessageID?: number;
+    assistantMessageID?: number;
   }) => Promise<void>;
   forkConversationFromTurn: (target: {
     item: Zotero.Item;
@@ -421,7 +423,13 @@ async function queueResponseTurnDeletion(
     setStatusMessage(t("Cannot delete while generating"), "ready");
     return;
   }
-  await deps.queueTurnDeletion(normalized);
+  await deps.queueTurnDeletion({
+    ...normalized,
+    ...(pair.userMessage.id ? { userMessageID: pair.userMessage.id } : {}),
+    ...(pair.assistantMessage.id
+      ? { assistantMessageID: pair.assistantMessage.id }
+      : {}),
+  });
 }
 
 function normalizeTurnTarget(
@@ -554,10 +562,24 @@ export function attachMenuActionController(
         setStatusMessage(t("No deletable turn found"), "error");
         return;
       }
+      const promptPair = findResponseTurnPair(
+        deps.getHistory(Math.floor(target.conversationKey)),
+        {
+          conversationKey: Math.floor(target.conversationKey),
+          userTimestamp: Math.floor(target.userTimestamp),
+          assistantTimestamp: Math.floor(target.assistantTimestamp),
+        },
+      );
       await deps.queueTurnDeletion({
         conversationKey: Math.floor(target.conversationKey),
         userTimestamp: Math.floor(target.userTimestamp),
         assistantTimestamp: Math.floor(target.assistantTimestamp),
+        ...(promptPair?.userMessage.id
+          ? { userMessageID: promptPair.userMessage.id }
+          : {}),
+        ...(promptPair?.assistantMessage.id
+          ? { assistantMessageID: promptPair.assistantMessage.id }
+          : {}),
       });
     });
     deps.promptMenuForkBtn?.addEventListener("click", async (e: Event) => {

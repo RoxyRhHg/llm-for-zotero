@@ -3,6 +3,15 @@ import {
   type ContextCachePlan,
 } from "../../contextCache/manager";
 import { BALANCED_EVIDENCE_GUIDANCE } from "../../shared/quoteGuidance";
+import {
+  installConversationKeyLedgerAgentTriggers,
+  isConversationKeyRetiredInMemory,
+} from "../../shared/conversationKeyLedger";
+import {
+  areConversationWritesFrozen,
+  getConversationWriteGeneration,
+  isConversationWriteGenerationCurrent,
+} from "../../shared/conversationWriteFence";
 import type { PaperContextRef } from "../../shared/types";
 import type { AgentRuntimeRequest, AgentToolArtifact } from "../types";
 
@@ -111,6 +120,7 @@ async function ensureAgentEvidenceStore(): Promise<boolean> {
         `CREATE INDEX IF NOT EXISTS ${EVIDENCE_INDEX}
          ON ${EVIDENCE_TABLE} (conversation_key, last_seen_at DESC)`,
       );
+      await installConversationKeyLedgerAgentTriggers();
       return true;
     } catch (error) {
       logEvidenceStoreError(
@@ -808,6 +818,10 @@ async function persistEvidenceLedger(
       [conversationKey, conversationKey, MAX_EVIDENCE_ENTRIES],
     );
   } catch (error) {
+    if (isConversationKeyRetiredInMemory(conversationKey)) {
+      evidenceLedger.delete(lifecycleKey(conversationKey));
+      hydratedConversations.delete(lifecycleKey(conversationKey));
+    }
     logEvidenceStoreError("LLM Agent: Failed to persist evidence cache", error);
   }
 }
@@ -817,6 +831,7 @@ export async function hydrateAgentEvidenceCache(
 ): Promise<void> {
   const conversationKey = normalizePositiveInt(conversationKeyValue);
   if (!conversationKey) return;
+  const expectedGeneration = getConversationWriteGeneration(conversationKey);
   const key = lifecycleKey(conversationKey);
   if (hydratedConversations.has(key)) return;
   const dbReady = await ensureAgentEvidenceStore();
@@ -837,6 +852,13 @@ export async function hydrateAgentEvidenceCache(
           resourceSignature?: unknown;
         }>
       | undefined;
+    if (
+      isConversationKeyRetiredInMemory(conversationKey) ||
+      areConversationWritesFrozen(conversationKey) ||
+      !isConversationWriteGenerationCurrent(conversationKey, expectedGeneration)
+    ) {
+      return;
+    }
     const ledger = ensureLedgerForConversation(conversationKey);
     for (const row of rows || []) {
       const entryJson = typeof row.entryJson === "string" ? row.entryJson : "";
@@ -898,6 +920,7 @@ export async function commitAgentCacheEvidenceActivities(params: {
 }): Promise<void> {
   const conversationKey = normalizePositiveInt(params.conversationKey);
   if (!conversationKey || !params.activities.length) return;
+  if (isConversationKeyRetiredInMemory(conversationKey)) return;
   const ledger = ensureLedgerForConversation(conversationKey);
   const resourceSignature = normalizeText(params.resourceSignature, 4096);
   for (const activity of params.activities) {

@@ -1110,6 +1110,9 @@ export function waitForCodexAppServerTurnCompletion(params: {
   } = params;
   const timeoutMs =
     params.timeoutMs ?? DEFAULT_CODEX_APP_SERVER_TURN_TIMEOUT_MS;
+  if (signal?.aborted) {
+    return Promise.reject(createAbortError());
+  }
   return new Promise((resolve, reject) => {
     let accumulated = "";
     let settled = false;

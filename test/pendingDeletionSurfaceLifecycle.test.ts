@@ -5,7 +5,6 @@ import {
   configurePendingDeletionStoreEnv,
   resetPendingDeletionStoreForTests,
   DELETION_UNDO_WINDOW_MS,
-  MAX_FINALIZE_ATTEMPTS,
 } from "../src/core/conversations/pendingDeletionStore";
 import {
   forgetRecentlyDeletedConversation,
@@ -28,8 +27,9 @@ type FakeTimer = { fn: () => void; delayMs: number; cleared: boolean };
  * window). The invariants under test:
  *   - a conversation whose deletion committed is never re-seeded by a surface
  *     that still had it mounted (it must not reappear as an empty "New chat");
- *   - the surface that surrendered a chat goes back to it if the deletion is
- *     undone or abandoned, and no other surface is dragged onto it.
+ *   - the surface that surrendered a chat goes back to it only if the user
+ *     explicitly presses Undo; expiry and provider/local failures never
+ *     restore the conversation.
  */
 function createWorld() {
   const persistedRows = new Map<string, Record<string, unknown>>();
@@ -152,7 +152,7 @@ let freshKeySeq = 900;
 function mountSurface(name: string, mountedKey: number) {
   const surrendered = new Map<string, number>();
   const seededRows: number[] = [];
-  const state = { name, mountedKey };
+  const state = { name, mountedKey, instanceID: `instance-${mountedKey}` };
 
   const seedActiveRow = () => {
     const key = state.mountedKey;
@@ -182,6 +182,7 @@ function mountSurface(name: string, mountedKey: number) {
         state.mountedKey > 0
           ? {
               conversationKey: state.mountedKey,
+              instanceID: state.instanceID,
               kind: "global" as const,
               system: "upstream" as const,
             }
@@ -191,9 +192,11 @@ function mountSurface(name: string, mountedKey: number) {
     });
     if (action.type === "leave") {
       state.mountedKey = ++freshKeySeq;
+      state.instanceID = `instance-${state.mountedKey}`;
       if (action.remember) surrendered.set(entry.id, entry.conversationKey);
     } else if (action.type === "restore") {
       state.mountedKey = surrendered.get(entry.id) ?? entry.conversationKey;
+      state.instanceID = entry.instanceID;
       surrendered.delete(entry.id);
     } else if (action.type === "forget") {
       surrendered.delete(entry.id);
@@ -214,6 +217,7 @@ function mountSurface(name: string, mountedKey: number) {
 function conversationInput(key: number, wasActive = false) {
   return {
     conversationKind: "global" as const,
+    instanceID: `instance-${key}`,
     conversationID: `lfz:test:upstream:global:lib-1:paper-0:legacy-${key}`,
     catalogCreatedAt: 1_700_000_000_000,
     conversationKey: key,
@@ -354,28 +358,39 @@ describe("pending deletion across mounted surfaces", function () {
     surfaceA.unmount();
   });
 
-  it("an abandoned deletion puts the surrendering surface back on its chat", async function () {
+  it("a failed deletion remains hidden and retryable without restoring the chat", async function () {
     const world = createWorld();
     world.configure();
     const surfaceA = mountSurface("A", 1);
     const surfaceB = mountSurface("B", 2);
-    world.failFinalizes(MAX_FINALIZE_ATTEMPTS);
+    // Every local finalization attempt fails. The intent remains durable and
+    // the surrendered surface stays off the exact instance indefinitely.
+    world.failFinalizes(10_000);
     await pendingDeletionStore.queueConversationDeletion(
       conversationInput(1, true),
     );
-    for (let i = 0; i < MAX_FINALIZE_ATTEMPTS + 1; i++) {
+    for (let i = 0; i < 3; i++) {
       world.advance(DELETION_UNDO_WINDOW_MS + 1);
       await world.fireDueTimers();
     }
-    assert.equal(
+    assert.notEqual(
       surfaceA.state.mountedKey,
       1,
-      "the surface that gave the chat up must be put back on it",
+      "the surface must never be restored after expiry",
     );
     assert.equal(
       surfaceB.state.mountedKey,
       2,
       "an uninvolved surface keeps its own place",
+    );
+    assert.isTrue(
+      pendingDeletionStore.isConversationPendingDeletion(1),
+      "the failed deletion remains an outstanding obligation",
+    );
+    assert.notInclude(
+      surfaceA.seededRows,
+      1,
+      "retry failure must not re-seed the hidden instance",
     );
     surfaceA.unmount();
     surfaceB.unmount();

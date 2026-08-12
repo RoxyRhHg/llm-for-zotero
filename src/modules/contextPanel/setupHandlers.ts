@@ -107,7 +107,13 @@ import {
   addAutoLockedGlobalConversationKey,
   removeAutoLockedGlobalConversationKey,
   isAutoLockedGlobalConversation,
+  clearConversationOwnedRuntimeState,
+  getConversationWriteGeneration,
+  freezeConversationWrites,
+  unfreezeConversationWrites,
+  bumpConversationWriteGeneration,
 } from "./state";
+import { withConversationWriteLock } from "../../shared/conversationWriteFence";
 import {
   sanitizeText,
   setStatus,
@@ -175,6 +181,7 @@ import {
   getReasoningOptions,
   getSelectedReasoningForItem,
   retryLatestAssistantResponse,
+  resetSessionTokens,
   editLatestUserMessageAndRetry,
   editUserTurnAndRetry,
   findLatestRetryPair,
@@ -267,6 +274,11 @@ import {
 } from "./attachmentStorage";
 import { clearConversationSummary as clearConversationSummaryFromCache } from "./conversationSummaryCache";
 import { conversationRepository } from "../../core/conversations/repository";
+import { pendingDeletionStore } from "../../core/conversations/pendingDeletionStore";
+import {
+  enqueueConversationCleanupJobInTransaction,
+  initConversationCleanupJobs,
+} from "../../core/conversations/conversationCleanupJobs";
 import {
   clearConversation as clearStoredConversation,
   touchPaperConversationTitle,
@@ -275,9 +287,15 @@ import {
 import {
   ATTACHMENT_GC_MIN_AGE_MS,
   clearOwnerAttachmentRefs,
+  clearOwnerAttachmentRefsInTransaction,
   collectAndDeleteUnreferencedBlobs,
   replaceOwnerAttachmentRefs,
 } from "../../utils/attachmentRefStore";
+import {
+  initConversationForkLinksStore,
+  deleteConversationForkLinksForInstanceInTransaction,
+} from "../../shared/conversationForkLinks";
+import { initConversationSearchIndexStore } from "../../shared/conversationSearchIndex";
 import type {
   Message,
   ChatRuntimeMode,
@@ -455,7 +473,11 @@ import {
   type PaperSourceOption,
 } from "./setupHandlers/controllers/paperSourceOptionsController";
 import { clearAllAgentToolCaches } from "../../agent/tools";
-import { clearAgentConversationState } from "./agentConversationCleanup";
+import { initAgentTraceStore } from "../../agent/store/traceStore";
+import {
+  clearAgentConversationState,
+  clearPersistedAgentConversationRowsInTransaction,
+} from "./agentConversationCleanup";
 import { renderShortcuts } from "./shortcuts";
 import { loadConversationHistoryScope } from "./historyLoader";
 import {
@@ -532,10 +554,12 @@ import {
 import {
   retainClaudeRuntimeForBody,
   releaseClaudeRuntimeForBody,
+  releaseClaudeRuntimeForConversation,
 } from "../../claudeCode/runtimeRetention";
 import { isClaudePaperPortalItem } from "../../claudeCode/portal";
 import {
   clearClaudeConversation,
+  getClaudeConversationSummary,
   touchClaudeConversationTitle,
 } from "../../claudeCode/store";
 import {
@@ -544,6 +568,8 @@ import {
 } from "../../claudeCode/portal";
 import {
   clearCodexConversation,
+  clearCodexConversationSessionMetadata,
+  getCodexConversationSummary,
   touchCodexConversationTitle,
 } from "../../codexAppServer/store";
 import {
@@ -1326,6 +1352,8 @@ export function setupHandlers(
     conversationKey: number;
     userTimestamp: number;
     assistantTimestamp: number;
+    userMessageID?: number;
+    assistantMessageID?: number;
   }) => Promise<void> = async () => {};
   let forkConversationFromTurn: (target: {
     item: Zotero.Item;
@@ -1334,9 +1362,6 @@ export function setupHandlers(
     assistantTimestamp: number;
   }) => Promise<void> = async () => {};
   let finalizePendingTurnDeletionsForConversation: (
-    conversationKey: number,
-  ) => Promise<boolean> = async () => true;
-  let restorePendingConversationDeletionsFor: (
     conversationKey: number,
   ) => Promise<boolean> = async () => true;
   let closePaperPicker = () => {};
@@ -4742,8 +4767,6 @@ export function setupHandlers(
     historyLifecycleController.forkConversationFromTurn;
   finalizePendingTurnDeletionsForConversation =
     historyLifecycleController.finalizePendingTurnDeletionsForConversation;
-  restorePendingConversationDeletionsFor =
-    historyLifecycleController.restorePendingConversationDeletionsFor;
   resetHistorySearchState = historyLifecycleController.resetHistorySearchState;
 
   const switchRuntimeSystemFromControl = async (
@@ -6820,6 +6843,7 @@ export function setupHandlers(
     isCodexConversationSystem,
     normalizeConversationTitleSeed,
     getConversationKey,
+    getConversationWriteGeneration,
     touchClaudeConversationTitle,
     touchCodexConversationTitle,
     touchGlobalConversationTitle,
@@ -6909,8 +6933,8 @@ export function setupHandlers(
     setAbortController,
     finalizePendingTurnDeletionsForConversation: (conversationKey) =>
       finalizePendingTurnDeletionsForConversation(conversationKey),
-    restorePendingConversationDeletionsFor: (conversationKey) =>
-      restorePendingConversationDeletionsFor(conversationKey),
+    isConversationPendingDeletion: (conversationKey) =>
+      pendingDeletionStore.isConversationPendingDeletion(conversationKey),
     validateConversationScope: async (conversationKey) => {
       if (!item) return true;
       const conversationSystem = resolveConversationSystemForItem(item);
@@ -6955,7 +6979,65 @@ export function setupHandlers(
         paperItemID: Math.floor(paperItemID),
       });
     },
+    getConversationIdentity: async (conversationKey) => {
+      if (!item) return null;
+      const kind =
+        resolveDisplayConversationKind(item) === "paper" ? "paper" : "global";
+      const identityWitness =
+        await conversationRepository.getCatalogIdentityWitness({
+          system: getConversationSystem(),
+          kind,
+          conversationKey,
+        });
+      if (!identityWitness?.instanceID || !identityWitness.conversationID) {
+        return null;
+      }
+      let providerSessionId: string | undefined;
+      if (isCodexConversationSystem()) {
+        providerSessionId =
+          (await getCodexConversationSummary(conversationKey))
+            ?.providerSessionId || undefined;
+      } else if (isClaudeConversationSystem()) {
+        providerSessionId =
+          (await getClaudeConversationSummary(conversationKey))
+            ?.providerSessionId || undefined;
+      }
+      const baseItem = resolveConversationBaseItem(item);
+      const conversationKind = kind;
+      const libraryID = Math.floor(
+        Number(item.libraryID || baseItem?.libraryID || 0),
+      );
+      const paperItemID =
+        kind === "paper" ? Number(baseItem?.id || 0) || undefined : undefined;
+      const providerScope =
+        isClaudeConversationSystem() && libraryID > 0
+          ? buildClaudeScope({
+              libraryID,
+              kind,
+              paperItemID,
+              paperTitle:
+                kind === "paper"
+                  ? String(baseItem?.getField?.("title") || "").trim() ||
+                    undefined
+                  : undefined,
+            })
+          : undefined;
+      return {
+        instanceID: identityWitness.instanceID,
+        conversationID: identityWitness.conversationID,
+        providerSessionId,
+        providerScope,
+        conversationKind,
+        libraryID: libraryID > 0 ? libraryID : undefined,
+        paperItemID,
+      };
+    },
     clearTransientComposeStateForItem,
+    clearConversationOwnedRuntimeState,
+    freezeConversationWrites,
+    unfreezeConversationWrites,
+    bumpConversationWriteGeneration,
+    resetConversationSessionTokens: resetSessionTokens,
     resetComposePreviewUI,
     resetConversationHistory: (conversationKey) => {
       chatHistory.set(conversationKey, []);
@@ -6963,7 +7045,19 @@ export function setupHandlers(
     markConversationLoaded: (conversationKey) => {
       loadedConversationKeys.add(conversationKey);
     },
-    invalidateConversationSession: async (conversationKey) => {
+    invalidateConversationSession: async (
+      conversationKey,
+      expectedProviderSessionId,
+      expectedInstanceID,
+    ) => {
+      if (isCodexConversationSystem()) {
+        await clearCodexConversationSessionMetadata(
+          conversationKey,
+          expectedProviderSessionId,
+          expectedInstanceID,
+        );
+        return;
+      }
       if (!isClaudeConversationSystem() || !item) return;
       const libraryID = Number(item.libraryID || 0);
       const currentKind = resolveDisplayConversationKind(item);
@@ -6984,27 +7078,105 @@ export function setupHandlers(
       await invalidateClaudeConversationSession(await initAgentSubsystem(), {
         conversationKey,
         scope,
-      });
-      void touchClaudeConversation(conversationKey, {
-        providerSessionId: undefined,
-        scopedConversationKey: undefined,
-        scopeType: undefined,
-        scopeId: undefined,
-        scopeLabel: undefined,
-        cwd: undefined,
-        updatedAt: Date.now(),
+        metadata: expectedProviderSessionId
+          ? {
+              providerSessionId: expectedProviderSessionId,
+              instanceID: expectedInstanceID,
+            }
+          : expectedInstanceID
+            ? { instanceID: expectedInstanceID }
+            : undefined,
       });
     },
-    clearStoredConversation: (conversationKey) =>
-      isClaudeConversationSystem()
-        ? clearClaudeConversation(conversationKey)
-        : isCodexConversationSystem()
-          ? clearCodexConversation(conversationKey)
-          : clearStoredConversation(conversationKey),
-    resetConversationTitle: (conversationKey) =>
+    clearStoredConversation: (conversationKey, identity, onBeforeCommit) =>
+      withConversationWriteLock(conversationKey, () =>
+        isClaudeConversationSystem()
+          ? clearClaudeConversation(conversationKey, identity, onBeforeCommit)
+          : isCodexConversationSystem()
+            ? clearCodexConversation(conversationKey, identity, onBeforeCommit)
+            : clearStoredConversation(
+                conversationKey,
+                identity,
+                onBeforeCommit,
+              ),
+      ),
+    preparePersistentConversationClear: async () => {
+      // The fork-link table must exist before Clear's owning DB transaction
+      // begins.  The cleanup-jobs table is initialized here as well; the
+      // transaction callback below is intentionally DML-only and never runs
+      // schema DDL while content is being committed.
+      await initConversationForkLinksStore();
+      await initConversationCleanupJobs();
+      await initConversationSearchIndexStore();
+      await initAgentTraceStore();
+    },
+    clearPersistedConversationRowsInTransaction: async (
+      conversationKey,
+      identity,
+    ) => {
+      // This callback runs inside Clear's owning transaction.  Every operation
+      // here is direct DML so failures roll back the content commit together.
+      await clearPersistedAgentConversationRowsInTransaction(conversationKey);
+      await clearOwnerAttachmentRefsInTransaction(
+        "conversation",
+        conversationKey,
+      );
+      await deleteConversationForkLinksForInstanceInTransaction({
+        conversationKey,
+        conversationID: identity?.conversationID,
+        system: getConversationSystem(),
+      });
+      // The title is conversation-owned metadata. Clear it inside the same
+      // transaction as message/agent deletion so a transient post-commit
+      // title update failure cannot leave prompt-derived text visible on an
+      // otherwise empty conversation.
+      await conversationRepository.clearCatalogTitle({
+        system: getConversationSystem(),
+        conversationKey,
+        instanceID: identity?.instanceID,
+        conversationID: identity?.conversationID,
+        inTransaction: true,
+      });
+      const providerSessionId = String(
+        identity?.providerSessionId || "",
+      ).trim();
+      const system = getConversationSystem();
+      const hasClaudeScopeWitness =
+        system === "claude_code" &&
+        Boolean(
+          identity?.providerScope?.scopeType && identity.providerScope.scopeId,
+        );
+      if (
+        (providerSessionId || hasClaudeScopeWitness) &&
+        (system === "codex" || system === "claude_code")
+      ) {
+        const kind = identity?.conversationKind || "global";
+        const libraryID = identity?.libraryID || 0;
+        const paperItemID = identity?.paperItemID;
+        const job = await enqueueConversationCleanupJobInTransaction({
+          operation: system === "codex" ? "codex_archive" : "claude_invalidate",
+          system,
+          conversationKey,
+          instanceID: identity?.instanceID,
+          conversationKind: kind,
+          libraryID: libraryID > 0 ? libraryID : undefined,
+          paperItemID,
+          providerScope: identity?.providerScope,
+          providerSessionId,
+        });
+        if (!job) {
+          throw new Error(
+            "Provider cleanup job could not be persisted with Clear",
+          );
+        }
+      }
+    },
+    resetConversationTitle: (conversationKey, identity) =>
       conversationRepository.clearCatalogTitle({
         system: getConversationSystem(),
         conversationKey,
+        instanceID: identity?.instanceID,
+        conversationID: identity?.conversationID,
       }),
     clearOwnerAttachmentRefs,
     removeConversationAttachmentFiles,
@@ -7015,6 +7187,7 @@ export function setupHandlers(
     scheduleAttachmentGc,
     clearAgentToolCaches: clearAllAgentToolCaches,
     clearAgentConversationState,
+    releaseClaudeRuntimeForConversation,
     setStatusMessage: status
       ? (message, level) => {
           setStatus(status, message, level);

@@ -495,6 +495,8 @@ export type ExhaustiveReadBackend =
   | "unavailable";
 
 export type AgentRuntimeRequest = AgentRequest & {
+  /** Generation captured when this turn started; Clear advances it. */
+  conversationGeneration?: number;
   item?: Zotero.Item | null;
   history?: ChatMessage[];
   authMode?: ModelProviderAuthMode;
@@ -749,6 +751,14 @@ export type PreparedToolExecutionResult = {
 export type PreparedToolExecutionOptions = {
   inheritedApproval?: AgentInheritedApproval;
   forceConfirmation?: boolean;
+  /**
+   * Lifecycle fence checked immediately before any tool implementation runs.
+   * A tool may be prepared while a conversation is still live and execute only
+   * after Clear or deletion has frozen that conversation.
+   */
+  isExecutionAllowed?: () => boolean;
+  /** Serialize the actual side effect with Clear/deletion for this scope. */
+  executeWithLock?: <T>(task: () => Promise<T>) => Promise<T>;
 };
 
 export type PreparedToolExecution =

@@ -19,6 +19,12 @@ import { readNoteSnapshot } from "../../modules/contextPanel/noteSnapshot";
 import { extractQuoteCitationsFromToolContent } from "../../modules/contextPanel/quoteCitations";
 import type { AgentToolRegistry } from "../tools/registry";
 import type { ZoteroGateway } from "../services/zoteroGateway";
+import {
+  areConversationWritesFrozen,
+  getConversationWriteGeneration,
+  isConversationWriteGenerationCurrent,
+  withConversationWriteLock,
+} from "../../shared/conversationWriteFence";
 import type {
   AgentConfirmationResolution,
   AgentPendingAction,
@@ -130,6 +136,8 @@ const MCP_TOOLS_WITH_OWN_CONFIRMATION_POLICY = new Set([
 export type ZoteroMcpActiveScope = {
   profileSignature?: string;
   conversationKey?: number;
+  instanceID?: string;
+  conversationGeneration?: number;
   libraryID?: number;
   kind?: "global" | "paper";
   paperItemID?: number;
@@ -179,7 +187,10 @@ const scopedZoteroMcpScopes = new Map<
   string,
   { createdAt: number; expiresAt: number; scope: ZoteroMcpActiveScope }
 >();
-const conversationScopeTokens = new Map<string, string>();
+const conversationScopeTokens = new Map<
+  string,
+  { token: string; instanceID?: string }
+>();
 let activeZoteroMcpScope: ZoteroMcpActiveScope | null = null;
 let registeredMcpDeps: McpServerDeps | null = null;
 const mcpReadDedupeCache = new Map<
@@ -581,6 +592,7 @@ function normalizeActiveScope(
   scope: ZoteroMcpActiveScope,
 ): ZoteroMcpActiveScope {
   const paperContext = normalizePaperContext(scope.paperContext);
+  const conversationKey = normalizePositiveInt(scope.conversationKey);
   const paperItemID =
     normalizePositiveInt(scope.paperItemID) || paperContext?.itemId;
   const activeContextItemId =
@@ -588,7 +600,13 @@ function normalizeActiveScope(
     paperContext?.contextItemId;
   return {
     profileSignature: normalizeText(scope.profileSignature, 128),
-    conversationKey: normalizePositiveInt(scope.conversationKey),
+    conversationKey,
+    instanceID: normalizeText(scope.instanceID, 128),
+    conversationGeneration: conversationKey
+      ? Number.isFinite(scope.conversationGeneration)
+        ? Math.max(0, Math.floor(Number(scope.conversationGeneration)))
+        : getConversationWriteGeneration(conversationKey)
+      : undefined,
     libraryID: normalizePositiveInt(scope.libraryID),
     kind: scope.kind === "paper" ? "paper" : "global",
     paperItemID,
@@ -679,16 +697,21 @@ export function registerScopedZoteroMcpScope(
 export function resolveConversationScopeToken(params: {
   profileSignature?: string;
   conversationKey: number;
+  instanceID?: string;
 }): string {
   const conversationKey = Math.floor(Number(params.conversationKey));
   if (!Number.isFinite(conversationKey) || conversationKey <= 0) {
     return generateToken();
   }
-  const key = `${normalizeText(params.profileSignature, 256) || ""} ${conversationKey}`;
+  const instanceID = normalizeText(params.instanceID, 128);
+  const key = `${normalizeText(params.profileSignature, 256) || ""} ${conversationKey}${instanceID ? ` ${instanceID}` : ""}`;
   const existing = conversationScopeTokens.get(key);
-  if (existing) return existing;
+  if (existing) return existing.token;
   const token = generateToken();
-  conversationScopeTokens.set(key, token);
+  conversationScopeTokens.set(key, {
+    token,
+    ...(instanceID ? { instanceID } : {}),
+  });
   return token;
 }
 
@@ -700,15 +723,35 @@ export function resolveConversationScopeToken(params: {
 export function releaseConversationScopeToken(params: {
   profileSignature?: string;
   conversationKey: number;
+  instanceID?: string;
 }): void {
   const conversationKey = Math.floor(Number(params.conversationKey));
   if (!Number.isFinite(conversationKey) || conversationKey <= 0) return;
-  const key = `${normalizeText(params.profileSignature, 256) || ""} ${conversationKey}`;
-  const token = conversationScopeTokens.get(key);
-  if (!token) return;
+  const instanceID = normalizeText(params.instanceID, 128);
+  const key = `${normalizeText(params.profileSignature, 256) || ""} ${conversationKey}${instanceID ? ` ${instanceID}` : ""}`;
+  const entry = conversationScopeTokens.get(key);
+  if (!entry) {
+    // Older builds used a key-only token.  Once deletion supplies the old
+    // immutable instance, removing that legacy entry is safe and prevents a
+    // stale provider header from resolving into a later runtime.
+    if (instanceID) {
+      const legacyKey = `${normalizeText(params.profileSignature, 256) || ""} ${conversationKey}`;
+      const legacyEntry = conversationScopeTokens.get(legacyKey);
+      if (legacyEntry) {
+        conversationScopeTokens.delete(legacyKey);
+        scopedZoteroMcpScopes.delete(legacyEntry.token);
+        clearMcpReadDedupeCacheForScopeToken(legacyEntry.token);
+      }
+    }
+    return;
+  }
+  // A deletion carrying an immutable instance identity must never fall back
+  // to the legacy key-only lane: that key may already belong to a newer
+  // conversation. Legacy callers may still release legacy tokens by key.
+  if (instanceID && entry.instanceID !== instanceID) return;
   conversationScopeTokens.delete(key);
-  scopedZoteroMcpScopes.delete(token);
-  clearMcpReadDedupeCacheForScopeToken(token);
+  scopedZoteroMcpScopes.delete(entry.token);
+  clearMcpReadDedupeCacheForScopeToken(entry.token);
 }
 
 export function setActiveZoteroMcpScope(
@@ -1337,6 +1380,20 @@ function scopesMatchForConfirmation(
     return false;
   }
   if (
+    handlerScope.instanceID &&
+    requestScope.instanceID &&
+    handlerScope.instanceID !== requestScope.instanceID
+  ) {
+    return false;
+  }
+  if (
+    handlerScope.conversationGeneration !== undefined &&
+    requestScope.conversationGeneration !== undefined &&
+    handlerScope.conversationGeneration !== requestScope.conversationGeneration
+  ) {
+    return false;
+  }
+  if (
     handlerScope.conversationKey &&
     requestScope.conversationKey &&
     handlerScope.conversationKey !== requestScope.conversationKey
@@ -1402,6 +1459,7 @@ function createToolContext(
       : "unavailable";
   const request: AgentRuntimeRequest = {
     conversationKey: scope?.conversationKey || 0,
+    conversationGeneration: scope?.conversationGeneration,
     mode: "agent",
     userText:
       normalizeText(
@@ -1514,6 +1572,7 @@ function extractToolCallErrorText(
 async function requestZoteroMcpConfirmation(params: {
   execution: Extract<PreparedToolExecution, { kind: "confirmation" }>;
   headers?: Record<string, string>;
+  isExecutionAllowed?: () => boolean;
 }): Promise<McpToolCallResult> {
   const scope = resolveScopedMcpScope(params.headers);
   const handler = findZoteroMcpConfirmationHandler(scope);
@@ -1555,9 +1614,29 @@ async function requestZoteroMcpConfirmation(params: {
     approved: resolution.approved,
     actionId: resolution.actionId,
   });
-  const execution = resolution.approved
-    ? await params.execution.execute(resolution.data)
-    : params.execution.deny(resolution.data);
+  let execution: ReturnType<typeof params.execution.deny>;
+  if (!resolution.approved) {
+    execution = params.execution.deny(resolution.data);
+  } else if (params.isExecutionAllowed && !params.isExecutionAllowed()) {
+    return {
+      content: [
+        {
+          type: "text",
+          text: JSON.stringify({
+            ok: false,
+            error:
+              "Conversation lifecycle changed before this tool could execute.",
+          }),
+        },
+      ],
+      isError: true,
+    };
+  } else {
+    // The registry's confirmation executor already performs the final
+    // lifecycle check inside its per-conversation write lock.  Do not wrap
+    // it in a second lock here: that would await itself indefinitely.
+    execution = await params.execution.execute(resolution.data);
+  }
   return formatToolResult(execution);
 }
 
@@ -1619,6 +1698,12 @@ async function handleToolsCall(
   }
 
   const scope = resolveScopedMcpScope(headers);
+  const scopeConversationKey = scope?.conversationKey || 0;
+  const scopeGeneration = scopeConversationKey
+    ? Number.isFinite(scope?.conversationGeneration)
+      ? Number(scope?.conversationGeneration)
+      : getConversationWriteGeneration(scopeConversationKey)
+    : 0;
   const nativeFilesystemViolation = getRawPdfNativeFilesystemViolation({
     toolName: name,
     scope,
@@ -1690,6 +1775,21 @@ async function handleToolsCall(
         forceConfirmation:
           tool.spec.mutability === "write" &&
           !MCP_TOOLS_WITH_OWN_CONFIRMATION_POLICY.has(name),
+        isExecutionAllowed: () => {
+          return (
+            !scopeConversationKey ||
+            (!areConversationWritesFrozen(scopeConversationKey) &&
+              isConversationWriteGenerationCurrent(
+                scopeConversationKey,
+                scopeGeneration,
+              ))
+          );
+        },
+        executeWithLock: (task) => {
+          return scopeConversationKey
+            ? withConversationWriteLock(scopeConversationKey, task)
+            : task();
+        },
       },
     );
 
@@ -1697,6 +1797,16 @@ async function handleToolsCall(
       const result = await requestZoteroMcpConfirmation({
         execution: prepared,
         headers,
+        isExecutionAllowed: () => {
+          return (
+            !scopeConversationKey ||
+            (!areConversationWritesFrozen(scopeConversationKey) &&
+              isConversationWriteGenerationCurrent(
+                scopeConversationKey,
+                scopeGeneration,
+              ))
+          );
+        },
       });
       completeActivity({
         ok: !result.isError,

@@ -173,6 +173,7 @@ function mountPanel() {
 function conversationInput(key: number) {
   return {
     conversationKind: "global" as const,
+    instanceID: `instance-${key}`,
     conversationID: `lfz:test:upstream:global:lib-1:paper-0:legacy-${key}`,
     // Identity witness captured at queue time; queueing is refused without one.
     catalogCreatedAt: 1_700_000_000_000,
@@ -252,6 +253,7 @@ describe("pending deletion full lifecycle", function () {
     await pendingDeletionStore.queueConversationDeletion(conversationInput(2));
     assert.isTrue(panel.isConversationVisible(1));
     panel.unmount();
+    world.advance(DELETION_UNDO_WINDOW_MS + 1);
     await world.restart();
     assert.deepEqual(world.deletedConversations, [2]);
     assert.notInclude(world.deletedConversations, 1);
@@ -327,6 +329,7 @@ describe("pending deletion full lifecycle", function () {
       assistantTimestamp: 200,
     });
     world.killAllTimers();
+    world.advance(DELETION_UNDO_WINDOW_MS + 1);
     await world.restart();
     assert.deepEqual(world.deletedTurns, [{ conversationKey: 3, userTs: 100 }]);
   });
@@ -383,6 +386,7 @@ describe("pending deletion full lifecycle", function () {
     await pendingDeletionStore.queueConversationDeletion(conversationInput(9));
     // Crash before the timer fires: nothing finalized, row persisted.
     assert.equal(world.persistedRows.size, 1);
+    world.advance(DELETION_UNDO_WINDOW_MS + 1);
     await world.restart();
     assert.deepEqual(world.deletedConversations, [9]);
     assert.equal(world.persistedRows.size, 0);

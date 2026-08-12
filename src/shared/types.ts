@@ -227,6 +227,7 @@ export type PaperConversationSummary = {
 export type ClaudeConversationKind = "global" | "paper";
 
 export type ClaudeConversationSummary = {
+  instanceID?: string;
   conversationID: string;
   conversationKey: number;
   libraryID: number;
@@ -249,6 +250,7 @@ export type ClaudeConversationSummary = {
 export type CodexConversationKind = "global" | "paper";
 
 export type CodexConversationSummary = {
+  instanceID?: string;
   conversationID: string;
   conversationKey: number;
   libraryID: number;

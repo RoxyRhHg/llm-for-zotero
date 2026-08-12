@@ -33,6 +33,7 @@ type ConversationStoreReadiness = {
   chatStoreReady: boolean;
   claudeStoreReady: boolean;
   codexStoreReady: boolean;
+  pendingDeletionReady: boolean;
 };
 
 let startupUserSkillsLoadTask: Promise<void> | null = null;
@@ -99,6 +100,7 @@ async function initializeConversationStoresForStartup(): Promise<ConversationSto
     chatStoreReady: false,
     claudeStoreReady: false,
     codexStoreReady: false,
+    pendingDeletionReady: false,
   };
 
   try {
@@ -126,6 +128,14 @@ async function initializeConversationStoresForStartup(): Promise<ConversationSto
     await measureStartupPhase("pending deletion store", async () => {
       configurePendingDeletionSubsystem();
       await pendingDeletionStore.init();
+      // Load durable deletion intents before any panel/window can mount. This
+      // re-establishes the process-local write fence synchronously on restart,
+      // so a user cannot send into a conversation while its persisted delete
+      // intent is still waiting for the deferred startup sweep.  Finalization
+      // stays deferred: it does destructive local work and provider cleanup,
+      // and must not be able to delay or block the UI.
+      await pendingDeletionStore.loadPersistedFence();
+      readiness.pendingDeletionReady = true;
     });
   } catch (err) {
     ztoolkit.log("LLM: Failed to initialize pending deletion store", err);
@@ -140,7 +150,8 @@ function allConversationStoresReady(
   return (
     readiness.chatStoreReady &&
     readiness.claudeStoreReady &&
-    readiness.codexStoreReady
+    readiness.codexStoreReady &&
+    readiness.pendingDeletionReady
   );
 }
 
@@ -174,6 +185,18 @@ function scheduleConversationIntegrityAudit(): void {
       ztoolkit.log(
         "LLM: Conversation history integrity audit found issues",
         report,
+      );
+    }
+    // Migration quarantines conflicting identities but nothing read that table
+    // back, so a conversation that landed there was neither deleted nor
+    // reachable and left no signal. Summarize it so a user reporting a
+    // vanished conversation has something actionable in the log.
+    const { logConversationKeyQuarantineSummary } =
+      await import("./shared/conversationKeyLedger");
+    const quarantined = await logConversationKeyQuarantineSummary();
+    if (quarantined) {
+      ztoolkit.log(
+        `LLM: ${quarantined} conversation identity conflict(s) are quarantined; see the ledger log entry for keys and reasons`,
       );
     }
   });
@@ -252,6 +275,9 @@ function scheduleDeferredStartupWork(
     "legacy cache migrations",
     runDeferredLegacyMigrations,
   );
+  // Finalize intents whose Undo window elapsed while Zotero was closed. The
+  // fence itself was already re-established during blocking startup; this is
+  // only the destructive/provider half, so it stays off the critical path.
   runDeferredStartupTask("pending deletion sweep", async () => {
     await pendingDeletionStore.sweepAllPersisted("startup-sweep");
   });
@@ -289,6 +315,19 @@ async function onStartup() {
 
   const conversationStoreReadiness =
     await initializeConversationStoresForStartup();
+
+  // A durable deletion intent that was not loaded is an active write fence,
+  // but it must NOT abort startup. Throwing here skipped the preferences pane
+  // and every window, leaving the user with no plugin at all and no way to
+  // recover from the UI, over a failure in the least essential subsystem. The
+  // three conversation stores above already degrade rather than abort; this
+  // one now behaves the same way. The store retries the load on first write,
+  // so a transient database error self-heals instead of persisting.
+  if (!conversationStoreReadiness.pendingDeletionReady) {
+    ztoolkit.log(
+      "LLM: pending deletion fence not loaded at startup; will retry before the next conversation write",
+    );
+  }
 
   registerPrefsPane();
 

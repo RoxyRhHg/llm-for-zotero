@@ -651,13 +651,11 @@ export async function refreshConversationSearchIndexForConversation(params: {
   return true;
 }
 
-export async function deleteConversationSearchIndexRow(params: {
+export async function deleteConversationSearchIndexRowInTransaction(params: {
   conversationID?: string;
   system?: ConversationSystem;
   conversationKey?: number;
 }): Promise<boolean> {
-  const initialized = await initConversationSearchIndexStore();
-  if (!initialized) return false;
   const db = getZoteroDb();
   if (!db?.queryAsync) return false;
   const conversationID =
@@ -690,6 +688,24 @@ export async function deleteConversationSearchIndexRow(params: {
     [conversationKey],
   );
   return true;
+}
+
+/**
+ * Delete a search-index row outside a caller-owned transaction.
+ *
+ * Schema initialization is intentionally kept here. Destructive conversation
+ * transactions must call `deleteConversationSearchIndexRowInTransaction`
+ * instead after initializing the index, so a DDL statement can never be
+ * nested inside the atomic local deletion.
+ */
+export async function deleteConversationSearchIndexRow(params: {
+  conversationID?: string;
+  system?: ConversationSystem;
+  conversationKey?: number;
+}): Promise<boolean> {
+  const initialized = await initConversationSearchIndexStore();
+  if (!initialized) return false;
+  return deleteConversationSearchIndexRowInTransaction(params);
 }
 
 export async function refreshConversationSearchIndex(): Promise<boolean> {

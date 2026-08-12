@@ -29,6 +29,7 @@ import {
   resetClaudeBridgeRuntime,
 } from "../claudeCode/runtime";
 import { clearCodexZoteroMcpPreflightCache } from "../codexAppServer/mcpSetup";
+import { getConversationWriteGeneration } from "../shared/conversationWriteFence";
 
 let runtime: AgentRuntime | null = null;
 let runtimeInitTask: Promise<AgentRuntime> | null = null;
@@ -167,7 +168,19 @@ export function getAgentApi() {
     runTurn: (
       request: AgentRuntimeRequest,
       onEvent?: (event: AgentEvent) => void | Promise<void>,
-    ) => getAgentRuntime().runTurn({ request, onEvent }),
+    ) =>
+      getAgentRuntime().runTurn({
+        request:
+          request.conversationGeneration === undefined
+            ? {
+                ...request,
+                conversationGeneration: getConversationWriteGeneration(
+                  request.conversationKey,
+                ),
+              }
+            : request,
+        onEvent,
+      }),
     listTools: () => getAgentRuntime().listTools(),
     getToolDefinition: (name: string) =>
       getAgentRuntime().getToolDefinition(name),

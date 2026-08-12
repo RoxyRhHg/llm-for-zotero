@@ -58,6 +58,10 @@ describe("finalizeQueuedTurnDeletion", function () {
       queries.some((sql) => sql.includes("DELETE")),
       `expected a DELETE, got: ${queries.join(" | ")}`,
     );
+    assert.isTrue(
+      queries.some((sql) => sql.includes("llm_for_zotero_agent_transcript")),
+      "turn deletion must purge the durable agent transcript boundary",
+    );
   });
 
   it("returns false when the DB delete throws, leaving memory untouched", async function () {
@@ -102,6 +106,7 @@ describe("finalizeQueuedConversationDeletion stale-intent guards", function () {
       conversationKey: 2_000_000_777,
       libraryID: 1,
       system: "upstream" as const,
+      instanceID: "instance-original",
       title: "Chat",
       wasActive: false,
       queuedAt: 1_000,
@@ -165,6 +170,10 @@ describe("finalizeQueuedConversationDeletion stale-intent guards", function () {
     assert.deepEqual(result, { ok: true, dropped: true }, message);
   }
 
+  function assertQuarantined(result: unknown, message: string) {
+    assert.deepEqual(result, { ok: false, quarantined: true }, message);
+  }
+
   // COMPLETED = the queued conversation is genuinely gone (nothing owns the key,
   // or the key belongs to a different conversation now). Surfaces must treat it
   // as a real deletion — restoring anyone onto this key is what resurrected
@@ -184,6 +193,7 @@ describe("finalizeQueuedConversationDeletion stale-intent guards", function () {
       registryRows: () => [
         {
           conversationID: "lfz:original:owner",
+          instanceID: "instance-other",
           conversationKey: 2_000_000_777,
           system: "upstream",
           kind: "global",
@@ -218,7 +228,20 @@ describe("finalizeQueuedConversationDeletion stale-intent guards", function () {
     const destructive: string[] = [];
     installDb({
       catalogRow: { conversationID: "lfz:original:owner", createdAt: 500 },
-      registryRows: () => [],
+      registryRows: () => [
+        {
+          conversationID: "lfz:original:owner",
+          instanceID: "instance-original",
+          conversationKey: 2_000_000_777,
+          system: "upstream",
+          kind: "global",
+          profileSignature: "profile-default",
+          libraryID: 1,
+          paperItemID: null,
+          valid: 1,
+          invalidReason: null,
+        },
+      ],
       destructive,
     });
     const ok = await finalizeQueuedConversationDeletion(
@@ -248,7 +271,7 @@ describe("finalizeQueuedConversationDeletion stale-intent guards", function () {
     assert.lengthOf(destructive, 0);
   });
 
-  it("drops an intent persisted without an identity witness (older build)", async function () {
+  it("quarantines an intent persisted without an identity witness (older build)", async function () {
     // Rows written before the witness existed can never be verified, so they
     // must fail closed rather than trusting the recycled key.
     const destructive: string[] = [];
@@ -262,7 +285,7 @@ describe("finalizeQueuedConversationDeletion stale-intent guards", function () {
         catalogCreatedAt: 0,
       }) as never,
     );
-    assertDroppedAlive(ok, "nothing was deleted, so the chat is still alive");
+    assertQuarantined(ok, "nothing was deleted while identity is unverifiable");
     assert.lengthOf(destructive, 0);
   });
 
@@ -285,6 +308,7 @@ describe("finalizeQueuedConversationDeletion stale-intent guards", function () {
       registryRows: () => [
         {
           conversationID: "lfz:other:owner",
+          instanceID: "instance-other",
           conversationKey: 2_000_000_777,
           system: "upstream",
           kind: "global",

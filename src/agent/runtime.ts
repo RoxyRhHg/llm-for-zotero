@@ -85,6 +85,11 @@ import {
   hydrateAgentToolResultHandles,
   upsertAgentToolResultHandles,
 } from "./store/toolResultHandles";
+import {
+  areConversationWritesFrozen,
+  isConversationWriteGenerationCurrent,
+  withConversationWriteLock,
+} from "../shared/conversationWriteFence";
 
 const TOOL_RESULT_READ_TOOL_NAME = "tool_result_read";
 
@@ -686,6 +691,22 @@ export class AgentRuntime {
     signal?: AbortSignal;
   }): Promise<AgentRuntimeOutcome> {
     const request = params.request;
+    const writeAllowed = () =>
+      !areConversationWritesFrozen(request.conversationKey) &&
+      (request.conversationGeneration === undefined ||
+        isConversationWriteGenerationCurrent(
+          request.conversationKey,
+          request.conversationGeneration,
+        ));
+    const persistIfLive = async <T>(
+      task: () => Promise<T>,
+    ): Promise<T | undefined> => {
+      if (!writeAllowed()) return undefined;
+      return withConversationWriteLock(request.conversationKey, async () => {
+        if (!writeAllowed()) return undefined;
+        return task();
+      });
+    };
     try {
       await ensureModelCapabilities(
         {
@@ -722,21 +743,30 @@ export class AgentRuntime {
       let eventSeq = 0;
       let currentAnswerText = "";
       const item = request.item || null;
-      await createAgentRun({
-        runId,
-        conversationKey: request.conversationKey,
-        mode: "agent",
-        model: request.model,
-        status: "running",
-        createdAt: this.now(),
-      });
-      await params.onStart?.(runId);
+      await persistIfLive(() =>
+        createAgentRun({
+          runId,
+          conversationKey: request.conversationKey,
+          mode: "agent",
+          model: request.model,
+          status: "running",
+          createdAt: this.now(),
+        }),
+      );
+      // createAgentRun may have waited on the provider/DB.  Clear can commit
+      // during that await and intentionally leave the conversation key live,
+      // so a retired-key check alone is insufficient.  Never publish a late
+      // run ID into the cleared generation's UI/cache.
+      if (writeAllowed()) await params.onStart?.(runId);
 
       const emit = async (event: AgentEvent) => {
+        if (!writeAllowed()) return;
         for (const redactedEvent of eventStreamRedactor.process(event)) {
           eventSeq += 1;
-          await appendAgentRunEvent(runId, eventSeq, redactedEvent);
-          await params.onEvent?.(redactedEvent);
+          await persistIfLive(() =>
+            appendAgentRunEvent(runId, eventSeq, redactedEvent),
+          );
+          if (writeAllowed()) await params.onEvent?.(redactedEvent);
         }
       };
 
@@ -747,7 +777,7 @@ export class AgentRuntime {
           type: "fallback",
           reason,
         });
-        await finishAgentRun(runId, "completed");
+        await persistIfLive(() => finishAgentRun(runId, "completed"));
         return {
           kind: "fallback",
           runId,
@@ -832,15 +862,19 @@ export class AgentRuntime {
             messages: compacted.messages,
             compactedAt: this.now(),
           };
-          await upsertAgentToolResultHandles(compacted.handleRecords);
+          await persistIfLive(() =>
+            upsertAgentToolResultHandles(compacted.handleRecords),
+          );
           if (compacted.handleRecords.length) toolResultReadAvailable = true;
-          await replaceAgentTranscriptSegment(
-            turnPathRedactor.redactTerminalValue(transcriptSegment),
+          await persistIfLive(() =>
+            replaceAgentTranscriptSegment(
+              turnPathRedactor.redactTerminalValue(transcriptSegment),
+            ),
           );
           await emit({ type: "context_compacted", automatic: false });
         }
         await emit({ type: "final", text });
-        await finishAgentRun(runId, "completed", text);
+        await persistIfLive(() => finishAgentRun(runId, "completed", text));
         return {
           kind: "completed",
           runId,
@@ -929,10 +963,14 @@ export class AgentRuntime {
             compactedAt: this.now(),
           };
           transcriptMessagesForPrompt = transcriptSegment.messages;
-          await upsertAgentToolResultHandles(compacted.handleRecords);
+          await persistIfLive(() =>
+            upsertAgentToolResultHandles(compacted.handleRecords),
+          );
           if (compacted.handleRecords.length) toolResultReadAvailable = true;
-          await replaceAgentTranscriptSegment(
-            turnPathRedactor.redactTerminalValue(transcriptSegment),
+          await persistIfLive(() =>
+            replaceAgentTranscriptSegment(
+              turnPathRedactor.redactTerminalValue(transcriptSegment),
+            ),
           );
           await emit({ type: "context_compacted", automatic: true });
           messages.splice(
@@ -1012,30 +1050,40 @@ export class AgentRuntime {
             text: redactedFinalText,
           });
         }
-        await finishAgentRun(runId, status, redactedFinalText);
+        await persistIfLive(() =>
+          finishAgentRun(runId, status, redactedFinalText),
+        );
         if (status === "completed") {
-          await commitAgentReadActivities({
-            conversationKey: request.conversationKey,
-            activities: pendingReadActivities,
-            resourceSignature: resourceContextPlan.resourceSignature,
-          });
-          await commitAgentCoverageActivities({
-            conversationKey: request.conversationKey,
-            activities: pendingReadActivities,
-          });
-          await appendAgentTranscriptMessages({
-            conversationKey: request.conversationKey,
-            compatibilityKey: transcriptCompatibilityKey,
-            messages: turnPathRedactor.redactTerminalValue(
-              newTranscriptMessages,
-            ),
-          });
+          await persistIfLive(() =>
+            commitAgentReadActivities({
+              conversationKey: request.conversationKey,
+              activities: pendingReadActivities,
+              resourceSignature: resourceContextPlan.resourceSignature,
+            }),
+          );
+          await persistIfLive(() =>
+            commitAgentCoverageActivities({
+              conversationKey: request.conversationKey,
+              activities: pendingReadActivities,
+            }),
+          );
+          await persistIfLive(() =>
+            appendAgentTranscriptMessages({
+              conversationKey: request.conversationKey,
+              compatibilityKey: transcriptCompatibilityKey,
+              messages: turnPathRedactor.redactTerminalValue(
+                newTranscriptMessages,
+              ),
+            }),
+          );
           if (redactedFinalText) {
-            await recordAgentTurn(
-              request.conversationKey,
-              turnPathRedactor.redactTerminalText(request.userText),
-              toolsUsedThisTurn,
-              redactedFinalText,
+            await persistIfLive(() =>
+              recordAgentTurn(
+                request.conversationKey,
+                turnPathRedactor.redactTerminalText(request.userText),
+                toolsUsedThisTurn,
+                redactedFinalText,
+              ),
             );
           }
         }
@@ -1044,7 +1092,7 @@ export class AgentRuntime {
           runId,
           text: redactedFinalText,
           usedFallback: false,
-        };
+        } as const;
       };
       const emitFinalStep = async (
         step: Extract<AgentModelStep, { kind: "final" }>,
@@ -1092,10 +1140,12 @@ export class AgentRuntime {
         statusText: string,
       ): Promise<{ step: AgentModelStep; stepStreamedText: string }> => {
         if (params.signal?.aborted) {
-          await finishAgentRun(
-            runId,
-            "cancelled",
-            turnPathRedactor.redactTerminalText(currentAnswerText),
+          await persistIfLive(() =>
+            finishAgentRun(
+              runId,
+              "cancelled",
+              turnPathRedactor.redactTerminalText(currentAnswerText),
+            ),
           );
           throw new Error("Aborted");
         }
@@ -1141,7 +1191,9 @@ export class AgentRuntime {
           resourceSignature: resourceContextPlan.resourceSignature,
         });
         if (preflight.changed) {
-          await upsertAgentToolResultHandles(preflight.handleRecords);
+          await persistIfLive(() =>
+            upsertAgentToolResultHandles(preflight.handleRecords),
+          );
           if (preflight.handleRecords.length) toolResultReadAvailable = true;
           messages.splice(0, messages.length, ...preflight.messages);
           adapter.resetState?.();
@@ -1369,6 +1421,20 @@ export class AgentRuntime {
           inheritedApproval?: AgentInheritedApproval;
         } = {},
       ): Promise<ExecutedToolCall> => {
+        const lifecycleError = (): ExecutedToolCall => ({
+          toolResult: {
+            callId: call.id,
+            name: call.name,
+            ok: false,
+            content: {
+              error:
+                "Conversation lifecycle changed before this tool could execute.",
+            },
+          },
+        });
+        const executionAllowed = () =>
+          !params.signal?.aborted && writeAllowed();
+        if (!executionAllowed()) return lifecycleError();
         await emit({
           type: "tool_call",
           callId: call.id,
@@ -1384,6 +1450,9 @@ export class AgentRuntime {
           },
           {
             inheritedApproval: options.inheritedApproval,
+            isExecutionAllowed: executionAllowed,
+            executeWithLock: (task) =>
+              withConversationWriteLock(request.conversationKey, task),
           },
         );
         let executedCall: {
@@ -1395,6 +1464,7 @@ export class AgentRuntime {
           const { resolution } = await requestActionResolution(
             execution.action,
           );
+          if (!executionAllowed()) return lifecycleError();
           const confirmedExecution = resolution.approved
             ? await execution.execute(resolution.data)
             : execution.deny(resolution.data);
@@ -1404,6 +1474,7 @@ export class AgentRuntime {
             input: confirmedExecution.input,
           };
         } else {
+          if (!executionAllowed()) return lifecycleError();
           executedCall = {
             toolResult: execution.execution.result,
             toolDefinition: execution.execution.tool,
@@ -1505,6 +1576,19 @@ export class AgentRuntime {
           inheritedApproval?: AgentInheritedApproval;
         } = {},
       ): Promise<ToolWorkflowOutcome> => {
+        if (params.signal?.aborted || !writeAllowed()) {
+          return {
+            toolResult: {
+              callId: call.id,
+              name: call.name,
+              ok: false,
+              content: {
+                error:
+                  "Conversation lifecycle changed before this tool could execute.",
+              },
+            },
+          };
+        }
         const executedCall = await executePreparedToolCall(call, round, {
           inheritedApproval: options.inheritedApproval,
         });
@@ -1542,6 +1626,9 @@ export class AgentRuntime {
             }
 
             const { resolution } = await requestActionResolution(reviewAction);
+            if (params.signal?.aborted || !writeAllowed()) {
+              return { toolResult: currentResult };
+            }
             const reviewOutcome = await toolDefinition.resolveResultReview(
               currentInput as never,
               currentResult,
