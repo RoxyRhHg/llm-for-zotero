@@ -382,6 +382,11 @@ export type AgentToolCall = {
   id: string;
   name: string;
   arguments: unknown;
+  /**
+   * Gemini thought signature attached to the functionCall part.  Gemini 3
+   * rejects continuations that omit it, so it must survive history rebuilds.
+   */
+  thoughtSignature?: string;
 };
 
 export type AgentTraceDetailKind = "text" | "code" | "json" | "url";

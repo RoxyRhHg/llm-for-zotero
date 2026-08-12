@@ -93,6 +93,10 @@ const OPENAI_PATHS = [
 
 const GEMINI_PATHS = [
   "/",
+  "/v1",
+  "/v1/models",
+  "/v1alpha",
+  "/v1alpha/models",
   "/v1beta",
   "/v1beta/models",
   "/v1beta/openai",

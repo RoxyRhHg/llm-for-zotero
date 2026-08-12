@@ -1,4 +1,4 @@
-import { isResponsesBase } from "./apiHelpers";
+import { isGeminiBase, isResponsesBase } from "./apiHelpers";
 import { WEBCHAT_TARGETS } from "../webchat/types";
 
 export type ProviderProtocol =
@@ -156,6 +156,13 @@ export function inferLegacyProviderProtocol(params: {
   }
   if (isResponsesBase(params.apiBase || "")) {
     return "responses_api";
+  }
+  if (isGeminiBase(params.apiBase || "")) {
+    // Gemini URLs default to the native generateContent protocol unless the
+    // user pointed at the OpenAI-compatibility sub-path explicitly.
+    return getApiBasePathname(params.apiBase).includes("/openai")
+      ? "openai_chat_compat"
+      : "gemini_native";
   }
   if (isAnthropicMessagesBase(params.apiBase)) {
     return "anthropic_messages";

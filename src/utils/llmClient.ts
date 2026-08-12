@@ -62,6 +62,7 @@ import {
   normalizeTemperature,
   normalizeMaxTokensForModel,
   normalizeInputTokenCap,
+  resolveGeminiTemperature,
 } from "./normalization";
 import {
   getDefaultModelEntry,
@@ -2167,6 +2168,7 @@ export function buildReasoningPayload(
         typeof resolvedOption.value === "number" ? resolvedOption.value : 8192;
     } else {
       thinkingConfig.thinking_level =
+        resolvedOption.value === "minimal" ||
         resolvedOption.value === "low" ||
         resolvedOption.value === "medium" ||
         resolvedOption.value === "high"
@@ -2526,7 +2528,8 @@ function buildGeminiNativePayload(params: {
   apiBase?: string;
   messages: ChatMessage[];
   effectiveMaxTokens: number;
-  effectiveTemperature: number;
+  /** Omitted from the payload when undefined (Gemini 3 server default). */
+  temperature: number | undefined;
   reasoning?: ReasoningConfig;
   pdfParts?: Array<{ base64: string }>;
 }): Record<string, unknown> {
@@ -2582,7 +2585,9 @@ function buildGeminiNativePayload(params: {
     contents,
     generationConfig: {
       maxOutputTokens: params.effectiveMaxTokens,
-      temperature: params.effectiveTemperature,
+      ...(params.temperature !== undefined
+        ? { temperature: params.temperature }
+        : {}),
     },
   };
   if (params.reasoning?.provider === "gemini") {
@@ -2630,7 +2635,10 @@ function buildGeminiNativePayload(params: {
           : {
               includeThoughts: true,
               thinkingLevel:
-                value === "low" || value === "medium" || value === "high"
+                value === "minimal" ||
+                value === "low" ||
+                value === "medium" ||
+                value === "high"
                   ? value
                   : "medium",
             };
@@ -2668,9 +2676,19 @@ function assertCodexAppServerUsesNativeRuntime(
   );
 }
 
+/**
+ * Gemini marks thought-summary parts with `thought: true` when
+ * `includeThoughts` is requested.  A `thoughtSignature` alone does NOT make a
+ * part a thought: Gemini 3 attaches signatures to regular answer parts too.
+ */
+function isGeminiThoughtSummaryPart(part: { thought?: unknown }): boolean {
+  return part.thought === true;
+}
+
 async function parseGeminiNativeStreamResponse(
   body: ReadableStream<Uint8Array>,
   onDelta: (delta: string) => void,
+  onReasoning?: (event: ReasoningEvent) => void,
   onUsage?: (usage: UsageStats) => void,
 ): Promise<string> {
   const reader = body.getReader() as ReadableStreamDefaultReader<Uint8Array>;
@@ -2695,7 +2713,9 @@ async function parseGeminiNativeStreamResponse(
         try {
           const parsed = JSON.parse(data) as {
             candidates?: Array<{
-              content?: { parts?: Array<{ text?: string }> };
+              content?: {
+                parts?: Array<{ text?: string; thought?: unknown }>;
+              };
             }>;
             usageMetadata?: {
               promptTokenCount?: number;
@@ -2704,10 +2724,18 @@ async function parseGeminiNativeStreamResponse(
               cachedContentTokenCount?: number;
             };
           };
-          const text =
-            parsed.candidates?.[0]?.content?.parts
-              ?.map((p) => p.text || "")
-              .join("") || "";
+          const parts = parsed.candidates?.[0]?.content?.parts || [];
+          const thoughtText = parts
+            .filter((p) => isGeminiThoughtSummaryPart(p))
+            .map((p) => p.text || "")
+            .join("");
+          if (thoughtText && onReasoning) {
+            onReasoning({ details: thoughtText });
+          }
+          const text = parts
+            .filter((p) => !isGeminiThoughtSummaryPart(p))
+            .map((p) => p.text || "")
+            .join("");
           if (text) {
             fullText += text;
             onDelta(text);
@@ -3302,7 +3330,8 @@ async function callNativeProtocol(params: {
   model: string;
   messages: ChatMessage[];
   effectiveMaxTokens: number;
-  effectiveTemperature: number;
+  /** Raw request temperature; protocol-specific defaults are applied here. */
+  rawTemperature?: number | string;
   signal?: AbortSignal;
   onDelta?: (delta: string) => void;
   onReasoning?: (event: ReasoningEvent) => void;
@@ -3318,7 +3347,7 @@ async function callNativeProtocol(params: {
     model,
     messages,
     effectiveMaxTokens,
-    effectiveTemperature,
+    rawTemperature,
     signal,
     onDelta,
     onReasoning,
@@ -3357,7 +3386,7 @@ async function callNativeProtocol(params: {
           model,
           messages,
           effectiveMaxTokens,
-          effectiveTemperature,
+          effectiveTemperature: normalizeTemperature(rawTemperature),
           stream: isStreaming,
           reasoning: reasoningOverride,
           apiBase,
@@ -3370,7 +3399,7 @@ async function callNativeProtocol(params: {
           apiBase,
           messages,
           effectiveMaxTokens,
-          effectiveTemperature,
+          temperature: resolveGeminiTemperature(model, rawTemperature),
           reasoning: reasoningOverride,
           pdfParts: pdfParts.length ? pdfParts : undefined,
         });
@@ -3394,7 +3423,12 @@ async function callNativeProtocol(params: {
     if (!res.body) return callNativeProtocol({ ...params, onDelta: undefined });
     return protocol === "anthropic_messages"
       ? parseAnthropicStreamResponse(res.body, onDelta!, onReasoning, onUsage)
-      : parseGeminiNativeStreamResponse(res.body, onDelta!, onUsage);
+      : parseGeminiNativeStreamResponse(
+          res.body,
+          onDelta!,
+          onReasoning,
+          onUsage,
+        );
   }
   if (protocol === "anthropic_messages") {
     const data = (await res.json()) as {
@@ -3406,11 +3440,15 @@ async function callNativeProtocol(params: {
     );
   }
   const data = (await res.json()) as {
-    candidates?: Array<{ content?: { parts?: Array<{ text?: string }> } }>;
+    candidates?: Array<{
+      content?: { parts?: Array<{ text?: string; thought?: unknown }> };
+    }>;
   };
   return (
-    data.candidates?.[0]?.content?.parts?.map((p) => p.text || "").join("") ??
-    JSON.stringify(data)
+    data.candidates?.[0]?.content?.parts
+      ?.filter((p) => !isGeminiThoughtSummaryPart(p))
+      .map((p) => p.text || "")
+      .join("") ?? JSON.stringify(data)
   );
 }
 
@@ -3446,7 +3484,7 @@ export async function callLLM(params: ChatParams): Promise<string> {
         protocol: providerProtocol,
         authMode,
       }),
-      effectiveTemperature: normalizeTemperature(params.temperature),
+      rawTemperature: params.temperature,
       signal: params.signal,
       attachments: params.attachments,
       reasoning: params.reasoning,
@@ -3591,7 +3629,7 @@ export async function callLLMStream(
         protocol: providerProtocol,
         authMode,
       }),
-      effectiveTemperature: normalizeTemperature(params.temperature),
+      rawTemperature: params.temperature,
       signal: params.signal,
       onDelta,
       onReasoning,

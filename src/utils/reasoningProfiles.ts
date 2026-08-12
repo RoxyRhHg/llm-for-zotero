@@ -1,4 +1,4 @@
-const REASONING_PROFILE_TABLE_VERSION = 6;
+const REASONING_PROFILE_TABLE_VERSION = 7;
 
 export type ReasoningProvider =
   | "openai"
@@ -28,7 +28,12 @@ export type OpenAIReasoningEffort =
   | "xhigh"
   | (string & {});
 export type GeminiThinkingParam = "thinking_level" | "thinking_budget";
-export type GeminiThinkingValue = "low" | "medium" | "high" | number;
+export type GeminiThinkingValue =
+  | "minimal"
+  | "low"
+  | "medium"
+  | "high"
+  | number;
 export type GeminiReasoningOption = {
   level: ReasoningLevel;
   value: GeminiThinkingValue;
@@ -300,6 +305,92 @@ const GEMINI_3_PRO_PROFILE: ProviderProfile = {
     levelToValue: {
       high: "high",
       low: "low",
+    },
+  },
+};
+
+// gemini-3.1-pro and later pro releases add "medium" but still reject
+// "minimal" (see ai.google.dev/gemini-api/docs/thinking).
+const GEMINI_3X_PRO_PROFILE: ProviderProfile = {
+  supportsReasoning: true,
+  defaultLevel: "high",
+  options: [
+    option("high", "high"),
+    option("medium", "medium"),
+    option("low", "low"),
+  ],
+  gemini: {
+    param: "thinking_level",
+    defaultValue: "high",
+    levelToValue: {
+      high: "high",
+      medium: "medium",
+      low: "low",
+    },
+  },
+};
+
+// Flash releases support the full minimal..high ladder; defaults differ per
+// model (3.6-flash: medium, flash-lite: minimal, other flash: high).
+const GEMINI_36_FLASH_PROFILE: ProviderProfile = {
+  supportsReasoning: true,
+  defaultLevel: "medium",
+  options: [
+    option("medium", "medium"),
+    option("high", "high"),
+    option("low", "low"),
+    option("minimal", "minimal"),
+  ],
+  gemini: {
+    param: "thinking_level",
+    defaultValue: "medium",
+    levelToValue: {
+      medium: "medium",
+      high: "high",
+      low: "low",
+      minimal: "minimal",
+    },
+  },
+};
+
+const GEMINI_3_FLASH_PROFILE: ProviderProfile = {
+  supportsReasoning: true,
+  defaultLevel: "high",
+  options: [
+    option("high", "high"),
+    option("medium", "medium"),
+    option("low", "low"),
+    option("minimal", "minimal"),
+  ],
+  gemini: {
+    param: "thinking_level",
+    defaultValue: "high",
+    levelToValue: {
+      high: "high",
+      medium: "medium",
+      low: "low",
+      minimal: "minimal",
+    },
+  },
+};
+
+const GEMINI_3_FLASH_LITE_PROFILE: ProviderProfile = {
+  supportsReasoning: true,
+  defaultLevel: "minimal",
+  options: [
+    option("minimal", "minimal"),
+    option("low", "low"),
+    option("medium", "medium"),
+    option("high", "high"),
+  ],
+  gemini: {
+    param: "thinking_level",
+    defaultValue: "minimal",
+    levelToValue: {
+      minimal: "minimal",
+      low: "low",
+      medium: "medium",
+      high: "high",
     },
   },
 };
@@ -658,6 +749,22 @@ const PROFILE_RULES: Record<
       {
         match: /(^|[/:])gemini-2\.5(?:\b|[.-])/,
         profile: GEMINI_25_FLASH_PROFILE,
+      },
+      {
+        match: /(^|[/:])gemini-3(?:\.\d+)?-flash-lite(?:\b|[.-])/,
+        profile: GEMINI_3_FLASH_LITE_PROFILE,
+      },
+      {
+        match: /(^|[/:])gemini-3\.6-flash(?:\b|[.-])/,
+        profile: GEMINI_36_FLASH_PROFILE,
+      },
+      {
+        match: /(^|[/:])gemini-3(?:\.\d+)?-flash(?:\b|[.-])/,
+        profile: GEMINI_3_FLASH_PROFILE,
+      },
+      {
+        match: /(^|[/:])gemini-3\.\d+-pro(?:\b|[.-])/,
+        profile: GEMINI_3X_PRO_PROFILE,
       },
       {
         match: /(^|[/:])gemini-3-pro(?:\b|[.-])/,

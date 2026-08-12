@@ -19,6 +19,14 @@ describe("providerPresets", function () {
       "gemini",
     );
     assert.equal(
+      detectProviderPreset("https://generativelanguage.googleapis.com/v1"),
+      "gemini",
+    );
+    assert.equal(
+      detectProviderPreset("https://generativelanguage.googleapis.com/v1alpha"),
+      "gemini",
+    );
+    assert.equal(
       detectProviderPreset("https://api.anthropic.com/v1/chat/completions"),
       "anthropic",
     );

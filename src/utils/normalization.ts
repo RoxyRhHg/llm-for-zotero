@@ -33,6 +33,27 @@ export function normalizeTemperature(value?: number | string): number {
   return Math.min(2, Math.max(0, parsed));
 }
 
+/**
+ * Resolve the temperature to send to a Gemini model, or undefined to omit it.
+ *
+ * Google's Gemini 3 guidance is to leave temperature at its server-side
+ * default of 1.0 — lower values cause looping and degraded reasoning — so for
+ * Gemini 3+ models an unset temperature is omitted from the payload instead
+ * of falling back to DEFAULT_TEMPERATURE.  Explicit user values are always
+ * respected, and older Gemini generations keep the existing default.
+ */
+export function resolveGeminiTemperature(
+  model: string | undefined,
+  value?: number | string,
+): number | undefined {
+  const parsed =
+    typeof value === "string" ? Number.parseFloat(value) : Number(value);
+  if (Number.isFinite(parsed)) return Math.min(2, Math.max(0, parsed));
+  const generation = /(^|[/:@])gemini-(\d+)/i.exec(model || "");
+  if (generation && Number.parseInt(generation[2], 10) >= 3) return undefined;
+  return DEFAULT_TEMPERATURE;
+}
+
 /** Clamp a max-tokens value to [1, MAX_ALLOWED_TOKENS], falling back to DEFAULT_MAX_TOKENS. */
 export function normalizeMaxTokens(value?: number | string): number {
   const parsed =

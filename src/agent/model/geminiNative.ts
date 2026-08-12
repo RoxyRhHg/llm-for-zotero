@@ -5,7 +5,7 @@ import {
 } from "../../modelCapabilities";
 import {
   normalizeMaxTokensForModel,
-  normalizeTemperature,
+  resolveGeminiTemperature,
 } from "../../utils/normalization";
 import {
   buildProviderTransportHeaders,
@@ -259,7 +259,10 @@ function resolveGeminiReasoningConfig(request: AgentRuntimeRequest) {
   return {
     includeThoughts: true,
     thinkingLevel:
-      value === "low" || value === "medium" || value === "high"
+      value === "minimal" ||
+      value === "low" ||
+      value === "medium" ||
+      value === "high"
         ? value
         : "medium",
   };
@@ -331,6 +334,9 @@ function buildGeminiFunctionCallParts(
       name: call.name,
       args: call.arguments ?? {},
     },
+    ...(call.thoughtSignature
+      ? { thoughtSignature: call.thoughtSignature }
+      : {}),
   }));
 }
 
@@ -585,21 +591,13 @@ async function buildGeminiContinuationMessages(
   return contents;
 }
 
+/**
+ * Only `thought: true` marks a thought-summary part.  A `thoughtSignature`
+ * must NOT be treated as a thought marker: Gemini 3 attaches signatures to
+ * regular answer text and functionCall parts that stay in the answer channel.
+ */
 function isGeminiThoughtPart(part: GeminiPart): boolean {
-  if (part.thought === true) {
-    return true;
-  }
-  if (Object.prototype.hasOwnProperty.call(part, "thoughtSignature")) {
-    return true;
-  }
-  if (!part.functionCall || typeof part.functionCall !== "object") {
-    return false;
-  }
-  const functionCall = part.functionCall as Record<string, unknown>;
-  return (
-    functionCall.thought === true ||
-    Object.prototype.hasOwnProperty.call(functionCall, "thoughtSignature")
-  );
+  return part.thought === true;
 }
 
 function normalizeGeminiResponse(data: GeminiResponse): {
@@ -626,10 +624,18 @@ function normalizeGeminiResponse(data: GeminiResponse): {
       const functionCall = part.functionCall as {
         name?: unknown;
         args?: unknown;
+        thoughtSignature?: unknown;
       };
       const name =
         typeof functionCall.name === "string" ? functionCall.name.trim() : "";
       if (!name) continue;
+      const thoughtSignature =
+        typeof part.thoughtSignature === "string" && part.thoughtSignature
+          ? part.thoughtSignature
+          : typeof functionCall.thoughtSignature === "string" &&
+              functionCall.thoughtSignature
+            ? functionCall.thoughtSignature
+            : undefined;
       toolCalls.push({
         id: createFallbackToolCallId("gemini-call", index),
         name,
@@ -637,6 +643,7 @@ function normalizeGeminiResponse(data: GeminiResponse): {
           functionCall.args && typeof functionCall.args === "object"
             ? functionCall.args
             : {},
+        ...(thoughtSignature ? { thoughtSignature } : {}),
       });
     }
   }
@@ -665,27 +672,18 @@ async function parseGeminiStepStream(
   let buffer = "";
   let text = "";
   let reasoningText = "";
-  let toolCalls: AgentToolCall[] = [];
-  let responseParts: GeminiPart[] = [];
+  // Streaming chunks each carry only the new parts; accumulate them all so
+  // the cached model turn keeps every functionCall and thoughtSignature
+  // (parallel calls and trailing signature-only parts can arrive in separate
+  // chunks, and Gemini 3 rejects continuations that drop a required
+  // signature).
+  const allParts: GeminiPart[] = [];
 
   const handlePayload = async (payload: string) => {
     if (!payload || payload === "[DONE]") return;
     const parsed = JSON.parse(payload) as GeminiResponse;
     const normalized = normalizeGeminiResponse(parsed);
-    if (normalized.toolCalls.length) {
-      toolCalls = normalized.toolCalls;
-    }
-    if (
-      normalized.responseParts.some(
-        (part) =>
-          Object.prototype.hasOwnProperty.call(part, "functionCall") ||
-          Object.prototype.hasOwnProperty.call(part, "thoughtSignature"),
-      )
-    ) {
-      responseParts = normalized.responseParts;
-    } else if (!responseParts.length && normalized.responseParts.length) {
-      responseParts = normalized.responseParts;
-    }
+    allParts.push(...normalized.responseParts);
     if (normalized.reasoningText) {
       let reasoningDelta = normalized.reasoningText;
       if (normalized.reasoningText.startsWith(reasoningText)) {
@@ -733,7 +731,10 @@ async function parseGeminiStepStream(
   } finally {
     reader.releaseLock();
   }
-  return { text, toolCalls, responseParts };
+  const aggregate = normalizeGeminiResponse({
+    candidates: [{ content: { parts: allParts } }],
+  });
+  return { text, toolCalls: aggregate.toolCalls, responseParts: allParts };
 }
 
 function buildAssistantConversationMessage(step: {
@@ -822,7 +823,13 @@ export class GeminiNativeAgentAdapter implements AgentModelAdapter {
         },
       },
       generationConfig: {
-        temperature: normalizeTemperature(request.advanced?.temperature),
+        ...(() => {
+          const temperature = resolveGeminiTemperature(
+            request.model,
+            request.advanced?.temperature,
+          );
+          return temperature !== undefined ? { temperature } : {};
+        })(),
         maxOutputTokens: normalizeMaxTokensForModel(
           request.advanced?.maxTokens,
           request.model,

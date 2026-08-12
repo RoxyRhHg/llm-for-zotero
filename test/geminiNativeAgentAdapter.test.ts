@@ -699,4 +699,274 @@ describe("GeminiNativeAgentAdapter", function () {
       [{ results: [{ itemId: 101 }] }],
     );
   });
+
+  it("keeps a signed final answer part in the answer channel", async function () {
+    const adapter = new GeminiNativeAgentAdapter();
+    let callCount = 0;
+    const reasoning: string[] = [];
+    (
+      globalThis as typeof globalThis & {
+        ztoolkit: { getGlobal: (name: string) => unknown };
+      }
+    ).ztoolkit = {
+      getGlobal: (name: string) => {
+        if (name !== "fetch") return undefined;
+        return async () => {
+          callCount += 1;
+          return {
+            ok: true,
+            status: 200,
+            statusText: "OK",
+            body: makeSseStream([
+              'data: {"candidates":[{"content":{"parts":[{"text":"Signed final.","thoughtSignature":"sig-final"}]}}]}\n\n',
+            ]),
+            json: async () => ({
+              candidates: [
+                {
+                  content: {
+                    parts: [
+                      { text: "Signed final.", thoughtSignature: "sig-final" },
+                    ],
+                  },
+                },
+              ],
+            }),
+            text: async () => "",
+          };
+        };
+      },
+    };
+
+    const step = await adapter.runStep({
+      request: makeRequest({ model: "gemini-3.6-flash" }),
+      messages: [{ role: "user", content: "Summarize it" }],
+      tools,
+      onReasoning: async (event) => {
+        if (event.details) reasoning.push(event.details);
+      },
+    });
+
+    assert.equal(callCount, 1);
+    assert.equal(step.kind, "final");
+    if (step.kind !== "final") return;
+    assert.equal(step.text, "Signed final.");
+    assert.deepEqual(reasoning, []);
+  });
+
+  it("preserves parallel function calls split across stream chunks", async function () {
+    const adapter = new GeminiNativeAgentAdapter();
+    let callCount = 0;
+    let secondRequestBody: Record<string, unknown> | null = null;
+    (
+      globalThis as typeof globalThis & {
+        ztoolkit: { getGlobal: (name: string) => unknown };
+      }
+    ).ztoolkit = {
+      getGlobal: (name: string) => {
+        if (name !== "fetch") return undefined;
+        return async (_url: string, init?: RequestInit) => {
+          callCount += 1;
+          if (callCount === 1) {
+            return {
+              ok: true,
+              status: 200,
+              statusText: "OK",
+              body: makeSseStream([
+                'data: {"candidates":[{"content":{"parts":[{"functionCall":{"name":"read_paper","args":{"itemId":1}},"thoughtSignature":"sig-1"}]}}]}\n\n',
+                'data: {"candidates":[{"content":{"parts":[{"functionCall":{"name":"query_library","args":{"query":"attention"}}}]}}]}\n\n',
+              ]),
+              json: async () => ({}),
+              text: async () => "",
+            };
+          }
+          secondRequestBody = JSON.parse(String(init?.body || "{}")) as Record<
+            string,
+            unknown
+          >;
+          return {
+            ok: true,
+            status: 200,
+            statusText: "OK",
+            body: undefined,
+            json: async () => ({
+              candidates: [{ content: { parts: [{ text: "Done." }] } }],
+            }),
+            text: async () => "",
+          };
+        };
+      },
+    };
+
+    const stepTools: ToolSpec[] = [
+      {
+        name: "read_paper",
+        description: "read",
+        inputSchema: { type: "object" },
+        mutability: "read",
+        requiresConfirmation: false,
+      },
+      {
+        name: "query_library",
+        description: "search",
+        inputSchema: { type: "object" },
+        mutability: "read",
+        requiresConfirmation: false,
+      },
+    ];
+    const firstStep = await adapter.runStep({
+      request: makeRequest({ model: "gemini-3.6-flash" }),
+      messages: [{ role: "user", content: "Check the paper and the library" }],
+      tools: stepTools,
+    });
+
+    assert.equal(firstStep.kind, "tool_calls");
+    if (firstStep.kind !== "tool_calls") return;
+    assert.deepEqual(
+      firstStep.calls.map((call) => call.name),
+      ["read_paper", "query_library"],
+    );
+    assert.notEqual(firstStep.calls[0].id, firstStep.calls[1].id);
+
+    const secondStep = await adapter.runStep({
+      request: makeRequest({ model: "gemini-3.6-flash" }),
+      messages: [
+        { role: "user", content: "Check the paper and the library" },
+        firstStep.assistantMessage,
+        {
+          role: "tool",
+          tool_call_id: firstStep.calls[0].id,
+          name: firstStep.calls[0].name,
+          content: JSON.stringify({ ok: true }),
+        },
+        {
+          role: "tool",
+          tool_call_id: firstStep.calls[1].id,
+          name: firstStep.calls[1].name,
+          content: JSON.stringify({ results: [] }),
+        },
+      ],
+      tools: stepTools,
+    });
+
+    assert.equal(secondStep.kind, "final");
+    const contents =
+      (secondRequestBody?.contents as Array<{
+        role?: string;
+        parts?: Array<Record<string, unknown>>;
+      }>) || [];
+    const modelParts = contents[1]?.parts || [];
+    assert.deepEqual(
+      modelParts
+        .map((part) => part.functionCall as Record<string, unknown>)
+        .filter(Boolean)
+        .map((call) => call.name),
+      ["read_paper", "query_library"],
+    );
+    assert.equal(modelParts[0]?.thoughtSignature, "sig-1");
+  });
+
+  it("reattaches thought signatures when rebuilding history after resetState", async function () {
+    const adapter = new GeminiNativeAgentAdapter();
+    let callCount = 0;
+    let secondRequestBody: Record<string, unknown> | null = null;
+    (
+      globalThis as typeof globalThis & {
+        ztoolkit: { getGlobal: (name: string) => unknown };
+      }
+    ).ztoolkit = {
+      getGlobal: (name: string) => {
+        if (name !== "fetch") return undefined;
+        return async (_url: string, init?: RequestInit) => {
+          callCount += 1;
+          if (callCount === 1) {
+            return {
+              ok: true,
+              status: 200,
+              statusText: "OK",
+              body: undefined,
+              json: async () => ({
+                candidates: [
+                  {
+                    content: {
+                      parts: [
+                        {
+                          functionCall: {
+                            name: "read_paper",
+                            args: { itemId: 1 },
+                          },
+                          thoughtSignature: "sig-123",
+                        },
+                      ],
+                    },
+                  },
+                ],
+              }),
+              text: async () => "",
+            };
+          }
+          secondRequestBody = JSON.parse(String(init?.body || "{}")) as Record<
+            string,
+            unknown
+          >;
+          return {
+            ok: true,
+            status: 200,
+            statusText: "OK",
+            body: undefined,
+            json: async () => ({
+              candidates: [{ content: { parts: [{ text: "Done." }] } }],
+            }),
+            text: async () => "",
+          };
+        };
+      },
+    };
+
+    const stepTools: ToolSpec[] = [
+      {
+        name: "read_paper",
+        description: "read",
+        inputSchema: { type: "object" },
+        mutability: "read",
+        requiresConfirmation: false,
+      },
+    ];
+    const firstStep = await adapter.runStep({
+      request: makeRequest({ model: "gemini-3.6-flash" }),
+      messages: [{ role: "user", content: "Inspect this paper" }],
+      tools: stepTools,
+    });
+
+    assert.equal(firstStep.kind, "tool_calls");
+    if (firstStep.kind !== "tool_calls") return;
+
+    // Mid-turn prompt compaction wipes the adapter's cached conversation.
+    adapter.resetState();
+
+    const secondStep = await adapter.runStep({
+      request: makeRequest({ model: "gemini-3.6-flash" }),
+      messages: [
+        { role: "user", content: "Inspect this paper" },
+        firstStep.assistantMessage,
+        {
+          role: "tool",
+          tool_call_id: firstStep.calls[0].id,
+          name: firstStep.calls[0].name,
+          content: JSON.stringify({ ok: true }),
+        },
+      ],
+      tools: stepTools,
+    });
+
+    assert.equal(secondStep.kind, "final");
+    const contents =
+      (secondRequestBody?.contents as Array<{
+        role?: string;
+        parts?: Array<Record<string, unknown>>;
+      }>) || [];
+    const modelParts = contents[1]?.parts || [];
+    const functionCallPart = modelParts.find((part) => part.functionCall);
+    assert.isDefined(functionCallPart);
+    assert.equal(functionCallPart?.thoughtSignature, "sig-123");
+  });
 });
