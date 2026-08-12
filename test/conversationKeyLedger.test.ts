@@ -12,6 +12,7 @@ import {
   retireConversationKeyInTransaction,
   seedConversationKeyLedgerFromTombstones,
   reserveOrphanConversationMessageKeys,
+  seedConversationKeyLedgerFromCatalogs,
   retireOrphanedConversationLedgerEntries,
   unretireConversationKeyInTransaction,
   updateConversationKeyLedgerConversationIDInTransaction,
@@ -525,6 +526,171 @@ describe("permanent conversation key ledger", function () {
     const entry = await getConversationKeyLedgerEntry(6000);
     assert.equal(entry?.retiredAt, entry?.issuedAt);
     assert.equal(entry?.retirementReason, "orphan-message-row-without-catalog");
+  });
+
+  // Seeding only visits catalog rows the ledger has not already recorded. That
+  // filter must match the (key, instance) PAIR, not the key alone: a catalog
+  // row whose key is known but whose identity differs is precisely the conflict
+  // the quarantine table exists to record, and filtering on the key would skip
+  // it silently.
+  it("still quarantines a catalog row that claims a known key with a different identity", async function () {
+    await initConversationKeyLedgerStore();
+    const zotero = globalScope.Zotero as any;
+    await zotero.DB.queryAsync(
+      `CREATE TABLE conflict_catalog (
+        conversation_key INTEGER PRIMARY KEY,
+        conversation_instance_id TEXT,
+        conversation_id TEXT,
+        library_id INTEGER NOT NULL,
+        created_at INTEGER
+      )`,
+    );
+    await zotero.DB.executeTransaction(() =>
+      ensureConversationKeyLedgerEntryInTransaction({
+        conversationKey: 8000,
+        instanceID: "instance-original",
+        conversationID: "conversation-original",
+        system: "upstream",
+        kind: "global",
+        profileSignature: "profile-test",
+        libraryID: 1,
+        issuedAt: 1,
+      }),
+    );
+    await zotero.DB.queryAsync(
+      `INSERT INTO conflict_catalog
+        (conversation_key, conversation_instance_id, conversation_id, library_id, created_at)
+       VALUES (?, ?, ?, ?, ?)`,
+      [8000, "instance-conflicting", "conversation-conflicting", 1, 5],
+    );
+
+    await seedConversationKeyLedgerFromCatalogs([
+      { table: "conflict_catalog", system: "upstream", kind: "global" },
+    ]);
+
+    const quarantined = db
+      .prepare(
+        `SELECT conversation_key AS conversationKey, instance_id AS instanceID, reason
+         FROM llm_for_zotero_conversation_key_identity_quarantine`,
+      )
+      .all() as Array<Record<string, unknown>>;
+    assert.lengthOf(quarantined, 1);
+    assert.equal(quarantined[0]!.conversationKey, 8000);
+    assert.equal(quarantined[0]!.instanceID, "instance-conflicting");
+    // The original owner is untouched: seeding never picks a winner.
+    const entry = await getConversationKeyLedgerEntry(8000);
+    assert.equal(entry?.instanceID, "instance-original");
+  });
+
+  it("skips catalog rows the ledger already records", async function () {
+    await initConversationKeyLedgerStore();
+    const zotero = globalScope.Zotero as any;
+    await zotero.DB.queryAsync(
+      `CREATE TABLE seeded_catalog (
+        conversation_key INTEGER PRIMARY KEY,
+        conversation_instance_id TEXT,
+        conversation_id TEXT,
+        library_id INTEGER NOT NULL,
+        created_at INTEGER
+      )`,
+    );
+    await zotero.DB.queryAsync(
+      `INSERT INTO seeded_catalog
+        (conversation_key, conversation_instance_id, conversation_id, library_id, created_at)
+       VALUES (?, ?, ?, ?, ?)`,
+      [8100, "instance-seeded", "conversation-seeded", 1, 5],
+    );
+    const catalogs = [
+      {
+        table: "seeded_catalog",
+        system: "upstream" as const,
+        kind: "global" as const,
+      },
+    ];
+
+    await seedConversationKeyLedgerFromCatalogs(catalogs);
+    // A second pass must be a no-op, not a re-quarantine.
+    await seedConversationKeyLedgerFromCatalogs(catalogs);
+
+    assert.equal(
+      (await getConversationKeyLedgerEntry(8100))?.instanceID,
+      "instance-seeded",
+    );
+    const quarantined = db
+      .prepare(
+        `SELECT COUNT(*) AS n
+         FROM llm_for_zotero_conversation_key_identity_quarantine`,
+      )
+      .get() as { n: number };
+    assert.equal(quarantined.n, 0);
+  });
+
+  // Same defect class as the attachment fence: requiring an ISSUED conversation
+  // meant an agent run on a key the ledger had not yet seen failed hard at the
+  // database rather than being skipped. Retirement is the boundary.
+  it("blocks agent run events only for a retired conversation", async function () {
+    await initConversationKeyLedgerStore();
+    const zotero = globalScope.Zotero as any;
+    await zotero.DB.queryAsync(
+      `CREATE TABLE llm_for_zotero_agent_runs (
+        run_id TEXT PRIMARY KEY,
+        conversation_key INTEGER NOT NULL
+      )`,
+    );
+    await zotero.DB.queryAsync(
+      `CREATE TABLE llm_for_zotero_agent_run_events (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        run_id TEXT NOT NULL,
+        payload TEXT
+      )`,
+    );
+    await installConversationKeyLedgerAgentTriggers();
+
+    // A run on a conversation the ledger has never seen must still record.
+    await zotero.DB.queryAsync(
+      `INSERT INTO llm_for_zotero_agent_runs (run_id, conversation_key)
+       VALUES (?, ?)`,
+      ["run-unissued", 9100],
+    );
+    db.prepare(
+      `INSERT INTO llm_for_zotero_agent_run_events (run_id, payload)
+       VALUES (?, ?)`,
+    ).run("run-unissued", "{}");
+
+    // A run on a retired conversation must not.
+    await zotero.DB.executeTransaction(() =>
+      ensureConversationKeyLedgerEntryInTransaction({
+        conversationKey: 9200,
+        instanceID: "instance-retired-run",
+        conversationID: "conversation-retired-run",
+        system: "upstream",
+        kind: "global",
+        profileSignature: "profile-test",
+        libraryID: 1,
+        issuedAt: 1,
+      }),
+    );
+    await zotero.DB.queryAsync(
+      `INSERT INTO llm_for_zotero_agent_runs (run_id, conversation_key)
+       VALUES (?, ?)`,
+      ["run-retired", 9200],
+    );
+    await zotero.DB.executeTransaction(() =>
+      retireConversationKeyInTransaction({
+        conversationKey: 9200,
+        instanceID: "instance-retired-run",
+      }),
+    );
+    assert.throws(
+      () =>
+        db
+          .prepare(
+            `INSERT INTO llm_for_zotero_agent_run_events (run_id, payload)
+             VALUES (?, ?)`,
+          )
+          .run("run-retired", "{}"),
+      /conversation key is permanently retired/,
+    );
   });
 
   describe("orphan retirement requires evidence", function () {

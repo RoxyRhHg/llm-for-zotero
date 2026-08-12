@@ -1664,8 +1664,10 @@ export const pendingDeletionStore = {
    */
   loadPersistedFence(): Promise<void> {
     return enqueueOp(async () => {
-      await loadPersistedIntentsUnlocked({ forceExpired: false });
-      persistedFenceLoaded = true;
+      const loaded = await loadPersistedIntentsUnlocked({
+        forceExpired: false,
+      });
+      if (loaded) persistedFenceLoaded = true;
     });
   },
 
@@ -1703,6 +1705,7 @@ export const pendingDeletionStore = {
   ): Promise<void> {
     return enqueueOp(async () => {
       const eligible = await loadPersistedIntentsUnlocked(options);
+      if (!eligible) return;
       persistedFenceLoaded = true;
       // finalize() serializes per conversation, not on the global op chain,
       // so awaiting it from inside enqueueOp cannot deadlock.
@@ -1719,13 +1722,16 @@ export const pendingDeletionStore = {
  * op chain, and re-entering it here would deadlock.
  *
  * Returns the IDs whose Undo window has elapsed, i.e. those the sweep should
- * finalize.
+ * finalize, or null when there is no database to read -- which callers must
+ * NOT treat as "no intents exist". A transiently absent handle during startup
+ * would otherwise mark the fence complete while real deletions stayed
+ * unapplied, which is the exact failure the fence exists to prevent.
  */
 async function loadPersistedIntentsUnlocked(
   options: { forceExpired?: boolean } = {},
-): Promise<string[]> {
+): Promise<string[] | null> {
   const db = getZoteroDb();
-  if (!db) return [];
+  if (!db) return null;
   await pendingDeletionStore.init();
   const now = options.forceExpired ? Number.MAX_SAFE_INTEGER : env.now();
   const rows = (await db.queryAsync(

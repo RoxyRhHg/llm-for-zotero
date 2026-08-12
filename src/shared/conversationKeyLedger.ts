@@ -911,14 +911,21 @@ async function dropSupersededConversationFenceTriggers(
       `${safe}_issued_conversation_update`,
       `${safe}_live_conversation_insert`,
       `${safe}_live_conversation_update`,
+      // v1 agent-run-events fence: required an issued conversation.
+      `${safe}_live_run_insert`,
+      `${safe}_live_run_update`,
     ]) {
       try {
         await db.queryAsync(`DROP TRIGGER IF EXISTS ${legacy}`);
       } catch (error) {
-        // A test double without trigger support must not block store startup.
-        if (!/no such table|not authorized|syntax error/i.test(String(error))) {
-          throw error;
-        }
+        // Never fatal. A test double without trigger support, or a database
+        // that refuses the statement, leaves the superseded trigger in place --
+        // no worse than before this teardown existed. Aborting store startup
+        // over it would recreate the very failure mode F2 removed.
+        logLedger("LLM: could not drop superseded fence trigger", {
+          trigger: legacy,
+          error: String(error),
+        });
       }
     }
   }
@@ -1096,35 +1103,36 @@ export async function installConversationKeyLedgerAgentTriggers(): Promise<void>
   const eventsTable = "llm_for_zotero_agent_run_events";
   const runsTable = "llm_for_zotero_agent_runs";
   if (tables.has(eventsTable) && tables.has(runsTable)) {
+    await dropSupersededConversationFenceTriggers([eventsTable]);
     try {
-      await db.queryAsync(
-        `CREATE TRIGGER IF NOT EXISTS ${eventsTable}_live_run_insert
-         BEFORE INSERT ON ${eventsTable}
-         WHEN NOT EXISTS (
+      // Reject events for a run whose conversation was RETIRED, not for one the
+      // ledger has merely never seen. The superseded rule required a live
+      // ledger row, so an agent run on any conversation missing from the ledger
+      // -- a lazily created store racing the seeding pass -- failed hard at the
+      // database instead of being skipped, the same defect the attachment fence
+      // had.
+      const retiredRunConversation = `EXISTS (
            SELECT 1
            FROM ${runsTable} r
            JOIN ${KEY_LEDGER_TABLE} l
              ON l.conversation_key = r.conversation_key
-            AND l.retired_at IS NULL
+            AND l.retired_at IS NOT NULL
            WHERE r.run_id = NEW.run_id
-         )
+         )`;
+      await db.queryAsync(
+        `CREATE TRIGGER IF NOT EXISTS ${eventsTable}_conversation_fence_v${CONVERSATION_FENCE_VERSION}_insert
+         BEFORE INSERT ON ${eventsTable}
+         WHEN ${retiredRunConversation}
          BEGIN
-           SELECT RAISE(ABORT, 'agent run is not live');
+           SELECT RAISE(ABORT, '${RETIRED_KEY_ABORT_MESSAGE}');
          END`,
       );
       await db.queryAsync(
-        `CREATE TRIGGER IF NOT EXISTS ${eventsTable}_live_run_update
+        `CREATE TRIGGER IF NOT EXISTS ${eventsTable}_conversation_fence_v${CONVERSATION_FENCE_VERSION}_update
          BEFORE UPDATE OF run_id ON ${eventsTable}
-         WHEN NOT EXISTS (
-           SELECT 1
-           FROM ${runsTable} r
-           JOIN ${KEY_LEDGER_TABLE} l
-             ON l.conversation_key = r.conversation_key
-            AND l.retired_at IS NULL
-           WHERE r.run_id = NEW.run_id
-         )
+         WHEN ${retiredRunConversation}
          BEGIN
-           SELECT RAISE(ABORT, 'agent run is not live');
+           SELECT RAISE(ABORT, '${RETIRED_KEY_ABORT_MESSAGE}');
          END`,
       );
     } catch (error) {
@@ -1197,6 +1205,11 @@ export async function seedConversationKeyLedgerFromCatalogs(
          WHERE ${catalog.kindColumn ? "kind = ? AND " : ""}NOT EXISTS (
            SELECT 1 FROM ${KEY_LEDGER_TABLE} l
            WHERE l.conversation_key = ${table}.conversation_key
+             AND (
+               l.instance_id = ${table}.conversation_instance_id
+               OR ${table}.conversation_instance_id IS NULL
+               OR TRIM(${table}.conversation_instance_id) = ''
+             )
          )`,
         catalog.kindColumn ? [catalog.kind] : undefined,
       )) as Array<Record<string, unknown>> | undefined;
@@ -1214,6 +1227,11 @@ export async function seedConversationKeyLedgerFromCatalogs(
          WHERE ${catalog.kindColumn ? "kind = ? AND " : ""}NOT EXISTS (
            SELECT 1 FROM ${KEY_LEDGER_TABLE} l
            WHERE l.conversation_key = ${table}.conversation_key
+             AND (
+               l.instance_id = ${table}.conversation_instance_id
+               OR ${table}.conversation_instance_id IS NULL
+               OR TRIM(${table}.conversation_instance_id) = ''
+             )
          )`,
         catalog.kindColumn ? [catalog.kind] : undefined,
       )) as Array<Record<string, unknown>> | undefined;
