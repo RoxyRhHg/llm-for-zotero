@@ -1480,6 +1480,85 @@ export async function reserveOrphanConversationMessageKeys(params: {
   }
 }
 
+export type ConversationKeyQuarantineEntry = {
+  conversationKey: number;
+  instanceID: string;
+  conversationID: string;
+  system: string;
+  kind: string;
+  reason: string;
+  observedAt: number;
+};
+
+/**
+ * Read the identity quarantine.  Migration writes to this table in three
+ * places and nothing ever read it back, so a conversation that landed here was
+ * invisible: neither deleted nor reachable, with no signal anywhere. Exposing
+ * it is the difference between a diagnosable state and a silent dead end.
+ */
+export async function getConversationKeyQuarantineEntries(): Promise<
+  ConversationKeyQuarantineEntry[]
+> {
+  const db = getDb();
+  if (!db?.queryAsync) return [];
+  try {
+    const rows = (await db.queryAsync(
+      `SELECT conversation_key AS conversationKey,
+              instance_id AS instanceID,
+              conversation_id AS conversationID,
+              system,
+              kind,
+              reason,
+              observed_at AS observedAt
+       FROM ${KEY_QUARANTINE_TABLE}
+       ORDER BY observed_at DESC`,
+    )) as Array<Record<string, unknown>> | undefined;
+    return (rows || []).flatMap((row) => {
+      const conversationKey = normalizePositiveInt(row.conversationKey);
+      if (!conversationKey) return [];
+      return [
+        {
+          conversationKey,
+          instanceID: normalizeText(row.instanceID, 128),
+          conversationID: normalizeText(row.conversationID, 512),
+          system: normalizeText(row.system, 32),
+          kind: normalizeText(row.kind, 32),
+          reason: normalizeText(row.reason, 512),
+          observedAt: normalizePositiveInt(row.observedAt) || 0,
+        },
+      ];
+    });
+  } catch (error) {
+    if (/no such table|no table/i.test(String(error))) return [];
+    throw error;
+  }
+}
+
+/**
+ * Log a one-line summary of quarantined identities so a user reporting
+ * "my conversation vanished" has something actionable in the log.
+ */
+export async function logConversationKeyQuarantineSummary(): Promise<number> {
+  try {
+    const entries = await getConversationKeyQuarantineEntries();
+    if (!entries.length) return 0;
+    logLedger("LLM: conversation identities are quarantined", {
+      count: entries.length,
+      keys: entries.slice(0, 20).map((entry) => entry.conversationKey),
+      reasons: Array.from(new Set(entries.map((entry) => entry.reason))).slice(
+        0,
+        5,
+      ),
+    });
+    return entries.length;
+  } catch (error) {
+    logLedger("LLM: could not read the conversation identity quarantine", {
+      error: String(error),
+    });
+    return 0;
+  }
+}
+
 export const CONVERSATION_KEY_LEDGER_TABLE = KEY_LEDGER_TABLE;
 export const CONVERSATION_KEY_COUNTERS_TABLE = KEY_COUNTERS_TABLE;
 export const CONVERSATION_KEY_QUARANTINE_TABLE = KEY_QUARANTINE_TABLE;

@@ -13,6 +13,8 @@ import {
   seedConversationKeyLedgerFromTombstones,
   reserveOrphanConversationMessageKeys,
   seedConversationKeyLedgerFromCatalogs,
+  getConversationKeyQuarantineEntries,
+  logConversationKeyQuarantineSummary,
   retireOrphanedConversationLedgerEntries,
   unretireConversationKeyInTransaction,
   updateConversationKeyLedgerConversationIDInTransaction,
@@ -691,6 +693,50 @@ describe("permanent conversation key ledger", function () {
           .run("run-retired", "{}"),
       /conversation key is permanently retired/,
     );
+  });
+
+  it("exposes quarantined identities instead of leaving them invisible", async function () {
+    await initConversationKeyLedgerStore();
+    const zotero = globalScope.Zotero as any;
+    assert.deepEqual(await getConversationKeyQuarantineEntries(), []);
+    assert.equal(await logConversationKeyQuarantineSummary(), 0);
+
+    await zotero.DB.queryAsync(
+      `CREATE TABLE visible_catalog (
+        conversation_key INTEGER PRIMARY KEY,
+        conversation_instance_id TEXT,
+        conversation_id TEXT,
+        library_id INTEGER NOT NULL,
+        created_at INTEGER
+      )`,
+    );
+    await zotero.DB.executeTransaction(() =>
+      ensureConversationKeyLedgerEntryInTransaction({
+        conversationKey: 8200,
+        instanceID: "instance-owner",
+        conversationID: "conversation-owner",
+        system: "upstream",
+        kind: "global",
+        profileSignature: "profile-test",
+        libraryID: 1,
+        issuedAt: 1,
+      }),
+    );
+    await zotero.DB.queryAsync(
+      `INSERT INTO visible_catalog
+        (conversation_key, conversation_instance_id, conversation_id, library_id, created_at)
+       VALUES (?, ?, ?, ?, ?)`,
+      [8200, "instance-intruder", "conversation-intruder", 1, 5],
+    );
+    await seedConversationKeyLedgerFromCatalogs([
+      { table: "visible_catalog", system: "upstream", kind: "global" },
+    ]);
+
+    const entries = await getConversationKeyQuarantineEntries();
+    assert.lengthOf(entries, 1);
+    assert.equal(entries[0]!.conversationKey, 8200);
+    assert.include(entries[0]!.reason, "conflicting-legacy-identity");
+    assert.equal(await logConversationKeyQuarantineSummary(), 1);
   });
 
   describe("orphan retirement requires evidence", function () {

@@ -187,6 +187,18 @@ function scheduleConversationIntegrityAudit(): void {
         report,
       );
     }
+    // Migration quarantines conflicting identities but nothing read that table
+    // back, so a conversation that landed there was neither deleted nor
+    // reachable and left no signal. Summarize it so a user reporting a
+    // vanished conversation has something actionable in the log.
+    const { logConversationKeyQuarantineSummary } =
+      await import("./shared/conversationKeyLedger");
+    const quarantined = await logConversationKeyQuarantineSummary();
+    if (quarantined) {
+      ztoolkit.log(
+        `LLM: ${quarantined} conversation identity conflict(s) are quarantined; see the ledger log entry for keys and reasons`,
+      );
+    }
   });
 }
 
