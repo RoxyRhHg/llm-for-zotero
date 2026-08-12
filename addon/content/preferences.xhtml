@@ -11,6 +11,16 @@
   <linkset>
     <html:link rel="localization" href="__addonRef__-preferences.ftl" />
   </linkset>
+  <html:style>
+    /* The preferences window is a chrome document, whose used user-select value
+    roots at `none` — hints, helper text, and status lines must opt back in so
+    users can copy URLs and error details out of them. Interactive controls opt
+    out again. */ #__addonRef__-prefs { -moz-user-select: text; user-select:
+    text; } #__addonRef__-prefs button, #__addonRef__-prefs select,
+    #__addonRef__-prefs option, #__addonRef__-prefs summary, #__addonRef__-prefs
+    input[type="checkbox"], #__addonRef__-prefs input[type="radio"] {
+    -moz-user-select: none; user-select: none; }
+  </html:style>
   <groupbox>
     <html:div style="display: flex; flex-direction: column; padding: 10px">
       <!-- ═══ Tab bar ═══ -->
@@ -3174,6 +3184,7 @@
                     "
                   >
                     <html:span
+                      role="button"
                       data-sort-key="cached"
                       style="
                         width: 8px;
@@ -3184,21 +3195,25 @@
                       >&#x25CF;</html:span
                     >
                     <html:span
+                      role="button"
                       data-sort-key="title"
                       style="flex: 1; min-width: 0; cursor: pointer"
                       >Title</html:span
                     >
                     <html:span
+                      role="button"
                       data-sort-key="firstCreator"
                       style="flex: 0 0 90px; cursor: pointer"
                       >Author</html:span
                     >
                     <html:span
+                      role="button"
                       data-sort-key="year"
                       style="flex: 0 0 34px; text-align: right; cursor: pointer"
                       >Year</html:span
                     >
                     <html:span
+                      role="button"
                       data-sort-key="dateAdded"
                       style="flex: 0 0 64px; text-align: right; cursor: pointer"
                       >Added</html:span

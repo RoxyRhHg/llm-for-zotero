@@ -1,6 +1,15 @@
 /* LLM Panel Styles */
 
 .llm-panel {
+  /*
+   * Zotero windows are chrome documents, whose used user-select value roots
+   * at `none` — so every hint, status, and message the plugin renders is
+   * unselectable unless a surface root opts back in. Interactive affordances
+   * (drag handles, resize states, sort headers) keep their own explicit
+   * `user-select: none`.
+   */
+  -moz-user-select: text;
+  user-select: text;
   --llm-font-scale: 1;
   --llm-fs-10: calc(10px * var(--llm-font-scale));
   --llm-fs-11: calc(11px * var(--llm-font-scale));
@@ -1075,6 +1084,10 @@
    as the embedded chat panel (whose .llm-panel defines the same vars).
    applyPanelFontScale() sets --llm-font-scale on both .llm-panel and this root. */
 #llmforzotero-standalone-chat-root {
+  /* Chrome documents root user-select at `none`; opt this surface back in so
+     hints, statuses, and messages can be selected and copied. */
+  -moz-user-select: text;
+  user-select: text;
   --llm-font-scale: 1;
   --llm-fs-10: calc(10px * var(--llm-font-scale));
   --llm-fs-11: calc(11px * var(--llm-font-scale));
@@ -1444,7 +1457,6 @@
   text-transform: uppercase;
   letter-spacing: 0.04em;
   padding: 10px 6px 3px;
-  user-select: none;
 }
 
 .llm-standalone-search-item {
@@ -2037,7 +2049,6 @@
   text-transform: uppercase;
   letter-spacing: 0.04em;
   padding: 10px 6px 4px;
-  user-select: none;
 }
 
 .llm-standalone-conv-item {
@@ -2724,7 +2735,6 @@
   text-transform: uppercase;
   letter-spacing: 0.04em;
   padding: 8px 6px 3px;
-  user-select: none;
   width: 100%;
   box-sizing: border-box;
 }
@@ -3519,7 +3529,6 @@
   font-size: var(--llm-fs-11, 11px);
   font-weight: 600;
   color: var(--color-accent);
-  user-select: none;
 }
 
 .llm-inline-edit-header-cancel {
@@ -9812,7 +9821,6 @@ label.llm-search-results-item:hover {
   line-height: 1.2;
   font-weight: 600;
   color: var(--fill-tertiary);
-  user-select: none;
 }
 
 .llm-select-text-btn.llm-action-icon-only::before {
@@ -10385,7 +10393,6 @@ label.llm-search-results-item:hover {
   background: var(--material-background);
   border-bottom: 1px solid var(--stroke-secondary);
   pointer-events: none;
-  user-select: none;
 }
 
 .llm-model-option,
