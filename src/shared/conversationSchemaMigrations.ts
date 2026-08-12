@@ -1,3 +1,5 @@
+import { rekeyScopedConversationKey } from "./conversationScopedKey";
+
 type ZoteroDb = {
   queryAsync?: (sql: string, params?: unknown[]) => Promise<unknown>;
 };
@@ -36,6 +38,71 @@ function normalizeMigrationDescription(value: unknown): string | null {
     .replace(/\s+/g, " ")
     .trim();
   return normalized ? normalized.slice(0, 512) : null;
+}
+
+/**
+ * Move a legacy catalog row onto its new numeric key.
+ *
+ * Both runtime catalogs store a `scoped_conversation_key` whose leading token
+ * is the conversation key (see ./conversationScopedKey). Only that token may
+ * change here: the scope tail encodes the profile signature, library id, and
+ * paper item id, and those digits frequently repeat the conversation key. The
+ * value is therefore recomputed in TypeScript rather than patched with SQL
+ * `REPLACE()`, which rewrites every occurrence.
+ *
+ * `conversation_key` is `INTEGER PRIMARY KEY` in both catalogs, so this touches
+ * exactly one row. Intended to run inside the caller's migration transaction.
+ */
+export async function rekeyConversationCatalogKeyInTransaction(params: {
+  table: string;
+  legacyKey: number;
+  targetKey: number;
+}): Promise<void> {
+  const db = getZoteroDb();
+  const table = String(params.table || "").replace(/[^A-Za-z0-9_]/g, "");
+  const legacyKey = Math.floor(Number(params.legacyKey));
+  const targetKey = Math.floor(Number(params.targetKey));
+  if (
+    !db?.queryAsync ||
+    !table ||
+    !Number.isFinite(legacyKey) ||
+    !Number.isFinite(targetKey) ||
+    legacyKey <= 0 ||
+    targetKey <= 0 ||
+    legacyKey === targetKey
+  )
+    return;
+  let storedScopedKey: string | null = null;
+  try {
+    const rows = (await db.queryAsync(
+      `SELECT scoped_conversation_key AS scopedConversationKey
+       FROM ${table}
+       WHERE conversation_key = ?`,
+      [legacyKey],
+    )) as Array<{ scopedConversationKey?: unknown }> | undefined;
+    const stored = rows?.[0]?.scopedConversationKey;
+    storedScopedKey = typeof stored === "string" ? stored : null;
+  } catch (error) {
+    if (!/no such column|unknown column/i.test(String(error))) throw error;
+    // Catalogs predating the scoped-key column still need their numeric key
+    // moved; there is simply no scope binding to carry across.
+    await db.queryAsync(
+      `UPDATE ${table} SET conversation_key = ? WHERE conversation_key = ?`,
+      [targetKey, legacyKey],
+    );
+    return;
+  }
+  await db.queryAsync(
+    `UPDATE ${table}
+       SET conversation_key = ?,
+           scoped_conversation_key = ?
+     WHERE conversation_key = ?`,
+    [
+      targetKey,
+      rekeyScopedConversationKey(storedScopedKey, legacyKey, targetKey),
+      legacyKey,
+    ],
+  );
 }
 
 /**

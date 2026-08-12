@@ -14,6 +14,7 @@ import {
   type ClaudeModelCatalogRequestContext,
 } from "../claudeCode/modelCatalog";
 import { getClaudeProfileSignature } from "../claudeCode/projectSkills";
+import { buildScopedConversationKey } from "../shared/conversationScopedKey";
 import { getClaudeConversationSummary } from "../claudeCode/store";
 import { hasPendingEmptyClaudeCleanupJob } from "../core/conversations/conversationCleanupJobs";
 import { isNativeZoteroMcpToolsEnabled } from "../codexAppServer/prefs";
@@ -439,16 +440,6 @@ const lastRunBridgeContextByConversationKey = new Map<
 
 function isBridgeDebugEnabled(): boolean {
   return false;
-}
-
-function buildScopedConversationKey(
-  conversationKey: number,
-  scope?: { scopeType?: string; scopeId?: string },
-): string {
-  if (!scope?.scopeType || !scope.scopeId) {
-    return String(conversationKey);
-  }
-  return `${conversationKey}::${scope.scopeType}:${scope.scopeId}`;
 }
 
 async function resolveClaudeProviderSessionHint(

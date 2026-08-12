@@ -86,6 +86,7 @@ import {
   CONVERSATION_ID_TRANSITION_MIGRATION_ID,
   CONVERSATION_KEY_LEDGER_MIGRATION_ID,
   hasConversationSchemaMigration,
+  rekeyConversationCatalogKeyInTransaction,
   rekeyConversationOwnedRowsInTransaction,
   runConversationSchemaMigrationOnce,
 } from "../shared/conversationSchemaMigrations";
@@ -574,18 +575,11 @@ async function migrateLegacyCodexConversationKeys(): Promise<
 
     claimedKeys.add(targetConversationKey);
     if (targetConversationKey !== legacyConversationKey) {
-      await Zotero.DB.queryAsync(
-        `UPDATE ${CODEX_CONVERSATIONS_TABLE}
-           SET conversation_key = ?,
-               scoped_conversation_key = REPLACE(scoped_conversation_key, ?, ?)
-           WHERE conversation_key = ?`,
-        [
-          targetConversationKey,
-          String(legacyConversationKey),
-          String(targetConversationKey),
-          legacyConversationKey,
-        ],
-      );
+      await rekeyConversationCatalogKeyInTransaction({
+        table: CODEX_CONVERSATIONS_TABLE,
+        legacyKey: legacyConversationKey,
+        targetKey: targetConversationKey,
+      });
       if (!legacyKeyWasRetired) {
         await Zotero.DB.queryAsync(
           `UPDATE ${CODEX_MESSAGES_TABLE}
