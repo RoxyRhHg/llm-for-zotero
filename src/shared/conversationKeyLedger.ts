@@ -550,6 +550,96 @@ export async function initializeConversationKeyCounterInTransaction(
  * A live ledger row with no matching catalog witness is not a conversation;
  * retire it permanently so startup can never expose or allocate it again.
  */
+function logLedger(message: string, details?: Record<string, unknown>): void {
+  try {
+    (
+      globalThis as typeof globalThis & {
+        Zotero?: { debug?: (message: string, details?: unknown) => void };
+      }
+    ).Zotero?.debug?.(message, details);
+  } catch {
+    // Diagnostics must never break a migration.
+  }
+}
+
+const CONVERSATION_MESSAGE_TABLES = [
+  "llm_for_zotero_chat_messages",
+  "llm_for_zotero_claude_messages",
+  "llm_for_zotero_codex_messages",
+];
+
+/** True when any provider's message table still holds rows for this key. */
+async function conversationKeyHasMessages(
+  conversationKey: number,
+): Promise<boolean> {
+  const db = getDb();
+  if (!db?.queryAsync) return false;
+  for (const table of CONVERSATION_MESSAGE_TABLES) {
+    try {
+      const rows = (await db.queryAsync(
+        `SELECT 1 AS present FROM ${table}
+         WHERE conversation_key = ? LIMIT 1`,
+        [conversationKey],
+      )) as Array<{ present?: unknown }> | undefined;
+      if (rows?.length) return true;
+    } catch (error) {
+      if (!/no such table|no such column|unknown column/i.test(String(error))) {
+        throw error;
+      }
+    }
+  }
+  return false;
+}
+
+/**
+ * Reverse a retirement.  Retirement is otherwise permanent and irreversible,
+ * which makes any false positive unrecoverable data loss; this is the repair
+ * path for that case.  It deliberately refuses to revive a key that a real
+ * deletion retired -- only allocations abandoned by a crash, and identities
+ * quarantined by migration, are eligible.
+ */
+export async function unretireConversationKeyInTransaction(params: {
+  conversationKey: number;
+  instanceID: string;
+}): Promise<boolean> {
+  const db = getDb();
+  const key = normalizePositiveInt(params.conversationKey);
+  const instanceID = normalizeText(params.instanceID, 128);
+  if (!db?.queryAsync || !key || !instanceID) return false;
+  const rows = (await db.queryAsync(
+    `SELECT retirement_reason AS retirementReason
+     FROM ${KEY_LEDGER_TABLE}
+     WHERE conversation_key = ? AND instance_id = ? AND retired_at IS NOT NULL
+     LIMIT 1`,
+    [key, instanceID],
+  )) as Array<{ retirementReason?: unknown }> | undefined;
+  if (!rows?.length) return false;
+  const reason = normalizeText(rows[0]?.retirementReason, 256);
+  const REVIVABLE = [
+    "orphaned-ledger-allocation-after-crash",
+    "quarantined-identity",
+  ];
+  if (!REVIVABLE.includes(reason)) {
+    logLedger("LLM: refusing to unretire a deliberately deleted conversation", {
+      conversationKey: key,
+      reason,
+    });
+    return false;
+  }
+  await db.queryAsync(
+    `UPDATE ${KEY_LEDGER_TABLE}
+     SET retired_at = NULL, retirement_reason = NULL
+     WHERE conversation_key = ? AND instance_id = ?`,
+    [key, instanceID],
+  );
+  retiredConversationKeys.delete(key);
+  logLedger("LLM: unretired conversation key", {
+    conversationKey: key,
+    previousReason: reason,
+  });
+  return true;
+}
+
 export async function retireOrphanedConversationLedgerEntries(params: {
   system: ConversationSystem;
   kind: ConversationKeyLedgerKind;
@@ -569,6 +659,13 @@ export async function retireOrphanedConversationLedgerEntries(params: {
     const instanceID = normalizeText(row.instanceID, 128);
     if (!key || !instanceID) continue;
     let hasCatalogWitness = false;
+    // Retirement is permanent and there is no automatic way back, so absence
+    // of evidence is not evidence of absence: the key may only be retired when
+    // a catalog was actually read and did not contain it.  Previously a probe
+    // that failed (missing table, renamed column, a repair script mid-flight)
+    // was skipped, and if every probe failed the key was retired anyway --
+    // silently destroying a live conversation.
+    let probedSuccessfully = false;
     for (const table of params.catalogTables) {
       const safeTable = table.replace(/[^A-Za-z0-9_]/g, "");
       try {
@@ -580,6 +677,7 @@ export async function retireOrphanedConversationLedgerEntries(params: {
            LIMIT 1`,
           [key, instanceID],
         )) as Array<{ present?: unknown }> | undefined;
+        probedSuccessfully = true;
         if (witnessRows?.length) {
           hasCatalogWitness = true;
           break;
@@ -594,6 +692,31 @@ export async function retireOrphanedConversationLedgerEntries(params: {
       }
     }
     if (hasCatalogWitness) continue;
+    if (!probedSuccessfully) {
+      logLedger("LLM: skipping orphan retirement; no catalog could be read", {
+        conversationKey: key,
+        system: params.system,
+        kind: params.kind,
+      });
+      continue;
+    }
+    // An orphan with surviving messages is not the crash artifact this pass
+    // exists to clean up.  Retiring it would strand real user content behind a
+    // permanently closed key, so leave it for identity repair instead.
+    if (await conversationKeyHasMessages(key)) {
+      logLedger("LLM: skipping orphan retirement; messages still exist", {
+        conversationKey: key,
+        system: params.system,
+        kind: params.kind,
+      });
+      continue;
+    }
+    logLedger("LLM: retiring orphaned conversation key", {
+      conversationKey: key,
+      instanceID,
+      system: params.system,
+      kind: params.kind,
+    });
     await retireConversationKeyInTransaction({
       conversationKey: key,
       instanceID,

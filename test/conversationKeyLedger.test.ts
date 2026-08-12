@@ -12,6 +12,8 @@ import {
   retireConversationKeyInTransaction,
   seedConversationKeyLedgerFromTombstones,
   reserveOrphanConversationMessageKeys,
+  retireOrphanedConversationLedgerEntries,
+  unretireConversationKeyInTransaction,
   updateConversationKeyLedgerConversationIDInTransaction,
   ConversationRetiredError,
 } from "../src/shared/conversationKeyLedger";
@@ -523,5 +525,160 @@ describe("permanent conversation key ledger", function () {
     const entry = await getConversationKeyLedgerEntry(6000);
     assert.equal(entry?.retiredAt, entry?.issuedAt);
     assert.equal(entry?.retirementReason, "orphan-message-row-without-catalog");
+  });
+
+  describe("orphan retirement requires evidence", function () {
+    async function seedLiveEntry(conversationKey: number, instanceID: string) {
+      const zotero = globalScope.Zotero as any;
+      await zotero.DB.executeTransaction(() =>
+        ensureConversationKeyLedgerEntryInTransaction({
+          conversationKey,
+          instanceID,
+          conversationID: `conversation-${conversationKey}`,
+          system: "upstream",
+          kind: "global",
+          profileSignature: "profile-test",
+          libraryID: 1,
+          issuedAt: 1,
+        }),
+      );
+    }
+
+    it("retires a ledger entry whose catalog row really is gone", async function () {
+      await initConversationKeyLedgerStore();
+      const zotero = globalScope.Zotero as any;
+      await zotero.DB.queryAsync(
+        `CREATE TABLE live_catalog (
+          conversation_key INTEGER PRIMARY KEY,
+          conversation_instance_id TEXT,
+          conversation_id TEXT
+        )`,
+      );
+      await seedLiveEntry(7000, "instance-orphan");
+
+      await retireOrphanedConversationLedgerEntries({
+        system: "upstream",
+        kind: "global",
+        catalogTables: ["live_catalog"],
+      });
+
+      const entry = await getConversationKeyLedgerEntry(7000);
+      assert.isOk(entry?.retiredAt);
+      assert.equal(
+        entry?.retirementReason,
+        "orphaned-ledger-allocation-after-crash",
+      );
+    });
+
+    // Retirement is permanent and has no automatic reversal, so a probe that
+    // could not run must never be read as "the conversation is gone". Before
+    // this guard, a missing or renamed catalog table meant every live key in
+    // that range was silently and irreversibly destroyed at startup.
+    it("does not retire when no catalog could be read", async function () {
+      await initConversationKeyLedgerStore();
+      await seedLiveEntry(7100, "instance-unprobed");
+
+      await retireOrphanedConversationLedgerEntries({
+        system: "upstream",
+        kind: "global",
+        catalogTables: ["catalog_that_does_not_exist"],
+      });
+
+      const entry = await getConversationKeyLedgerEntry(7100);
+      assert.isUndefined(
+        entry?.retiredAt,
+        "an unreadable catalog is not evidence the conversation is gone",
+      );
+    });
+
+    // A crash-abandoned allocation has no messages. One that does is real user
+    // content, and retiring it would strand it behind a permanently closed key.
+    it("does not retire an orphan that still has messages", async function () {
+      await initConversationKeyLedgerStore();
+      const zotero = globalScope.Zotero as any;
+      await zotero.DB.queryAsync(
+        `CREATE TABLE live_catalog (
+          conversation_key INTEGER PRIMARY KEY,
+          conversation_instance_id TEXT,
+          conversation_id TEXT
+        )`,
+      );
+      await zotero.DB.queryAsync(
+        `CREATE TABLE llm_for_zotero_chat_messages (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          conversation_key INTEGER NOT NULL,
+          text TEXT
+        )`,
+      );
+      await zotero.DB.queryAsync(
+        `INSERT INTO llm_for_zotero_chat_messages (conversation_key, text)
+         VALUES (?, ?)`,
+        [7200, "real user content"],
+      );
+      await seedLiveEntry(7200, "instance-has-messages");
+
+      await retireOrphanedConversationLedgerEntries({
+        system: "upstream",
+        kind: "global",
+        catalogTables: ["live_catalog"],
+      });
+
+      const entry = await getConversationKeyLedgerEntry(7200);
+      assert.isUndefined(entry?.retiredAt);
+    });
+
+    it("can reverse a crash retirement but not a real deletion", async function () {
+      await initConversationKeyLedgerStore();
+      const zotero = globalScope.Zotero as any;
+      await zotero.DB.queryAsync(
+        `CREATE TABLE live_catalog (
+          conversation_key INTEGER PRIMARY KEY,
+          conversation_instance_id TEXT,
+          conversation_id TEXT
+        )`,
+      );
+      await seedLiveEntry(7300, "instance-crash");
+      await seedLiveEntry(7400, "instance-deleted");
+
+      // 7400 is retired the way a user deletion retires it. This must happen
+      // before the orphan pass: retirement records its FIRST cause (the reason
+      // column is COALESCEd), and that first cause is what decides whether the
+      // retirement is reversible.
+      await zotero.DB.executeTransaction(() =>
+        retireConversationKeyInTransaction({
+          conversationKey: 7400,
+          instanceID: "instance-deleted",
+          reason: "conversation-deleted",
+        }),
+      );
+      await retireOrphanedConversationLedgerEntries({
+        system: "upstream",
+        kind: "global",
+        catalogTables: ["live_catalog"],
+      });
+
+      assert.isTrue(
+        await zotero.DB.executeTransaction(() =>
+          unretireConversationKeyInTransaction({
+            conversationKey: 7300,
+            instanceID: "instance-crash",
+          }),
+        ),
+      );
+      assert.isUndefined(
+        (await getConversationKeyLedgerEntry(7300))?.retiredAt,
+      );
+
+      assert.isFalse(
+        await zotero.DB.executeTransaction(() =>
+          unretireConversationKeyInTransaction({
+            conversationKey: 7400,
+            instanceID: "instance-deleted",
+          }),
+        ),
+        "a deliberate deletion must stay retired",
+      );
+      assert.isOk((await getConversationKeyLedgerEntry(7400))?.retiredAt);
+    });
   });
 });
