@@ -145,12 +145,15 @@ export function runAfterSelectChangeDispatch(work: () => void): void {
 export type ProviderModelFetchStatus =
   | { kind: "needs_api_key" }
   | { kind: "loading" }
-  | { kind: "error"; message: string }
-  /** A refresh finished without producing a snapshot (no endpoint / no fetch). */
-  | { kind: "unavailable" }
+  /**
+   * The catalog is unavailable (fetch failed, no endpoint, or an empty list).
+   * This is deliberately silent: no error line is shown and the row falls
+   * back to the plain text input so the user simply types the model name.
+   */
+  | { kind: "manual_entry" }
   | { kind: "ready"; total: number; stale: boolean };
 
-/** Status line shown under the model row while the catalog loads or fails. */
+/** Status line shown under the model row while the catalog loads. */
 export function resolveProviderModelFetchStatus(args: {
   apiKey: string;
   loading: boolean;
@@ -160,14 +163,27 @@ export function resolveProviderModelFetchStatus(args: {
   const models = args.snapshot?.models || [];
   if (!models.length) {
     if (args.loading) return { kind: "loading" };
-    if (!args.snapshot) return { kind: "unavailable" };
-    return args.snapshot.error
-      ? { kind: "error", message: args.snapshot.error }
-      : { kind: "ready", total: 0, stale: false };
+    return { kind: "manual_entry" };
   }
   return {
     kind: "ready",
     total: models.length,
     stale: Boolean(args.snapshot?.error),
   };
+}
+
+/**
+ * Which field the model row should present: the catalog dropdown or the plain
+ * text input. Manual entry wins while the catalog is unavailable, while the
+ * user explicitly chose "Customized…", and always while the input has focus —
+ * a late catalog refresh must never yank the field out from under typing.
+ */
+export function resolveModelEntryMode(args: {
+  status: ProviderModelFetchStatus;
+  userCustomized: boolean;
+  inputFocused: boolean;
+}): "select" | "manual" {
+  if (args.userCustomized || args.inputFocused) return "manual";
+  if (args.status.kind === "manual_entry") return "manual";
+  return "select";
 }

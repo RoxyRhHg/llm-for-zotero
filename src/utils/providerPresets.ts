@@ -141,7 +141,15 @@ const QWEN_PATHS = [
   "/api/v2/apps/protocols/compatible-mode/v1",
   "/api/v2/apps/protocols/compatible-mode/v1/responses",
 ];
-const KIMI_PATHS = ["/", "/v1", "/v1/chat/completions"];
+const KIMI_PATHS = [
+  "/",
+  "/v1",
+  "/v1/chat/completions",
+  // Kimi-for-Coding subscription endpoint (api.kimi.com).
+  "/coding",
+  "/coding/v1",
+  "/coding/v1/chat/completions",
+];
 const MIMO_PATHS = ["/", "/v1", "/v1/chat/completions"];
 const COPILOT_PATHS = ["/", "/chat/completions", "/models"];
 
@@ -256,9 +264,10 @@ export const PROVIDER_PRESETS: ProviderPreset[] = [
     defaultProtocol: "openai_chat_compat",
     supportedProtocols: ["openai_chat_compat"],
     helperText:
-      "Preset uses Moonshot's international API. Use api.moonshot.cn for China.",
+      "Moonshot platform keys use api.moonshot.ai (api.moonshot.cn for China). " +
+      "Kimi coding-plan keys only work with https://api.kimi.com/coding/v1.",
     matches: makeHostAndPathMatcher(
-      ["api.moonshot.cn", "api.moonshot.ai"],
+      ["api.moonshot.cn", "api.moonshot.ai", "api.kimi.com"],
       KIMI_PATHS,
     ),
     supportsEmbeddings: false,

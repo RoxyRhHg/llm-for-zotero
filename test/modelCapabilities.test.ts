@@ -25,7 +25,7 @@ describe("model capability service", function () {
   it("recognizes a new Kimi model from registry data without a plugin release", function () {
     const registry: ModelCapabilityRegistry = {
       schemaVersion: 1,
-      revision: 2,
+      revision: 3,
       models: [
         {
           match: { provider: "kimi", exact: "kimi-v4" },
@@ -142,7 +142,7 @@ describe("model capability service", function () {
           return new Response(
             JSON.stringify({
               schemaVersion: 1,
-              revision: 2,
+              revision: 3,
               models: [
                 {
                   match: { provider: "kimi", exact: "kimi-v4" },
@@ -209,7 +209,7 @@ describe("model capability service", function () {
           text: async () =>
             JSON.stringify({
               schemaVersion: 1,
-              revision: 2,
+              revision: 3,
               models: [
                 {
                   match: { provider: "kimi", exact: "kimi-v4" },
@@ -389,5 +389,85 @@ describe("model capability service", function () {
       ["kimi-k3"],
     );
     assert.deepEqual(secondModels, firstModels);
+  });
+
+  it("compiles kimi-k3 reasoning as the top-level reasoning_effort field", function () {
+    const capabilities = getModelCapabilities({
+      provider: "kimi",
+      model: "kimi-k3",
+      apiBase: "https://api.moonshot.ai/v1",
+      protocol: "openai_chat_compat",
+    });
+    assert.equal(capabilities.reasoning.kind, "select");
+    assert.equal(capabilities.reasoning.defaultOptionId, "max");
+    const compiled = compileReasoningControls(capabilities, { level: "low" });
+    assert.deepEqual(compiled?.extra, { reasoning_effort: "low" });
+  });
+
+  it("maps Kimi-for-Coding model ids onto the K3 capability entries", function () {
+    const identityBase = {
+      provider: "kimi" as const,
+      apiBase: "https://api.kimi.com/coding/v1",
+      protocol: "openai_chat_compat" as const,
+    };
+    const k3 = getModelCapabilities({ ...identityBase, model: "k3" });
+    assert.equal(k3.reasoning.kind, "select");
+    assert.equal(k3.reasoning.defaultOptionId, "max");
+    assert.deepEqual(compileReasoningControls(k3, { level: "high" })?.extra, {
+      reasoning_effort: "high",
+    });
+
+    const k3Compact = getModelCapabilities({
+      ...identityBase,
+      model: "k3-256k",
+    });
+    assert.equal(k3Compact.reasoning.kind, "select");
+    assert.equal(k3Compact.limits.contextWindowTokens, 262144);
+
+    const forCoding = getModelCapabilities({
+      ...identityBase,
+      model: "kimi-for-coding",
+    });
+    assert.equal(forCoding.reasoning.kind, "select");
+  });
+
+  it("ships the deployable registry with the K3 reasoning_effort wire format", async function () {
+    const { readFileSync } = await import("node:fs");
+    const registry = JSON.parse(
+      readFileSync("registry/model-capabilities.v1.json", "utf8"),
+    ) as {
+      revision: number;
+      models: Array<{
+        match: { provider?: string; prefix?: string; exact?: string };
+        reasoning?: {
+          options?: Array<{ controls?: { body?: Record<string, unknown> } }>;
+        };
+      }>;
+    };
+    const k3Entries = registry.models.filter(
+      (entry) =>
+        entry.match.provider === "kimi" &&
+        (entry.match.prefix || entry.match.exact || "").includes("k3"),
+    );
+    assert.isAbove(k3Entries.length, 0, "registry keeps a kimi-k3 entry");
+    for (const entry of k3Entries) {
+      for (const option of entry.reasoning?.options || []) {
+        assert.notProperty(
+          option.controls?.body || {},
+          "thinking",
+          "K3 must not send the K2.x thinking parameter",
+        );
+        assert.property(option.controls?.body || {}, "reasoning_effort");
+      }
+    }
+    const coveredPrefixes = registry.models
+      .filter((entry) => entry.match.provider === "kimi")
+      .map((entry) => entry.match.prefix || entry.match.exact || "");
+    assert.include(coveredPrefixes, "k3", "coding-endpoint alias k3 covered");
+    assert.include(
+      coveredPrefixes,
+      "kimi-for-coding",
+      "coding-endpoint alias kimi-for-coding covered",
+    );
   });
 });

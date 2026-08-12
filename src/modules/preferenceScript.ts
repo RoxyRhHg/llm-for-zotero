@@ -35,6 +35,7 @@ import {
   buildProviderModelSelectRows,
   canFetchProviderModels,
   createSelectRebuildGate,
+  resolveModelEntryMode,
   resolveProviderModelFetchStatus,
   runAfterSelectChangeDispatch,
 } from "../utils/providerModelPicker";
@@ -464,29 +465,45 @@ function attachProviderModelSelect(args: {
   const statusEl = el(doc, "span", HELPER_STYLE);
   statusEl.style.display = "none";
 
-  let customizedActive = false;
+  let userCustomized = false;
   let loading = false;
   let fetchToken = 0;
 
   const readSnapshot = () =>
     getModelCatalogStatus(buildProviderCatalogIdentity(group));
 
-  // While "Customized…" is active the text input IS the field (full width);
-  // leaving it (blur or Enter) swaps the dropdown back in, now listing the
-  // typed name as the selected option.
+  const currentStatus = () =>
+    resolveProviderModelFetchStatus({
+      apiKey: group.apiKey,
+      loading,
+      snapshot: readSnapshot(),
+    });
+
+  // The manual text input takes over while the catalog is unavailable, while
+  // "Customized…" is explicitly active, and while the input has focus; the
+  // dropdown returns once a catalog exists and the input is idle.
+  const currentMode = () =>
+    resolveModelEntryMode({
+      status: currentStatus(),
+      userCustomized,
+      inputFocused: doc.activeElement === input,
+    });
+
   const syncModes = () => {
-    input.style.display = customizedActive ? "" : "none";
-    select.style.display = customizedActive ? "none" : "";
+    const manual = currentMode() === "manual";
+    input.style.display = manual ? "" : "none";
+    select.style.display = manual ? "none" : "";
   };
 
   let renderedOptionsSignature = "";
   const rewriteOptions = () => {
+    const manual = currentMode() === "manual";
     const rows = buildProviderModelSelectRows({
       savedModel: modelEntry.model,
       catalog: readSnapshot()?.models || [],
-      customizedActive,
+      customizedActive: manual,
     });
-    const desiredValue = customizedActive
+    const desiredValue = manual
       ? CUSTOMIZED_MODEL_OPTION_VALUE
       : modelEntry.model.trim();
     // Skip the DOM rewrite when nothing changed: a TTL-cached refresh resolves
@@ -523,11 +540,7 @@ function attachProviderModelSelect(args: {
   const rebuildOptions = rebuildGate.requestRebuild;
 
   const updateStatus = () => {
-    const status = resolveProviderModelFetchStatus({
-      apiKey: group.apiKey,
-      loading,
-      snapshot: readSnapshot(),
-    });
+    const status = currentStatus();
     if (status.kind === "needs_api_key") {
       statusEl.textContent = t(
         "Enter the API key above to fetch this provider's models.",
@@ -538,21 +551,12 @@ function attachProviderModelSelect(args: {
       statusEl.textContent = t("Fetching models…");
       statusEl.style.color = "var(--fill-secondary, #888)";
       statusEl.style.display = "block";
-    } else if (status.kind === "error") {
-      statusEl.textContent = `✗ ${t("Couldn't fetch models:")} ${status.message}`;
-      statusEl.style.color = "red";
-      statusEl.style.display = "block";
-    } else if (status.kind === "unavailable") {
-      statusEl.textContent = t("Couldn't fetch the model list.");
-      statusEl.style.color = "red";
-      statusEl.style.display = "block";
-    } else if (status.total === 0) {
-      statusEl.textContent = t("The provider returned no models.");
-      statusEl.style.color = "var(--fill-secondary, #888)";
-      statusEl.style.display = "block";
     } else {
+      // "manual_entry" is deliberately silent: the row already fell back to
+      // the plain text input, so an error line would only add noise.
       statusEl.style.display = "none";
     }
+    syncModes();
   };
 
   const refreshCatalog = async () => {
@@ -588,14 +592,14 @@ function attachProviderModelSelect(args: {
   const applyModelChoice = (chosenValue: string) => {
     rebuildGate.popupClosed();
     if (chosenValue === CUSTOMIZED_MODEL_OPTION_VALUE) {
-      customizedActive = true;
+      userCustomized = true;
       input.value = modelEntry.model;
       syncModes();
       rebuildOptions();
       input.focus();
       return;
     }
-    customizedActive = false;
+    userCustomized = false;
     input.value = chosenValue;
     args.onModelPicked(chosenValue);
     syncModes();
@@ -611,8 +615,9 @@ function attachProviderModelSelect(args: {
   });
 
   const exitCustomized = () => {
-    if (!customizedActive) return;
-    customizedActive = false;
+    userCustomized = false;
+    // With the catalog still unavailable the mode stays manual, so the typed
+    // value keeps its field; otherwise the dropdown returns with it listed.
     syncModes();
     rebuildOptions();
   };
@@ -1736,8 +1741,10 @@ export async function registerPrefsScripts(_window: Window | undefined | null) {
               githubToken: group.apiKey,
             });
             if (!models.length) {
-              fetchModelsStatus.textContent = t("No models found");
-              fetchModelsStatus.style.color = "red";
+              fetchModelsStatus.textContent = t(
+                "No models found — type the model name instead.",
+              );
+              fetchModelsStatus.style.color = "var(--fill-secondary, #888)";
               return;
             }
             // Build a map of existing models to preserve user-customized advanced settings
@@ -1768,9 +1775,12 @@ export async function registerPrefsScripts(_window: Window | undefined | null) {
             );
             fetchModelsStatus.style.color = "green";
             setTimeout(() => rerender(), 300);
-          } catch (err) {
-            fetchModelsStatus.textContent = `✗ ${(err as Error).message}`;
-            fetchModelsStatus.style.color = "red";
+          } catch (_err) {
+            // Keep fetch failures quiet: manual model entry still works.
+            fetchModelsStatus.textContent = t(
+              "Couldn't fetch models — type the model name instead.",
+            );
+            fetchModelsStatus.style.color = "var(--fill-secondary, #888)";
           } finally {
             fetchModelsBtn.disabled = false;
           }

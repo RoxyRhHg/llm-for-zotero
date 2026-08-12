@@ -12,6 +12,10 @@ import {
 import { MAX_ALLOWED_TOKENS } from "../utils/llmDefaults";
 import { BUNDLED_MODEL_CAPABILITY_REGISTRY } from "./bundled";
 import {
+  inferProviderFromApiBase,
+  inferProviderFromModelName,
+} from "./providerInference";
+import {
   applyControlPatch,
   cloneRegistry,
   findRegistryEntry,
@@ -167,19 +171,13 @@ function providerFromIdentity(
   if (explicit && explicit !== "customized" && explicit !== "unknown") {
     return explicit as ModelCapabilityProvider;
   }
-  const base = normalize(identity.apiBase);
-  if (base.includes("moonshot")) return "kimi";
-  if (base.includes("generativelanguage.googleapis.com")) return "gemini";
-  if (base.includes("anthropic.com")) return "anthropic";
-  if (base.includes("deepseek.com")) return "deepseek";
-  if (base.includes("openai.com")) return "openai";
-  if (base.includes("api.x.ai") || base.includes("x.ai")) return "grok";
-  if (base.includes("dashscope") || base.includes("aliyuncs.com"))
-    return "qwen";
-  if (base.includes("bigmodel.cn")) return "glm";
-  if (base.includes("minimax")) return "minimax";
-  if (base.includes("xiaomimimo.com")) return "mimo";
-  return "unknown";
+  return (
+    inferProviderFromApiBase(normalize(identity.apiBase)) ??
+    // Relays and unrecognized hosts still serve recognizable models; the
+    // model name keeps its provider family (and thus its reasoning profile).
+    inferProviderFromModelName(normalize(identity.model)) ??
+    "unknown"
+  );
 }
 
 function legacyReasoningProvider(

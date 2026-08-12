@@ -81,6 +81,7 @@ import {
 import {
   getModelCapabilities,
   getRuntimeReasoningOptions as getCatalogReasoningOptions,
+  inferProviderFromModelName,
 } from "../../modelCapabilities";
 import { applyModelInputTokenCap } from "../../utils/modelInputCap";
 import { formatDisplayModelName } from "../../utils/modelDisplayLabel";
@@ -2041,32 +2042,25 @@ function getCachedAgentRunEvents(
   return agentRunTraceCache.get(normalizedRunId) || [];
 }
 
+const REASONING_PROVIDER_KINDS = new Set<ReasoningProviderKind>([
+  "openai",
+  "gemini",
+  "deepseek",
+  "kimi",
+  "mimo",
+  "qwen",
+  "grok",
+  "anthropic",
+]);
+
 export function detectReasoningProvider(
   modelName: string,
 ): ReasoningProviderKind {
-  const name = modelName.trim().toLowerCase();
-  if (!name) return "unsupported";
-  if (name.startsWith("deepseek")) {
-    return "deepseek";
-  }
-  if (/(^|[/:])kimi(?:\b|[.-])/.test(name)) {
-    return "kimi";
-  }
-  if (/(^|[/:])mimo-v2(?:\.5)?(?:-(?:pro|omni|flash))?(?:\b|[.-])/.test(name)) {
-    return "mimo";
-  }
-  if (/(^|[/:])(?:qwen(?:\d+)?|qwq|qvq)(?:\b|[.-])/.test(name)) {
-    return "qwen";
-  }
-  if (/(^|[/:])grok(?:\b|[.-])/.test(name)) {
-    return "grok";
-  }
-  if (/(^|[/:.])claude(?:\b|[.-])/.test(name)) {
-    return "anthropic";
-  }
-  if (name.includes("gemini")) return "gemini";
-  if (/^(gpt-5|o\d)(\b|[.-])/.test(name)) return "openai";
-  return "unsupported";
+  const inferred = inferProviderFromModelName(modelName);
+  return inferred &&
+    REASONING_PROVIDER_KINDS.has(inferred as ReasoningProviderKind)
+    ? (inferred as ReasoningProviderKind)
+    : "unsupported";
 }
 
 export function getReasoningOptions(

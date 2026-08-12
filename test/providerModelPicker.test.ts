@@ -5,6 +5,7 @@ import {
   buildProviderModelSelectRows,
   canFetchProviderModels,
   createSelectRebuildGate,
+  resolveModelEntryMode,
   resolveProviderModelFetchStatus,
   runAfterSelectChangeDispatch,
   resolveProviderPickerPresetId,
@@ -190,26 +191,27 @@ describe("providerModelPicker", function () {
       );
     });
 
-    it("reports unavailable when a refresh finished without a snapshot", function () {
+    it("falls back to silent manual entry when the fetch could not run", function () {
       assert.deepEqual(
         resolveProviderModelFetchStatus({
           apiKey: "k",
           loading: false,
           snapshot: null,
         }),
-        { kind: "unavailable" },
+        { kind: "manual_entry" },
         "a finished refresh with no snapshot means the fetch could not run",
       );
     });
 
-    it("surfaces fetch errors when there is nothing cached to show", function () {
+    it("falls back to silent manual entry when the fetch failed", function () {
       assert.deepEqual(
         resolveProviderModelFetchStatus({
           apiKey: "k",
           loading: false,
           snapshot: { models: [], error: "catalog request failed: 401" },
         }),
-        { kind: "error", message: "catalog request failed: 401" },
+        { kind: "manual_entry" },
+        "fetch failures must not surface as red status lines",
       );
     });
 
@@ -232,14 +234,79 @@ describe("providerModelPicker", function () {
       );
     });
 
-    it("distinguishes an empty catalog from an error", function () {
+    it("treats an empty catalog as silent manual entry", function () {
       assert.deepEqual(
         resolveProviderModelFetchStatus({
           apiKey: "k",
           loading: false,
           snapshot: { models: [] },
         }),
-        { kind: "ready", total: 0, stale: false },
+        { kind: "manual_entry" },
+      );
+    });
+  });
+
+  describe("resolveModelEntryMode", function () {
+    it("uses manual entry while the catalog is unavailable", function () {
+      assert.equal(
+        resolveModelEntryMode({
+          status: { kind: "manual_entry" },
+          userCustomized: false,
+          inputFocused: false,
+        }),
+        "manual",
+      );
+    });
+
+    it("keeps the dropdown while a key is missing or a fetch runs", function () {
+      assert.equal(
+        resolveModelEntryMode({
+          status: { kind: "needs_api_key" },
+          userCustomized: false,
+          inputFocused: false,
+        }),
+        "select",
+      );
+      assert.equal(
+        resolveModelEntryMode({
+          status: { kind: "loading" },
+          userCustomized: false,
+          inputFocused: false,
+        }),
+        "select",
+      );
+    });
+
+    it("returns to the dropdown when models arrive and the input is idle", function () {
+      assert.equal(
+        resolveModelEntryMode({
+          status: { kind: "ready", total: 3, stale: false },
+          userCustomized: false,
+          inputFocused: false,
+        }),
+        "select",
+      );
+    });
+
+    it("never swaps the field away while the user is typing in it", function () {
+      assert.equal(
+        resolveModelEntryMode({
+          status: { kind: "ready", total: 3, stale: false },
+          userCustomized: false,
+          inputFocused: true,
+        }),
+        "manual",
+      );
+    });
+
+    it("honors an explicit Customized… choice regardless of the catalog", function () {
+      assert.equal(
+        resolveModelEntryMode({
+          status: { kind: "ready", total: 3, stale: false },
+          userCustomized: true,
+          inputFocused: false,
+        }),
+        "manual",
       );
     });
   });

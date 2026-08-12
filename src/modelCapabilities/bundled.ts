@@ -1,13 +1,40 @@
-import type { ModelCapabilityRegistry } from "./types";
+import type {
+  ModelCapabilityRegistry,
+  ModelReasoningCapability,
+} from "./types";
 
 /**
  * Bundled fallback.  Keep this intentionally small and conservative: the
  * remote registry can add new models, while this copy must remain safe when
  * the user is offline or GitHub is unavailable.
  */
+// K3 takes a top-level `reasoning_effort` and rejects the K2.x `thinking`
+// parameter (platform.kimi.ai "Reasoning Effort" + K2→K3 migration guide).
+const KIMI_K3_REASONING: ModelReasoningCapability = {
+  kind: "select",
+  defaultOptionId: "max",
+  options: [
+    {
+      id: "low",
+      label: "Low",
+      controls: { body: { reasoning_effort: "low" } },
+    },
+    {
+      id: "high",
+      label: "High",
+      controls: { body: { reasoning_effort: "high" } },
+    },
+    {
+      id: "max",
+      label: "Max",
+      controls: { body: { reasoning_effort: "max" } },
+    },
+  ],
+};
+
 export const BUNDLED_MODEL_CAPABILITY_REGISTRY: ModelCapabilityRegistry = {
   schemaVersion: 1,
-  revision: 1,
+  revision: 2,
   models: [
     {
       match: { provider: "kimi", prefix: "kimi-k2.6" },
@@ -47,33 +74,24 @@ export const BUNDLED_MODEL_CAPABILITY_REGISTRY: ModelCapabilityRegistry = {
     {
       match: { provider: "kimi", prefix: "kimi-k3" },
       limits: { contextWindowTokens: 1048576, inputTokens: 1048576 },
-      reasoning: {
-        kind: "select",
-        defaultOptionId: "max",
-        options: [
-          {
-            id: "low",
-            label: "Low",
-            controls: {
-              body: { thinking: { type: "enabled", effort: "low" } },
-            },
-          },
-          {
-            id: "high",
-            label: "High",
-            controls: {
-              body: { thinking: { type: "enabled", effort: "high" } },
-            },
-          },
-          {
-            id: "max",
-            label: "Max",
-            controls: {
-              body: { thinking: { type: "enabled", effort: "max" } },
-            },
-          },
-        ],
-      },
+      reasoning: KIMI_K3_REASONING,
+    },
+    {
+      // Kimi-for-Coding (api.kimi.com/coding/v1) serves the K3 family under
+      // bare ids: k3, k3-256k, kimi-for-coding, kimi-for-coding-highspeed.
+      match: { provider: "kimi", prefix: "k3" },
+      limits: { contextWindowTokens: 262144, inputTokens: 262144 },
+      reasoning: KIMI_K3_REASONING,
+    },
+    {
+      match: { provider: "kimi", exact: "k3-256k" },
+      limits: { contextWindowTokens: 262144, inputTokens: 262144 },
+      reasoning: KIMI_K3_REASONING,
+    },
+    {
+      match: { provider: "kimi", prefix: "kimi-for-coding" },
+      limits: { contextWindowTokens: 262144, inputTokens: 262144 },
+      reasoning: KIMI_K3_REASONING,
     },
     {
       match: { provider: "qwen", prefix: "qwen-long" },
