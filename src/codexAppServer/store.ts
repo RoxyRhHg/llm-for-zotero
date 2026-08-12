@@ -29,6 +29,7 @@ import {
   RUNTIME_CONVERSATION_KEY_END,
   isConversationKeyFor,
   isConversationKeyForKind,
+  getConversationKeyRange,
 } from "../shared/conversationKeySpace";
 import {
   buildLatestStoredMessagesQuery,
@@ -91,6 +92,7 @@ import {
 import {
   allocateConversationKeyInTransaction,
   withRetiredKeyErrorMapping,
+  nextUnissuedConversationKeyInRange,
   ConversationRetiredError,
   ensureConversationKeyLedgerEntry,
   ensureConversationKeyLedgerEntryInTransaction,
@@ -562,8 +564,12 @@ async function migrateLegacyCodexConversationKeys(): Promise<
           : getLastAllocatedCodexGlobalConversationKey()) || 0) + 1,
         (await getMaxCodexConversationKey(kind)) + 1,
       );
-      while (await isUnavailable(targetConversationKey))
-        targetConversationKey += 1;
+      const range = getConversationKeyRange("codex", kind);
+      targetConversationKey = await nextUnissuedConversationKeyInRange({
+        start: range.start,
+        endExclusive: range.endExclusive,
+        atLeast: targetConversationKey,
+      });
     }
 
     claimedKeys.add(targetConversationKey);

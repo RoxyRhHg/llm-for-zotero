@@ -640,6 +640,48 @@ export async function unretireConversationKeyInTransaction(params: {
   return true;
 }
 
+/**
+ * Next key to issue in a range, without searching for gaps.
+ *
+ * Migration fallbacks previously did `while (await isIssued(k)) k += 1`, which
+ * has three problems: it issues one query per occupied key; it has no ceiling,
+ * so it can walk out of its own range into another system's key space; and
+ * against a test double that answers every SELECT identically it never
+ * terminates, spinning a core indefinitely (observed: three such processes at
+ * ~97% CPU for 23 hours).
+ *
+ * It also contradicted the allocator's own rule -- keys are monotonic and gaps
+ * are never reused -- so this takes the range maximum in one query and fails
+ * closed when the range is exhausted.
+ */
+export async function nextUnissuedConversationKeyInRange(params: {
+  start: number;
+  endExclusive: number;
+  atLeast?: number;
+}): Promise<number> {
+  const db = getDb();
+  const start = normalizePositiveInt(params.start);
+  const endExclusive = normalizePositiveInt(params.endExclusive);
+  if (!db?.queryAsync || !start || !endExclusive || endExclusive <= start) {
+    throw new Error("Invalid conversation key allocation range");
+  }
+  const floor = Math.max(start, normalizePositiveInt(params.atLeast) || start);
+  const rows = (await db.queryAsync(
+    `SELECT MAX(conversation_key) AS maxKey
+     FROM ${KEY_LEDGER_TABLE}
+     WHERE conversation_key >= ? AND conversation_key < ?`,
+    [start, endExclusive],
+  )) as Array<{ maxKey?: unknown }> | undefined;
+  const maxIssued = normalizePositiveInt(rows?.[0]?.maxKey) || 0;
+  const next = Math.max(floor, maxIssued + 1);
+  if (next >= endExclusive) {
+    throw new Error(
+      `Conversation key range ${start}..${endExclusive} is exhausted`,
+    );
+  }
+  return next;
+}
+
 export async function retireOrphanedConversationLedgerEntries(params: {
   system: ConversationSystem;
   kind: ConversationKeyLedgerKind;

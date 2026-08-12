@@ -23,6 +23,7 @@ import {
 import {
   isConversationKeyFor,
   isConversationKeyForKind,
+  getConversationKeyRange,
 } from "../shared/conversationKeySpace";
 import {
   buildLatestStoredMessagesQuery,
@@ -84,6 +85,7 @@ import {
 import {
   allocateConversationKeyInTransaction,
   withRetiredKeyErrorMapping,
+  nextUnissuedConversationKeyInRange,
   ConversationRetiredError,
   ensureConversationKeyLedgerEntry,
   ensureConversationKeyLedgerEntryInTransaction,
@@ -476,8 +478,12 @@ async function migrateLegacyClaudeConversationKeys(): Promise<
           : getLastAllocatedClaudeGlobalConversationKey()) || 0) + 1,
         (await getMaxClaudeConversationKey(kind)) + 1,
       );
-      while (await isUnavailable(targetConversationKey))
-        targetConversationKey += 1;
+      const range = getConversationKeyRange("claude_code", kind);
+      targetConversationKey = await nextUnissuedConversationKeyInRange({
+        start: range.start,
+        endExclusive: range.endExclusive,
+        atLeast: targetConversationKey,
+      });
     }
 
     claimedKeys.add(targetConversationKey);

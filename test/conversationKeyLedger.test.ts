@@ -13,6 +13,7 @@ import {
   seedConversationKeyLedgerFromTombstones,
   reserveOrphanConversationMessageKeys,
   seedConversationKeyLedgerFromCatalogs,
+  nextUnissuedConversationKeyInRange,
   getConversationKeyQuarantineEntries,
   logConversationKeyQuarantineSummary,
   retireOrphanedConversationLedgerEntries,
@@ -737,6 +738,92 @@ describe("permanent conversation key ledger", function () {
     assert.equal(entries[0]!.conversationKey, 8200);
     assert.include(entries[0]!.reason, "conflicting-legacy-identity");
     assert.equal(await logConversationKeyQuarantineSummary(), 1);
+  });
+
+  describe("range allocation is monotonic and terminates", function () {
+    it("returns the next key above the range maximum, never a gap", async function () {
+      await initConversationKeyLedgerStore();
+      const zotero = globalScope.Zotero as any;
+      for (const key of [1000, 1001, 1005]) {
+        await zotero.DB.executeTransaction(() =>
+          ensureConversationKeyLedgerEntryInTransaction({
+            conversationKey: key,
+            instanceID: `instance-${key}`,
+            conversationID: `conversation-${key}`,
+            system: "upstream",
+            kind: "global",
+            profileSignature: "profile-test",
+            libraryID: 1,
+            issuedAt: 1,
+          }),
+        );
+      }
+      // 1002-1004 are gaps. Reusing them would contradict permanent non-reuse,
+      // so allocation continues above the maximum.
+      assert.equal(
+        await nextUnissuedConversationKeyInRange({
+          start: 1000,
+          endExclusive: 1100,
+        }),
+        1006,
+      );
+      // A caller-supplied floor is respected when it is higher.
+      assert.equal(
+        await nextUnissuedConversationKeyInRange({
+          start: 1000,
+          endExclusive: 1100,
+          atLeast: 1050,
+        }),
+        1050,
+      );
+    });
+
+    it("fails closed when the range is exhausted", async function () {
+      await initConversationKeyLedgerStore();
+      const zotero = globalScope.Zotero as any;
+      await zotero.DB.executeTransaction(() =>
+        ensureConversationKeyLedgerEntryInTransaction({
+          conversationKey: 1099,
+          instanceID: "instance-last",
+          conversationID: "conversation-last",
+          system: "upstream",
+          kind: "global",
+          profileSignature: "profile-test",
+          libraryID: 1,
+          issuedAt: 1,
+        }),
+      );
+      try {
+        await nextUnissuedConversationKeyInRange({
+          start: 1000,
+          endExclusive: 1100,
+        });
+        assert.fail("expected the exhausted range to throw");
+      } catch (error) {
+        assert.match(String(error), /exhausted/i);
+      }
+    });
+
+    // The superseded implementation walked keys with one query per occupied
+    // key and no ceiling. Against a stub that answers every SELECT the same
+    // way -- which several test doubles in this repo do -- it never
+    // terminated, spinning a core indefinitely.
+    it("terminates against a stub that answers every query identically", async function () {
+      await initConversationKeyLedgerStore();
+      const zotero = globalScope.Zotero as any;
+      const realQuery = zotero.DB.queryAsync;
+      zotero.DB.queryAsync = async (sql: string, params?: unknown[]) => {
+        if (sql.trimStart().toUpperCase().startsWith("SELECT")) {
+          return [{ conversationKey: 1, instanceID: "x", maxKey: undefined }];
+        }
+        return realQuery(sql, params);
+      };
+      const key = await nextUnissuedConversationKeyInRange({
+        start: 2000,
+        endExclusive: 2100,
+      });
+      assert.equal(key, 2000);
+    });
   });
 
   describe("orphan retirement requires evidence", function () {

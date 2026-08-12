@@ -63,6 +63,7 @@ import {
 import {
   allocateConversationKeyInTransaction,
   withRetiredKeyErrorMapping,
+  nextUnissuedConversationKeyInRange,
   ConversationRetiredError,
   ensureConversationKeyLedgerEntryInTransaction,
   getConversationKeyLedgerEntry,
@@ -1053,14 +1054,17 @@ async function getNextAvailableGlobalConversationKey(
       UPSTREAM_RUNTIME_CONVERSATION_KEY_END,
     ],
   )) as Array<{ maxConversationKey?: unknown }> | undefined;
-  let candidate = Number.isFinite(Number(rows?.[0]?.maxConversationKey))
+  const candidate = Number.isFinite(Number(rows?.[0]?.maxConversationKey))
     ? Math.max(
         UPSTREAM_GLOBAL_ALLOCATED_CONVERSATION_KEY_BASE,
         Math.floor(Number(rows?.[0]?.maxConversationKey)) + 1,
       )
     : UPSTREAM_GLOBAL_ALLOCATED_CONVERSATION_KEY_BASE;
-  while (await getConversationKeyLedgerEntry(candidate)) candidate += 1;
-  return candidate;
+  return nextUnissuedConversationKeyInRange({
+    start: UPSTREAM_GLOBAL_ALLOCATED_CONVERSATION_KEY_BASE,
+    endExclusive: UPSTREAM_RUNTIME_CONVERSATION_KEY_END,
+    atLeast: candidate,
+  });
 }
 
 type ConversationKeyRemap = {
