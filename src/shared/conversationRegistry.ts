@@ -530,7 +530,69 @@ async function migrateLegacyRegistrySchema(
   await db.queryAsync(`DROP TABLE IF EXISTS ${legacyTable}`);
 }
 
-export async function initConversationRegistryStore(): Promise<void> {
+/**
+ * True when the legacy-key index still carries the superseded UNIQUE
+ * constraint and therefore has to be replaced.
+ */
+async function isLegacyKeyIndexUnique(): Promise<boolean> {
+  const db = getZoteroDb();
+  if (!db?.queryAsync) return false;
+  try {
+    const rows = (await db.queryAsync(
+      `PRAGMA index_list(${CONVERSATION_REGISTRY_TABLE})`,
+    )) as Array<{ name?: unknown; unique?: unknown }> | undefined;
+    return (rows || []).some(
+      (row) =>
+        row?.name === CONVERSATION_REGISTRY_LEGACY_KEY_INDEX &&
+        Number(row?.unique) === 1,
+    );
+  } catch {
+    // Without PRAGMA support fall back to replacing it, which is correct but
+    // costs an index rebuild on this handle's first initialization only.
+    return true;
+  }
+}
+
+let registryInitTask: Promise<void> | null = null;
+let registryInitDbRef: unknown = null;
+
+/**
+ * Prepare the registry schema once per database handle.
+ *
+ * This runs schema work -- PRAGMA table_info, a backfill scan, and index
+ * maintenance -- and `getRegisteredConversationScope` awaits it on every
+ * lookup, from ~30 call sites including message append and history rendering.
+ * Unmemoized, each lookup paid all of it; worse, the legacy-key index was
+ * dropped and recreated each time, so a single conversation lookup rebuilt an
+ * index over the whole registry table.
+ *
+ * The result is cached against the DB handle so tests and profile switches,
+ * which swap the handle, still re-initialize.
+ */
+export function initConversationRegistryStore(): Promise<void> {
+  const db = getZoteroDb();
+  if (!db?.queryAsync) return Promise.resolve();
+  if (registryInitTask && registryInitDbRef === db) return registryInitTask;
+  registryInitDbRef = db;
+  registryInitTask = initConversationRegistryStoreUncached().catch((error) => {
+    // A failed init must not be cached as success: clear it so the next
+    // caller retries rather than running against an unprepared schema.
+    if (registryInitDbRef === db) {
+      registryInitTask = null;
+      registryInitDbRef = null;
+    }
+    throw error;
+  });
+  return registryInitTask;
+}
+
+/** Test-only reset so fixtures can swap the database between cases. */
+export function resetConversationRegistryStoreInitForTests(): void {
+  registryInitTask = null;
+  registryInitDbRef = null;
+}
+
+async function initConversationRegistryStoreUncached(): Promise<void> {
   const db = getZoteroDb();
   if (!db?.queryAsync) return;
   const columns = await getTableColumns(CONVERSATION_REGISTRY_TABLE);
@@ -551,9 +613,14 @@ export async function initConversationRegistryStore(): Promise<void> {
   // incompatible with immutable instances: a later conversation is allowed
   // to reuse the key after the old instance has been deleted.  Drop the old
   // unique index and retain only a lookup index.
-  await db.queryAsync(
-    `DROP INDEX IF EXISTS ${CONVERSATION_REGISTRY_LEGACY_KEY_INDEX}`,
-  );
+  //
+  // Only drop when the existing index is actually the unique one. Dropping
+  // unconditionally rebuilt the index over the whole table on every call.
+  if (await isLegacyKeyIndexUnique()) {
+    await db.queryAsync(
+      `DROP INDEX IF EXISTS ${CONVERSATION_REGISTRY_LEGACY_KEY_INDEX}`,
+    );
+  }
   await db.queryAsync(
     `CREATE INDEX IF NOT EXISTS ${CONVERSATION_REGISTRY_LEGACY_KEY_INDEX}
      ON ${CONVERSATION_REGISTRY_TABLE} (legacy_conversation_key, updated_at DESC)`,

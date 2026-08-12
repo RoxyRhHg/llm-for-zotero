@@ -647,59 +647,51 @@ export async function retireOrphanedConversationLedgerEntries(params: {
 }): Promise<void> {
   const db = getDb();
   if (!db?.queryAsync) return;
-  const rows = (await db.queryAsync(
-    `SELECT conversation_key AS conversationKey,
-            instance_id AS instanceID
-     FROM ${KEY_LEDGER_TABLE}
-     WHERE system = ? AND kind = ? AND retired_at IS NULL`,
-    [params.system, params.kind],
-  )) as Array<{ conversationKey?: unknown; instanceID?: unknown }> | undefined;
-  for (const row of rows || []) {
+  const catalogTables = params.catalogTables
+    .map((table) => table.replace(/[^A-Za-z0-9_]/g, ""))
+    .filter(Boolean);
+  if (!catalogTables.length) return;
+  // Ask for the orphans directly instead of reading every live entry and
+  // probing each catalog per row. This ran on every launch and cost roughly
+  // (live conversations x catalogs) queries; it now costs one, and normally
+  // returns nothing.
+  //
+  // Retirement is permanent with no automatic reversal, so absence of evidence
+  // must not be read as evidence of absence: if this query cannot run at all
+  // -- a missing table, a renamed column, a repair script mid-flight -- nothing
+  // is retired. The previous per-row loop skipped failed probes and then
+  // retired the key anyway, silently destroying live conversations.
+  const notInAnyCatalog = catalogTables
+    .map(
+      (table) => `NOT EXISTS (
+           SELECT 1 FROM ${table} c
+           WHERE c.conversation_key = l.conversation_key
+             AND c.conversation_instance_id = l.instance_id
+         )`,
+    )
+    .join(" AND ");
+  let rows: Array<{ conversationKey?: unknown; instanceID?: unknown }> = [];
+  try {
+    rows = ((await db.queryAsync(
+      `SELECT l.conversation_key AS conversationKey,
+              l.instance_id AS instanceID
+       FROM ${KEY_LEDGER_TABLE} l
+       WHERE l.system = ? AND l.kind = ? AND l.retired_at IS NULL
+         AND ${notInAnyCatalog}`,
+      [params.system, params.kind],
+    )) || []) as Array<{ conversationKey?: unknown; instanceID?: unknown }>;
+  } catch (error) {
+    logLedger("LLM: skipping orphan retirement; catalogs unreadable", {
+      system: params.system,
+      kind: params.kind,
+      error: String(error),
+    });
+    return;
+  }
+  for (const row of rows) {
     const key = normalizePositiveInt(row.conversationKey);
     const instanceID = normalizeText(row.instanceID, 128);
     if (!key || !instanceID) continue;
-    let hasCatalogWitness = false;
-    // Retirement is permanent and there is no automatic way back, so absence
-    // of evidence is not evidence of absence: the key may only be retired when
-    // a catalog was actually read and did not contain it.  Previously a probe
-    // that failed (missing table, renamed column, a repair script mid-flight)
-    // was skipped, and if every probe failed the key was retired anyway --
-    // silently destroying a live conversation.
-    let probedSuccessfully = false;
-    for (const table of params.catalogTables) {
-      const safeTable = table.replace(/[^A-Za-z0-9_]/g, "");
-      try {
-        const witnessRows = (await db.queryAsync(
-          `SELECT 1 AS present
-           FROM ${safeTable}
-           WHERE conversation_key = ?
-             AND conversation_instance_id = ?
-           LIMIT 1`,
-          [key, instanceID],
-        )) as Array<{ present?: unknown }> | undefined;
-        probedSuccessfully = true;
-        if (witnessRows?.length) {
-          hasCatalogWitness = true;
-          break;
-        }
-      } catch (error) {
-        if (
-          /no such table|no such column|unknown column/i.test(String(error))
-        ) {
-          continue;
-        }
-        throw error;
-      }
-    }
-    if (hasCatalogWitness) continue;
-    if (!probedSuccessfully) {
-      logLedger("LLM: skipping orphan retirement; no catalog could be read", {
-        conversationKey: key,
-        system: params.system,
-        kind: params.kind,
-      });
-      continue;
-    }
     // An orphan with surviving messages is not the crash artifact this pass
     // exists to clean up.  Retiring it would strand real user content behind a
     // permanently closed key, so leave it for identity repair instead.
@@ -1201,7 +1193,11 @@ export async function seedConversationKeyLedgerFromCatalogs(
                 library_id AS libraryID,
                 ${catalog.kind === "paper" ? "paper_item_id" : "NULL"} AS paperItemID,
                 COALESCE(last_activity_at, created_at, updated_at) AS issuedAt
-         FROM ${table}${catalog.kindColumn ? " WHERE kind = ?" : ""}`,
+         FROM ${table}
+         WHERE ${catalog.kindColumn ? "kind = ? AND " : ""}NOT EXISTS (
+           SELECT 1 FROM ${KEY_LEDGER_TABLE} l
+           WHERE l.conversation_key = ${table}.conversation_key
+         )`,
         catalog.kindColumn ? [catalog.kind] : undefined,
       )) as Array<Record<string, unknown>> | undefined;
     } catch (error) {
@@ -1214,7 +1210,11 @@ export async function seedConversationKeyLedgerFromCatalogs(
                 library_id AS libraryID,
                 ${catalog.kind === "paper" ? "paper_item_id" : "NULL"} AS paperItemID,
                 created_at AS issuedAt
-         FROM ${table}${catalog.kindColumn ? " WHERE kind = ?" : ""}`,
+         FROM ${table}
+         WHERE ${catalog.kindColumn ? "kind = ? AND " : ""}NOT EXISTS (
+           SELECT 1 FROM ${KEY_LEDGER_TABLE} l
+           WHERE l.conversation_key = ${table}.conversation_key
+         )`,
         catalog.kindColumn ? [catalog.kind] : undefined,
       )) as Array<Record<string, unknown>> | undefined;
     }

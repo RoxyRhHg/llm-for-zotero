@@ -62,7 +62,7 @@ import {
 } from "../shared/conversationSchemaMigrations";
 import {
   allocateConversationKeyInTransaction,
-  assertConversationKeyLiveInTransaction,
+  withRetiredKeyErrorMapping,
   ConversationRetiredError,
   ensureConversationKeyLedgerEntryInTransaction,
   getConversationKeyLedgerEntry,
@@ -573,17 +573,29 @@ async function resolveUpstreamAppendIdentity(
   conversationID: string | null;
   ledgerAvailable: boolean;
 }> {
-  const registered = await getRegisteredConversationScope(conversationKey);
-  let ledger;
   const ledgerAvailable = isConversationKeyLedgerStoreInitialized();
-  if (ledgerAvailable) {
-    ledger = await getConversationKeyLedgerEntry(conversationKey);
-  }
+  const ledger = ledgerAvailable
+    ? await getConversationKeyLedgerEntry(conversationKey)
+    : undefined;
+  // The registry is only consulted as a fallback when the ledger cannot answer.
+  // Reading it eagerly cost an extra query on every message append even though
+  // the normal path -- ledger initialized, entry present -- never uses it.
+  let registeredCache: Awaited<
+    ReturnType<typeof getRegisteredConversationScope>
+  > | null = null;
+  let registeredLoaded = false;
+  const registered = async () => {
+    if (!registeredLoaded) {
+      registeredCache = await getRegisteredConversationScope(conversationKey);
+      registeredLoaded = true;
+    }
+    return registeredCache;
+  };
   if (ledgerAvailable) {
     if (!ledger || ledger.retiredAt) {
       throw new ConversationRetiredError(
         conversationKey,
-        requestedInstanceID || registered?.instanceID || "",
+        requestedInstanceID || (await registered())?.instanceID || "",
       );
     }
     if (requestedInstanceID && requestedInstanceID !== ledger.instanceID) {
@@ -592,12 +604,18 @@ async function resolveUpstreamAppendIdentity(
       );
     }
   }
-  const instanceID =
-    ledger?.instanceID || requestedInstanceID || registered?.instanceID || null;
+  if (ledger?.instanceID && ledger?.conversationID) {
+    return {
+      instanceID: ledger.instanceID,
+      conversationID: ledger.conversationID,
+      ledgerAvailable,
+    };
+  }
+  const fallback = await registered();
   return {
-    instanceID,
-    conversationID:
-      ledger?.conversationID || registered?.conversationID || null,
+    instanceID:
+      ledger?.instanceID || requestedInstanceID || fallback?.instanceID || null,
+    conversationID: ledger?.conversationID || fallback?.conversationID || null,
     ledgerAvailable,
   };
 }
@@ -2584,113 +2602,122 @@ export async function appendMessage(
     instanceID,
   );
   const conversationID = appendIdentity.conversationID;
-  await Zotero.DB.executeTransaction(async () => {
-    if (appendIdentity.ledgerAvailable) {
-      await assertConversationKeyLiveInTransaction({
-        conversationKey: normalizedKey,
-        instanceID: appendIdentity.instanceID || "",
-      });
-      const catalogTable = isUpstreamPaperConversationKey(normalizedKey)
-        ? PAPER_CONVERSATIONS_TABLE
-        : GLOBAL_CONVERSATIONS_TABLE;
-      const catalogRows = (await Zotero.DB.queryAsync(
-        `SELECT conversation_id AS conversationID
+  // The database fence is the authority on retirement; translate its abort so
+  // callers keep the typed error the removed pre-check used to raise.
+  await withRetiredKeyErrorMapping(
+    normalizedKey,
+    appendIdentity.instanceID || "",
+    () =>
+      Zotero.DB.executeTransaction(async () => {
+        if (appendIdentity.ledgerAvailable) {
+          const catalogTable = isUpstreamPaperConversationKey(normalizedKey)
+            ? PAPER_CONVERSATIONS_TABLE
+            : GLOBAL_CONVERSATIONS_TABLE;
+          const catalogRows = (await Zotero.DB.queryAsync(
+            `SELECT conversation_id AS conversationID
          FROM ${catalogTable}
          WHERE conversation_key = ?
            AND conversation_instance_id = ?
          LIMIT 1`,
-        [normalizedKey, appendIdentity.instanceID],
-      )) as Array<{ conversationID?: unknown }> | undefined;
-      if (!catalogRows?.length) {
-        throw new ConversationRetiredError(
-          normalizedKey,
-          appendIdentity.instanceID || "",
-        );
-      }
-    }
-    const identityAvailable =
-      appendIdentity.ledgerAvailable || Boolean(appendIdentity.instanceID);
-    const identityColumn = identityAvailable
-      ? ", conversation_instance_id"
-      : "";
-    const identityPlaceholder = identityAvailable ? ", ?" : "";
-    await Zotero.DB.queryAsync(
-      `INSERT INTO ${CHAT_MESSAGES_TABLE}
+            [normalizedKey, appendIdentity.instanceID],
+          )) as Array<{ conversationID?: unknown }> | undefined;
+          if (!catalogRows?.length) {
+            throw new ConversationRetiredError(
+              normalizedKey,
+              appendIdentity.instanceID || "",
+            );
+          }
+        }
+        const identityAvailable =
+          appendIdentity.ledgerAvailable || Boolean(appendIdentity.instanceID);
+        const identityColumn = identityAvailable
+          ? ", conversation_instance_id"
+          : "";
+        const identityPlaceholder = identityAvailable ? ", ?" : "";
+        await Zotero.DB.queryAsync(
+          `INSERT INTO ${CHAT_MESSAGES_TABLE}
         (conversation_id, conversation_key, role, text, timestamp, run_mode, agent_run_id, selected_text, selected_text_contexts_json, selected_texts_json, selected_text_sources_json, selected_text_paper_contexts_json, selected_text_note_contexts_json, forced_skill_ids_json, paper_contexts_json, pdf_paper_contexts_json, full_text_paper_contexts_json, citation_paper_contexts_json, quote_citations_json, collection_contexts_json, tag_contexts_json, screenshot_images, attachments_json, model_attachments_json, generated_images_json, model_name, model_entry_id, model_provider_label, interrupted, webchat_run_state, webchat_completion_reason, reasoning_summary, reasoning_details, context_tokens, context_window${identityColumn})
        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?${identityPlaceholder})`,
-      [
-        conversationID,
-        normalizedKey,
-        message.role,
-        message.text,
-        Number.isFinite(timestamp) ? Math.floor(timestamp) : Date.now(),
-        message.runMode || null,
-        message.agentRunId || null,
-        selectedTexts[0] || message.selectedText || null,
-        selectedTextContexts.length
-          ? JSON.stringify(selectedTextContexts)
-          : null,
-        selectedTexts.length ? JSON.stringify(selectedTexts) : null,
-        selectedTextSources.length ? JSON.stringify(selectedTextSources) : null,
-        selectedTextPaperContexts.some((entry) => Boolean(entry))
-          ? JSON.stringify(selectedTextPaperContexts)
-          : null,
-        selectedTextNoteContexts.some((entry) => Boolean(entry))
-          ? JSON.stringify(selectedTextNoteContexts)
-          : null,
-        message.role === "user"
-          ? serializeForcedSkillIds(message.forcedSkillIds)
-          : null,
-        paperContexts.length ? JSON.stringify(paperContexts) : null,
-        pdfPaperContexts.length ? JSON.stringify(pdfPaperContexts) : null,
-        fullTextPaperContexts.length
-          ? JSON.stringify(fullTextPaperContexts)
-          : null,
-        citationPaperContexts.length
-          ? JSON.stringify(citationPaperContexts)
-          : null,
-        quoteCitations.length ? JSON.stringify(quoteCitations) : null,
-        selectedCollectionContexts.length
-          ? JSON.stringify(selectedCollectionContexts)
-          : null,
-        selectedTagContexts.length ? JSON.stringify(selectedTagContexts) : null,
-        screenshotImages.length ? JSON.stringify(screenshotImages) : null,
-        attachments.length ? JSON.stringify(attachments) : null,
-        hasExplicitModelAttachments ? JSON.stringify(modelAttachments) : null,
-        generatedImages.length ? JSON.stringify(generatedImages) : null,
-        message.modelName || null,
-        message.modelEntryId || null,
-        message.modelProviderLabel || null,
-        message.interrupted ? 1 : null,
-        message.webchatRunState || null,
-        message.webchatCompletionReason || null,
-        message.reasoningSummary || null,
-        message.reasoningDetails || null,
-        Number.isFinite(Number(message.contextTokens))
-          ? Math.floor(Number(message.contextTokens))
-          : null,
-        Number.isFinite(Number(message.contextWindow))
-          ? Math.floor(Number(message.contextWindow))
-          : null,
-        ...(identityAvailable ? [appendIdentity.instanceID] : []),
-      ],
-    );
-    // Adoption: once a real message is persisted into a webchat-flagged row
-    // (the user exited webchat mode and kept chatting in the draft), the row
-    // is a normal conversation and must become visible in history again.
-    await Zotero.DB.queryAsync(
-      `UPDATE ${
-        isUpstreamPaperConversationKey(normalizedKey)
-          ? PAPER_CONVERSATIONS_TABLE
-          : GLOBAL_CONVERSATIONS_TABLE
-      }
+          [
+            conversationID,
+            normalizedKey,
+            message.role,
+            message.text,
+            Number.isFinite(timestamp) ? Math.floor(timestamp) : Date.now(),
+            message.runMode || null,
+            message.agentRunId || null,
+            selectedTexts[0] || message.selectedText || null,
+            selectedTextContexts.length
+              ? JSON.stringify(selectedTextContexts)
+              : null,
+            selectedTexts.length ? JSON.stringify(selectedTexts) : null,
+            selectedTextSources.length
+              ? JSON.stringify(selectedTextSources)
+              : null,
+            selectedTextPaperContexts.some((entry) => Boolean(entry))
+              ? JSON.stringify(selectedTextPaperContexts)
+              : null,
+            selectedTextNoteContexts.some((entry) => Boolean(entry))
+              ? JSON.stringify(selectedTextNoteContexts)
+              : null,
+            message.role === "user"
+              ? serializeForcedSkillIds(message.forcedSkillIds)
+              : null,
+            paperContexts.length ? JSON.stringify(paperContexts) : null,
+            pdfPaperContexts.length ? JSON.stringify(pdfPaperContexts) : null,
+            fullTextPaperContexts.length
+              ? JSON.stringify(fullTextPaperContexts)
+              : null,
+            citationPaperContexts.length
+              ? JSON.stringify(citationPaperContexts)
+              : null,
+            quoteCitations.length ? JSON.stringify(quoteCitations) : null,
+            selectedCollectionContexts.length
+              ? JSON.stringify(selectedCollectionContexts)
+              : null,
+            selectedTagContexts.length
+              ? JSON.stringify(selectedTagContexts)
+              : null,
+            screenshotImages.length ? JSON.stringify(screenshotImages) : null,
+            attachments.length ? JSON.stringify(attachments) : null,
+            hasExplicitModelAttachments
+              ? JSON.stringify(modelAttachments)
+              : null,
+            generatedImages.length ? JSON.stringify(generatedImages) : null,
+            message.modelName || null,
+            message.modelEntryId || null,
+            message.modelProviderLabel || null,
+            message.interrupted ? 1 : null,
+            message.webchatRunState || null,
+            message.webchatCompletionReason || null,
+            message.reasoningSummary || null,
+            message.reasoningDetails || null,
+            Number.isFinite(Number(message.contextTokens))
+              ? Math.floor(Number(message.contextTokens))
+              : null,
+            Number.isFinite(Number(message.contextWindow))
+              ? Math.floor(Number(message.contextWindow))
+              : null,
+            ...(identityAvailable ? [appendIdentity.instanceID] : []),
+          ],
+        );
+        // Adoption: once a real message is persisted into a webchat-flagged row
+        // (the user exited webchat mode and kept chatting in the draft), the row
+        // is a normal conversation and must become visible in history again.
+        await Zotero.DB.queryAsync(
+          `UPDATE ${
+            isUpstreamPaperConversationKey(normalizedKey)
+              ? PAPER_CONVERSATIONS_TABLE
+              : GLOBAL_CONVERSATIONS_TABLE
+          }
        SET webchat_session = 0
        WHERE conversation_key = ?
          AND COALESCE(webchat_session, 0) = 1`,
-      [normalizedKey],
-    );
-    await refreshUpstreamConversationCatalogSummary(normalizedKey);
-  });
+          [normalizedKey],
+        );
+        await refreshUpstreamConversationCatalogSummary(normalizedKey);
+      }),
+  );
   await refreshUpstreamConversationSearchIndex(normalizedKey);
 }
 

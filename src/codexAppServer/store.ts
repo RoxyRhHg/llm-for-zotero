@@ -90,7 +90,7 @@ import {
 } from "../shared/conversationSchemaMigrations";
 import {
   allocateConversationKeyInTransaction,
-  assertConversationKeyLiveInTransaction,
+  withRetiredKeyErrorMapping,
   ConversationRetiredError,
   ensureConversationKeyLedgerEntry,
   ensureConversationKeyLedgerEntryInTransaction,
@@ -1721,93 +1721,98 @@ export async function appendCodexMessage(
   );
   const conversationID = appendIdentity.conversationID;
 
-  await Zotero.DB.executeTransaction(async () => {
-    if (appendIdentity.ledgerAvailable) {
-      await assertConversationKeyLiveInTransaction({
-        conversationKey: normalizedKey,
-        instanceID: appendIdentity.instanceID || "",
-      });
-      const catalogRows = (await Zotero.DB.queryAsync(
-        `SELECT conversation_id AS conversationID
+  // The database fence is the authority on retirement; translate its abort
+  // so callers keep the typed error the removed pre-check used to raise.
+  await withRetiredKeyErrorMapping(
+    normalizedKey,
+    appendIdentity.instanceID || "",
+    () =>
+      Zotero.DB.executeTransaction(async () => {
+        if (appendIdentity.ledgerAvailable) {
+          const catalogRows = (await Zotero.DB.queryAsync(
+            `SELECT conversation_id AS conversationID
          FROM ${CODEX_CONVERSATIONS_TABLE}
          WHERE conversation_key = ?
            AND conversation_instance_id = ?
          LIMIT 1`,
-        [normalizedKey, appendIdentity.instanceID],
-      )) as Array<{ conversationID?: unknown }> | undefined;
-      if (!catalogRows?.length) {
-        throw new ConversationRetiredError(
-          normalizedKey,
-          appendIdentity.instanceID || "",
-        );
-      }
-    }
-    const identityAvailable =
-      appendIdentity.ledgerAvailable || Boolean(appendIdentity.instanceID);
-    const identityColumn = identityAvailable
-      ? ", conversation_instance_id"
-      : "";
-    const identityPlaceholder = identityAvailable ? ", ?" : "";
-    await Zotero.DB.queryAsync(
-      `INSERT INTO ${CODEX_MESSAGES_TABLE}
+            [normalizedKey, appendIdentity.instanceID],
+          )) as Array<{ conversationID?: unknown }> | undefined;
+          if (!catalogRows?.length) {
+            throw new ConversationRetiredError(
+              normalizedKey,
+              appendIdentity.instanceID || "",
+            );
+          }
+        }
+        const identityAvailable =
+          appendIdentity.ledgerAvailable || Boolean(appendIdentity.instanceID);
+        const identityColumn = identityAvailable
+          ? ", conversation_instance_id"
+          : "";
+        const identityPlaceholder = identityAvailable ? ", ?" : "";
+        await Zotero.DB.queryAsync(
+          `INSERT INTO ${CODEX_MESSAGES_TABLE}
         (conversation_id, conversation_key, role, text, timestamp, run_mode, agent_run_id, selected_text, selected_text_contexts_json, selected_texts_json, selected_text_sources_json, selected_text_paper_contexts_json, selected_text_note_contexts_json, forced_skill_ids_json, paper_contexts_json, pdf_paper_contexts_json, full_text_paper_contexts_json, citation_paper_contexts_json, quote_citations_json, screenshot_images, attachments_json, generated_images_json, model_name, model_entry_id, model_provider_label, interrupted, webchat_run_state, webchat_completion_reason, reasoning_summary, reasoning_details, compact_marker, context_tokens, context_window${identityColumn})
        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?${identityPlaceholder})`,
-      [
-        conversationID,
-        normalizedKey,
-        message.role,
-        message.text || "",
-        messageTimestamp,
-        message.runMode || null,
-        message.agentRunId || null,
-        selectedTexts[0] || message.selectedText || null,
-        selectedTextContexts.length
-          ? JSON.stringify(selectedTextContexts)
-          : null,
-        selectedTexts.length ? JSON.stringify(selectedTexts) : null,
-        selectedTextSources.length ? JSON.stringify(selectedTextSources) : null,
-        selectedTextPaperContexts.some((entry) => Boolean(entry))
-          ? JSON.stringify(selectedTextPaperContexts)
-          : null,
-        selectedTextNoteContexts.some((entry) => Boolean(entry))
-          ? JSON.stringify(selectedTextNoteContexts)
-          : null,
-        message.role === "user"
-          ? serializeForcedSkillIds(message.forcedSkillIds)
-          : null,
-        paperContexts.length ? JSON.stringify(paperContexts) : null,
-        pdfPaperContexts.length ? JSON.stringify(pdfPaperContexts) : null,
-        fullTextPaperContexts.length
-          ? JSON.stringify(fullTextPaperContexts)
-          : null,
-        citationPaperContexts.length
-          ? JSON.stringify(citationPaperContexts)
-          : null,
-        quoteCitations.length ? JSON.stringify(quoteCitations) : null,
-        screenshotImages.length ? JSON.stringify(screenshotImages) : null,
-        attachments.length ? JSON.stringify(attachments) : null,
-        generatedImages.length ? JSON.stringify(generatedImages) : null,
-        message.modelName || null,
-        message.modelEntryId || null,
-        message.modelProviderLabel || null,
-        message.interrupted ? 1 : null,
-        message.webchatRunState || null,
-        message.webchatCompletionReason || null,
-        message.reasoningSummary || null,
-        message.reasoningDetails || null,
-        message.compactMarker ? 1 : 0,
-        Number.isFinite(Number(message.contextTokens))
-          ? Math.floor(Number(message.contextTokens))
-          : null,
-        Number.isFinite(Number(message.contextWindow))
-          ? Math.floor(Number(message.contextWindow))
-          : null,
-        ...(identityAvailable ? [appendIdentity.instanceID] : []),
-      ],
-    );
-    await touchCodexConversationActivity(normalizedKey, messageTimestamp);
-    await refreshCodexConversationCatalogSummary(normalizedKey);
-  });
+          [
+            conversationID,
+            normalizedKey,
+            message.role,
+            message.text || "",
+            messageTimestamp,
+            message.runMode || null,
+            message.agentRunId || null,
+            selectedTexts[0] || message.selectedText || null,
+            selectedTextContexts.length
+              ? JSON.stringify(selectedTextContexts)
+              : null,
+            selectedTexts.length ? JSON.stringify(selectedTexts) : null,
+            selectedTextSources.length
+              ? JSON.stringify(selectedTextSources)
+              : null,
+            selectedTextPaperContexts.some((entry) => Boolean(entry))
+              ? JSON.stringify(selectedTextPaperContexts)
+              : null,
+            selectedTextNoteContexts.some((entry) => Boolean(entry))
+              ? JSON.stringify(selectedTextNoteContexts)
+              : null,
+            message.role === "user"
+              ? serializeForcedSkillIds(message.forcedSkillIds)
+              : null,
+            paperContexts.length ? JSON.stringify(paperContexts) : null,
+            pdfPaperContexts.length ? JSON.stringify(pdfPaperContexts) : null,
+            fullTextPaperContexts.length
+              ? JSON.stringify(fullTextPaperContexts)
+              : null,
+            citationPaperContexts.length
+              ? JSON.stringify(citationPaperContexts)
+              : null,
+            quoteCitations.length ? JSON.stringify(quoteCitations) : null,
+            screenshotImages.length ? JSON.stringify(screenshotImages) : null,
+            attachments.length ? JSON.stringify(attachments) : null,
+            generatedImages.length ? JSON.stringify(generatedImages) : null,
+            message.modelName || null,
+            message.modelEntryId || null,
+            message.modelProviderLabel || null,
+            message.interrupted ? 1 : null,
+            message.webchatRunState || null,
+            message.webchatCompletionReason || null,
+            message.reasoningSummary || null,
+            message.reasoningDetails || null,
+            message.compactMarker ? 1 : 0,
+            Number.isFinite(Number(message.contextTokens))
+              ? Math.floor(Number(message.contextTokens))
+              : null,
+            Number.isFinite(Number(message.contextWindow))
+              ? Math.floor(Number(message.contextWindow))
+              : null,
+            ...(identityAvailable ? [appendIdentity.instanceID] : []),
+          ],
+        );
+        await touchCodexConversationActivity(normalizedKey, messageTimestamp);
+        await refreshCodexConversationCatalogSummary(normalizedKey);
+      }),
+  );
   await refreshCodexConversationSearchIndex(normalizedKey);
 }
 
