@@ -245,6 +245,15 @@ export type WorkflowTestPendingDeletionState = {
   persistedRowCount: number;
 };
 
+export type WorkflowTestPendingSendDeleteResult = {
+  conversationKeyBefore: number;
+  conversationKeyAfter?: number;
+  requestPendingBeforeClick: boolean;
+  requestPendingAfterClick: boolean;
+  pendingDeletionQueued: boolean;
+  statusText: string;
+};
+
 export type WorkflowTestHistoryRow = {
   conversationKey: number;
   title: string;
@@ -443,6 +452,10 @@ export type WorkflowTestApi = {
     conversationKey: number,
   ) => Promise<void>;
   clickPanelDelete: (panelId: string) => Promise<void>;
+  exercisePanelDeleteDuringPendingSend: (
+    panelId: string,
+    text: string,
+  ) => Promise<WorkflowTestPendingSendDeleteResult>;
   seedPanelStoredTurn: (
     panelId: string,
     userText: string,

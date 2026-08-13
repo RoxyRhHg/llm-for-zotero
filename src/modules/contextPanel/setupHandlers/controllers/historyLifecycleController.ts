@@ -3210,16 +3210,34 @@ export function createHistoryLifecycleController(
     }
   };
 
+  const rejectConversationDeletionWhileGenerating = (
+    conversationKey: number,
+  ): boolean => {
+    if (!isRequestPending(conversationKey)) return false;
+    if (status) {
+      setStatus(status, t("Cannot delete while generating"), "ready");
+    }
+    return true;
+  };
+
   const queueHistoryDeletion = async (
     entry: ConversationHistoryEntry,
     conversationSystem: ConversationSystem = getConversationSystem(),
   ): Promise<boolean> => {
     if (!item) return false;
     if (!entry.deletable) return false;
+    if (rejectConversationDeletionWhileGenerating(entry.conversationKey)) {
+      return false;
+    }
     const targetEntry = await hydrateHistoryEntryForDeletion(
       entry,
       conversationSystem,
     );
+    if (
+      rejectConversationDeletionWhileGenerating(targetEntry.conversationKey)
+    ) {
+      return false;
+    }
     const libraryID =
       normalizeHistoryPaperItemID(targetEntry.libraryID) ||
       getCurrentLibraryID();
@@ -3248,6 +3266,13 @@ export function createHistoryLifecycleController(
         kind: targetEntry.kind,
         conversationKey: targetEntry.conversationKey,
       });
+    // No await may separate this final check from queueConversationDeletion:
+    // that call freezes writes synchronously at the durable intent boundary.
+    if (
+      rejectConversationDeletionWhileGenerating(targetEntry.conversationKey)
+    ) {
+      return false;
+    }
     const queued = await pendingDeletionStore.queueConversationDeletion({
       conversationKind: targetEntry.kind,
       instanceID: identityWitness?.instanceID || "",
@@ -3322,6 +3347,9 @@ export function createHistoryLifecycleController(
       if (status) {
         setStatus(status, t("Deletion pending; retrying safely"), "warning");
       }
+      return false;
+    }
+    if (rejectConversationDeletionWhileGenerating(conversationKey)) {
       return false;
     }
 

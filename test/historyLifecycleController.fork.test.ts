@@ -9,6 +9,7 @@ import {
   chatHistory,
   conversationForkLinks,
   loadedConversationKeys,
+  setPendingRequestId,
 } from "../src/modules/contextPanel/state";
 import type { Message } from "../src/modules/contextPanel/types";
 import {
@@ -397,6 +398,7 @@ describe("historyLifecycleController fork behavior", function () {
     conversationForkLinks.delete(TARGET_CONVERSATION_KEY);
     loadedConversationKeys.delete(SOURCE_CONVERSATION_KEY);
     loadedConversationKeys.delete(TARGET_CONVERSATION_KEY);
+    setPendingRequestId(SOURCE_CONVERSATION_KEY, 0);
     resetPendingDeletionStoreForTests();
     configurePendingDeletionStoreEnv({
       setTimer: () => null,
@@ -422,6 +424,7 @@ describe("historyLifecycleController fork behavior", function () {
     conversationForkLinks.delete(TARGET_CONVERSATION_KEY);
     loadedConversationKeys.delete(SOURCE_CONVERSATION_KEY);
     loadedConversationKeys.delete(TARGET_CONVERSATION_KEY);
+    setPendingRequestId(SOURCE_CONVERSATION_KEY, 0);
     globalScope.Zotero = originalZotero;
     if (originalZtoolkit) {
       globalScope.ztoolkit = originalZtoolkit;
@@ -791,6 +794,28 @@ describe("historyLifecycleController fork behavior", function () {
       );
     });
   }
+
+  it("rejects header deletion while its conversation is generating", async function () {
+    let catalogRead = false;
+    conversationRepository.getCatalogEntry = async (params) => {
+      catalogRead = true;
+      return makeCatalogEntry({
+        conversationKey: params.conversationKey,
+        kind: params.kind,
+        libraryID: LIBRARY_ID,
+        userTurnCount: 1,
+      });
+    };
+    setPendingRequestId(SOURCE_CONVERSATION_KEY, 77);
+    const { controller, status } = createControllerHarness();
+
+    const queued = await controller.queueCurrentConversationDeletion();
+
+    assert.isFalse(queued);
+    assert.isFalse(catalogRead, "the guard should reject before DB hydration");
+    assert.equal(status.textContent, t("Cannot delete while generating"));
+    assert.isNull(pendingDeletionStore.getLatestPending());
+  });
 
   it("routes the Claude Code paper trash action through the same conversation deletion", async function () {
     const paperItem = {

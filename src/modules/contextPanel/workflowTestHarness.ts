@@ -10,6 +10,7 @@ import {
   chatHistory,
   loadedConversationKeys,
   paperContextModeOverrides,
+  isRequestPending,
 } from "./state";
 import type { ResolvedContextSource, SendQuestionOptions } from "./types";
 import type {
@@ -37,6 +38,7 @@ import type {
   WorkflowTestWebChatPdfToggleDiagnostics,
   WorkflowTestWebChatPdfTurn,
   WorkflowTestPendingDeletionState,
+  WorkflowTestPendingSendDeleteResult,
   WorkflowTestHistoryRow,
   WorkflowTestHistorySearchResult,
   WorkflowTestSeededTurn,
@@ -3003,6 +3005,128 @@ async function clickPanelDelete(panelId: string): Promise<void> {
   );
 }
 
+async function exercisePanelDeleteDuringPendingSend(
+  panelId: string,
+  text: string,
+): Promise<WorkflowTestPendingSendDeleteResult> {
+  assertWorkflowTestEnabled();
+  const panel = getPanel(panelId);
+  const mountedItem = activeContextPanels.get(panel.body)?.() || panel.item;
+  const conversationKeyBefore = getConversationKey(mountedItem);
+  if (!conversationKeyBefore) {
+    throw new Error("Workflow panel has no active conversation key");
+  }
+
+  const input = panel.body.querySelector(
+    "#llm-input",
+  ) as HTMLTextAreaElement | null;
+  const sendBtn = panel.body.querySelector(
+    "#llm-send",
+  ) as HTMLButtonElement | null;
+  if (!input || !sendBtn) {
+    throw new Error("Workflow panel composer was not rendered");
+  }
+
+  lastSend = null;
+  lastFinalRequest = null;
+  const sendSettledSequenceBefore = getWorkflowTestSendSettledSequence();
+  let finalRequestReached = false;
+  let releaseFinalRequest: () => void = () => {};
+  const finalRequestGate = new Promise<void>((resolve) => {
+    releaseFinalRequest = resolve;
+  });
+  setWorkflowTestSendInterceptor((opts) => {
+    opts.apiBase = "http://127.0.0.1:9/v1";
+    opts.apiKey = "workflow-test-key";
+    opts.authMode = "api_key";
+    lastSend = opts;
+    return true;
+  });
+  setWorkflowTestFinalRequestInterceptor(async (snapshot) => {
+    lastFinalRequest = snapshot;
+    finalRequestReached = true;
+    await finalRequestGate;
+    return true;
+  });
+
+  try {
+    input.value = text;
+    const eventCtor = panel.body.ownerDocument.defaultView?.Event ?? Event;
+    input.dispatchEvent(new eventCtor("input", { bubbles: true }));
+    sendBtn.click();
+
+    const pendingDeadline = Date.now() + 10_000;
+    while (
+      (!finalRequestReached || !isRequestPending(conversationKeyBefore)) &&
+      Date.now() < pendingDeadline
+    ) {
+      await Zotero.Promise.delay(25);
+    }
+    const requestPendingBeforeClick = isRequestPending(conversationKeyBefore);
+    if (!finalRequestReached || !requestPendingBeforeClick) {
+      throw new Error(
+        `Workflow send did not reach a pending provider boundary: ${JSON.stringify(
+          {
+            finalRequestReached,
+            requestPendingBeforeClick,
+            diagnostics: await getDiagnostics(panelId),
+          },
+        )}`,
+      );
+    }
+
+    dispatchWorkflowClick(
+      panel.body,
+      ".llm-clear-btn",
+      "Delete conversation button",
+    );
+
+    const decisionDeadline = Date.now() + 3_000;
+    let diagnostics = await getDiagnostics(panelId);
+    let pendingDeletionQueued =
+      pendingDeletionStore.isConversationPendingDeletion(conversationKeyBefore);
+    while (
+      diagnostics.conversationKey === conversationKeyBefore &&
+      !pendingDeletionQueued &&
+      !String(diagnostics.statusText || "").includes(
+        "Cannot delete while generating",
+      ) &&
+      Date.now() < decisionDeadline
+    ) {
+      await Zotero.Promise.delay(25);
+      diagnostics = await getDiagnostics(panelId);
+      pendingDeletionQueued =
+        pendingDeletionStore.isConversationPendingDeletion(
+          conversationKeyBefore,
+        );
+    }
+
+    return {
+      conversationKeyBefore,
+      conversationKeyAfter: diagnostics.conversationKey,
+      requestPendingBeforeClick,
+      requestPendingAfterClick: isRequestPending(conversationKeyBefore),
+      pendingDeletionQueued,
+      statusText: diagnostics.statusText || "",
+    };
+  } finally {
+    releaseFinalRequest();
+    const settledDeadline = Date.now() + 10_000;
+    while (
+      getWorkflowTestSendSettledSequence() <= sendSettledSequenceBefore &&
+      Date.now() < settledDeadline
+    ) {
+      await Zotero.Promise.delay(25);
+    }
+    setWorkflowTestSendInterceptor((opts) => {
+      lastSend = opts;
+    });
+    setWorkflowTestFinalRequestInterceptor((snapshot) => {
+      lastFinalRequest = snapshot;
+    });
+  }
+}
+
 async function seedPanelStoredTurn(
   panelId: string,
   userText: string,
@@ -3281,6 +3405,7 @@ export function installWorkflowTestHarness(targetAddon: {
     listPanelHistory,
     deletePanelHistoryConversation,
     clickPanelDelete,
+    exercisePanelDeleteDuringPendingSend,
     seedPanelStoredTurn,
     deletePanelTurn,
     clickPanelUndo,

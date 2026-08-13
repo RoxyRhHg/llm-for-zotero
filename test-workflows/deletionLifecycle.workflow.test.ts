@@ -144,6 +144,51 @@ describe("deletion lifecycle", function () {
     });
   }
 
+  it("rejects header trash while the active conversation is generating", async function () {
+    await withPrefs(
+      {
+        enableCodexAppServerMode: false,
+        enableClaudeCodeMode: false,
+        conversationSystem: "upstream",
+      },
+      async () =>
+        surfacing(async () => {
+          const api = getWorkflowTestApi();
+          await api.reset();
+          const fixture = await api.createPaperWithPdfFixture({
+            title: "Pending Header Delete Paper",
+            pdfTitle: "pending-header-delete.pdf",
+          });
+          try {
+            const panel = await api.renderPanelForItem(fixture.parentItemId);
+            const result = await api.exercisePanelDeleteDuringPendingSend(
+              panel.panelId,
+              "Keep this request active while I click delete",
+            );
+
+            assert.isTrue(result.requestPendingBeforeClick);
+            assert.isTrue(result.requestPendingAfterClick);
+            assert.equal(
+              result.conversationKeyAfter,
+              result.conversationKeyBefore,
+              JSON.stringify(result),
+            );
+            assert.isFalse(
+              result.pendingDeletionQueued,
+              JSON.stringify(result),
+            );
+            assert.include(
+              result.statusText,
+              "Cannot delete while generating",
+              JSON.stringify(result),
+            );
+          } finally {
+            await api.cleanupFixture(fixture);
+          }
+        }),
+    );
+  });
+
   it("delete → remount (user switches) → undo from the new panel restores the chat", async function () {
     await surfacing(async () => {
       const api = getWorkflowTestApi();
