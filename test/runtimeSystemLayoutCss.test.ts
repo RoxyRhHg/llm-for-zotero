@@ -49,6 +49,22 @@ describe("runtime system control layout", function () {
     );
   });
 
+  it("keeps the mode chip label at chrome size so the header row ignores font scale", function () {
+    const css = source("addon/content/zoteroPane.css");
+    const modeChipRule = extractCssRule(css, ".llm-mode-chip");
+
+    // Every other control in the header row is a fixed size that ignores
+    // --llm-font-scale (20px history buttons, 24px runtime toggles, 28px action
+    // icons, and this pill's own 22px height). Scaling only the chip's text made
+    // it the single width-variable element in that row, so at large font scales
+    // it outgrew the header's first grid column and painted over
+    // .llm-header-actions instead of shrinking — the chip is pinned rigid by the
+    // assertions above, so overlap was the only outlet left.
+    assert.include(modeChipRule, "font-size: 12px");
+    assert.notInclude(modeChipRule, "font-size: var(--llm-fs-12)");
+    assert.include(modeChipRule, "height: 22px");
+  });
+
   it("keeps both runtime buttons fixed at 24px and in normal flow", function () {
     const css = source("addon/content/zoteroPane.css");
     const buttonRule = extractCssRule(css, ".llm-runtime-system-toggle");

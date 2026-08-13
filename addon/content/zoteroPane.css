@@ -547,7 +547,17 @@
   background: var(--fill-quinary);
   cursor: pointer;
   font: inherit;
-  font-size: var(--llm-fs-12);
+  /*
+   * Header chrome does not scale with --llm-font-scale: the runtime toggles are
+   * locked at 24px, the action icons at 28px, the history buttons at 20px, and
+   * this pill at 22px tall. Scaling only the chip's text made it the one
+   * width-variable element in a fixed-width row, so at large font scales it
+   * outgrew the header's first grid column and overflowed onto
+   * .llm-header-actions (43px of overlap at a 316px sidebar, font scale 1.8).
+   * It also overflowed its own 22px pill vertically. Keep the label pinned to
+   * the chrome size so the row's width is independent of the font setting.
+   */
+  font-size: 12px;
   font-weight: 600;
   color: var(--fill-primary);
   padding: 2px 9px;
