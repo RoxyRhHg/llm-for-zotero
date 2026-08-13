@@ -1748,6 +1748,30 @@ async function getStandaloneDiagnostics(): Promise<WorkflowTestStandaloneDiagnos
   return readStandaloneDiagnostics();
 }
 
+async function ensureStandaloneWorkflowPanelReady(): Promise<{
+  contentArea: HTMLElement;
+  item: Zotero.Item;
+}> {
+  const doc = await waitForStandaloneReady();
+  const contentArea = doc.querySelector(
+    ".llm-standalone-content",
+  ) as HTMLElement | null;
+  let item = contentArea
+    ? activeContextPanels.get(contentArea)?.() || null
+    : null;
+  if (!contentArea || !item) {
+    throw new Error("Standalone workflow chat panel is not mounted");
+  }
+
+  // Standalone mounting provisions and hydrates the conversation in a detached
+  // async task. Await the same gate a real send uses instead of assuming that a
+  // fixed paint delay is long enough under database or migration load.
+  await ensureConversationLoaded(item);
+  item = activeContextPanels.get(contentArea)?.() || item;
+  refreshChat(contentArea, item);
+  return { contentArea, item };
+}
+
 async function openStandaloneForItem(
   itemId: number,
 ): Promise<WorkflowTestStandaloneDiagnostics> {
@@ -1757,8 +1781,7 @@ async function openStandaloneForItem(
   await closeStandalone();
   await selectZoteroItemForWorkflow(itemId).catch(() => undefined);
   openStandaloneChat({ initialItem: item });
-  await waitForStandaloneReady();
-  await Zotero.Promise.delay(150);
+  await ensureStandaloneWorkflowPanelReady();
   return readStandaloneDiagnostics();
 }
 
@@ -1783,7 +1806,7 @@ async function clickStandaloneTab(
   ) as HTMLButtonElement | null;
   if (!button) throw new Error(`Standalone ${tab} tab was not rendered`);
   button.click();
-  await Zotero.Promise.delay(250);
+  await ensureStandaloneWorkflowPanelReady();
   return readStandaloneDiagnostics();
 }
 
@@ -1981,17 +2004,11 @@ async function seedStandaloneUserMessage(
   text: string,
 ): Promise<WorkflowTestStandaloneDiagnostics> {
   assertWorkflowTestEnabled();
-  const doc = await waitForStandaloneReady();
-  const contentArea = doc.querySelector(
-    ".llm-standalone-content",
-  ) as HTMLElement | null;
-  const item = contentArea
-    ? activeContextPanels.get(contentArea)?.() || null
-    : null;
-  if (!contentArea || !item) {
-    throw new Error("Standalone workflow chat panel is not mounted");
-  }
+  const { contentArea, item } = await ensureStandaloneWorkflowPanelReady();
   const conversationKey = getConversationKey(item);
+  if (!conversationKey) {
+    throw new Error("Standalone workflow panel has no active conversation key");
+  }
   const message = {
     role: "user" as const,
     text,
@@ -2000,13 +2017,21 @@ async function seedStandaloneUserMessage(
   const conversationSystem =
     (contentArea.querySelector("#llm-main") as HTMLElement | null)?.dataset
       .conversationSystem || "upstream";
-  await appendWorkflowStoredMessage(
-    conversationSystem === "codex" || conversationSystem === "claude_code"
-      ? conversationSystem
-      : "upstream",
-    conversationKey,
-    message,
-  );
+  try {
+    await appendWorkflowStoredMessage(
+      conversationSystem === "codex" || conversationSystem === "claude_code"
+        ? conversationSystem
+        : "upstream",
+      conversationKey,
+      message,
+    );
+  } catch (error) {
+    throw new Error(
+      `Standalone workflow seed failed (${text}) for key ${conversationKey}: ${String(
+        (error as Error)?.message || error,
+      )}`,
+    );
+  }
   chatHistory.set(conversationKey, [message]);
   loadedConversationKeys.add(conversationKey);
   refreshChat(contentArea, item);

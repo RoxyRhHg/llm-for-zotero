@@ -1,5 +1,6 @@
 import { defineConfig } from "zotero-plugin-scaffold";
 import pkg from "./package.json";
+import { patchGeneratedWorkflowTestReporter } from "./scripts/workflow-test-reporter.mjs";
 
 const webChatLiveTestsEnabled = process.env.LLM_FOR_ZOTERO_WEBCHAT_LIVE === "1";
 const workflowTestsEnabled =
@@ -60,6 +61,9 @@ export default defineConfig({
           watch: false,
         }
       : {}),
+    hooks: {
+      "test:bundleTests": () => patchGeneratedWorkflowTestReporter(),
+    },
     waitForPlugin: `() => Zotero.${pkg.config.addonInstance}.data.initialized`,
   },
 
