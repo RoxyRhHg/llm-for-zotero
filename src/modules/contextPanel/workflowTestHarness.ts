@@ -1085,6 +1085,53 @@ function readWebChatPdfChipState(
   };
 }
 
+/*
+ * The PDF chip is re-rendered as a fresh element rather than mutated in place,
+ * so reading it a fixed number of milliseconds after an action is a race: on an
+ * idle machine the new node is always there in time, and on a loaded CI runner
+ * it sometimes is not, which silently yields the previous chip's state. Wait for
+ * the state itself instead of for the clock.
+ */
+async function waitForChipState(
+  panel: PanelRecord,
+  predicate: (state: WorkflowTestWebChatPdfChipState) => boolean,
+  label: string,
+  timeoutMs = 2000,
+): Promise<WorkflowTestWebChatPdfChipState> {
+  const startedAt = Date.now();
+  let state = readWebChatPdfChipState(panel);
+  while (!predicate(state)) {
+    if (Date.now() - startedAt > timeoutMs) {
+      throw new Error(
+        `Timed out after ${timeoutMs}ms waiting for ${label}; last chip state was ${JSON.stringify(state)}`,
+      );
+    }
+    await Zotero.Promise.delay(10);
+    state = readWebChatPdfChipState(panel);
+  }
+  return state;
+}
+
+/*
+ * A second panel mounted on the same item mirrors the first, and the test's
+ * whole point is that the two never disagree. The mirror syncs after the panel
+ * that was acted on, so read it once it has converged rather than immediately.
+ * If it never converges that is a real defect, and this reports it as an
+ * explicit timeout naming both states instead of quietly returning stale data.
+ */
+async function readMirrorChipStateInSyncWith(
+  mirrorPanel: PanelRecord | null,
+  primary: WorkflowTestWebChatPdfChipState,
+  label: string,
+): Promise<WorkflowTestWebChatPdfChipState | null> {
+  if (!mirrorPanel) return null;
+  return waitForChipState(
+    mirrorPanel,
+    (state) => state.fullText === primary.fullText,
+    `the mirror panel's PDF chip to match the acted-on panel ${label} (expected fullText=${primary.fullText})`,
+  );
+}
+
 async function toggleWebChatPdfChip(
   panel: PanelRecord,
 ): Promise<{ defaultPrevented: boolean; statusText: string }> {
@@ -1101,8 +1148,15 @@ async function toggleWebChatPdfChip(
     cancelable: true,
     button: 2,
   });
+  // The toggle always flips the chip between full-text and retrieval, so the
+  // flip is an exact condition to wait on rather than a stability guess.
+  const fullTextBefore = readWebChatPdfChipState(panel).fullText;
   chip.dispatchEvent(event);
-  await Zotero.Promise.delay(50);
+  await waitForChipState(
+    panel,
+    (state) => state.fullText !== fullTextBefore,
+    "the WebChat PDF chip to flip after the toggle",
+  );
   return {
     defaultPrevented: event.defaultPrevented,
     statusText:
@@ -1119,6 +1173,11 @@ async function captureWebChatPdfTurn(
 ): Promise<WorkflowTestWebChatPdfTurn> {
   let modeBeforeOutcome = "";
   let modeAfterOutcome = "";
+  // A successful send that carried the PDF spends it, greying the chip out.
+  // Anything else -- a prompt-only send, or a send that failed and so delivered
+  // nothing -- must leave the chip exactly as it was. That makes the final
+  // state an exact value to wait for rather than something to sample and hope.
+  const fullTextBeforeTurn = readWebChatPdfChipState(panel).fullText;
   setWorkflowTestSendInterceptor((opts) => {
     lastSend = opts;
     modeBeforeOutcome = readWebChatPdfChipState(panel).modeOverride;
@@ -1140,7 +1199,15 @@ async function captureWebChatPdfTurn(
     modeAfterOutcome = readWebChatPdfChipState(panel).modeOverride;
   });
   const send = await ask(panel.id, question);
-  await Zotero.Promise.delay(50);
+  const expectedFullText =
+    send.webchatSendPdf === true && outcome === "success"
+      ? false
+      : fullTextBeforeTurn;
+  const chipAfterTurn = await waitForChipState(
+    panel,
+    (state) => state.fullText === expectedFullText,
+    `the WebChat PDF chip to settle at fullText=${expectedFullText} after the ${outcome} turn`,
+  );
   return {
     question: send.question,
     outcome,
@@ -1150,7 +1217,7 @@ async function captureWebChatPdfTurn(
     ),
     modeBeforeOutcome,
     modeAfterOutcome,
-    chipAfterTurn: readWebChatPdfChipState(panel),
+    chipAfterTurn,
   };
 }
 
@@ -1167,52 +1234,68 @@ async function exerciseWebChatPdfToggleWorkflow(
   }
 
   const initialChip = readWebChatPdfChipState(panel);
-  const mirrorInitialChip = mirrorPanel
-    ? readWebChatPdfChipState(mirrorPanel)
-    : null;
+  const mirrorInitialChip = await readMirrorChipStateInSyncWith(
+    mirrorPanel,
+    initialChip,
+    "initially",
+  );
   try {
     const initialPdfTurn = await captureWebChatPdfTurn(
       panel,
       "workflow pdf initial turn",
       "success",
     );
-    const mirrorAfterInitialPdfTurn = mirrorPanel
-      ? readWebChatPdfChipState(mirrorPanel)
-      : null;
+    const mirrorAfterInitialPdfTurn = await readMirrorChipStateInSyncWith(
+      mirrorPanel,
+      initialPdfTurn.chipAfterTurn,
+      "after the initial PDF turn",
+    );
     const automaticPromptOnlyTurn = await captureWebChatPdfTurn(
       panel,
       "workflow automatic prompt-only turn",
       "success",
     );
-    const mirrorAfterAutomaticPromptOnlyTurn = mirrorPanel
-      ? readWebChatPdfChipState(mirrorPanel)
-      : null;
+    const mirrorAfterAutomaticPromptOnlyTurn =
+      await readMirrorChipStateInSyncWith(
+        mirrorPanel,
+        automaticPromptOnlyTurn.chipAfterTurn,
+        "after the automatic prompt-only turn",
+      );
     const toggleOn = await toggleWebChatPdfChip(panel);
     const chipAfterToggleOn = readWebChatPdfChipState(panel);
-    const mirrorAfterToggleOn = mirrorPanel
-      ? readWebChatPdfChipState(mirrorPanel)
-      : null;
+    const mirrorAfterToggleOn = await readMirrorChipStateInSyncWith(
+      mirrorPanel,
+      chipAfterToggleOn,
+      "after toggling the PDF back on",
+    );
     const failedPdfTurn = await captureWebChatPdfTurn(
       panel,
       "workflow failed pdf turn",
       "failed",
     );
-    const mirrorAfterFailedPdfTurn = mirrorPanel
-      ? readWebChatPdfChipState(mirrorPanel)
-      : null;
+    const mirrorAfterFailedPdfTurn = await readMirrorChipStateInSyncWith(
+      mirrorPanel,
+      failedPdfTurn.chipAfterTurn,
+      "after the failed PDF turn",
+    );
     const toggleOff = await toggleWebChatPdfChip(panel);
     const chipAfterToggleOff = readWebChatPdfChipState(panel);
-    const mirrorAfterToggleOff = mirrorPanel
-      ? readWebChatPdfChipState(mirrorPanel)
-      : null;
+    const mirrorAfterToggleOff = await readMirrorChipStateInSyncWith(
+      mirrorPanel,
+      chipAfterToggleOff,
+      "after toggling the PDF off",
+    );
     const explicitPromptOnlyTurn = await captureWebChatPdfTurn(
       panel,
       "workflow explicit prompt-only turn",
       "success",
     );
-    const mirrorAfterExplicitPromptOnlyTurn = mirrorPanel
-      ? readWebChatPdfChipState(mirrorPanel)
-      : null;
+    const mirrorAfterExplicitPromptOnlyTurn =
+      await readMirrorChipStateInSyncWith(
+        mirrorPanel,
+        explicitPromptOnlyTurn.chipAfterTurn,
+        "after the explicit prompt-only turn",
+      );
 
     return {
       webChatMode: true,
@@ -1259,8 +1342,9 @@ async function toggleWebChatPdfChipForWorkflow(
 ): Promise<WorkflowTestWebChatPdfChipState> {
   assertWorkflowTestEnabled();
   const panel = getPanel(panelId);
+  // toggleWebChatPdfChip now returns only once the flip has actually landed, so
+  // there is nothing left to sleep for.
   await toggleWebChatPdfChip(panel);
-  await Zotero.Promise.delay(100);
   return readWebChatPdfChipState(panel);
 }
 
