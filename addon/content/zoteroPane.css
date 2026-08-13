@@ -951,20 +951,6 @@
 }
 
 @container (max-width: 380px) {
-  /*
-   * Compact header. Below this width the row is already down to icon-only
-   * buttons, and the fixed furniture around the chip (20px history buttons,
-   * 54px runtime toggles, 96px action icons, gaps) leaves it barely 100px --
-   * about 14px of label text. The chip is pinned rigid elsewhere in this file,
-   * so a scaled label here cannot shrink or truncate and instead overflows the
-   * header's first grid column onto .llm-header-actions. Stop scaling it here
-   * only; at any usable sidebar width the label scales with --llm-font-scale as
-   * normal.
-   */
-  .llm-mode-chip {
-    font-size: 12px;
-  }
-
   .llm-header-actions {
     gap: 0;
   }
@@ -975,6 +961,18 @@
     height: 24px;
     min-height: 24px;
     padding: 0;
+  }
+
+  /*
+   * Tighten the leading gaps when the trailing icons compact, so the space
+   * comes out of the chrome rather than out of the mode chip's label. The chip
+   * is the only element here that scales with --llm-font-scale, and it is
+   * pinned rigid, so every pixel reclaimed from these gaps is headroom the
+   * label can grow into before it reaches the action icons. The icons keep
+   * their own size — only the spacing between them closes up.
+   */
+  .llm-history-bar {
+    gap: 4px;
   }
 
   .llm-clear-btn {
@@ -2253,7 +2251,13 @@
   gap: 12px;
   padding: 0 16px;
   font-size: var(--llm-fs-12);
-  line-height: 20px;
+  /*
+   * The row is sized purely by this line box (no height, no vertical padding),
+   * so a fixed 20px clipped the descenders off the document title as soon as
+   * --llm-font-scale pushed the glyphs past it. Scale the row with the text:
+   * identical 20px at scale 1, taller as the font grows.
+   */
+  line-height: calc(20px * var(--llm-font-scale));
   font-weight: 500;
   color: var(--fill-primary);
   border-bottom: 1px solid var(--stroke-secondary);

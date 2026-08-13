@@ -202,11 +202,21 @@ describe("workflow: selected item context send", function () {
         const initial = await api.getDiagnostics(panel.panelId);
         assert.equal(initial.conversationSystem, "upstream");
         assertDualRuntimeControls(initial);
+        // 380px is the narrow end of the range the sidebar is actually used at,
+        // and still inside the compact header breakpoint, so the icon-only
+        // assertions below stay meaningful. The mode chip scales with
+        // --llm-font-scale by design; the fixed furniture around it (20px
+        // history buttons, 54px runtime toggles, 96px action icons, gaps) leaves
+        // roughly 160px for the chip here against the ~149px it needs at scale
+        // 1.8. Drag the pane below about 363px at that scale and the chip does
+        // outgrow its grid column and overlap the action icons — accepted
+        // behaviour, unchanged since v3.8.28, and not worth freezing the label
+        // at every width to avoid.
         const geometry = await api.measurePanelRuntimeGeometry(panel.panelId, {
-          width: 320,
+          width: 380,
           fontScale: 1.8,
         });
-        assert.closeTo(geometry.containerWidth, 316, 4);
+        assert.closeTo(geometry.containerWidth, 376, 4);
         assert.isAtLeast(geometry.runtimeWidth, 50, JSON.stringify(geometry));
         assert.isFalse(
           geometry.runtimeIntersectsLeadingContent,

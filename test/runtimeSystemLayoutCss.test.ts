@@ -49,22 +49,47 @@ describe("runtime system control layout", function () {
     );
   });
 
-  it("scales the mode chip label with the font setting, capped only in the compact header", function () {
+  it("scales the mode chip label with the plugin font setting at every width", function () {
     const css = source("addon/content/zoteroPane.css");
     const modeChipRule = extractCssRule(css, ".llm-mode-chip");
-    const compactBlock =
-      css.match(/@container \(max-width: 380px\) \{[\s\S]*?\n\}/)?.[0] || "";
-    const compactChipRule = extractCssRule(compactBlock, ".llm-mode-chip");
 
-    // The label must scale with --llm-font-scale at any usable sidebar width —
-    // a static chip is a downgrade at the widths people actually use.
+    // The label follows --llm-font-scale like the rest of the plugin's text.
+    // A static chip, or one frozen behind a width breakpoint, is a downgrade at
+    // the sidebar widths people actually use — it stops responding to the font
+    // size shortcuts.
     assert.include(modeChipRule, "font-size: var(--llm-fs-12)");
 
-    // Below the compact breakpoint the fixed furniture (20px history buttons,
-    // 54px runtime toggles, 96px action icons, gaps) leaves the chip barely
-    // 100px, and the assertions above pin it rigid, so a scaled label there
-    // cannot shrink or truncate — it overflows onto .llm-header-actions.
-    assert.include(compactChipRule, "font-size: 12px");
+    // No width breakpoint may pin it either: the compact header shrinks buttons
+    // to icons, but the chip keeps scaling.
+    const compactBlock =
+      css.match(/@container \(max-width: 380px\) \{[\s\S]*?\n\}/)?.[0] || "";
+    assert.notEqual(compactBlock, "", "compact header block must still exist");
+    assert.notInclude(compactBlock, ".llm-mode-chip");
+  });
+
+  it("tightens the leading gaps in the compact header without resizing the icons", function () {
+    const css = source("addon/content/zoteroPane.css");
+    const compactBlock =
+      css.match(/@container \(max-width: 380px\) \{[\s\S]*?\n\}/)?.[0] || "";
+    const historyBarCompactRule = extractCssRule(
+      compactBlock,
+      ".llm-history-bar",
+    );
+    // Both selectors appear in a shared rule before their sized ones, so
+    // collect every rule that targets them rather than just the first match.
+    const historyIconRules = (
+      css.match(/\.llm-history-(?:new|toggle)\s*\{[^}]*\}/g) || []
+    ).join("\n");
+
+    // The chip is the only element in this row that scales with
+    // --llm-font-scale, and it is pinned rigid, so it can only grow into space
+    // the fixed chrome gives up. Reclaim that from the spacing, not from the
+    // icons — their 20px size is deliberate and must not follow the width.
+    assert.include(historyBarCompactRule, "gap: 4px");
+    assert.include(historyIconRules, "width: 20px");
+    assert.notInclude(historyIconRules, "width: 16px");
+    assert.notInclude(compactBlock, ".llm-history-new");
+    assert.notInclude(compactBlock, ".llm-history-toggle");
   });
 
   it("keeps both runtime buttons fixed at 24px and in normal flow", function () {
