@@ -38,31 +38,32 @@ type RegistryRow = RuntimeConversationRow & {
   invalidReason?: string | null;
 };
 
+type LedgerRow = {
+  conversationKey: number;
+  instanceID: string;
+  conversationID: string;
+  system: string;
+  kind: string;
+  profileSignature: string;
+  libraryID: number;
+  paperItemID?: number | null;
+  issuedAt: number;
+  retiredAt?: number | null;
+};
+
 function installProvisioningDb(): {
   queries: QueryRecord[];
   conversations: Map<number, RuntimeConversationRow>;
   registry: Map<number, RegistryRow>;
+  ledger: Map<number, LedgerRow>;
   restore: () => void;
 } {
   const originalZotero = globalThis.Zotero;
   const queries: QueryRecord[] = [];
   const conversations = new Map<number, RuntimeConversationRow>();
   const registry = new Map<number, RegistryRow>();
-  const ledger = new Map<
-    number,
-    {
-      conversationKey: number;
-      instanceID: string;
-      conversationID: string;
-      system: string;
-      kind: string;
-      profileSignature: string;
-      libraryID: number;
-      paperItemID?: number | null;
-      issuedAt: number;
-      retiredAt?: number | null;
-    }
-  >();
+  let transactionTail: Promise<void> = Promise.resolve();
+  const ledger = new Map<number, LedgerRow>();
   (globalThis as typeof globalThis & { Zotero: typeof Zotero }).Zotero = {
     Profile: {
       dir: "/tmp/llm-for-zotero-provisioning-test",
@@ -80,6 +81,17 @@ function installProvisioningDb(): {
         ) {
           const row = ledger.get(Number(queryParams[0]));
           return row ? [row] : [];
+        }
+        if (
+          sql.includes("SELECT MAX(conversation_key) AS maxKey") &&
+          sql.includes("FROM llm_for_zotero_conversation_key_ledger")
+        ) {
+          const start = Number(queryParams[0]);
+          const endExclusive = Number(queryParams[1]);
+          const keys = Array.from(ledger.keys()).filter(
+            (key) => key >= start && key < endExclusive,
+          );
+          return [{ maxKey: keys.length ? Math.max(...keys) : null }];
         }
         if (
           sql.includes("INSERT INTO llm_for_zotero_conversation_key_ledger")
@@ -112,6 +124,17 @@ function installProvisioningDb(): {
               ? Number(retiredAt)
               : null,
           });
+          return [];
+        }
+        if (
+          sql.includes("UPDATE llm_for_zotero_conversation_key_ledger") &&
+          sql.includes("SET conversation_id = ?")
+        ) {
+          const [conversationID, conversationKey, instanceID] = queryParams;
+          const row = ledger.get(Number(conversationKey));
+          if (row?.instanceID === String(instanceID)) {
+            row.conversationID = String(conversationID);
+          }
           return [];
         }
         if (
@@ -316,8 +339,14 @@ function installProvisioningDb(): {
         }
         return [];
       },
-      executeTransaction: async (callback: () => Promise<unknown>) =>
-        await callback(),
+      executeTransaction: async (callback: () => Promise<unknown>) => {
+        const transaction = transactionTail.then(callback, callback);
+        transactionTail = transaction.then(
+          () => undefined,
+          () => undefined,
+        );
+        return transaction;
+      },
     },
     debug: () => undefined,
   } as unknown as typeof Zotero;
@@ -325,6 +354,7 @@ function installProvisioningDb(): {
     queries,
     conversations,
     registry,
+    ledger,
     restore: () => {
       (globalThis as typeof globalThis & { Zotero?: typeof Zotero }).Zotero =
         originalZotero;
@@ -455,6 +485,60 @@ describe("conversation provisioning", function () {
         1,
         "concurrent render paths must share one catalog creation",
       );
+    } finally {
+      restore();
+    }
+  });
+
+  it("coalesces concurrent replacement of a retired Claude paper key", async function () {
+    const { queries, ledger, restore } = installProvisioningDb();
+    try {
+      const paperItem = {
+        id: 3342,
+        libraryID: 1,
+        parentID: undefined,
+        isAttachment: () => false,
+        isRegularItem: () => true,
+      } as unknown as Zotero.Item;
+      globalThis.Zotero.Items.get = (itemID: number) =>
+        itemID === 3342 ? paperItem : null;
+      const retiredKey = buildDefaultClaudePaperConversationKey(3342);
+      ledger.set(retiredKey, {
+        conversationKey: retiredKey,
+        instanceID: "instance-retired-claude-paper",
+        conversationID: "conversation-retired-claude-paper",
+        system: "claude_code",
+        kind: "paper",
+        profileSignature: "profile-test",
+        libraryID: 1,
+        paperItemID: 3342,
+        issuedAt: 1,
+        retiredAt: 2,
+      });
+      const firstPortalItem = createClaudePaperPortalItem(
+        paperItem,
+        retiredKey,
+      ) as Zotero.Item;
+      const secondPortalItem = createClaudePaperPortalItem(
+        paperItem,
+        retiredKey,
+      ) as Zotero.Item;
+
+      const results = await Promise.all([
+        provisionConversationScopeForItem({ item: firstPortalItem }),
+        provisionConversationScopeForItem({ item: secondPortalItem }),
+      ]);
+
+      assert.deepEqual(results, [true, true]);
+      assert.lengthOf(
+        queries.filter((query) =>
+          query.sql.includes("INSERT INTO llm_for_zotero_claude_conversations"),
+        ),
+        1,
+        "concurrent render paths must share one retired-key replacement",
+      );
+      assert.equal(firstPortalItem.id, secondPortalItem.id);
+      assert.notEqual(firstPortalItem.id, retiredKey);
     } finally {
       restore();
     }

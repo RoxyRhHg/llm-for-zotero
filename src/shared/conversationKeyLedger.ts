@@ -48,11 +48,18 @@ const KEY_LEDGER_INSTANCE_INDEX =
 let keyLedgerStoreInitialized = false;
 let initializedDbRef: ZoteroDb | null = null;
 const retiredConversationKeys = new Set<number>();
+let retiredConversationKeysDbRef: ZoteroDb | null = null;
 
 type ZoteroDb = {
   queryAsync?: (sql: string, params?: unknown[]) => Promise<unknown>;
   executeTransaction?: <T>(task: () => Promise<T>) => Promise<T>;
 };
+
+type QueryableZoteroDb = ZoteroDb & {
+  queryAsync: NonNullable<ZoteroDb["queryAsync"]>;
+};
+
+const ledgerInitializationByDb = new WeakMap<ZoteroDb, Promise<void>>();
 
 function getDb(): ZoteroDb | null {
   return (
@@ -198,17 +205,10 @@ function normalizeEntry(
   };
 }
 
-export async function initConversationKeyLedgerStore(): Promise<void> {
-  const db = getDb();
-  if (!db?.queryAsync)
-    throw new Error("Conversation key ledger DB is unavailable");
-  keyLedgerStoreInitialized = false;
-  initializedDbRef = null;
-  // Rebuild the process-local fence from the durable ledger on every store
-  // initialization.  Tests and profile migrations can replace rows while
-  // keeping the same DB wrapper; retaining an old in-memory key would then
-  // falsely retire a newly issued live key.
-  retiredConversationKeys.clear();
+async function initializeConversationKeyLedgerStore(
+  db: QueryableZoteroDb,
+): Promise<void> {
+  const nextRetiredConversationKeys = new Set<number>();
   await db.queryAsync(
     `CREATE TABLE IF NOT EXISTS ${KEY_LEDGER_TABLE} (
       conversation_key INTEGER PRIMARY KEY,
@@ -264,25 +264,82 @@ export async function initConversationKeyLedgerStore(): Promise<void> {
   )) as Array<{ conversationKey?: unknown }> | undefined;
   for (const row of retiredRows || []) {
     const key = normalizePositiveInt(row.conversationKey);
-    if (key) retiredConversationKeys.add(key);
+    if (key) nextRetiredConversationKeys.add(key);
   }
   // Agent stores are lazy and may already exist when the ledger is restored
   // after a restart.  Install the database fence for any such tables now;
   // each lazy store also calls this helper after creating its own table.
-  try {
-    await installConversationKeyLedgerAgentTriggers();
-  } catch (error) {
-    // Ledger readiness is a safety claim: callers may only trust retired-key
-    // writes after every discovered agent trigger has been installed.  Keep
-    // the store unready so the next startup/lazy-store attempt retries rather
-    // than silently running with a partial database fence.
-    keyLedgerStoreInitialized = false;
-    initializedDbRef = null;
-    retiredConversationKeys.clear();
-    throw error;
+  await installConversationKeyLedgerAgentTriggers();
+  if (getDb() !== db) {
+    throw new Error("Conversation key ledger DB changed during initialization");
   }
+  retiredConversationKeys.clear();
+  for (const key of nextRetiredConversationKeys) {
+    retiredConversationKeys.add(key);
+  }
+  retiredConversationKeysDbRef = db;
   keyLedgerStoreInitialized = true;
   initializedDbRef = db;
+}
+
+async function ensureConversationKeyLedgerStoreInitialized(
+  forceRefresh: boolean,
+): Promise<void> {
+  const db = getDb();
+  if (!db?.queryAsync)
+    throw new Error("Conversation key ledger DB is unavailable");
+  const queryableDb = db as QueryableZoteroDb;
+  const inFlight = ledgerInitializationByDb.get(db);
+  if (inFlight) {
+    await inFlight;
+    if (!forceRefresh) return;
+  }
+  if (!forceRefresh && keyLedgerStoreInitialized && initializedDbRef === db) {
+    return;
+  }
+
+  // A new database must not inherit retirement state from an old profile.
+  // A same-database refresh keeps the conservative in-memory fence intact
+  // until the durable replacement has been read successfully.
+  if (retiredConversationKeysDbRef && retiredConversationKeysDbRef !== db) {
+    retiredConversationKeys.clear();
+    retiredConversationKeysDbRef = null;
+  }
+  keyLedgerStoreInitialized = false;
+  initializedDbRef = null;
+  const initialization = initializeConversationKeyLedgerStore(
+    queryableDb,
+  ).catch((error) => {
+    // Readiness is a safety claim: callers may only trust it after every
+    // discovered trigger has been installed.  Keep the store unready so the
+    // next startup or lazy-store attempt retries, while retaining the prior
+    // same-database fence conservatively if a forced refresh failed.
+    if (getDb() === db) {
+      keyLedgerStoreInitialized = false;
+      initializedDbRef = null;
+    }
+    throw error;
+  });
+  ledgerInitializationByDb.set(db, initialization);
+  try {
+    await initialization;
+  } finally {
+    if (ledgerInitializationByDb.get(db) === initialization) {
+      ledgerInitializationByDb.delete(db);
+    }
+  }
+}
+
+export async function initConversationKeyLedgerStore(): Promise<void> {
+  await ensureConversationKeyLedgerStoreInitialized(false);
+}
+
+/**
+ * Re-read durable retirement state after a migration or test intentionally
+ * changes ledger rows while retaining the same Zotero DB wrapper.
+ */
+export async function refreshConversationKeyLedgerStore(): Promise<void> {
+  await ensureConversationKeyLedgerStoreInitialized(true);
 }
 
 export function isConversationKeyLedgerStoreInitialized(): boolean {
@@ -300,12 +357,22 @@ export function isConversationKeyRetiredInMemory(
   conversationKey: number,
 ): boolean {
   const key = normalizePositiveInt(conversationKey);
-  return Boolean(key && retiredConversationKeys.has(key));
+  return Boolean(
+    key &&
+    retiredConversationKeysDbRef === getDb() &&
+    retiredConversationKeys.has(key),
+  );
 }
 
 export function rememberConversationKeyRetired(conversationKey: number): void {
   const key = normalizePositiveInt(conversationKey);
-  if (key) retiredConversationKeys.add(key);
+  const db = getDb();
+  if (!key || !db) return;
+  if (retiredConversationKeysDbRef !== db) {
+    retiredConversationKeys.clear();
+    retiredConversationKeysDbRef = db;
+  }
+  retiredConversationKeys.add(key);
 }
 
 export async function getConversationKeyLedgerEntry(

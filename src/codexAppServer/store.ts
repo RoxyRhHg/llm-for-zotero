@@ -100,6 +100,7 @@ import {
   getConversationKeyLedgerEntry,
   initializeConversationKeyCounterInTransaction,
   initConversationKeyLedgerStore,
+  refreshConversationKeyLedgerStore,
   isConversationKeyLedgerStoreInitialized,
   installConversationKeyLedgerCatalogTriggers,
   installConversationKeyLedgerMessageTriggers,
@@ -1525,7 +1526,7 @@ export async function initCodexAppServerStore(): Promise<void> {
         await repairCodexConversationIdentityRegistry({ inTransaction: true });
       },
     );
-    await initConversationKeyLedgerStore();
+    await refreshConversationKeyLedgerStore();
     await initRecentlyDeletedConversationTombstones();
     await runConversationSchemaMigrationOnce(
       CONVERSATION_KEY_LEDGER_MIGRATION_ID,

@@ -71,12 +71,11 @@ import {
 type ConversationKind = "global" | "paper";
 
 // A full item-pane render intentionally starts conversation loading from both
-// the deferred onRender path and onAsyncRender.  Runtime provisioning performs
-// a read-then-create sequence, so those callers can both observe a missing
-// default conversation before either create transaction commits.  Share the
-// in-flight result per immutable scope: one caller creates the catalog/ledger
-// identity and every concurrent caller receives that same entry.
-const inFlightRuntimeProvisions = new Map<
+// the deferred onRender path and onAsyncRender.  Provisioning performs several
+// read-then-create decisions, including replacement of a retired deterministic
+// key, so coalesce the whole identity decision.  Each caller still binds the
+// shared result to its own item object after this promise resolves.
+const inFlightConversationProvisions = new Map<
   string,
   Promise<ConversationCatalogEntry | null>
 >();
@@ -357,8 +356,8 @@ async function provisionUpstreamConversation(scope: {
     : null;
 }
 
-function buildRuntimeProvisionKey(
-  system: "claude_code" | "codex",
+function buildConversationProvisionKey(
+  system: ConversationSystem,
   scope: {
     conversationKey: number;
     kind: ConversationKind;
@@ -375,8 +374,8 @@ function buildRuntimeProvisionKey(
   ].join(":");
 }
 
-async function provisionRuntimeConversation(
-  system: "claude_code" | "codex",
+async function provisionConversationEntry(
+  system: ConversationSystem,
   scope: {
     conversationKey: number;
     kind: ConversationKind;
@@ -384,19 +383,53 @@ async function provisionRuntimeConversation(
     paperItemID?: number;
   },
 ): Promise<ConversationCatalogEntry | null> {
-  const inFlightKey = buildRuntimeProvisionKey(system, scope);
-  const inFlight = inFlightRuntimeProvisions.get(inFlightKey);
+  const inFlightKey = buildConversationProvisionKey(system, scope);
+  const inFlight = inFlightConversationProvisions.get(inFlightKey);
   if (inFlight) return inFlight;
 
-  const provision = provisionRuntimeConversationUncoalesced(system, scope);
-  inFlightRuntimeProvisions.set(inFlightKey, provision);
+  const provision = provisionConversationEntryUncoalesced(system, scope);
+  inFlightConversationProvisions.set(inFlightKey, provision);
   try {
     return await provision;
   } finally {
-    if (inFlightRuntimeProvisions.get(inFlightKey) === provision) {
-      inFlightRuntimeProvisions.delete(inFlightKey);
+    if (inFlightConversationProvisions.get(inFlightKey) === provision) {
+      inFlightConversationProvisions.delete(inFlightKey);
     }
   }
+}
+
+async function provisionConversationEntryUncoalesced(
+  system: ConversationSystem,
+  scope: {
+    conversationKey: number;
+    kind: ConversationKind;
+    libraryID: number;
+    paperItemID?: number;
+  },
+): Promise<ConversationCatalogEntry | null> {
+  const currentLedger = await getConversationKeyLedgerEntry(
+    scope.conversationKey,
+  );
+  if (currentLedger?.retiredAt) {
+    // A deterministic paper/library key can be reused as a Zotero item ID
+    // after its conversation was deleted.  Never let the stale catalog witness
+    // win the first lookup; allocate exactly one fresh immutable identity.
+    const replacement = await conversationRepository.createCatalogEntry({
+      system,
+      kind: scope.kind,
+      libraryID: scope.libraryID,
+      paperItemID: scope.paperItemID,
+    });
+    return replacement && rememberProvisionedConversation(scope, replacement)
+      ? replacement
+      : null;
+  }
+  if (system === "upstream") {
+    return provisionUpstreamConversation(scope);
+  }
+  return system === "claude_code"
+    ? provisionClaudeConversation(scope)
+    : provisionCodexConversation(scope);
 }
 
 async function provisionRuntimeConversationUncoalesced(
@@ -626,7 +659,7 @@ async function provisionClaudeConversation(scope: {
   libraryID: number;
   paperItemID?: number;
 }): Promise<ConversationCatalogEntry | null> {
-  return provisionRuntimeConversation("claude_code", scope);
+  return provisionRuntimeConversationUncoalesced("claude_code", scope);
 }
 
 async function provisionCodexConversation(scope: {
@@ -635,7 +668,7 @@ async function provisionCodexConversation(scope: {
   libraryID: number;
   paperItemID?: number;
 }): Promise<ConversationCatalogEntry | null> {
-  return provisionRuntimeConversation("codex", scope);
+  return provisionRuntimeConversationUncoalesced("codex", scope);
 }
 
 export async function provisionConversationScopeForItem(params: {
@@ -652,34 +685,7 @@ export async function provisionConversationScopeForItem(params: {
   const scope = resolveProvisionScope(params.item, storageSystem);
   if (!scope) return false;
   try {
-    const currentLedger = await getConversationKeyLedgerEntry(
-      scope.conversationKey,
-    );
-    if (currentLedger?.retiredAt) {
-      // A deterministic paper/library key can be reused as a Zotero item ID
-      // after its conversation was deleted.  Never let the stale catalog
-      // witness win the first lookup; allocate a fresh conversation and bind
-      // this exact item object to it before any message write occurs.
-      const replacement = await conversationRepository.createCatalogEntry({
-        system: storageSystem,
-        kind: scope.kind,
-        libraryID: scope.libraryID,
-        paperItemID: scope.paperItemID,
-      });
-      if (!replacement) return false;
-      if (!rememberProvisionedConversation(scope, replacement)) return false;
-      bindProvisionedConversationKey(params.item, replacement.conversationKey);
-      bindSyntheticPortalItemToEntry(params.item, replacement);
-      return true;
-    }
-    let entry: ConversationCatalogEntry | null = null;
-    if (storageSystem === "claude_code") {
-      entry = await provisionClaudeConversation(scope);
-    } else if (storageSystem === "codex") {
-      entry = await provisionCodexConversation(scope);
-    } else if (storageSystem === "upstream") {
-      entry = await provisionUpstreamConversation(scope);
-    }
+    const entry = await provisionConversationEntry(storageSystem, scope);
     if (entry && entry.conversationKey !== scope.conversationKey) {
       bindProvisionedConversationKey(params.item, entry.conversationKey);
     }

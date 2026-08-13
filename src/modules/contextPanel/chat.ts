@@ -46,7 +46,7 @@ import {
   buildClaudeScope,
   captureClaudeSessionInfo,
   getClaudeBridgeRuntime,
-  invalidateClaudeConversationSession,
+  invalidateClaudeConversationSessionWithinWriteLock,
   isClaudeConversationSystemActive,
   updateLatestClaudeConversationAssistantMessageWithinWriteLock,
   updateLatestClaudeConversationUserMessageWithinWriteLock,
@@ -8060,14 +8060,17 @@ async function detachProviderForEdit(
     });
     if (!job) return false;
     try {
-      await invalidateClaudeConversationSession(await initAgentSubsystem(), {
-        conversationKey,
-        scope,
-        metadata: {
-          ...(providerSessionId ? { providerSessionId } : {}),
-          instanceID: catalog.instanceID,
+      await invalidateClaudeConversationSessionWithinWriteLock(
+        await initAgentSubsystem(),
+        {
+          conversationKey,
+          scope,
+          metadata: {
+            ...(providerSessionId ? { providerSessionId } : {}),
+            instanceID: catalog.instanceID,
+          },
         },
-      });
+      );
       await completeConversationCleanupJob(job.id);
     } catch (error) {
       await failConversationCleanupJob(job, error);

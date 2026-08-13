@@ -108,6 +108,12 @@ type ResolveExternalConfirmation = (
   errorMessage?: string;
 }>;
 
+type SessionInvalidationParams = {
+  conversationKey: number;
+  scope?: BridgeScope;
+  metadata?: Record<string, unknown>;
+};
+
 export type AgentRuntimeLike = Pick<
   AgentRuntime,
   | "listTools"
@@ -154,11 +160,13 @@ export type AgentRuntimeLike = Pick<
     probeId?: string;
     providerSessionId?: string;
   }): Promise<RuntimeRetentionResponse | null>;
-  invalidateSession(params: {
-    conversationKey: number;
-    scope?: BridgeScope;
-    metadata?: Record<string, unknown>;
-  }): Promise<SessionInvalidationResponse | null>;
+  invalidateSession(
+    params: SessionInvalidationParams,
+  ): Promise<SessionInvalidationResponse | null>;
+  /** Caller must already hold the conversation write lock. */
+  invalidateSessionWithinWriteLock(
+    params: SessionInvalidationParams,
+  ): Promise<SessionInvalidationResponse | null>;
   invalidateAllHotRuntimes(): Promise<{ invalidated: boolean } | null>;
   runExternalAction(
     name: string,
@@ -2553,6 +2561,34 @@ export function createExternalBackendBridgeRuntime(options: {
     return cachedSlashCommands;
   };
 
+  const clearInvalidatedSessionStateWithinWriteLock = (
+    conversationKey: number,
+  ): void => {
+    clearLastRunBridgeContext(conversationKey);
+    conversationScopeByKey.delete(conversationKey);
+    conversationContextSignature.delete(conversationKey);
+  };
+
+  const invalidateSessionWithinWriteLock = async ({
+    conversationKey,
+    scope,
+    metadata,
+  }: SessionInvalidationParams): Promise<SessionInvalidationResponse | null> => {
+    const bridgeUrl = normalizeBaseUrl(getBridgeUrl());
+    if (!bridgeUrl) {
+      clearInvalidatedSessionStateWithinWriteLock(conversationKey);
+      return null;
+    }
+    const outcome = await invalidateExternalBridgeSession({
+      baseUrl: bridgeUrl,
+      conversationKey,
+      scope,
+      metadata,
+    });
+    clearInvalidatedSessionStateWithinWriteLock(conversationKey);
+    return outcome;
+  };
+
   return {
     listTools: () => coreRuntime.listTools(),
     getToolDefinition: (name: string) => coreRuntime.getToolDefinition(name),
@@ -2626,29 +2662,15 @@ export function createExternalBackendBridgeRuntime(options: {
             : undefined),
       });
     },
-    invalidateSession: async ({ conversationKey, scope, metadata }) => {
-      const bridgeUrl = normalizeBaseUrl(getBridgeUrl());
-      if (!bridgeUrl) {
-        await withConversationWriteLock(conversationKey, async () => {
-          clearLastRunBridgeContext(conversationKey);
-          conversationScopeByKey.delete(conversationKey);
-          conversationContextSignature.delete(conversationKey);
-        });
-        return null;
-      }
-      const outcome = await invalidateExternalBridgeSession({
-        baseUrl: bridgeUrl,
-        conversationKey,
-        scope,
-        metadata,
-      });
-      await withConversationWriteLock(conversationKey, async () => {
-        clearLastRunBridgeContext(conversationKey);
-        conversationScopeByKey.delete(conversationKey);
-        conversationContextSignature.delete(conversationKey);
-      });
-      return outcome;
-    },
+    invalidateSession: ({ conversationKey, scope, metadata }) =>
+      withConversationWriteLock(conversationKey, () =>
+        invalidateSessionWithinWriteLock({
+          conversationKey,
+          scope,
+          metadata,
+        }),
+      ),
+    invalidateSessionWithinWriteLock,
     invalidateAllHotRuntimes: async () => {
       const bridgeUrl = normalizeBaseUrl(getBridgeUrl());
       if (!bridgeUrl) {

@@ -69,6 +69,7 @@ import {
   getConversationKeyLedgerEntry,
   initializeConversationKeyCounterInTransaction,
   initConversationKeyLedgerStore,
+  refreshConversationKeyLedgerStore,
   isConversationKeyLedgerStoreInitialized,
   installConversationKeyLedgerCatalogTriggers,
   installConversationKeyLedgerMessageTriggers,
@@ -1833,7 +1834,7 @@ export async function initChatStore(): Promise<void> {
         await backfillUpstreamConversationRegistry({ inTransaction: true });
       },
     );
-    await initConversationKeyLedgerStore();
+    await refreshConversationKeyLedgerStore();
     await initRecentlyDeletedConversationTombstones();
     // Tombstone-only keys must be burned before legacy migration chooses a
     // target.  Otherwise a pre-ledger tombstone can be mistaken for an

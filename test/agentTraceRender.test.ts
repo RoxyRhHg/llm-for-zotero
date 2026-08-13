@@ -3617,6 +3617,60 @@ describe("agentTrace render", function () {
     assert.isFalse(chipLabels.some((label) => label.includes("...")));
   });
 
+  it("uses the shared Paper chip structure across agent providers", function () {
+    const providers = ["Claude Code", "Codex", "OpenAI", "Anthropic", "Gemini"];
+    const events: AgentRunEventRecord[] = [
+      {
+        runId: "run-provider-parity",
+        seq: 1,
+        eventType: "final",
+        payload: { type: "final", text: "Done." },
+        createdAt: 1,
+      },
+    ];
+
+    for (const modelProviderLabel of providers) {
+      const trace = renderAgentTrace({
+        doc: fakeDocument,
+        userMessage: {
+          role: "user",
+          text: "Use this paper.",
+          timestamp: 1,
+          paperContexts: [
+            {
+              itemId: 10,
+              contextItemId: 11,
+              title: "Provider parity paper",
+            },
+          ],
+        },
+        message: {
+          role: "assistant",
+          text: "Done.",
+          timestamp: 2,
+          runMode: "agent",
+          modelProviderLabel,
+        },
+        events,
+      }) as unknown as FakeElement;
+
+      const chips = trace.findAllByClass("llm-agent-process-chip");
+      assert.lengthOf(chips, 1, modelProviderLabel);
+      const icon = chips[0].findByClass("llm-agent-process-chip-icon");
+      const label = chips[0].findByClass("llm-agent-process-chip-label");
+      assert.isNotNull(icon, modelProviderLabel);
+      assert.isTrue(
+        icon?.classList.contains("llm-context-svg-icon"),
+        modelProviderLabel,
+      );
+      assert.isTrue(
+        icon?.classList.contains("llm-context-icon-paper"),
+        modelProviderLabel,
+      );
+      assert.equal(label ? collectFakeText(label) : "", "Paper");
+    }
+  });
+
   it("preserves custom chip title and long label values as details", function () {
     const longTitle =
       "https://example.org/articles/with/a/very/long/path/that/must/remain/recoverable";
@@ -3630,6 +3684,37 @@ describe("agentTrace render", function () {
     assert.deepEqual(buildAgentTraceChipDetails({ label: longLabel }), [
       { label: "Detail", value: longLabel, kind: "text" },
     ]);
+  });
+
+  it("keeps agent trace chip icons aligned to the first label line", function () {
+    const css = readFileSync("addon/content/zoteroPane.css", "utf8");
+    const chipRule =
+      css.match(/\.llm-agent-process-chip\s*\{[\s\S]*?\}/)?.[0] || "";
+    const chipIconRule =
+      css.match(/\.llm-agent-process-chip-icon\s*\{[\s\S]*?\}/)?.[0] || "";
+    const svgIconRule =
+      css.match(
+        /\.llm-agent-process-chip-icon\.llm-context-svg-icon\s*\{[\s\S]*?\}/,
+      )?.[0] || "";
+    const fallbackIconRule =
+      css.match(
+        /\.llm-agent-process-chip-icon:not\(\.llm-context-svg-icon\)\s*\{[\s\S]*?\}/,
+      )?.[0] || "";
+    assert.include(chipRule, "align-items: flex-start");
+    assert.include(
+      chipIconRule,
+      "margin-block-start: calc(0.25px * var(--llm-font-scale, 1))",
+    );
+    assert.include(svgIconRule, "width: var(--llm-fs-12)");
+    assert.include(svgIconRule, "height: var(--llm-fs-12)");
+    assert.include(fallbackIconRule, "font-size: var(--llm-fs-12)");
+    assert.include(fallbackIconRule, "line-height: 1");
+
+    for (const fontScale of [0.8, 1.2, 1.8]) {
+      const labelLineCenter = (10 * fontScale * 1.25) / 2;
+      const iconCenter = 0.25 * fontScale + (12 * fontScale) / 2;
+      assert.approximately(iconCenter, labelLineCenter, 1e-9);
+    }
   });
 
   it("does not ellipsize agent trace chip labels in CSS", function () {

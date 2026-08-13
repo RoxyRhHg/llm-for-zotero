@@ -4745,12 +4745,17 @@
 
 .llm-agent-process-chip-icon {
   flex: 0 0 auto;
+  /*
+   * Keep the icon centered in the first scaled 12.5px label line without
+   * centering it against the full height of a wrapped label.
+   */
+  margin-block-start: calc(0.25px * var(--llm-font-scale, 1));
   opacity: 0.92;
 }
 
 .llm-agent-process-chip-icon.llm-context-svg-icon {
-  width: 12px;
-  height: 12px;
+  width: var(--llm-fs-12);
+  height: var(--llm-fs-12);
 }
 
 .llm-agent-process-chip-icon:not(.llm-context-svg-icon) {

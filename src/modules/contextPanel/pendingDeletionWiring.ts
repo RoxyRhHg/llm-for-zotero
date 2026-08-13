@@ -23,7 +23,7 @@ import { clearCodexConversationSessionMetadata } from "../../codexAppServer/stor
 import { archiveCodexAppServerThread } from "../../codexAppServer/nativeClient";
 import {
   buildClaudeScope,
-  invalidateClaudeConversationSession,
+  invalidateClaudeConversationSessionWithinWriteLock,
 } from "../../claudeCode/runtime";
 import { clearConversationOwnedRuntimeState } from "./state";
 import { sweepOrphanedAgentTraceExports } from "../../agent/store/traceStore";
@@ -157,7 +157,7 @@ export function configurePendingDeletionSubsystem(): void {
               );
             }
             try {
-              await invalidateClaudeConversationSession(
+              await invalidateClaudeConversationSessionWithinWriteLock(
                 await initAgentSubsystem(),
                 {
                   conversationKey: turn.conversationKey,

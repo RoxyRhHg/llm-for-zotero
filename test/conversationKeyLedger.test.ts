@@ -6,6 +6,7 @@ import {
   ensureConversationKeyLedgerEntryInTransaction,
   getConversationKeyLedgerEntry,
   initConversationKeyLedgerStore,
+  isConversationKeyRetiredInMemory,
   installConversationKeyLedgerCatalogTriggers,
   installConversationKeyLedgerAgentTriggers,
   installConversationKeyLedgerMessageTriggers,
@@ -17,6 +18,7 @@ import {
   getConversationKeyQuarantineEntries,
   logConversationKeyQuarantineSummary,
   retireOrphanedConversationLedgerEntries,
+  refreshConversationKeyLedgerStore,
   unretireConversationKeyInTransaction,
   updateConversationKeyLedgerConversationIDInTransaction,
   ConversationRetiredError,
@@ -61,6 +63,65 @@ describe("permanent conversation key ledger", function () {
   afterEach(function () {
     db.close();
     globalScope.Zotero = originalZotero;
+  });
+
+  it("coalesces and caches initialization for the same database", async function () {
+    const zotero = globalScope.Zotero as any;
+    const queryAsync = zotero.DB.queryAsync;
+    let ledgerTableCreates = 0;
+    zotero.DB.queryAsync = async (sql: string, params?: unknown[]) => {
+      if (
+        sql.includes(
+          "CREATE TABLE IF NOT EXISTS llm_for_zotero_conversation_key_ledger",
+        )
+      ) {
+        ledgerTableCreates += 1;
+      }
+      return queryAsync(sql, params);
+    };
+
+    await Promise.all([
+      initConversationKeyLedgerStore(),
+      initConversationKeyLedgerStore(),
+    ]);
+    await initConversationKeyLedgerStore();
+
+    assert.equal(
+      ledgerTableCreates,
+      1,
+      "ordinary callers must share and reuse one initialization",
+    );
+
+    await zotero.DB.queryAsync(
+      `INSERT INTO llm_for_zotero_conversation_key_ledger
+        (conversation_key, instance_id, conversation_id, system, kind,
+         profile_signature, library_id, paper_item_id, issued_at, retired_at,
+         retirement_reason)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      [
+        9900,
+        "instance-refresh",
+        "conversation-refresh",
+        "upstream",
+        "global",
+        "profile-test",
+        1,
+        null,
+        1,
+        2,
+        "test-refresh",
+      ],
+    );
+    assert.isFalse(isConversationKeyRetiredInMemory(9900));
+
+    await refreshConversationKeyLedgerStore();
+
+    assert.isTrue(isConversationKeyRetiredInMemory(9900));
+    assert.equal(
+      ledgerTableCreates,
+      2,
+      "an explicit refresh must rebuild durable retirement state once",
+    );
   });
 
   it("retires a key permanently and allocates the next high-water key", async function () {

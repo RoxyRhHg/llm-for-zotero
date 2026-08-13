@@ -306,54 +306,62 @@ export async function invalidateAllClaudeHotRuntimes(
   await getClaudeBridgeRuntime(coreRuntime).invalidateAllHotRuntimes();
 }
 
+type ClaudeConversationInvalidationParams = {
+  conversationKey: number;
+  scope?: ClaudeBridgeScope | null;
+  metadata?: Record<string, unknown>;
+};
+
 export async function invalidateClaudeConversationSession(
   coreRuntime: AgentRuntime,
-  params: {
-    conversationKey: number;
-    scope?: ClaudeBridgeScope | null;
-    metadata?: Record<string, unknown>;
-  },
+  params: ClaudeConversationInvalidationParams,
 ): Promise<void> {
-  await withConversationWriteLock(params.conversationKey, async () => {
-    const bridgeUrl = getBridgeUrl();
-    const expectedInstanceID =
-      params.metadata && typeof params.metadata.instanceID === "string"
-        ? params.metadata.instanceID.trim()
-        : "";
-    const expectedProviderSessionId =
-      params.metadata && typeof params.metadata.providerSessionId === "string"
-        ? params.metadata.providerSessionId.trim()
-        : "";
-    // An empty-session cleanup job is a scope/instance witness for the session
-    // that existed before deletion.  Serialize the witness check with runtime
-    // metadata persistence so a replacement turn cannot win between the read
-    // and adapter invalidation.
-    if (!expectedProviderSessionId && expectedInstanceID) {
-      const current = await getClaudeConversationSummary(
-        params.conversationKey,
-      );
-      if (String(current?.providerSessionId || "").trim()) return;
-      // A delayed empty-session cleanup witness must never
-      // wildcard-invalidate a catalog instance that still has live turns.
-      // The turn's own start path will force a fresh provider session when a
-      // durable cleanup job is still pending.
-      if (Number(current?.userTurnCount || 0) > 0) return;
-    }
-    forgetClaudeConversationScope(
-      params.conversationKey,
-      expectedInstanceID || undefined,
-    );
-    await clearClaudeConversationSessionMetadata(
-      params.conversationKey,
-      expectedProviderSessionId || undefined,
-      expectedInstanceID || undefined,
-    );
-    if (!bridgeUrl.trim()) return;
-    await getClaudeBridgeRuntime(coreRuntime).invalidateSession({
-      conversationKey: params.conversationKey,
-      scope: params.scope || undefined,
-      metadata: params.metadata,
-    });
+  await withConversationWriteLock(params.conversationKey, () =>
+    invalidateClaudeConversationSessionWithinWriteLock(coreRuntime, params),
+  );
+}
+
+/** Caller must already hold the conversation write lock. */
+export async function invalidateClaudeConversationSessionWithinWriteLock(
+  coreRuntime: AgentRuntime,
+  params: ClaudeConversationInvalidationParams,
+): Promise<void> {
+  const bridgeUrl = getBridgeUrl();
+  const expectedInstanceID =
+    params.metadata && typeof params.metadata.instanceID === "string"
+      ? params.metadata.instanceID.trim()
+      : "";
+  const expectedProviderSessionId =
+    params.metadata && typeof params.metadata.providerSessionId === "string"
+      ? params.metadata.providerSessionId.trim()
+      : "";
+  // An empty-session cleanup job is a scope/instance witness for the session
+  // that existed before deletion.  Serialize the witness check with runtime
+  // metadata persistence so a replacement turn cannot win between the read
+  // and adapter invalidation.
+  if (!expectedProviderSessionId && expectedInstanceID) {
+    const current = await getClaudeConversationSummary(params.conversationKey);
+    if (String(current?.providerSessionId || "").trim()) return;
+    // A delayed empty-session cleanup witness must never
+    // wildcard-invalidate a catalog instance that still has live turns.
+    // The turn's own start path will force a fresh provider session when a
+    // durable cleanup job is still pending.
+    if (Number(current?.userTurnCount || 0) > 0) return;
+  }
+  forgetClaudeConversationScope(
+    params.conversationKey,
+    expectedInstanceID || undefined,
+  );
+  await clearClaudeConversationSessionMetadata(
+    params.conversationKey,
+    expectedProviderSessionId || undefined,
+    expectedInstanceID || undefined,
+  );
+  if (!bridgeUrl.trim()) return;
+  await getClaudeBridgeRuntime(coreRuntime).invalidateSessionWithinWriteLock({
+    conversationKey: params.conversationKey,
+    scope: params.scope || undefined,
+    metadata: params.metadata,
   });
 }
 
