@@ -70,6 +70,17 @@ import {
 
 type ConversationKind = "global" | "paper";
 
+// A full item-pane render intentionally starts conversation loading from both
+// the deferred onRender path and onAsyncRender.  Runtime provisioning performs
+// a read-then-create sequence, so those callers can both observe a missing
+// default conversation before either create transaction commits.  Share the
+// in-flight result per immutable scope: one caller creates the catalog/ledger
+// identity and every concurrent caller receives that same entry.
+const inFlightRuntimeProvisions = new Map<
+  string,
+  Promise<ConversationCatalogEntry | null>
+>();
+
 function normalizePositiveInt(value: unknown): number | null {
   const parsed = Number(value);
   if (!Number.isFinite(parsed) || parsed <= 0) return null;
@@ -346,7 +357,49 @@ async function provisionUpstreamConversation(scope: {
     : null;
 }
 
+function buildRuntimeProvisionKey(
+  system: "claude_code" | "codex",
+  scope: {
+    conversationKey: number;
+    kind: ConversationKind;
+    libraryID: number;
+    paperItemID?: number;
+  },
+): string {
+  return [
+    system,
+    scope.kind,
+    scope.libraryID,
+    scope.paperItemID || 0,
+    scope.conversationKey,
+  ].join(":");
+}
+
 async function provisionRuntimeConversation(
+  system: "claude_code" | "codex",
+  scope: {
+    conversationKey: number;
+    kind: ConversationKind;
+    libraryID: number;
+    paperItemID?: number;
+  },
+): Promise<ConversationCatalogEntry | null> {
+  const inFlightKey = buildRuntimeProvisionKey(system, scope);
+  const inFlight = inFlightRuntimeProvisions.get(inFlightKey);
+  if (inFlight) return inFlight;
+
+  const provision = provisionRuntimeConversationUncoalesced(system, scope);
+  inFlightRuntimeProvisions.set(inFlightKey, provision);
+  try {
+    return await provision;
+  } finally {
+    if (inFlightRuntimeProvisions.get(inFlightKey) === provision) {
+      inFlightRuntimeProvisions.delete(inFlightKey);
+    }
+  }
+}
+
+async function provisionRuntimeConversationUncoalesced(
   system: "claude_code" | "codex",
   scope: {
     conversationKey: number;

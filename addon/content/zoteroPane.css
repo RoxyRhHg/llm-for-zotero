@@ -920,9 +920,18 @@
   background: var(--fill-quinary);
 }
 
+.llm-clear-btn {
+  width: 28px;
+  min-width: 28px;
+  height: 28px;
+  min-height: 28px;
+  padding: 0;
+  font-size: 0;
+}
+
 .llm-clear-btn::before {
   content: "";
-  display: none;
+  display: block;
   width: 16px;
   height: 16px;
   background-color: currentColor;
@@ -935,19 +944,6 @@
   -webkit-mask-position: center;
   -webkit-mask-size: contain;
   pointer-events: none;
-}
-
-.llm-clear-btn[data-compact="true"] {
-  width: 28px;
-  min-width: 28px;
-  height: 28px;
-  min-height: 28px;
-  padding: 0;
-  font-size: 0;
-}
-
-.llm-clear-btn[data-compact="true"]::before {
-  display: block;
 }
 
 @container (max-width: 380px) {
@@ -973,19 +969,6 @@
    */
   .llm-history-bar {
     gap: 4px;
-  }
-
-  .llm-clear-btn {
-    width: 24px;
-    min-width: 24px;
-    height: 24px;
-    min-height: 24px;
-    padding: 0;
-    font-size: 0;
-  }
-
-  .llm-clear-btn::before {
-    display: block;
   }
 }
 
@@ -1262,7 +1245,7 @@
   -webkit-mask-image: url("icons/action-export.svg");
 }
 
-/* Clear icon — trash */
+/* Delete conversation icon — shared trash asset */
 .llm-standalone-icon-clear::before {
   mask-image: url("icons/action-clear.svg");
   -webkit-mask-image: url("icons/action-clear.svg");

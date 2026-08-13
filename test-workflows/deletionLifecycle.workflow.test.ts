@@ -49,6 +49,101 @@ async function surfacing(fn: () => Promise<void>): Promise<void> {
 describe("deletion lifecycle", function () {
   this.timeout(45000);
 
+  for (const runtime of [
+    {
+      label: "upstream/Agent",
+      system: "upstream",
+      prefs: {
+        enableCodexAppServerMode: false,
+        enableClaudeCodeMode: false,
+        conversationSystem: "upstream",
+      },
+    },
+    {
+      label: "Claude Code",
+      system: "claude_code",
+      prefs: {
+        enableCodexAppServerMode: false,
+        enableClaudeCodeMode: true,
+        conversationSystem: "claude_code",
+      },
+    },
+    {
+      label: "Codex",
+      system: "codex",
+      prefs: {
+        enableCodexAppServerMode: true,
+        enableClaudeCodeMode: false,
+        conversationSystem: "codex",
+      },
+    },
+  ] as const) {
+    it(`header trash action deletes the active ${runtime.label} conversation and renders a fresh panel`, async function () {
+      await withPrefs(runtime.prefs, async () =>
+        surfacing(async () => {
+          const api = getWorkflowTestApi();
+          await api.reset();
+          const fixture = await api.createPaperWithPdfFixture({
+            title: `Header Delete ${runtime.label} Paper`,
+            pdfTitle: `header-delete-${runtime.system}.pdf`,
+          });
+          try {
+            const panel = await api.renderPanelForItem(fixture.parentItemId);
+            const before = await api.getDiagnostics(panel.panelId);
+            assert.equal(before.conversationSystem, runtime.system);
+            const seeded = await api.seedPanelStoredTurn(
+              panel.panelId,
+              `delete ${runtime.label} question`,
+              `delete ${runtime.label} answer`,
+            );
+            assert.equal(
+              await api.getPanelVisibleMessageCount(panel.panelId),
+              2,
+            );
+
+            await api.clickPanelDelete(panel.panelId);
+
+            const after = await api.getDiagnostics(panel.panelId);
+            assert.equal(after.conversationSystem, runtime.system);
+            assert.notEqual(after.conversationKey, seeded.conversationKey);
+            assert.equal(
+              await api.getPanelVisibleMessageCount(panel.panelId),
+              0,
+              "the replacement panel must be empty",
+            );
+            const pending = await api.getPendingDeletionState();
+            assert.include(
+              pending.pendingConversationKeys,
+              seeded.conversationKey,
+            );
+            assert.equal(pending.persistedRowCount, 1);
+            assert.isTrue(await api.isPanelUndoToastVisible(panel.panelId));
+            const history = await api.listPanelHistory(panel.panelId);
+            assert.notInclude(
+              history.map((row) => row.conversationKey),
+              seeded.conversationKey,
+            );
+
+            await api.clickPanelUndo(panel.panelId);
+            const restored = await api.getDiagnostics(panel.panelId);
+            assert.equal(restored.conversationKey, seeded.conversationKey);
+            assert.equal(
+              await api.getPanelVisibleMessageCount(panel.panelId),
+              2,
+              "Undo must restore the deleted conversation and its messages",
+            );
+            assert.equal(
+              (await api.getPendingDeletionState()).persistedRowCount,
+              0,
+            );
+          } finally {
+            await api.cleanupFixture(fixture);
+          }
+        }),
+      );
+    });
+  }
+
   it("delete → remount (user switches) → undo from the new panel restores the chat", async function () {
     await surfacing(async () => {
       const api = getWorkflowTestApi();

@@ -333,11 +333,10 @@ export async function invalidateClaudeConversationSession(
         params.conversationKey,
       );
       if (String(current?.providerSessionId || "").trim()) return;
-      // Clear preserves the catalog row, so a replacement turn can begin
-      // before its provider session has been captured back into the catalog.
-      // An empty-session cleanup witness must never wildcard-invalidate that
-      // active replacement mapping; the turn's own start path will force a
-      // fresh provider session when the durable job is still pending.
+      // A delayed empty-session cleanup witness must never
+      // wildcard-invalidate a catalog instance that still has live turns.
+      // The turn's own start path will force a fresh provider session when a
+      // durable cleanup job is still pending.
       if (Number(current?.userTurnCount || 0) > 0) return;
     }
     forgetClaudeConversationScope(
@@ -435,9 +434,24 @@ export async function appendClaudeConversationMessage(
   message: StoredChatMessage,
   instanceID?: string,
 ): Promise<void> {
+  await withConversationWriteLock(conversationKey, () =>
+    appendClaudeConversationMessageWithinWriteLock(
+      conversationKey,
+      message,
+      instanceID,
+    ),
+  );
+}
+
+/** Caller must already hold the conversation write lock. */
+export async function appendClaudeConversationMessageWithinWriteLock(
+  conversationKey: number,
+  message: StoredChatMessage,
+  instanceID?: string,
+): Promise<void> {
   await appendClaudeMessage(conversationKey, message, instanceID);
   await pruneClaudeConversation(conversationKey);
-  await touchClaudeConversation(conversationKey, {
+  await touchClaudeConversationWithinWriteLock(conversationKey, {
     updatedAt: message.timestamp,
     model: message.modelName,
     instanceID,
@@ -448,8 +462,21 @@ export async function updateLatestClaudeConversationUserMessage(
   conversationKey: number,
   message: Parameters<typeof updateLatestClaudeUserMessage>[1],
 ): Promise<void> {
+  await withConversationWriteLock(conversationKey, () =>
+    updateLatestClaudeConversationUserMessageWithinWriteLock(
+      conversationKey,
+      message,
+    ),
+  );
+}
+
+/** Caller must already hold the conversation write lock. */
+export async function updateLatestClaudeConversationUserMessageWithinWriteLock(
+  conversationKey: number,
+  message: Parameters<typeof updateLatestClaudeUserMessage>[1],
+): Promise<void> {
   await updateLatestClaudeUserMessage(conversationKey, message);
-  await touchClaudeConversation(conversationKey, {
+  await touchClaudeConversationWithinWriteLock(conversationKey, {
     updatedAt: message.timestamp,
   });
 }
@@ -458,8 +485,21 @@ export async function updateLatestClaudeConversationAssistantMessage(
   conversationKey: number,
   message: Parameters<typeof updateLatestClaudeAssistantMessage>[1],
 ): Promise<void> {
+  await withConversationWriteLock(conversationKey, () =>
+    updateLatestClaudeConversationAssistantMessageWithinWriteLock(
+      conversationKey,
+      message,
+    ),
+  );
+}
+
+/** Caller must already hold the conversation write lock. */
+export async function updateLatestClaudeConversationAssistantMessageWithinWriteLock(
+  conversationKey: number,
+  message: Parameters<typeof updateLatestClaudeAssistantMessage>[1],
+): Promise<void> {
   await updateLatestClaudeAssistantMessage(conversationKey, message);
-  await touchClaudeConversation(conversationKey, {
+  await touchClaudeConversationWithinWriteLock(conversationKey, {
     updatedAt: message.timestamp,
     model: message.modelName,
   });
@@ -470,83 +510,93 @@ export async function deleteClaudeConversationTurnMessages(
   userTimestamp: number,
   assistantTimestamp: number,
 ): Promise<void> {
-  await deleteClaudeConversationTurnMessagesStore(
-    conversationKey,
-    userTimestamp,
-    assistantTimestamp,
-  );
-  await touchClaudeConversation(conversationKey, {
-    updatedAt: Date.now(),
+  await withConversationWriteLock(conversationKey, async () => {
+    await deleteClaudeConversationTurnMessagesStore(
+      conversationKey,
+      userTimestamp,
+      assistantTimestamp,
+    );
+    await touchClaudeConversationWithinWriteLock(conversationKey, {
+      updatedAt: Date.now(),
+    });
+  });
+}
+
+type ClaudeConversationTouchUpdates = {
+  title?: string | null;
+  updatedAt?: number;
+  providerSessionId?: string | null;
+  scopedConversationKey?: string | null;
+  scopeType?: string | null;
+  scopeId?: string | null;
+  scopeLabel?: string | null;
+  cwd?: string | null;
+  model?: string | null;
+  effort?: string | null;
+  instanceID?: string;
+  expectedGeneration?: number;
+};
+
+/** Caller must already hold the conversation write lock. */
+export async function touchClaudeConversationWithinWriteLock(
+  conversationKey: number,
+  updates: ClaudeConversationTouchUpdates,
+): Promise<void> {
+  const expectedGeneration =
+    updates.expectedGeneration ??
+    getConversationWriteGeneration(conversationKey);
+  if (
+    areConversationWritesFrozen(conversationKey) ||
+    !isConversationWriteGenerationCurrent(conversationKey, expectedGeneration)
+  ) {
+    return;
+  }
+  const summary = await getClaudeConversationSummary(conversationKey);
+  if (!summary) return;
+  const hasOwn = (key: string) =>
+    Object.prototype.hasOwnProperty.call(updates, key);
+  if (
+    updates.instanceID &&
+    summary.instanceID &&
+    updates.instanceID !== summary.instanceID
+  ) {
+    return;
+  }
+  await upsertClaudeConversationSummary({
+    conversationKey: summary.conversationKey,
+    instanceID: summary.instanceID,
+    libraryID: summary.libraryID,
+    kind: summary.kind,
+    paperItemID: summary.paperItemID,
+    createdAt: summary.createdAt,
+    updatedAt: updates.updatedAt || Date.now(),
+    title: hasOwn("title") ? updates.title || undefined : summary.title,
+    providerSessionId: hasOwn("providerSessionId")
+      ? updates.providerSessionId || undefined
+      : summary.providerSessionId,
+    scopedConversationKey: hasOwn("scopedConversationKey")
+      ? updates.scopedConversationKey || undefined
+      : summary.scopedConversationKey,
+    scopeType: hasOwn("scopeType")
+      ? updates.scopeType || undefined
+      : summary.scopeType,
+    scopeId: hasOwn("scopeId") ? updates.scopeId || undefined : summary.scopeId,
+    scopeLabel: hasOwn("scopeLabel")
+      ? updates.scopeLabel || undefined
+      : summary.scopeLabel,
+    cwd: hasOwn("cwd") ? updates.cwd || undefined : summary.cwd,
+    model: hasOwn("model") ? updates.model || undefined : summary.model,
+    effort: hasOwn("effort") ? updates.effort || undefined : summary.effort,
   });
 }
 
 export async function touchClaudeConversation(
   conversationKey: number,
-  updates: {
-    title?: string | null;
-    updatedAt?: number;
-    providerSessionId?: string | null;
-    scopedConversationKey?: string | null;
-    scopeType?: string | null;
-    scopeId?: string | null;
-    scopeLabel?: string | null;
-    cwd?: string | null;
-    model?: string | null;
-    effort?: string | null;
-    instanceID?: string;
-    expectedGeneration?: number;
-  },
+  updates: ClaudeConversationTouchUpdates,
 ): Promise<void> {
-  await withConversationWriteLock(conversationKey, async () => {
-    const expectedGeneration =
-      updates.expectedGeneration ??
-      getConversationWriteGeneration(conversationKey);
-    if (
-      areConversationWritesFrozen(conversationKey) ||
-      !isConversationWriteGenerationCurrent(conversationKey, expectedGeneration)
-    ) {
-      return;
-    }
-    const summary = await getClaudeConversationSummary(conversationKey);
-    if (!summary) return;
-    const hasOwn = (key: string) =>
-      Object.prototype.hasOwnProperty.call(updates, key);
-    if (
-      updates.instanceID &&
-      summary.instanceID &&
-      updates.instanceID !== summary.instanceID
-    ) {
-      return;
-    }
-    await upsertClaudeConversationSummary({
-      conversationKey: summary.conversationKey,
-      instanceID: summary.instanceID,
-      libraryID: summary.libraryID,
-      kind: summary.kind,
-      paperItemID: summary.paperItemID,
-      createdAt: summary.createdAt,
-      updatedAt: updates.updatedAt || Date.now(),
-      title: hasOwn("title") ? updates.title || undefined : summary.title,
-      providerSessionId: hasOwn("providerSessionId")
-        ? updates.providerSessionId || undefined
-        : summary.providerSessionId,
-      scopedConversationKey: hasOwn("scopedConversationKey")
-        ? updates.scopedConversationKey || undefined
-        : summary.scopedConversationKey,
-      scopeType: hasOwn("scopeType")
-        ? updates.scopeType || undefined
-        : summary.scopeType,
-      scopeId: hasOwn("scopeId")
-        ? updates.scopeId || undefined
-        : summary.scopeId,
-      scopeLabel: hasOwn("scopeLabel")
-        ? updates.scopeLabel || undefined
-        : summary.scopeLabel,
-      cwd: hasOwn("cwd") ? updates.cwd || undefined : summary.cwd,
-      model: hasOwn("model") ? updates.model || undefined : summary.model,
-      effort: hasOwn("effort") ? updates.effort || undefined : summary.effort,
-    });
-  });
+  await withConversationWriteLock(conversationKey, () =>
+    touchClaudeConversationWithinWriteLock(conversationKey, updates),
+  );
 }
 
 export async function captureClaudeSessionInfo(

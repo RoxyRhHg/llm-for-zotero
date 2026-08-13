@@ -107,13 +107,8 @@ import {
   addAutoLockedGlobalConversationKey,
   removeAutoLockedGlobalConversationKey,
   isAutoLockedGlobalConversation,
-  clearConversationOwnedRuntimeState,
   getConversationWriteGeneration,
-  freezeConversationWrites,
-  unfreezeConversationWrites,
-  bumpConversationWriteGeneration,
 } from "./state";
-import { withConversationWriteLock } from "../../shared/conversationWriteFence";
 import {
   sanitizeText,
   setStatus,
@@ -270,32 +265,19 @@ import {
   extractManagedBlobHash,
   isManagedBlobPath,
   removeAttachmentFile,
-  removeConversationAttachmentFiles,
 } from "./attachmentStorage";
 import { clearConversationSummary as clearConversationSummaryFromCache } from "./conversationSummaryCache";
 import { conversationRepository } from "../../core/conversations/repository";
 import { pendingDeletionStore } from "../../core/conversations/pendingDeletionStore";
 import {
-  enqueueConversationCleanupJobInTransaction,
-  initConversationCleanupJobs,
-} from "../../core/conversations/conversationCleanupJobs";
-import {
-  clearConversation as clearStoredConversation,
   touchPaperConversationTitle,
   touchGlobalConversationTitle,
 } from "../../utils/chatStore";
 import {
   ATTACHMENT_GC_MIN_AGE_MS,
-  clearOwnerAttachmentRefs,
-  clearOwnerAttachmentRefsInTransaction,
   collectAndDeleteUnreferencedBlobs,
   replaceOwnerAttachmentRefs,
 } from "../../utils/attachmentRefStore";
-import {
-  initConversationForkLinksStore,
-  deleteConversationForkLinksForInstanceInTransaction,
-} from "../../shared/conversationForkLinks";
-import { initConversationSearchIndexStore } from "../../shared/conversationSearchIndex";
 import type {
   Message,
   ChatRuntimeMode,
@@ -361,7 +343,6 @@ import {
   type RuntimeConversationSystem,
   type RuntimeSystemControls,
 } from "./runtimeSystemControls";
-import { shouldCompactHeaderClearButton } from "./headerClearPresentation";
 import { getPanelDomRefs } from "./setupHandlers/domRefs";
 import {
   chooseAutoLoadedContextPanelItem,
@@ -436,7 +417,6 @@ import {
   parseZoteroItemDragData,
 } from "./setupHandlers/controllers/fileIntakeController";
 import { createSendFlowController } from "./setupHandlers/controllers/sendFlowController";
-import { createClearConversationController } from "./setupHandlers/controllers/clearConversationController";
 import { cancelVisiblePendingConfirmationCards } from "./setupHandlers/controllers/cancelPendingConfirmationController";
 import { buildInlineEditRetryContextSnapshot } from "./setupHandlers/controllers/inlineEditRetryController";
 import { attachAssistantSelectionPopup } from "./setupHandlers/controllers/assistantSelectionPopupController";
@@ -473,18 +453,13 @@ import {
   type PaperSourceOption,
 } from "./setupHandlers/controllers/paperSourceOptionsController";
 import { clearAllAgentToolCaches } from "../../agent/tools";
-import { initAgentTraceStore } from "../../agent/store/traceStore";
-import {
-  clearAgentConversationState,
-  clearPersistedAgentConversationRowsInTransaction,
-} from "./agentConversationCleanup";
+import { clearAgentConversationState } from "./agentConversationCleanup";
 import { renderShortcuts } from "./shortcuts";
 import { loadConversationHistoryScope } from "./historyLoader";
 import {
   buildClaudeScope,
   getClaudeRuntimeModelEntries as getFallbackClaudeRuntimeModelEntries,
   invalidateAllClaudeHotRuntimes,
-  invalidateClaudeConversationSession,
   listClaudeEfforts,
   listClaudeModels,
   rememberClaudeConversationSelection,
@@ -554,30 +529,18 @@ import {
 import {
   retainClaudeRuntimeForBody,
   releaseClaudeRuntimeForBody,
-  releaseClaudeRuntimeForConversation,
 } from "../../claudeCode/runtimeRetention";
 import { isClaudePaperPortalItem } from "../../claudeCode/portal";
-import {
-  clearClaudeConversation,
-  getClaudeConversationSummary,
-  touchClaudeConversationTitle,
-} from "../../claudeCode/store";
+import { touchClaudeConversationTitle } from "../../claudeCode/store";
 import {
   createClaudeGlobalPortalItem,
   createClaudePaperPortalItem,
 } from "../../claudeCode/portal";
-import {
-  clearCodexConversation,
-  clearCodexConversationSessionMetadata,
-  getCodexConversationSummary,
-  touchCodexConversationTitle,
-} from "../../codexAppServer/store";
+import { touchCodexConversationTitle } from "../../codexAppServer/store";
 import {
   createCodexGlobalPortalItem,
   createCodexPaperPortalItem,
 } from "../../codexAppServer/portal";
-import { resolveConversationStorageSystem } from "../../shared/conversationStorageRouting";
-import { validateConversationScope } from "../../shared/conversationRegistry";
 
 type ActionMenuTrigger = "/" | "$";
 type ActiveActionToken = PaperSearchSlashToken & {
@@ -867,12 +830,6 @@ export function setupHandlers(
     Boolean(ElementCtor && value instanceof ElementCtor);
   const headerTop = body.querySelector(
     ".llm-header-top",
-  ) as HTMLDivElement | null;
-  const headerInfo = headerTop?.querySelector(
-    ".llm-header-info",
-  ) as HTMLDivElement | null;
-  const headerActions = headerTop?.querySelector(
-    ".llm-header-actions",
   ) as HTMLDivElement | null;
   panelRoot.tabIndex = 0;
   applyPanelFontScale(panelRoot);
@@ -1361,9 +1318,6 @@ export function setupHandlers(
     userTimestamp: number;
     assistantTimestamp: number;
   }) => Promise<void> = async () => {};
-  let finalizePendingTurnDeletionsForConversation: (
-    conversationKey: number,
-  ) => Promise<boolean> = async () => true;
   let closePaperPicker = () => {};
   let clearForcedSkill = () => {};
   let renderWebChatHistoryMenu: () => Promise<void> = async () => {};
@@ -2176,38 +2130,6 @@ export function setupHandlers(
     sendBtn,
     cancelBtn,
   });
-  const syncResponsiveHeaderClearButton = () => {
-    if (
-      isStandalonePanel ||
-      !headerTop ||
-      !headerInfo ||
-      !headerActions ||
-      !clearBtn
-    ) {
-      return;
-    }
-    if (panelRoot.dataset.webchatMode === "true") {
-      clearBtn.dataset.compact = "false";
-      return;
-    }
-
-    // Always measure the full label first so widening the sidebar restores it.
-    clearBtn.dataset.compact = "false";
-    const headerRect = headerTop.getBoundingClientRect();
-    const headerInfoRect = headerInfo.getBoundingClientRect();
-    const actionsRect = headerActions.getBoundingClientRect();
-    const leftContentRight =
-      headerInfoRect.left +
-      Math.max(headerInfoRect.width, Number(headerInfo.scrollWidth) || 0);
-    clearBtn.dataset.compact = shouldCompactHeaderClearButton({
-      headerRight: headerRect.right,
-      leftContentRight,
-      actionsLeft: actionsRect.left,
-      actionsRight: actionsRect.right,
-    })
-      ? "true"
-      : "false";
-  };
   let lastUserContextAlignmentPanelWidth = -1;
   const getRoundedPanelWidth = () =>
     Math.ceil(
@@ -2222,7 +2144,6 @@ export function setupHandlers(
         conversationKey,
         () => {
           applyResponsiveActionButtonsLayout();
-          syncResponsiveHeaderClearButton();
           if (
             panelWidth <= 0 ||
             panelWidth !== lastUserContextAlignmentPanelWidth
@@ -4765,8 +4686,6 @@ export function setupHandlers(
   }
   forkConversationFromTurn =
     historyLifecycleController.forkConversationFromTurn;
-  finalizePendingTurnDeletionsForConversation =
-    historyLifecycleController.finalizePendingTurnDeletionsForConversation;
   resetHistorySearchState = historyLifecycleController.resetHistorySearchState;
 
   const switchRuntimeSystemFromControl = async (
@@ -6156,16 +6075,21 @@ export function setupHandlers(
       void warmUpWebChatHistory();
     }
 
-    // Clear button → "Exit" in webchat, restore "Clear" otherwise
+    // The conversation trash action becomes "Exit" only in WebChat.
     if (clearBtn) {
       if (isWebChat) {
         clearBtn.textContent = "Exit";
         (clearBtn as HTMLButtonElement).disabled = false;
         clearBtn.style.opacity = "";
-        clearBtn.title = "Exit webchat and return to previous model";
+        clearBtn.title = t("Exit webchat and return to previous model");
+        clearBtn.setAttribute(
+          "aria-label",
+          t("Exit webchat and return to previous model"),
+        );
       } else {
-        clearBtn.textContent = "Clear";
-        clearBtn.title = "";
+        clearBtn.textContent = "";
+        clearBtn.title = t("Delete conversation");
+        clearBtn.setAttribute("aria-label", t("Delete conversation"));
       }
     }
 
@@ -6922,291 +6846,8 @@ export function setupHandlers(
     consumeForcedSkillIds,
   });
   doSend = sendFlowController.doSend;
-  const { clearCurrentConversation } = createClearConversationController({
-    getConversationKey: () => (item ? getConversationKey(item) : null),
-    getCurrentItemID: () =>
-      item && Number.isFinite(item.id) && item.id > 0 ? item.id : null,
-    getPendingRequestId,
-    getAbortController,
-    setCancelledRequestId,
-    setPendingRequestId,
-    setAbortController,
-    finalizePendingTurnDeletionsForConversation: (conversationKey) =>
-      finalizePendingTurnDeletionsForConversation(conversationKey),
-    isConversationPendingDeletion: (conversationKey) =>
-      pendingDeletionStore.isConversationPendingDeletion(conversationKey),
-    validateConversationScope: async (conversationKey) => {
-      if (!item) return true;
-      const conversationSystem = resolveConversationSystemForItem(item);
-      const storageSystem = resolveConversationStorageSystem({
-        conversationKey,
-        conversationSystem,
-      });
-      const kind = resolveDisplayConversationKind(item);
-      const libraryID = Number(item.libraryID || 0);
-      if (
-        !storageSystem ||
-        !kind ||
-        !Number.isFinite(libraryID) ||
-        libraryID <= 0
-      ) {
-        return true;
-      }
-      if (kind === "global") {
-        return validateConversationScope({
-          conversationKey,
-          system: storageSystem,
-          kind: "global",
-          libraryID: Math.floor(libraryID),
-        });
-      }
-      const baseItem = resolveConversationBaseItem(item);
-      const paperItemID = Number(baseItem?.id || 0);
-      const paperLibraryID = Number(baseItem?.libraryID || libraryID);
-      if (
-        !Number.isFinite(paperItemID) ||
-        paperItemID <= 0 ||
-        !Number.isFinite(paperLibraryID) ||
-        paperLibraryID <= 0
-      ) {
-        return true;
-      }
-      return validateConversationScope({
-        conversationKey,
-        system: storageSystem,
-        kind: "paper",
-        libraryID: Math.floor(paperLibraryID),
-        paperItemID: Math.floor(paperItemID),
-      });
-    },
-    getConversationIdentity: async (conversationKey) => {
-      if (!item) return null;
-      const kind =
-        resolveDisplayConversationKind(item) === "paper" ? "paper" : "global";
-      const identityWitness =
-        await conversationRepository.getCatalogIdentityWitness({
-          system: getConversationSystem(),
-          kind,
-          conversationKey,
-        });
-      if (!identityWitness?.instanceID || !identityWitness.conversationID) {
-        return null;
-      }
-      let providerSessionId: string | undefined;
-      if (isCodexConversationSystem()) {
-        providerSessionId =
-          (await getCodexConversationSummary(conversationKey))
-            ?.providerSessionId || undefined;
-      } else if (isClaudeConversationSystem()) {
-        providerSessionId =
-          (await getClaudeConversationSummary(conversationKey))
-            ?.providerSessionId || undefined;
-      }
-      const baseItem = resolveConversationBaseItem(item);
-      const conversationKind = kind;
-      const libraryID = Math.floor(
-        Number(item.libraryID || baseItem?.libraryID || 0),
-      );
-      const paperItemID =
-        kind === "paper" ? Number(baseItem?.id || 0) || undefined : undefined;
-      const providerScope =
-        isClaudeConversationSystem() && libraryID > 0
-          ? buildClaudeScope({
-              libraryID,
-              kind,
-              paperItemID,
-              paperTitle:
-                kind === "paper"
-                  ? String(baseItem?.getField?.("title") || "").trim() ||
-                    undefined
-                  : undefined,
-            })
-          : undefined;
-      return {
-        instanceID: identityWitness.instanceID,
-        conversationID: identityWitness.conversationID,
-        providerSessionId,
-        providerScope,
-        conversationKind,
-        libraryID: libraryID > 0 ? libraryID : undefined,
-        paperItemID,
-      };
-    },
-    clearTransientComposeStateForItem,
-    clearConversationOwnedRuntimeState,
-    freezeConversationWrites,
-    unfreezeConversationWrites,
-    bumpConversationWriteGeneration,
-    resetConversationSessionTokens: resetSessionTokens,
-    resetComposePreviewUI,
-    resetConversationHistory: (conversationKey) => {
-      chatHistory.set(conversationKey, []);
-    },
-    markConversationLoaded: (conversationKey) => {
-      loadedConversationKeys.add(conversationKey);
-    },
-    invalidateConversationSession: async (
-      conversationKey,
-      expectedProviderSessionId,
-      expectedInstanceID,
-    ) => {
-      if (isCodexConversationSystem()) {
-        await clearCodexConversationSessionMetadata(
-          conversationKey,
-          expectedProviderSessionId,
-          expectedInstanceID,
-        );
-        return;
-      }
-      if (!isClaudeConversationSystem() || !item) return;
-      const libraryID = Number(item.libraryID || 0);
-      const currentKind = resolveDisplayConversationKind(item);
-      const baseItem = resolveConversationBaseItem(item);
-      if (!Number.isFinite(libraryID) || libraryID <= 0 || !currentKind) return;
-      const scope = buildClaudeScope({
-        libraryID: Math.floor(libraryID),
-        kind: currentKind,
-        paperItemID:
-          currentKind === "paper"
-            ? Number(baseItem?.id || 0) || undefined
-            : undefined,
-        paperTitle:
-          currentKind === "paper"
-            ? String(baseItem?.getField?.("title") || "").trim() || undefined
-            : undefined,
-      });
-      await invalidateClaudeConversationSession(await initAgentSubsystem(), {
-        conversationKey,
-        scope,
-        metadata: expectedProviderSessionId
-          ? {
-              providerSessionId: expectedProviderSessionId,
-              instanceID: expectedInstanceID,
-            }
-          : expectedInstanceID
-            ? { instanceID: expectedInstanceID }
-            : undefined,
-      });
-    },
-    clearStoredConversation: (conversationKey, identity, onBeforeCommit) =>
-      withConversationWriteLock(conversationKey, () =>
-        isClaudeConversationSystem()
-          ? clearClaudeConversation(conversationKey, identity, onBeforeCommit)
-          : isCodexConversationSystem()
-            ? clearCodexConversation(conversationKey, identity, onBeforeCommit)
-            : clearStoredConversation(
-                conversationKey,
-                identity,
-                onBeforeCommit,
-              ),
-      ),
-    preparePersistentConversationClear: async () => {
-      // The fork-link table must exist before Clear's owning DB transaction
-      // begins.  The cleanup-jobs table is initialized here as well; the
-      // transaction callback below is intentionally DML-only and never runs
-      // schema DDL while content is being committed.
-      await initConversationForkLinksStore();
-      await initConversationCleanupJobs();
-      await initConversationSearchIndexStore();
-      await initAgentTraceStore();
-    },
-    clearPersistedConversationRowsInTransaction: async (
-      conversationKey,
-      identity,
-    ) => {
-      // This callback runs inside Clear's owning transaction.  Every operation
-      // here is direct DML so failures roll back the content commit together.
-      await clearPersistedAgentConversationRowsInTransaction(conversationKey);
-      await clearOwnerAttachmentRefsInTransaction(
-        "conversation",
-        conversationKey,
-      );
-      await deleteConversationForkLinksForInstanceInTransaction({
-        conversationKey,
-        conversationID: identity?.conversationID,
-        system: getConversationSystem(),
-      });
-      // The title is conversation-owned metadata. Clear it inside the same
-      // transaction as message/agent deletion so a transient post-commit
-      // title update failure cannot leave prompt-derived text visible on an
-      // otherwise empty conversation.
-      await conversationRepository.clearCatalogTitle({
-        system: getConversationSystem(),
-        conversationKey,
-        instanceID: identity?.instanceID,
-        conversationID: identity?.conversationID,
-        inTransaction: true,
-      });
-      const providerSessionId = String(
-        identity?.providerSessionId || "",
-      ).trim();
-      const system = getConversationSystem();
-      const hasClaudeScopeWitness =
-        system === "claude_code" &&
-        Boolean(
-          identity?.providerScope?.scopeType && identity.providerScope.scopeId,
-        );
-      if (
-        (providerSessionId || hasClaudeScopeWitness) &&
-        (system === "codex" || system === "claude_code")
-      ) {
-        const kind = identity?.conversationKind || "global";
-        const libraryID = identity?.libraryID || 0;
-        const paperItemID = identity?.paperItemID;
-        const job = await enqueueConversationCleanupJobInTransaction({
-          operation: system === "codex" ? "codex_archive" : "claude_invalidate",
-          system,
-          conversationKey,
-          instanceID: identity?.instanceID,
-          conversationKind: kind,
-          libraryID: libraryID > 0 ? libraryID : undefined,
-          paperItemID,
-          providerScope: identity?.providerScope,
-          providerSessionId,
-        });
-        if (!job) {
-          throw new Error(
-            "Provider cleanup job could not be persisted with Clear",
-          );
-        }
-      }
-    },
-    resetConversationTitle: (conversationKey, identity) =>
-      conversationRepository.clearCatalogTitle({
-        system: getConversationSystem(),
-        conversationKey,
-        instanceID: identity?.instanceID,
-        conversationID: identity?.conversationID,
-      }),
-    clearOwnerAttachmentRefs,
-    removeConversationAttachmentFiles,
-    refreshChatPreservingScroll,
-    refreshGlobalHistoryHeader: () => {
-      void refreshGlobalHistoryHeader();
-    },
-    scheduleAttachmentGc,
-    clearAgentToolCaches: clearAllAgentToolCaches,
-    clearAgentConversationState,
-    releaseClaudeRuntimeForConversation,
-    setStatusMessage: status
-      ? (message, level) => {
-          setStatus(status, message, level);
-        }
-      : undefined,
-    logError: (message, err) => {
-      ztoolkit.log(message, err);
-    },
-    // [webchat] Check if the currently selected model uses webchat auth
-    isWebChatActive: () => {
-      const { selectedEntry } = getSelectedModelInfo();
-      return selectedEntry?.authMode === "webchat";
-    },
-    getWebChatHost: () => {
-      const port = Zotero.Prefs.get("httpServer.port") || 23119;
-      return `http://127.0.0.1:${port}/llm-for-zotero/webchat`;
-    },
-    markNextWebChatSendAsNewChat,
-  });
+  // The header trash action uses the same durable, undoable deletion
+  // lifecycle as Delete in conversation history.
   const executeSend = async () => {
     // If the inline edit widget is active, route through editUserTurnAndRetry
     // instead of the normal send flow.
@@ -7992,7 +7633,7 @@ export function setupHandlers(
     e.stopPropagation();
   });
 
-  // Clear button
+  // Delete conversation button
   if (clearBtn) {
     clearBtn.addEventListener("click", (e: Event) => {
       e.preventDefault();
@@ -8051,7 +7692,7 @@ export function setupHandlers(
         return;
       }
 
-      void clearCurrentConversation();
+      void historyLifecycleController.queueCurrentConversationDeletion();
     });
   }
 

@@ -126,21 +126,42 @@ describe("runtime system control layout", function () {
     assert.notInclude(standaloneSource, "20.998 10.949");
   });
 
-  it("reuses the standalone clear icon for the responsive sidebar button", function () {
+  it("uses the existing compact trash icon at every sidebar width", function () {
     const css = source("addon/content/zoteroPane.css");
     const sidebarSource = source("src/modules/contextPanel/buildUI.ts");
     const handlerSource = source("src/modules/contextPanel/setupHandlers.ts");
+    const standaloneSource = source(
+      "src/modules/contextPanel/standaloneWindow.ts",
+    );
+    const deleteButtonRule = extractCssRule(css, ".llm-clear-btn");
+    const deleteIconRule = extractCssRule(css, ".llm-clear-btn::before");
 
     assert.include(sidebarSource, "llm-btn-icon llm-clear-btn");
-    assert.include(css, '.llm-clear-btn[data-compact="true"]');
+    assert.include(sidebarSource, 'title: t("Delete conversation")');
+    assert.include(
+      sidebarSource,
+      'clearBtn.setAttribute("aria-label", t("Delete conversation"))',
+    );
+    assert.notInclude(sidebarSource, 'textContent: t("Clear")');
+    assert.include(deleteButtonRule, "width: 28px");
+    assert.include(deleteButtonRule, "font-size: 0");
+    assert.include(deleteIconRule, "display: block");
+    assert.notInclude(css, '.llm-clear-btn[data-compact="true"]');
     assert.include(css, "@container (max-width: 380px)");
     assert.equal(
       css.split('url("icons/action-clear.svg")').length - 1,
       4,
-      "the sidebar and standalone masks must share the same clear asset",
+      "the sidebar and standalone masks must share the existing trash asset",
     );
-    assert.include(handlerSource, "syncResponsiveHeaderClearButton");
-    assert.include(handlerSource, "shouldCompactHeaderClearButton");
+    assert.notInclude(handlerSource, "syncResponsiveHeaderClearButton");
+    assert.notInclude(handlerSource, "shouldCompactHeaderClearButton");
+    assert.include(handlerSource, 'clearBtn.textContent = ""');
+    assert.include(handlerSource, 't("Delete conversation")');
+    assert.include(
+      standaloneSource,
+      'iconClear.title = t("Delete conversation")',
+    );
+    assert.notInclude(standaloneSource, 'iconClear.title = t("Clear")');
   });
 
   it("keeps the sidebar export icon fixed when plugin text scales", function () {

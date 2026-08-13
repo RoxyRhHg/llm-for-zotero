@@ -206,36 +206,6 @@ type StatusLevel = "ready" | "warning" | "error";
 
 const pendingDeletionSubscriptionsByBody = new WeakMap<Element, () => void>();
 
-// Committing hidden turns before a user action is best effort: correctness
-// comes from filterMessagesInPendingTurns, not from the finalize completing.
-// The store serializes ops on one chain, so without a bound this inherits an
-// unrelated conversation's provider latency (a codex thread archive can run to
-// its 60s request timeout). Twin of awaitPendingTurnFinalize in chat.ts;
-// AbortController is not dependable under Gecko, hence Promise.race.
-const PENDING_TURN_FINALIZE_WAIT_MS = 3_000;
-
-async function awaitPendingTurnFinalize(
-  finalize: Promise<boolean>,
-): Promise<boolean> {
-  let timeoutId: ReturnType<typeof setTimeout> | undefined;
-  try {
-    return await Promise.race([
-      finalize.then(
-        (ok) => ok,
-        () => false,
-      ),
-      new Promise<boolean>((resolve) => {
-        timeoutId = setTimeout(
-          () => resolve(false),
-          PENDING_TURN_FINALIZE_WAIT_MS,
-        );
-      }),
-    ]);
-  } finally {
-    if (timeoutId !== undefined) clearTimeout(timeoutId);
-  }
-}
-
 // Conversations a surface gave up because a deletion was queued, keyed by
 // pending-deletion entry id. Kept on the body (not the controller) so a panel
 // rebuild inside the same window still knows where to put the user back.
@@ -675,8 +645,12 @@ export function createHistoryLifecycleController(
     }, TOP_TOAST_TIMEOUT_MS);
   };
 
-  const isHistoryEntryActive = (entry: ConversationHistoryEntry): boolean => {
+  const isHistoryEntryActive = (
+    entry: ConversationHistoryEntry,
+    conversationSystem: ConversationSystem = getConversationSystem(),
+  ): boolean => {
     if (!item) return false;
+    if (getConversationSystem() !== conversationSystem) return false;
     const activeConversationKey = getConversationKey(item);
     if (entry.kind === "paper" && !isGlobalMode()) {
       return !isGlobalMode() && activeConversationKey === entry.conversationKey;
@@ -3205,10 +3179,11 @@ export function createHistoryLifecycleController(
 
   const hydrateHistoryEntryForDeletion = async (
     entry: ConversationHistoryEntry,
+    conversationSystem: ConversationSystem,
   ): Promise<ConversationHistoryEntry> => {
     try {
       const summary = await conversationRepository.getCatalogEntry({
-        system: getConversationSystem(),
+        system: conversationSystem,
         kind: entry.kind,
         conversationKey: entry.conversationKey,
       });
@@ -3235,17 +3210,23 @@ export function createHistoryLifecycleController(
     }
   };
 
-  const queueHistoryDeletion = async (entry: ConversationHistoryEntry) => {
-    if (!item) return;
-    if (!entry.deletable) return;
-    const targetEntry = await hydrateHistoryEntryForDeletion(entry);
+  const queueHistoryDeletion = async (
+    entry: ConversationHistoryEntry,
+    conversationSystem: ConversationSystem = getConversationSystem(),
+  ): Promise<boolean> => {
+    if (!item) return false;
+    if (!entry.deletable) return false;
+    const targetEntry = await hydrateHistoryEntryForDeletion(
+      entry,
+      conversationSystem,
+    );
     const libraryID =
       normalizeHistoryPaperItemID(targetEntry.libraryID) ||
       getCurrentLibraryID();
     if (!libraryID) {
       if (status)
         setStatus(status, t("No active library for deletion"), "error");
-      return;
+      return false;
     }
 
     if (
@@ -3253,17 +3234,17 @@ export function createHistoryLifecycleController(
         targetEntry.conversationKey,
       )
     ) {
-      return;
+      return false;
     }
 
-    const wasActive = isHistoryEntryActive(targetEntry);
+    const wasActive = isHistoryEntryActive(targetEntry, conversationSystem);
     // Capture the catalog row's identity witness BEFORE queueing: keys are
     // recycled, so this is the only value that lets the finalizer prove it is
     // still deleting this conversation. A missing witness is persisted as a
     // durable intent and moves to identity quarantine after the Undo window.
     const identityWitness =
       await conversationRepository.getCatalogIdentityWitness({
-        system: getConversationSystem(),
+        system: conversationSystem,
         kind: targetEntry.kind,
         conversationKey: targetEntry.conversationKey,
       });
@@ -3275,7 +3256,7 @@ export function createHistoryLifecycleController(
       catalogCreatedAt: identityWitness?.catalogCreatedAt || 0,
       conversationKey: targetEntry.conversationKey,
       libraryID,
-      system: getConversationSystem(),
+      system: conversationSystem,
       paperItemID: targetEntry.paperItemID,
       providerSessionId: targetEntry.providerSessionId || undefined,
       title: targetEntry.title,
@@ -3286,7 +3267,7 @@ export function createHistoryLifecycleController(
         setStatus(status, t("Failed to queue deletion. Check logs."), "error");
       }
       await refreshGlobalHistoryHeader();
-      return;
+      return false;
     }
 
     // The intent is durable now.  Only after the write-ahead row exists may
@@ -3314,6 +3295,71 @@ export function createHistoryLifecycleController(
     await refreshGlobalHistoryHeader();
     if (status)
       setStatus(status, t("Conversation deleted. Undo available."), "ready");
+    return true;
+  };
+
+  /**
+   * Delete the conversation currently mounted in this surface through the
+   * exact same durable/undoable lifecycle as a history-row Delete action.
+   *
+   * The system, kind, key, and catalog data are captured before the first
+   * await. This prevents a runtime-mode or item switch during hydration from
+   * retargeting the destructive action to a different conversation.
+   */
+  const queueCurrentConversationDeletion = async (): Promise<boolean> => {
+    syncStateFromDeps();
+    const targetItem = item;
+    if (!targetItem) return false;
+
+    const conversationSystem = getConversationSystem();
+    const conversationKey = Math.floor(Number(getConversationKey(targetItem)));
+    const kind = resolveDisplayConversationKind(targetItem);
+    if (kind !== "global" && kind !== "paper") return false;
+    if (!Number.isFinite(conversationKey) || conversationKey <= 0) {
+      return false;
+    }
+    if (pendingDeletionStore.isConversationPendingDeletion(conversationKey)) {
+      if (status) {
+        setStatus(status, t("Deletion pending; retrying safely"), "warning");
+      }
+      return false;
+    }
+
+    const summary = await conversationRepository.getCatalogEntry({
+      system: conversationSystem,
+      kind,
+      conversationKey,
+    });
+    if (!summary || summary.kind !== kind) {
+      if (status) {
+        setStatus(status, t("No saved conversation to delete"), "warning");
+      }
+      return false;
+    }
+
+    const entry = createHistorySearchEntry({
+      kind,
+      conversationID: summary.conversationID,
+      conversationKey,
+      title: summary.title,
+      createdAt: summary.createdAt,
+      lastActivityAt: summary.lastActivityAt,
+      isDraft: summary.userTurnCount === 0,
+      userTurnCount: summary.userTurnCount,
+      paperItemID: summary.paperItemID,
+      sessionVersion: summary.sessionVersion,
+    });
+    if (!entry) return false;
+
+    return queueHistoryDeletion(
+      {
+        ...entry,
+        libraryID: summary.libraryID,
+        providerSessionId: summary.providerSessionId,
+        scopedConversationKey: summary.scopedConversationKey,
+      },
+      conversationSystem,
+    );
   };
 
   const createAndSwitchGlobalConversation = async (
@@ -4213,17 +4259,9 @@ export function createHistoryLifecycleController(
       return ensureWebChatSessionPaperConversation();
     },
     runExplicitNewChatAction,
+    queueCurrentConversationDeletion,
     queueTurnDeletion,
     forkConversationFromTurn,
-    // Clear commits hidden turns but must never commit a pending CONVERSATION
-    // deletion: that would destroy the catalog row Clear is designed to keep.
-    finalizePendingTurnDeletionsForConversation: (conversationKey: number) =>
-      awaitPendingTurnFinalize(
-        pendingDeletionStore.finalizeTurnsForConversation(
-          conversationKey,
-          "clear-conversation",
-        ),
-      ),
     isConversationPendingDeletion: (conversationKey: number) =>
       pendingDeletionStore.isConversationPendingDeletion(conversationKey),
     resetHistorySearchState,

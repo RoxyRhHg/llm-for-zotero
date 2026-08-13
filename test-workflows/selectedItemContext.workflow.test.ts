@@ -235,8 +235,8 @@ describe("workflow: selected item context send", function () {
           JSON.stringify(geometry),
         );
         assert.isTrue(
-          geometry.clearButtonCompact,
-          "the narrow header must replace the Clear label with its icon",
+          geometry.deleteButtonIconOnly,
+          "the narrow header must render the delete action as the trash icon",
         );
         const wideGeometry = await api.measurePanelRuntimeGeometry(
           panel.panelId,
@@ -249,9 +249,9 @@ describe("workflow: selected item context send", function () {
           wideGeometry.runtimeIntersectsTrailingContent,
           JSON.stringify(wideGeometry),
         );
-        assert.isFalse(
-          wideGeometry.clearButtonCompact,
-          "the full Clear label must return when the header has room",
+        assert.isTrue(
+          wideGeometry.deleteButtonIconOnly,
+          "the wide header must keep the delete action icon-only",
         );
 
         const rapid = await api.clickPanelSystemTogglesRapidly(panel.panelId, [

@@ -1021,7 +1021,8 @@ export function openStandaloneChat(options?: {
       ) as HTMLButtonElement;
       iconClear.className = "llm-standalone-icon-btn llm-standalone-icon-clear";
       iconClear.type = "button";
-      iconClear.title = t("Clear");
+      iconClear.title = t("Delete conversation");
+      iconClear.setAttribute("aria-label", t("Delete conversation"));
 
       iconStrip.append(
         iconSidebarToggle,
@@ -1468,10 +1469,12 @@ export function openStandaloneChat(options?: {
           openTab.classList.toggle("active", standaloneMode === "open");
         }
 
-        // Clear/Exit icon — show "Exit" text, hide the trash icon via CSS class
-        iconClear.title = isWebChat
+        // Delete/Exit action — show "Exit" text only in WebChat.
+        const deleteOrExitLabel = isWebChat
           ? t("Exit webchat and return to previous model")
-          : t("Clear");
+          : t("Delete conversation");
+        iconClear.title = deleteOrExitLabel;
+        iconClear.setAttribute("aria-label", deleteOrExitLabel);
         iconClear.textContent = isWebChat ? t("Exit") : "";
         iconClear.classList.toggle("llm-standalone-icon-exit", isWebChat);
 

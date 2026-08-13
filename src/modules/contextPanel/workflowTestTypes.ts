@@ -122,7 +122,7 @@ export type WorkflowTestRuntimeGeometry = {
   runtimeTrailingOverlapPx: number;
   runtimeWithinContainer: boolean;
   trailingContentWithinContainer: boolean;
-  clearButtonCompact: boolean;
+  deleteButtonIconOnly: boolean;
   centeredContentOffset: number;
 };
 
@@ -442,6 +442,7 @@ export type WorkflowTestApi = {
     panelId: string,
     conversationKey: number,
   ) => Promise<void>;
+  clickPanelDelete: (panelId: string) => Promise<void>;
   seedPanelStoredTurn: (
     panelId: string,
     userText: string,

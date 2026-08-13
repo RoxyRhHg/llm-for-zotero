@@ -421,6 +421,45 @@ describe("conversation provisioning", function () {
     }
   });
 
+  it("coalesces concurrent Claude provisioning for a fresh paper", async function () {
+    const { queries, conversations, registry, restore } =
+      installProvisioningDb();
+    try {
+      const paperItem = {
+        id: 3341,
+        libraryID: 1,
+        parentID: undefined,
+        isAttachment: () => false,
+        isRegularItem: () => true,
+      } as unknown as Zotero.Item;
+      globalThis.Zotero.Items.get = (itemID: number) =>
+        itemID === 3341 ? paperItem : null;
+      const conversationKey = buildDefaultClaudePaperConversationKey(3341);
+      const portalItem = createClaudePaperPortalItem(
+        paperItem,
+        conversationKey,
+      ) as Zotero.Item;
+
+      const results = await Promise.all([
+        provisionConversationScopeForItem({ item: portalItem }),
+        provisionConversationScopeForItem({ item: portalItem }),
+      ]);
+
+      assert.deepEqual(results, [true, true]);
+      assert.equal(conversations.get(conversationKey)?.paperItemID, 3341);
+      assert.equal(registry.get(conversationKey)?.paperItemID, 3341);
+      assert.lengthOf(
+        queries.filter((query) =>
+          query.sql.includes("INSERT INTO llm_for_zotero_claude_conversations"),
+        ),
+        1,
+        "concurrent render paths must share one catalog creation",
+      );
+    } finally {
+      restore();
+    }
+  });
+
   it("does not register an arbitrary missing Codex paper key", async function () {
     const { queries, restore } = installProvisioningDb();
     try {

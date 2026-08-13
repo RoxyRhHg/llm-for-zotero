@@ -42,14 +42,14 @@ import {
   isClaudeAutoCompactEnabled,
 } from "../../claudeCode/prefs";
 import {
-  appendClaudeConversationMessage,
+  appendClaudeConversationMessageWithinWriteLock,
   buildClaudeScope,
   captureClaudeSessionInfo,
   getClaudeBridgeRuntime,
   invalidateClaudeConversationSession,
   isClaudeConversationSystemActive,
-  updateLatestClaudeConversationAssistantMessage,
-  updateLatestClaudeConversationUserMessage,
+  updateLatestClaudeConversationAssistantMessageWithinWriteLock,
+  updateLatestClaudeConversationUserMessageWithinWriteLock,
 } from "../../claudeCode/runtime";
 import { getCodexProfileSignature } from "../../codexAppServer/constants";
 import { clearCodexNativeReadLedgerForConversation } from "../../codexAppServer/nativeContextLedger";
@@ -1673,7 +1673,10 @@ async function updateStoredLatestUserMessageByConversationUnlocked(
   });
   if (!storageSystem) return;
   if (storageSystem === "claude_code") {
-    await updateLatestClaudeConversationUserMessage(conversationKey, message);
+    await updateLatestClaudeConversationUserMessageWithinWriteLock(
+      conversationKey,
+      message,
+    );
     return;
   }
   if (storageSystem === "codex") {
@@ -1707,19 +1710,22 @@ async function updateStoredLatestAssistantMessageByConversationUnlocked(
   if (!storageSystem) return;
   if (storageSystem === "claude_code") {
     const latestContextSnapshot = contextUsageSnapshots.get(conversationKey);
-    await updateLatestClaudeConversationAssistantMessage(conversationKey, {
-      ...message,
-      contextTokens:
-        Number.isFinite(Number(message.contextTokens)) &&
-        Number(message.contextTokens) > 0
-          ? Math.floor(Number(message.contextTokens))
-          : latestContextSnapshot?.contextTokens,
-      contextWindow:
-        Number.isFinite(Number(message.contextWindow)) &&
-        Number(message.contextWindow) > 0
-          ? Math.floor(Number(message.contextWindow))
-          : latestContextSnapshot?.contextWindow,
-    });
+    await updateLatestClaudeConversationAssistantMessageWithinWriteLock(
+      conversationKey,
+      {
+        ...message,
+        contextTokens:
+          Number.isFinite(Number(message.contextTokens)) &&
+          Number(message.contextTokens) > 0
+            ? Math.floor(Number(message.contextTokens))
+            : latestContextSnapshot?.contextTokens,
+        contextWindow:
+          Number.isFinite(Number(message.contextWindow)) &&
+          Number(message.contextWindow) > 0
+            ? Math.floor(Number(message.contextWindow))
+            : latestContextSnapshot?.contextWindow,
+      },
+    );
     return;
   }
   if (storageSystem === "codex") {
@@ -1805,7 +1811,7 @@ async function persistConversationMessage(
       });
       if (!storageSystem) return;
       if (storageSystem === "claude_code") {
-        await appendClaudeConversationMessage(
+        await appendClaudeConversationMessageWithinWriteLock(
           conversationKey,
           message,
           undefined,

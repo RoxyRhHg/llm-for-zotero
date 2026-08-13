@@ -1009,7 +1009,7 @@ async function measurePanelRuntimeGeometry(
         actionsRect,
         containerRect,
       ),
-      clearButtonCompact:
+      deleteButtonIconOnly:
         clearButtonRect.width <= 28.5 &&
         Number.parseFloat(clearButtonStyle?.fontSize || "") === 0,
       centeredContentOffset: 0,
@@ -1895,7 +1895,7 @@ async function measureStandaloneRuntimeGeometry(input: {
       runtimeTrailingOverlapPx: 0,
       runtimeWithinContainer: rectWithinContainer(runtimeRect, containerRect),
       trailingContentWithinContainer: true,
-      clearButtonCompact: false,
+      deleteButtonIconOnly: false,
       centeredContentOffset: Math.abs(tabsCenter - containerCenter),
     };
   } finally {
@@ -2945,6 +2945,39 @@ async function deletePanelHistoryConversation(
   await Zotero.Promise.delay(300);
 }
 
+async function clickPanelDelete(panelId: string): Promise<void> {
+  assertWorkflowTestEnabled();
+  const panel = getPanel(panelId);
+  const itemBefore = activeContextPanels.get(panel.body)?.() || panel.item;
+  const conversationKeyBefore = getConversationKey(itemBefore);
+  dispatchWorkflowClick(
+    panel.body,
+    ".llm-clear-btn",
+    "Delete conversation button",
+  );
+
+  // The header trash action queues the same deletion used by history.
+  // Wait for this mounted surface to leave the doomed key and render the fresh
+  // empty conversation selected by the shared deletion subscriber.
+  const deadline = Date.now() + 8000;
+  while (Date.now() < deadline) {
+    const currentItem = activeContextPanels.get(panel.body)?.() || panel.item;
+    const currentKey = getConversationKey(currentItem);
+    if (
+      currentKey !== conversationKeyBefore &&
+      pendingDeletionStore.isConversationPendingDeletion(conversationKeyBefore)
+    ) {
+      await Zotero.Promise.delay(100);
+      return;
+    }
+    await Zotero.Promise.delay(50);
+  }
+  const currentItem = activeContextPanels.get(panel.body)?.() || panel.item;
+  throw new Error(
+    `Delete did not leave conversation ${conversationKeyBefore}; current=${getConversationKey(currentItem)}`,
+  );
+}
+
 async function seedPanelStoredTurn(
   panelId: string,
   userText: string,
@@ -3222,6 +3255,7 @@ export function installWorkflowTestHarness(targetAddon: {
     cleanupFixture,
     listPanelHistory,
     deletePanelHistoryConversation,
+    clickPanelDelete,
     seedPanelStoredTurn,
     deletePanelTurn,
     clickPanelUndo,
