@@ -49,20 +49,22 @@ describe("runtime system control layout", function () {
     );
   });
 
-  it("keeps the mode chip label at chrome size so the header row ignores font scale", function () {
+  it("scales the mode chip label with the font setting, capped only in the compact header", function () {
     const css = source("addon/content/zoteroPane.css");
     const modeChipRule = extractCssRule(css, ".llm-mode-chip");
+    const compactBlock =
+      css.match(/@container \(max-width: 380px\) \{[\s\S]*?\n\}/)?.[0] || "";
+    const compactChipRule = extractCssRule(compactBlock, ".llm-mode-chip");
 
-    // Every other control in the header row is a fixed size that ignores
-    // --llm-font-scale (20px history buttons, 24px runtime toggles, 28px action
-    // icons, and this pill's own 22px height). Scaling only the chip's text made
-    // it the single width-variable element in that row, so at large font scales
-    // it outgrew the header's first grid column and painted over
-    // .llm-header-actions instead of shrinking — the chip is pinned rigid by the
-    // assertions above, so overlap was the only outlet left.
-    assert.include(modeChipRule, "font-size: 12px");
-    assert.notInclude(modeChipRule, "font-size: var(--llm-fs-12)");
-    assert.include(modeChipRule, "height: 22px");
+    // The label must scale with --llm-font-scale at any usable sidebar width —
+    // a static chip is a downgrade at the widths people actually use.
+    assert.include(modeChipRule, "font-size: var(--llm-fs-12)");
+
+    // Below the compact breakpoint the fixed furniture (20px history buttons,
+    // 54px runtime toggles, 96px action icons, gaps) leaves the chip barely
+    // 100px, and the assertions above pin it rigid, so a scaled label there
+    // cannot shrink or truncate — it overflows onto .llm-header-actions.
+    assert.include(compactChipRule, "font-size: 12px");
   });
 
   it("keeps both runtime buttons fixed at 24px and in normal flow", function () {
