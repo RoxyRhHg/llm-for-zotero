@@ -49,7 +49,8 @@ const ALLOWED_SAMPLING_KEYS = new Set([
   "omitWhenReasoning",
 ]);
 
-function isRecord(value: unknown): value is Record<string, unknown> {
+/** The plugin's one plain-object guard; import it rather than re-typing it. */
+export function isRecord(value: unknown): value is Record<string, unknown> {
   return Boolean(value) && typeof value === "object" && !Array.isArray(value);
 }
 

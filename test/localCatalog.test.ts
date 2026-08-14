@@ -227,6 +227,34 @@ describe("local model catalog (Ollama)", function () {
       assert.isUndefined(models[1].limits);
     });
 
+    it("merges the detail onto the tag row when the user typed the short name", async function () {
+      // `ollama run qwen3` answers to plain `qwen3`, but /api/tags lists the
+      // same weights as `qwen3:latest`. The /api/show detail must land on the
+      // tag row rather than being discarded over the implicit tag.
+      const models = await fetchOllamaCatalog({
+        fetchFn: (async (url: string) => {
+          if (url.endsWith("/api/tags")) {
+            return jsonResponse({
+              models: [{ name: "qwen3:latest" }, { name: "gemma3:4b" }],
+            });
+          }
+          return jsonResponse(showPayload());
+        }) as unknown as typeof fetch,
+        apiBase: "http://localhost:11434",
+        detailModel: "qwen3",
+      });
+      const detailed = models.find((model) => model.id === "qwen3:latest");
+      assert.equal(
+        detailed?.limits?.contextWindowTokens,
+        40960,
+        "the detail carries the tag row's canonical id",
+      );
+      assert.isUndefined(
+        models.find((model) => model.id === "qwen3"),
+        "no duplicate row for the shorthand",
+      );
+    });
+
     it("issues no /api/show call when no model is selected", async function () {
       let showCalls = 0;
       await fetchOllamaCatalog({

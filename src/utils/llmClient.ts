@@ -106,7 +106,9 @@ import {
   compileReasoningControls,
   ensureModelCapabilities,
   getModelCapabilities,
+  isRecord,
   isReservedRequestKey,
+  profileOverrideAppliesTo,
   type ModelProfileOverride,
 } from "../modelCapabilities";
 
@@ -1750,7 +1752,7 @@ function buildResponsesTokenParam(maxTokens: number) {
   return { max_output_tokens: maxTokens };
 }
 
-function normalizeMaxTokensForRequest(params: {
+export function normalizeMaxTokensForRequest(params: {
   value?: number;
   model: string;
   apiBase?: string;
@@ -2208,14 +2210,28 @@ export function buildReasoningPayload(
     providerProtocol,
     options,
   );
-  const extraBody = stripReservedRequestKeys(
-    options?.profileOverride?.extraBody,
-  );
+  const extraBody = resolveUserExtraBody(options?.profileOverride, modelName);
   if (!extraBody) return base;
   return {
     extra: { ...extraBody, ...base.extra },
     omitTemperature: base.omitTemperature,
   };
+}
+
+/**
+ * The extra request parameters an override contributes to a request — after
+ * the reserved-key strip, and only when the override was authored for the
+ * model being called (a dormant override from a renamed entry contributes
+ * nothing; see `forModel`).
+ */
+export function resolveUserExtraBody(
+  profileOverride: ModelProfileOverride | undefined,
+  modelName: string | undefined,
+): Record<string, unknown> | undefined {
+  if (!profileOverrideAppliesTo(profileOverride, modelName || "")) {
+    return undefined;
+  }
+  return stripReservedRequestKeys(profileOverride?.extraBody);
 }
 
 /**
@@ -2227,7 +2243,7 @@ export function buildReasoningPayload(
  * envelope, so an unfiltered `messages` or `tools` key would replace the
  * conversation or drop every tool definition.
  */
-function stripReservedRequestKeys(
+export function stripReservedRequestKeys(
   extraBody: Record<string, unknown> | undefined,
 ): Record<string, unknown> | undefined {
   if (!extraBody) return undefined;
@@ -2465,6 +2481,7 @@ function buildAnthropicMessagesPayload(params: {
   anthropicModeOverride?: AnthropicReasoningModeOverride;
   pdfParts?: NativePdfPart[];
   contextCache?: ContextCachePlan;
+  profileOverride?: ModelProfileOverride;
 }): Record<string, unknown> {
   const systemParts = params.messages
     .filter((m) => m.role === "system")
@@ -2544,6 +2561,7 @@ function buildAnthropicMessagesPayload(params: {
     {
       maxTokens: params.effectiveMaxTokens,
       anthropicModeOverride: params.anthropicModeOverride,
+      profileOverride: params.profileOverride,
     },
   );
   Object.assign(payload, reasoningPayload.extra);
@@ -2675,6 +2693,7 @@ function buildGeminiNativePayload(params: {
   temperature: number | undefined;
   reasoning?: ReasoningConfig;
   pdfParts?: Array<{ base64: string }>;
+  profileOverride?: ModelProfileOverride;
 }): Record<string, unknown> {
   const systemParts = params.messages
     .filter((m) => m.role === "system")
@@ -2724,9 +2743,17 @@ function buildGeminiNativePayload(params: {
       }
     }
   }
+  // User extra parameters ride along here the same as on every other
+  // protocol; a user generationConfig is merged under the envelope so the
+  // dedicated temperature/max-token fields keep the last word on a collision.
+  const extraBody = resolveUserExtraBody(params.profileOverride, params.model);
+  const { generationConfig: extraGenerationConfig, ...extraTop } = (extraBody ||
+    {}) as { generationConfig?: unknown } & Record<string, unknown>;
   const payload: Record<string, unknown> = {
+    ...extraTop,
     contents,
     generationConfig: {
+      ...(isRecord(extraGenerationConfig) ? extraGenerationConfig : {}),
       maxOutputTokens: params.effectiveMaxTokens,
       ...(params.temperature !== undefined
         ? { temperature: params.temperature }
@@ -2740,6 +2767,7 @@ function buildGeminiNativePayload(params: {
         model: params.model,
         apiBase: params.apiBase,
         protocol: "gemini_native",
+        profileOverride: params.profileOverride,
       }),
       params.reasoning,
     );
@@ -2948,9 +2976,15 @@ function toOllamaChatMessages(messages: ChatMessage[]): OllamaChatMessage[] {
   });
 }
 
-function buildOllamaChatPayload(params: {
+/**
+ * The one Ollama `/api/chat` envelope builder, shared by chat mode and the
+ * agent adapter so the merge subtleties below exist in exactly one place.
+ */
+export function buildOllamaChatPayload(params: {
   model: string;
-  messages: ChatMessage[];
+  /** Pre-converted messages (agent adapter) or ChatMessages (chat mode). */
+  messages: ChatMessage[] | Array<Record<string, unknown>>;
+  messagesAreConverted?: boolean;
   stream: boolean;
   temperature?: number;
   /**
@@ -2961,6 +2995,8 @@ function buildOllamaChatPayload(params: {
   numPredict?: number;
   /** Runtime context window, so what we claim and what Ollama allocates agree. */
   numCtx?: number;
+  /** Tool definitions (agent mode). User extra params never occupy this key. */
+  tools?: unknown[];
   reasoningExtra?: Record<string, unknown>;
 }): Record<string, unknown> {
   const options: Record<string, unknown> = {};
@@ -2974,20 +3010,19 @@ function buildOllamaChatPayload(params: {
   // `options.repeat_penalty` would otherwise replace the whole object and
   // silently drop num_ctx, reinstating the context truncation this protocol
   // exists to avoid. User keys win within the merge; the envelope does not.
-  const mergedOptions = isPlainRecord(extraOptions)
+  const mergedOptions = isRecord(extraOptions)
     ? { ...options, ...extraOptions }
     : options;
   return {
     model: params.model,
-    messages: toOllamaChatMessages(params.messages),
+    messages: params.messagesAreConverted
+      ? params.messages
+      : toOllamaChatMessages(params.messages as ChatMessage[]),
     stream: params.stream,
+    ...(params.tools?.length ? { tools: params.tools } : {}),
     ...(Object.keys(mergedOptions).length ? { options: mergedOptions } : {}),
     ...extraTop,
   };
-}
-
-function isPlainRecord(value: unknown): value is Record<string, unknown> {
-  return Boolean(value) && typeof value === "object" && !Array.isArray(value);
 }
 
 /**
@@ -2997,7 +3032,7 @@ function isPlainRecord(value: unknown): value is Record<string, unknown> {
  * "unset" and let the server decide; any other value is the user's explicit
  * choice and is honoured.
  */
-function resolveOllamaNumPredict(effectiveMaxTokens: number): number {
+export function resolveOllamaNumPredict(effectiveMaxTokens: number): number {
   return effectiveMaxTokens === DEFAULT_MAX_TOKENS ? -1 : effectiveMaxTokens;
 }
 
@@ -3007,7 +3042,7 @@ function resolveOllamaNumPredict(effectiveMaxTokens: number): number {
  * Allocating exactly the cap the plugin trimmed to keeps the claim and the
  * allocation in agreement.
  */
-function resolveOllamaNumCtx(
+export function resolveOllamaNumCtx(
   protocol: ProviderProtocol,
   limitTokens: number,
 ): number | undefined {
@@ -3018,7 +3053,13 @@ function resolveOllamaNumCtx(
 }
 
 type OllamaChatChunk = {
-  message?: { content?: unknown; thinking?: unknown };
+  message?: {
+    content?: unknown;
+    thinking?: unknown;
+    tool_calls?: Array<{
+      function?: { name?: string; arguments?: unknown };
+    }>;
+  };
   done?: boolean;
   done_reason?: string;
   prompt_eval_count?: number;
@@ -3026,8 +3067,12 @@ type OllamaChatChunk = {
   error?: string;
 };
 
+/** A tool call as Ollama frames it; the agent layer assigns ids itself. */
+export type OllamaRawToolCall = { name: string; arguments: unknown };
+
 /**
- * Parse Ollama's `/api/chat` stream.
+ * Parse Ollama's `/api/chat` stream — the one NDJSON parser for both chat
+ * mode and the agent adapter, so a wire quirk is fixed in exactly one place.
  *
  * The framing is NDJSON — one complete JSON object per line, with no `data:`
  * prefix — so `parseStreamResponse` cannot be reused: it skips every line that
@@ -3037,19 +3082,23 @@ type OllamaChatChunk = {
  * the whole reason this protocol exists (see #363): over Ollama's
  * OpenAI-compatible endpoint some models put the entire answer in the reasoning
  * field and leave content empty.
+ *
+ * Ollama emits each tool call complete in a single chunk, so `onToolCall`
+ * fires once per call with no per-index accumulation.
  */
 export async function parseOllamaChatStream(
   body: ReadableStream<Uint8Array>,
-  onDelta: (delta: string) => void,
-  onReasoning?: (event: ReasoningEvent) => void,
-  onUsage?: (usage: UsageStats) => void,
+  onDelta: (delta: string) => void | Promise<void>,
+  onReasoning?: (event: ReasoningEvent) => void | Promise<void>,
+  onUsage?: (usage: UsageStats) => void | Promise<void>,
+  onToolCall?: (call: OllamaRawToolCall) => void,
 ): Promise<string> {
   const reader = body.getReader() as ReadableStreamDefaultReader<Uint8Array>;
   const decoder = new TextDecoder("utf-8");
   let buffer = "";
   let fullText = "";
 
-  const handleLine = (line: string) => {
+  const handleLine = async (line: string) => {
     const trimmed = line.trim();
     if (!trimmed) return;
     let parsed: OllamaChatChunk;
@@ -3063,18 +3112,25 @@ export async function parseOllamaChatStream(
       throw new Error(`Ollama error: ${parsed.error}`);
     }
     const thinking = normalizeStreamText(parsed.message?.thinking ?? "");
-    if (thinking && onReasoning) onReasoning({ details: thinking });
+    if (thinking && onReasoning) await onReasoning({ details: thinking });
     const content = normalizeStreamText(parsed.message?.content ?? "");
     if (content) {
       fullText += content;
-      onDelta(content);
+      await onDelta(content);
+    }
+    if (onToolCall && Array.isArray(parsed.message?.tool_calls)) {
+      for (const call of parsed.message.tool_calls) {
+        const name = call?.function?.name?.trim();
+        if (!name) continue;
+        onToolCall({ name, arguments: call.function?.arguments });
+      }
     }
     if (parsed.done && onUsage) {
       const promptTokens = parsed.prompt_eval_count ?? 0;
       const completionTokens = parsed.eval_count ?? 0;
       const totalTokens = promptTokens + completionTokens;
       if (totalTokens > 0) {
-        onUsage({
+        await onUsage({
           promptTokens,
           completionTokens,
           totalTokens,
@@ -3092,10 +3148,10 @@ export async function parseOllamaChatStream(
       buffer += decoder.decode(value, { stream: true });
       const lines = buffer.split("\n");
       buffer = lines.pop() || "";
-      for (const line of lines) handleLine(line);
+      for (const line of lines) await handleLine(line);
     }
     // Flush a trailing object that arrived without a closing newline.
-    if (buffer.trim()) handleLine(buffer);
+    if (buffer.trim()) await handleLine(buffer);
   } finally {
     reader.releaseLock();
   }
@@ -3162,6 +3218,9 @@ function createChatPayloadBuilder(params: {
         .filter(Boolean);
       const codexPayload = {
         model,
+        // User extra parameters, envelope keys after them so a collision
+        // resolves the same way as on every other protocol.
+        ...(resolveUserExtraBody(params.profileOverride, model) || {}),
         ...responsesInput,
         instructions: codexInstructionsParts.join("\n\n"),
         ...(codexReasoningEffort
@@ -3757,6 +3816,7 @@ async function callNativeProtocol(params: {
             anthropicModeOverride: reasoningOverride?.anthropicModeOverride,
             pdfParts: pdfParts.length ? pdfParts : undefined,
             contextCache: params.contextCache,
+            profileOverride: params.profileOverride,
           })
         : buildGeminiNativePayload({
             model,
@@ -3766,6 +3826,7 @@ async function callNativeProtocol(params: {
             temperature: resolveGeminiTemperature(model, rawTemperature),
             reasoning: reasoningOverride,
             pdfParts: pdfParts.length ? pdfParts : undefined,
+            profileOverride: params.profileOverride,
           });
   const res = await postWithReasoningFallback({
     url,

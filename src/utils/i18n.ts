@@ -553,20 +553,20 @@ const zhCN: Record<string, string> = {
   "For LM Studio, llama.cpp, vLLM, Jan and other local OpenAI-compatible servers. No API key required.":
     "适用于 LM Studio、llama.cpp、vLLM、Jan 等本地 OpenAI 兼容服务。无需 API 密钥。",
   // ── Model parameter editor ─────────────────────────────────────────
-  Tools: "工具",
-  Streaming: "流式输出",
   "Reasoning levels": "思考级别",
-  "The levels the reasoning menu offers, and the parameters each one sends — for example reasoning_effort=high, or think=high on Ollama. For an off switch add a level named off that disables it: reasoning_effort=none, or think=false on Ollama. Leaving a level's parameters blank uses the provider's default, which is not the same as off.":
-    "思考菜单中提供的级别，以及每个级别发送的参数——例如 reasoning_effort=high，在 Ollama 上则是 think=high。若需要关闭开关，请添加一个名为 off 的级别并填写用于关闭的参数：reasoning_effort=none，在 Ollama 上则是 think=false。留空参数将使用服务商的默认行为，这与关闭并不相同。",
+  "Future-proofing: when a provider ships a new reasoning level, add it here yourself — no plugin update needed. Type only the level name — ultra, off, anything — and the plugin sends it in the provider's own parameter, shown next to the level. The model decides what is valid: use Test to try every custom level. Deleting every level hides the reasoning menu.":
+    "面向未来的设计：当服务商推出新的思考级别时，你可以自行在此添加，无需等待插件更新。只需输入级别名称——ultra、off 或任何名称——插件会以该服务商自己的参数发送（显示在级别旁边）。级别是否有效由模型决定：点击 Test 可逐一验证自定义级别。删除所有级别会完全隐藏思考菜单。",
+  "Discard changes and return to the detected profile":
+    "放弃更改并恢复为检测到的配置",
   "+ Add level": "+ 添加级别",
   "Delete level": "删除级别",
   level: "级别",
   "Duplicate level — ignored": "级别重复 — 已忽略",
   "Use letters, digits, - or _ so the level is remembered":
     "请使用字母、数字、- 或 _，否则该级别不会被记住",
-  "Unknown level — add parameters or the provider default is used":
-    "未知级别 — 请填写参数，否则将使用服务商默认值",
-  "Expected key=value: ": "应为 key=value：",
+  "Testing custom settings…": "正在测试自定义设置…",
+  "extra parameters": "额外参数",
+  rejected: "被拒绝",
   "Extra request parameters": "额外请求参数",
   'A JSON object merged into every request to this model, for example {"top_k": 40, "options": {"repeat_penalty": 1.1}}.':
     '一个 JSON 对象，会合并进发往该模型的每次请求，例如 {"top_k": 40, "options": {"repeat_penalty": 1.1}}。',
@@ -648,8 +648,6 @@ const zhCN: Record<string, string> = {
   "Runtime defaults": "运行时默认值",
   Model: "模型",
   Auto: "自动",
-  Yes: "是",
-  No: "否",
   Low: "低",
   Medium: "中",
   High: "高",

@@ -4,40 +4,44 @@
  * Every heuristic for inferring what a model can do — name regexes, hosted
  * profiles, what a server volunteers — goes stale as models ship. Rather than
  * chase that, the user gets the last word: an override sits on top of the
- * detected profile and wins.
+ * detected profile and wins. The customization surface is deliberately small
+ * and maps to what actually changes when a provider ships a new model:
+ * reasoning levels (a new effort such as `ultra`), the context window, and a
+ * raw request-parameter escape hatch. Feature flags like tools or streaming
+ * are the plugin's job to detect, never the user's to declare.
  *
- * The shape deliberately reuses `RegistryModelEntry` minus its `match` (the
- * model is implied by where the override is stored), so there is no second
- * schema to maintain and the same merge machinery applies.
+ * The shape deliberately reuses `RegistryModelEntry` fields, so there is no
+ * second schema to maintain and the same merge machinery applies.
  *
  * **Trust boundary.** The registry allowlist in `registry.ts` exists because
  * the remote registry is fetched over the network. A user editing their own
  * provider is a different domain: local-model users need `top_k`,
  * `repeat_penalty`, `stop` and friends, all of which that allowlist blocks. So
- * arbitrary keys are permitted here — but path segments that would let a value
- * escape into the prototype chain are not.
+ * arbitrary keys are permitted here — but keys that would let a value escape
+ * into the prototype chain are not.
  */
 
-import type {
-  ModelFeatureCapabilities,
-  ModelInputCapabilities,
-  ModelCapabilityLimits,
-  ModelReasoningCapability,
-  ModelSamplingCapability,
-} from "./types";
+import type { ModelCapabilityLimits, ModelReasoningCapability } from "./types";
+import { isRecord, MODEL_CAPABILITY_MAX_TOKEN_LIMIT } from "./registry";
 
 export type ModelProfileOverride = {
+  /**
+   * The model name this override was authored for. Parameters are tuned to
+   * one specific model, so when the entry is pointed at a different model the
+   * override goes dormant instead of being applied — or destroyed. Renaming
+   * back restores it. Absent on overrides written before this field existed;
+   * those apply unconditionally.
+   */
+  forModel?: string;
   limits?: ModelCapabilityLimits;
   reasoning?: ModelReasoningCapability;
-  sampling?: ModelSamplingCapability;
-  inputs?: Partial<ModelInputCapabilities>;
-  features?: Partial<ModelFeatureCapabilities>;
-  /** Extra request-body parameters, expressed as dot-paths. */
+  /** Extra request-body parameters, merged into every request to this model. */
   extraBody?: Record<string, unknown>;
 };
 
 /**
- * Path segments that must never be walked when expanding a dot-path.
+ * Path segments that must never be walked when expanding a dot-path, and keys
+ * that must never appear in a stored request body.
  *
  * A naive walker resolves `__proto__` to `Object.prototype` and then writes
  * through it, which mutates every object in the runtime. `constructor` and
@@ -55,6 +59,19 @@ export function isForbiddenPathSegment(segment: string): boolean {
   return FORBIDDEN_PATH_SEGMENTS.has(segment);
 }
 
+/**
+ * The shape a reasoning level id must have to survive the pref store.
+ *
+ * The editor warns on ids outside this shape and the pref-store validator in
+ * prefHelpers drops them — one pattern, imported by both, so the warning and
+ * the store can never disagree about what "will be remembered" means.
+ */
+export const REASONING_LEVEL_ID_PATTERN = /^[a-z0-9][a-z0-9_-]{0,31}$/;
+
+export function isValidReasoningLevelId(value: string): boolean {
+  return REASONING_LEVEL_ID_PATTERN.test(value);
+}
+
 /** Serialized size ceiling; the override is read on every capability resolve. */
 export const MAX_PROFILE_OVERRIDE_BYTES = 16 * 1024;
 
@@ -62,10 +79,13 @@ export const MAX_PROFILE_OVERRIDE_BYTES = 16 * 1024;
  * Request-envelope keys a user parameter must never occupy.
  *
  * Payload builders spread the user's extra parameters into the request body,
- * most of them after the envelope, so a parameter named `messages`, `tools` or
- * `stream` would replace the conversation, drop every tool definition, or turn
- * off streaming. Each fails in a way that looks nothing like "the parameter I
- * typed was wrong", so the editor refuses them outright.
+ * most of them before the envelope, so a parameter named `messages`, `tools`
+ * or `stream` would collide with the conversation, the tool definitions, or
+ * the streaming switch. `temperature` and the max-token keys are refused for a
+ * different reason: dedicated fields for them already exist in the same
+ * advanced panel, and a copy here would be silently outranked by the envelope
+ * — failing in a way that looks nothing like "the parameter I typed was
+ * wrong". The editor refuses all of them with a visible message.
  */
 const RESERVED_REQUEST_KEYS = new Set([
   "model",
@@ -79,6 +99,10 @@ const RESERVED_REQUEST_KEYS = new Set([
   "stream_options",
   "tools",
   "tool_choice",
+  "temperature",
+  "max_tokens",
+  "max_completion_tokens",
+  "max_output_tokens",
 ]);
 
 export function isReservedRequestKey(key: string): boolean {
@@ -147,13 +171,12 @@ export function flattenToDotPaths(
   return rows;
 }
 
-function isPlainObject(value: unknown): value is Record<string, unknown> {
-  return Boolean(value) && typeof value === "object" && !Array.isArray(value);
-}
-
 /**
  * Infer a scalar's type from the text the user typed, so a simple
- * `key=value` field needs no separate type picker.
+ * `key=value` field needs no separate type picker. The value is trimmed:
+ * `think= high` must send `"high"`, not `" high"` — a leading space survives
+ * to the wire otherwise, and the provider's rejection of it looks nothing
+ * like a typo.
  */
 export function coerceParameterValue(raw: string): unknown {
   const trimmed = raw.trim();
@@ -165,7 +188,7 @@ export function coerceParameterValue(raw: string): unknown {
     const parsed = Number(trimmed);
     if (Number.isFinite(parsed)) return parsed;
   }
-  return raw;
+  return trimmed;
 }
 
 /**
@@ -232,7 +255,7 @@ export function parseJsonObjectField(raw: string): {
   } catch (error) {
     return { error: error instanceof Error ? error.message : String(error) };
   }
-  if (!isPlainObject(parsed)) {
+  if (!isRecord(parsed)) {
     return { error: "expected a JSON object" };
   }
   const reserved = Object.keys(parsed).filter(isReservedRequestKey);
@@ -257,7 +280,8 @@ export function stringifyJsonObjectField(
  *
  * Absent and empty must stay distinguishable: an empty object would read as
  * "override every field to nothing", which is exactly what a user pressing
- * Reset does not mean.
+ * Reset does not mean. `forModel` alone does not keep an override alive — it
+ * is provenance, not a customization.
  */
 export function pruneProfileOverride(
   override: ModelProfileOverride | undefined,
@@ -270,69 +294,106 @@ export function pruneProfileOverride(
   if (override.reasoning?.options?.length || override.reasoning?.kind) {
     pruned.reasoning = override.reasoning;
   }
-  if (override.sampling && Object.keys(override.sampling).length) {
-    pruned.sampling = override.sampling;
-  }
-  if (override.inputs && Object.keys(override.inputs).length) {
-    pruned.inputs = { ...override.inputs };
-  }
-  if (override.features && Object.keys(override.features).length) {
-    pruned.features = { ...override.features };
-  }
   if (override.extraBody && Object.keys(override.extraBody).length) {
     pruned.extraBody = override.extraBody;
   }
-  return Object.keys(pruned).length ? pruned : undefined;
+  if (!Object.keys(pruned).length) return undefined;
+  if (override.forModel?.trim()) {
+    pruned.forModel = override.forModel.trim();
+  }
+  return pruned;
 }
 
+/**
+ * Whether a stored override belongs to the model an entry currently points
+ * at. Overrides written before `forModel` existed apply unconditionally.
+ */
+export function profileOverrideAppliesTo(
+  override: ModelProfileOverride | undefined,
+  model: string,
+): boolean {
+  if (!override) return false;
+  if (!override.forModel) return true;
+  return override.forModel === model.trim();
+}
+
+/**
+ * Deep-copy a request body, dropping any key that could reach the prototype
+ * chain — at every level, inside arrays included. Unlike a dot-path
+ * round-trip, this preserves the user's structure exactly: a literal `"a.b"`
+ * key stays `"a.b"` rather than being rewritten into nesting.
+ */
 function sanitizeBody(value: unknown): Record<string, unknown> | undefined {
-  if (!isPlainObject(value)) return undefined;
-  const rows = flattenToDotPaths(value).filter(
-    (row) => !row.key.split(".").some(isForbiddenPathSegment),
-  );
-  const expanded = expandDotPaths(rows);
-  return Object.keys(expanded).length ? expanded : undefined;
+  if (!isRecord(value)) return undefined;
+  const cleaned = sanitizeRecord(value);
+  return Object.keys(cleaned).length ? cleaned : undefined;
 }
 
-function sanitizeNumber(value: unknown): number | undefined {
+function sanitizeRecord(
+  value: Record<string, unknown>,
+): Record<string, unknown> {
+  const out: Record<string, unknown> = {};
+  for (const [key, entry] of Object.entries(value)) {
+    if (isForbiddenPathSegment(key)) continue;
+    out[key] = sanitizeValue(entry);
+  }
+  return out;
+}
+
+function sanitizeValue(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(sanitizeValue);
+  if (isRecord(value)) return sanitizeRecord(value);
+  return value;
+}
+
+function sanitizeTokenLimit(value: unknown): number | undefined {
   const parsed = Math.floor(Number(value));
-  return Number.isSafeInteger(parsed) && parsed > 0 ? parsed : undefined;
+  return Number.isSafeInteger(parsed) &&
+    parsed > 0 &&
+    parsed <= MODEL_CAPABILITY_MAX_TOKEN_LIMIT
+    ? parsed
+    : undefined;
 }
 
 /**
  * Validate a stored override. Unknown body keys are allowed (that is the
  * point); structurally impossible values are dropped so a corrupt pref can
- * never break request building.
+ * never break request building. Sections this schema no longer supports
+ * (feature and input flags from earlier builds) are dropped the same way —
+ * per-model feature toggles are the plugin's job to detect, not the user's
+ * to declare.
  */
 export function normalizeProfileOverride(
   value: unknown,
 ): ModelProfileOverride | undefined {
-  if (!isPlainObject(value)) return undefined;
+  if (!isRecord(value)) return undefined;
   if (JSON.stringify(value).length > MAX_PROFILE_OVERRIDE_BYTES) {
     return undefined;
   }
   const result: ModelProfileOverride = {};
 
-  if (isPlainObject(value.limits)) {
+  if (typeof value.forModel === "string" && value.forModel.trim()) {
+    const forModel = value.forModel.trim();
+    if (forModel.length <= 256) result.forModel = forModel;
+  }
+
+  if (isRecord(value.limits)) {
     const limits: ModelCapabilityLimits = {};
-    const context = sanitizeNumber(value.limits.contextWindowTokens);
-    const input = sanitizeNumber(value.limits.inputTokens);
-    const output = sanitizeNumber(value.limits.outputTokens);
+    const context = sanitizeTokenLimit(value.limits.contextWindowTokens);
+    const input = sanitizeTokenLimit(value.limits.inputTokens);
+    const output = sanitizeTokenLimit(value.limits.outputTokens);
     if (context !== undefined) limits.contextWindowTokens = context;
     if (input !== undefined) limits.inputTokens = input;
     if (output !== undefined) limits.outputTokens = output;
     if (Object.keys(limits).length) result.limits = limits;
   }
 
-  if (
-    isPlainObject(value.reasoning) &&
-    Array.isArray(value.reasoning.options)
-  ) {
+  if (isRecord(value.reasoning) && Array.isArray(value.reasoning.options)) {
     const options = value.reasoning.options
-      .filter(isPlainObject)
+      .filter(isRecord)
       .map((option) => {
         const body = sanitizeBody(
-          isPlainObject(option.controls) ? option.controls.body : undefined,
+          isRecord(option.controls) ? option.controls.body : undefined,
         );
         return {
           id: String(option.id || "").trim(),
@@ -352,33 +413,6 @@ export function normalizeProfileOverride(
       };
     } else if (value.reasoning.kind === "none") {
       result.reasoning = { kind: "none", options: [] };
-    }
-  }
-
-  if (isPlainObject(value.sampling)) {
-    const temperature = value.sampling.temperature;
-    if (
-      temperature === "configurable" ||
-      temperature === "fixed" ||
-      temperature === "unsupported"
-    ) {
-      result.sampling = { temperature };
-    }
-  }
-
-  for (const section of ["inputs", "features"] as const) {
-    const raw = value[section];
-    if (!isPlainObject(raw)) continue;
-    const flags: Record<string, boolean> = {};
-    const allowed =
-      section === "inputs"
-        ? ["text", "image", "video", "pdf"]
-        : ["tools", "streaming", "promptCache"];
-    for (const key of allowed) {
-      if (typeof raw[key] === "boolean") flags[key] = raw[key];
-    }
-    if (Object.keys(flags).length) {
-      result[section] = flags as never;
     }
   }
 

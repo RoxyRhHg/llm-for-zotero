@@ -5257,6 +5257,7 @@ export function setupHandlers(
             entry.model,
             entry.apiBase,
             entry.providerProtocol,
+            entry.advanced?.profileOverride,
           );
           const retryAdvanced = getAdvancedModelParams(entry.entryId);
           await retryLatestAssistantResponse(
@@ -5441,6 +5442,7 @@ export function setupHandlers(
       currentModel,
       selectedProfile?.apiBase,
       selectedProfile?.providerProtocol,
+      selectedProfile?.advanced?.profileOverride,
     );
     const enabledLevels = options
       .filter((option) => option.enabled)

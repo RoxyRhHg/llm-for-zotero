@@ -174,6 +174,11 @@ function normalizeAdvancedModelConfig(
     value?.inputMode,
     runtimeMode,
   );
+  // Validated but NOT gated by forModel here: this normalization also feeds
+  // the storage round-trip, and gating at this layer would silently drop a
+  // dormant override from the pref store on the next save. Dormancy is
+  // enforced where the override is consumed — `applyProfileOverride` for
+  // capabilities, `resolveUserExtraBody` for request parameters.
   const profileOverride = normalizeProfileOverride(value?.profileOverride);
   return {
     temperature: normalizeTemperature(

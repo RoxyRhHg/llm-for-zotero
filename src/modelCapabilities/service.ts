@@ -15,9 +15,17 @@ import {
   inferProviderFromApiBase,
   inferProviderFromModelName,
 } from "./providerInference";
-import { fetchOllamaCatalog, usesOllamaCatalog } from "./localCatalog";
+import {
+  fetchOllamaCatalog,
+  stripImplicitLatestTag,
+  usesOllamaCatalog,
+} from "./localCatalog";
+import { getAbortController } from "../utils/apiHelpers";
 import { isLocalModelApiBase } from "../utils/providerPresets";
-import { normalizeProfileOverride } from "./profileOverride";
+import {
+  normalizeProfileOverride,
+  profileOverrideAppliesTo,
+} from "./profileOverride";
 import {
   applyControlPatch,
   cloneRegistry,
@@ -304,8 +312,15 @@ function getCatalogSnapshot(
 function getLiveModel(
   identity: ModelCapabilityIdentity,
 ): DiscoveredModel | undefined {
-  return getCatalogSnapshot(identity)?.models.find(
-    (model) => model.id === identity.model,
+  const models = getCatalogSnapshot(identity)?.models;
+  if (!models) return undefined;
+  return (
+    models.find((model) => model.id === identity.model) ??
+    models.find(
+      (model) =>
+        stripImplicitLatestTag(model.id) ===
+        stripImplicitLatestTag(identity.model),
+    )
   );
 }
 
@@ -377,6 +392,26 @@ function mergeReasoning(
   if (live?.reasoningSupported === false) {
     return { reasoning: { kind: "none", options: [] }, source: "live" };
   }
+  // A recognized family may keep its level set, but never its request body,
+  // when the model is served over Ollama's native protocol: `qwen3` there
+  // needs `think`, never DashScope's `chat_template_kwargs`. This outranks
+  // the registry entry and the legacy profiles alike — both are maintained
+  // for hosted deployments, and neither may ship hosted encodings to a local
+  // server. Whichever source says "this model reasons", the encoding is
+  // Ollama's.
+  if (
+    protocol === "ollama_native" &&
+    (live?.reasoningSupported || entry?.reasoning || legacy.options.length)
+  ) {
+    return {
+      reasoning: ollamaThinkOptions(),
+      source: live?.reasoningSupported
+        ? "live"
+        : entry?.reasoning
+          ? activeRegistrySource
+          : "legacy",
+    };
+  }
   if (entry?.reasoning) {
     return {
       reasoning: clone(entry.reasoning),
@@ -384,12 +419,6 @@ function mergeReasoning(
     };
   }
   if (live?.reasoningSupported) {
-    // The level set a hosted profile carries over is right, but its request
-    // body is not: `qwen3` on Ollama needs `think`, never DashScope's
-    // `chat_template_kwargs`. Only the encoding is local-specific.
-    if (protocol === "ollama_native") {
-      return { reasoning: ollamaThinkOptions(), source: "live" };
-    }
     return {
       reasoning: legacy.options.length
         ? legacy
@@ -597,11 +626,12 @@ export function getModelCapabilities(
 /**
  * The user's word is final: an override sits above legacy, registry and live.
  *
- * Applied per section and only where the override actually states something, so
- * a user correcting one context window does not blank out everything the
+ * Applied per section and only where the override actually states something,
+ * so a user correcting one context window does not blank out everything the
  * server reported. Clearing a field removes it from the stored override
  * entirely (see `pruneProfileOverride`), which is what makes Reset
- * indistinguishable from never having edited.
+ * indistinguishable from never having edited. An override authored for a
+ * different model (see `forModel`) is dormant, not applied — and not deleted.
  */
 function applyProfileOverride(
   snapshot: ResolvedModelCapabilities,
@@ -609,6 +639,9 @@ function applyProfileOverride(
 ): ResolvedModelCapabilities {
   const override = normalizeProfileOverride(rawOverride);
   if (!override) return snapshot;
+  if (!profileOverrideAppliesTo(override, snapshot.identity.model)) {
+    return snapshot;
+  }
   const provenance = { ...snapshot.provenance };
   const next: ResolvedModelCapabilities = { ...snapshot };
 
@@ -620,26 +653,8 @@ function applyProfileOverride(
     next.reasoning = clone(override.reasoning);
     provenance.reasoning = "user";
   }
-  if (override.sampling) {
-    next.sampling = { ...snapshot.sampling, ...override.sampling };
-    provenance.sampling = "user";
-  }
-  if (override.inputs) {
-    next.inputs = { ...snapshot.inputs, ...override.inputs };
-    provenance.inputs = "user";
-  }
-  if (override.features) {
-    next.features = { ...snapshot.features, ...override.features };
-    provenance.features = "user";
-  }
   next.provenance = provenance;
-  if (
-    override.limits ||
-    override.reasoning ||
-    override.sampling ||
-    override.inputs ||
-    override.features
-  ) {
+  if (override.limits || override.reasoning) {
     next.source = "user";
   }
   return next;
@@ -722,11 +737,6 @@ function persistRegistry(registry: typeof activeRegistry): void {
     // Persistence is an optimization; an unavailable preference service must
     // not discard a valid in-memory registry update.
   }
-}
-
-function getAbortController(): typeof AbortController | undefined {
-  return (globalThis as unknown as { AbortController?: typeof AbortController })
-    .AbortController;
 }
 
 export async function refreshModelCapabilityRegistry(

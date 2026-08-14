@@ -94,6 +94,7 @@ import {
 } from "../../utils/llmClient";
 import {
   getModelCapabilities,
+  type ModelProfileOverride,
   getRuntimeReasoningOptions as getCatalogReasoningOptions,
   inferProviderFromModelName,
 } from "../../modelCapabilities";
@@ -2288,6 +2289,7 @@ export function getReasoningOptions(
   modelName: string,
   apiBase?: string,
   providerProtocol?: ProviderProtocol,
+  profileOverride?: ModelProfileOverride,
 ): ReasoningOption[] {
   if (provider === "anthropic") {
     const resolvedProtocol =
@@ -2298,11 +2300,14 @@ export function getReasoningOptions(
       });
     if (resolvedProtocol !== "anthropic_messages") return [];
   }
+  // The user's override is part of the identity: the menu must offer exactly
+  // the levels the request builder will encode, custom ones included.
   return getCatalogReasoningOptions({
     provider: provider === "unsupported" ? undefined : provider,
     model: modelName,
     apiBase,
     protocol: providerProtocol,
+    profileOverride,
   }).map((option) => ({
     level: option.level as LLMReasoningLevel,
     enabled: option.enabled,
@@ -2407,6 +2412,7 @@ export function getSelectedReasoningForItem(
   modelName: string,
   apiBase?: string,
   providerProtocol?: ProviderProtocol,
+  profileOverride?: ModelProfileOverride,
 ): LLMReasoningConfig | undefined {
   const detectedProvider = detectReasoningProvider(modelName, apiBase);
   const resolvedCapabilityProvider = getModelCapabilities({
@@ -2414,6 +2420,7 @@ export function getSelectedReasoningForItem(
     model: modelName,
     apiBase,
     protocol: providerProtocol,
+    profileOverride,
   }).provider;
   const provider: ReasoningProviderKind = [
     "openai",
@@ -2433,6 +2440,7 @@ export function getSelectedReasoningForItem(
     modelName,
     apiBase,
     providerProtocol,
+    profileOverride,
   )
     .filter((option) => option.enabled)
     .map((option) => option.level);
@@ -3391,6 +3399,8 @@ function resolveEffectiveRequestConfig(params: {
     params.providerProtocol ||
     explicitEntry?.providerProtocol ||
     fallbackEntry?.providerProtocol;
+  const advanced =
+    params.advanced || explicitEntry?.advanced || fallbackEntry?.advanced;
   const reasoning =
     params.reasoning ||
     getSelectedReasoningForItem(
@@ -3398,9 +3408,8 @@ function resolveEffectiveRequestConfig(params: {
       model,
       apiBase,
       providerProtocol,
+      advanced?.profileOverride,
     );
-  const advanced =
-    params.advanced || explicitEntry?.advanced || fallbackEntry?.advanced;
   return {
     model,
     apiBase,

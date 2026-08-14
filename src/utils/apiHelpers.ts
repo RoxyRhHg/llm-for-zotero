@@ -44,6 +44,16 @@ export function resolveOllamaNativeApiRoot(apiBase: string): string {
   return resolveOllamaNativeEndpoint(apiBase).replace(/\/chat$/, "");
 }
 
+/**
+ * AbortController is not guaranteed in Zotero's Gecko chrome context. Every
+ * fetch-with-timeout in the plugin must go through this one guarded lookup so
+ * a future fallback (or a platform change) lands everywhere at once.
+ */
+export function getAbortController(): typeof AbortController | undefined {
+  return (globalThis as unknown as { AbortController?: typeof AbortController })
+    .AbortController;
+}
+
 // =============================================================================
 // Functions
 // =============================================================================

@@ -1,3 +1,4 @@
+import { isValidReasoningLevelId } from "../../modelCapabilities";
 import {
   config,
   ASSISTANT_NOTE_MAP_PREF_KEY,
@@ -117,15 +118,15 @@ const GENERIC_FONT_FAMILIES = new Set([
  * users can define their own levels in the per-model parameter editor. An
  * allowlist of the seven levels the plugin happened to know about would let
  * such a level be selected for one session and then silently forgotten on
- * restart. The pattern keeps the sanitising intent — bounded length, safe
- * charset, no injection into the pref store — without freezing the vocabulary.
+ * restart. The shared pattern keeps the sanitising intent — bounded length,
+ * safe charset, no injection into the pref store — without freezing the
+ * vocabulary, and is the same one the editor warns against, so "will be
+ * remembered" means the same thing in both places.
  */
-const REASONING_LEVEL_PATTERN = /^[a-z0-9][a-z0-9_-]{0,31}$/;
-
 function isReasoningLevelSelection(
   value: string,
 ): value is ReasoningLevelSelection {
-  return REASONING_LEVEL_PATTERN.test(value);
+  return isValidReasoningLevelId(value);
 }
 
 const REASONING_LEVEL_SELECTIONS = {

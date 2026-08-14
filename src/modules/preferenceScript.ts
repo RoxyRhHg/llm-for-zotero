@@ -6,7 +6,7 @@ import {
   DEFAULT_SYSTEM_PROMPT,
   DEFAULT_TEMPERATURE,
 } from "../utils/llmDefaults";
-import { HTML_NS } from "../utils/domHelpers";
+import { HTML_NS, el, iconBtn } from "../utils/domHelpers";
 import { registerAddonDialog } from "../utils/dialogRegistry";
 import {
   normalizeMaxTokensForModel,
@@ -44,6 +44,7 @@ import {
   getModelCapabilities,
   getModelCatalogStatus,
   refreshModelCatalog,
+  subscribeModelCapabilities,
   type ModelProfileOverride,
 } from "../modelCapabilities";
 import { createModelProfileEditor } from "./modelProfileEditor";
@@ -63,6 +64,7 @@ import {
 } from "../utils/providerProtocol";
 import {
   runProviderConnectionTest,
+  runProviderSettingsChecks,
   runCodexAppServerConnectionTest,
 } from "../utils/providerConnectionTest";
 import { normalizeAgentPermissionMode } from "../shared/agentPermissionMode";
@@ -400,37 +402,42 @@ function resolveModelSelectedProtocol(
 }
 
 // ── DOM helpers ────────────────────────────────────────────────────
+// `el` and `iconBtn` live in utils/domHelpers so the profile editor and this
+// pane render identical controls from one definition.
 
-function el<K extends keyof HTMLElementTagNameMap>(
-  doc: Document,
-  tag: K,
-  style?: string,
-  text?: string,
-): HTMLElementTagNameMap[K] {
-  const node = doc.createElementNS(HTML_NS, tag) as HTMLElementTagNameMap[K];
-  if (style) node.setAttribute("style", style);
-  if (text !== undefined) node.textContent = text;
-  return node;
-}
+// ── Live profile editors ───────────────────────────────────────────
+// Capability data (context window, thinking support) arrives asynchronously
+// from the model catalog, so profile editors repaint when it lands instead of
+// freezing whatever was cached when the pane mounted. One shared subscription
+// serves every editor; disconnected editors are pruned on each notify, and
+// the subscription retires itself when the last one is gone — the pane has no
+// teardown hook, so lifecycle is keyed to the DOM. An editor the user is
+// typing in is skipped: a repaint would eat the in-progress edit.
 
-function iconBtn(
-  doc: Document,
-  label: string,
-  title: string,
-): HTMLButtonElement {
-  const btn = el(
-    doc,
-    "button",
-    "padding: 0; width: 22px; height: 22px; border: none; background: transparent;" +
-      " color: var(--fill-secondary, #888); font-size: 16px; font-weight: 500;" +
-      " display: inline-flex; align-items: center; justify-content: center;" +
-      " cursor: pointer; flex-shrink: 0; border-radius: 4px; line-height: 1;",
-    label,
-  ) as HTMLButtonElement;
-  btn.type = "button";
-  btn.title = title;
-  btn.setAttribute("aria-label", title);
-  return btn;
+type LiveProfileEditor = { element: HTMLElement; refresh: () => void };
+const liveProfileEditors: LiveProfileEditor[] = [];
+let unsubscribeCapabilityUpdates: (() => void) | null = null;
+
+function registerLiveProfileEditor(entry: LiveProfileEditor) {
+  liveProfileEditors.push(entry);
+  if (unsubscribeCapabilityUpdates) return;
+  unsubscribeCapabilityUpdates = subscribeModelCapabilities(() => {
+    for (let index = liveProfileEditors.length - 1; index >= 0; index -= 1) {
+      if (!liveProfileEditors[index].element.isConnected) {
+        liveProfileEditors.splice(index, 1);
+      }
+    }
+    if (!liveProfileEditors.length) {
+      unsubscribeCapabilityUpdates?.();
+      unsubscribeCapabilityUpdates = null;
+      return;
+    }
+    for (const editor of liveProfileEditors) {
+      const active = editor.element.ownerDocument?.activeElement;
+      if (active && editor.element.contains(active)) continue;
+      editor.refresh();
+    }
+  });
 }
 
 // ── Provider model select (fetch & choose) ─────────────────────────
@@ -2169,6 +2176,7 @@ export async function registerPrefsScripts(_window: Window | undefined | null) {
           t,
           getOverride: () => modelEntry.profileOverride,
           getDetected: resolveDetectedProfile,
+          getModelName: () => modelEntry.model,
           onChange: (next: ModelProfileOverride | undefined) => {
             if (next) {
               modelEntry.profileOverride = next;
@@ -2194,17 +2202,24 @@ export async function registerPrefsScripts(_window: Window | undefined | null) {
           ),
           profileEditor.element,
         );
+        // The detected profile arrives asynchronously (catalog fetch), so the
+        // editor repaints when capability data lands rather than seeding once
+        // from whatever was cached at mount time.
+        registerLiveProfileEditor({
+          element: profileEditor.element,
+          refresh: () => profileEditor.refresh(resolveDetectedProfile()),
+        });
 
         /**
          * Parameters are tuned for one specific model, so pointing this entry
-         * at a different one must not carry them across. Left in place, a
-         * `kimi-k2.6` override (thinking.type) would silently replace what
-         * `kimi-k3` actually wants (reasoning_effort), and the panel would show
-         * the old model's levels as if they were detected.
+         * at a different one must not apply them there — the override carries
+         * the model it was authored for and goes dormant on a mismatch (see
+         * `forModel`), so a rename never destroys it and renaming back
+         * restores it. The repaint swaps the panel to the new model's
+         * detected profile.
          */
         function onSelectedModelChanged(previousModel: string) {
           if (previousModel.trim() === modelEntry.model.trim()) return;
-          if (modelEntry.profileOverride) delete modelEntry.profileOverride;
           profileEditor.refresh(resolveDetectedProfile());
         }
 
@@ -2358,16 +2373,45 @@ export async function registerPrefsScripts(_window: Window | undefined | null) {
               apiKey,
               modelName,
             });
+            // The editor validates nothing about a level's meaning — the
+            // model is the judge — so the test also tries every customized
+            // setting and shows the server's verdict per item.
+            statusLine.textContent = t("Testing custom settings…");
+            statusLine.style.color = "";
+            const settingsChecks = await runProviderSettingsChecks({
+              fetchFn,
+              protocol: providerProtocol,
+              authMode,
+              apiBase,
+              apiKey,
+              modelName,
+              profileOverride: modelEntry.profileOverride,
+            });
+            const settingsLines = settingsChecks.map((check) => {
+              const label =
+                check.kind === "extra"
+                  ? t("extra parameters")
+                  : `${t("level")} ${check.id}`;
+              return check.ok
+                ? `✓ ${label}`
+                : `✗ ${label} — ${check.error || t("rejected")}`;
+            });
+            const settingsFailed = settingsChecks.some((check) => !check.ok);
+            const settingsSuffix = settingsLines.length
+              ? `\n${settingsLines.join("\n")}`
+              : "";
             if (result.warning) {
               statusLine.textContent =
                 `${t("⚠ Connected, but no answer — ")}${t(result.warning)}\n` +
-                `${t("Agent capability: ")}${result.capabilityLabel}`;
+                `${t("Agent capability: ")}${result.capabilityLabel}` +
+                settingsSuffix;
               statusLine.style.color = "darkorange";
             } else {
               statusLine.textContent =
                 `${t("✓ Success — model says: ")}"${result.reply}"\n` +
-                `${t("Agent capability: ")}${result.capabilityLabel}`;
-              statusLine.style.color = "green";
+                `${t("Agent capability: ")}${result.capabilityLabel}` +
+                settingsSuffix;
+              statusLine.style.color = settingsFailed ? "darkorange" : "green";
             }
           } catch (error) {
             statusLine.textContent = `✗ ${(error as Error).message}`;

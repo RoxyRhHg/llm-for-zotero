@@ -14,7 +14,11 @@
 
 // apiHelpers is a leaf module; importing the transport layer here would close
 // a cycle back through modelProviders into modelCapabilities.
-import { resolveOllamaNativeApiRoot } from "../utils/apiHelpers";
+import {
+  getAbortController,
+  resolveOllamaNativeApiRoot,
+} from "../utils/apiHelpers";
+import { MODEL_CAPABILITY_MAX_TOKEN_LIMIT } from "./registry";
 import type { DiscoveredModel, ModelCapabilityLimits } from "./types";
 
 /** Values Ollama reports in `/api/show` → `capabilities`. */
@@ -22,8 +26,17 @@ const CAPABILITY_VISION = "vision";
 const CAPABILITY_TOOLS = "tools";
 const CAPABILITY_THINKING = "thinking";
 
-/** Guards a hostile or broken server from producing absurd limits. */
-const MAX_CONTEXT_TOKENS = 100_000_000;
+/**
+ * Ollama names every tag explicitly — `/api/tags` reports `qwen3:latest`
+ * while the same weights answer to plain `qwen3` on every endpoint. Compare
+ * ids with the implicit `:latest` stripped so a hand-typed short name still
+ * finds the catalog row (and its context window and thinking capability).
+ * Hosted ids never contain `:latest`, so exact matching stays authoritative
+ * everywhere else.
+ */
+export function stripImplicitLatestTag(id: string): string {
+  return id.endsWith(":latest") ? id.slice(0, -":latest".length) : id;
+}
 
 type OllamaTagsResponse = {
   models?: Array<{
@@ -86,7 +99,7 @@ export function readContextLength(
     if (
       Number.isSafeInteger(value) &&
       value > 0 &&
-      value <= MAX_CONTEXT_TOKENS
+      value <= MODEL_CAPABILITY_MAX_TOKEN_LIMIT
     ) {
       return value;
     }
@@ -129,11 +142,7 @@ async function fetchJson(
   init: RequestInit,
   timeoutMs: number,
 ): Promise<unknown> {
-  const AbortControllerCtor = (
-    globalThis as typeof globalThis & {
-      AbortController?: typeof AbortController;
-    }
-  ).AbortController;
+  const AbortControllerCtor = getAbortController();
   const controller = AbortControllerCtor
     ? new AbortControllerCtor()
     : undefined;
@@ -254,9 +263,13 @@ export async function fetchOllamaCatalog(params: {
       })
     : null;
 
+  // Merge by tag-normalized id but keep the catalog's canonical name: the
+  // user may have typed `qwen3` while the server lists `qwen3:latest`, and
+  // the /api/show detail must not be discarded over the implicit tag.
+  const detailKey = detail ? stripImplicitLatestTag(detail.id) : null;
   return summaries.map((summary) =>
-    detail && summary.id === detail.id
-      ? detail
+    detail && detailKey === stripImplicitLatestTag(summary.id)
+      ? { ...detail, id: summary.id }
       : ({ id: summary.id, source: "live" } as DiscoveredModel),
   );
 }

@@ -99,11 +99,26 @@ describe("model profile override", function () {
 
     it("prunes empty sections rather than storing them", function () {
       assert.isUndefined(pruneProfileOverride({}));
-      assert.isUndefined(pruneProfileOverride({ limits: {}, inputs: {} }));
+      assert.isUndefined(pruneProfileOverride({ limits: {} }));
       assert.isUndefined(pruneProfileOverride(undefined));
       assert.deepEqual(pruneProfileOverride({ limits: { inputTokens: 10 } }), {
         limits: { inputTokens: 10 },
       });
+    });
+
+    it("does not keep an override alive on forModel alone", function () {
+      // forModel is provenance, not a customization; an override that says
+      // only "I was written for qwen3" has nothing to apply.
+      assert.isUndefined(
+        pruneProfileOverride({ forModel: "qwen3", limits: {} }),
+      );
+      assert.deepEqual(
+        pruneProfileOverride({
+          forModel: " qwen3 ",
+          limits: { inputTokens: 10 },
+        }),
+        { limits: { inputTokens: 10 }, forModel: "qwen3" },
+      );
     });
 
     it("does not read a zero or empty string as an override", function () {
@@ -599,13 +614,17 @@ describe("model profile override", function () {
       }
     });
 
-    it("keeps only recognized boolean flags", function () {
+    it("drops feature and input flags written by earlier builds", function () {
+      // Per-model feature toggles are the plugin's job to detect, never the
+      // user's to declare — a stored override from the build that offered
+      // them loses those sections on read and keeps the rest.
       const normalized = normalizeProfileOverride({
-        inputs: { image: true, bogus: true, pdf: "yes" },
-        features: { tools: false, nonsense: 1 },
+        inputs: { image: true, pdf: true },
+        features: { tools: false },
+        sampling: { temperature: "fixed" },
+        extraBody: { top_k: 40 },
       });
-      assert.deepEqual(normalized?.inputs, { image: true });
-      assert.deepEqual(normalized?.features, { tools: false });
+      assert.deepEqual(normalized, { extraBody: { top_k: 40 } });
     });
 
     it("drops reasoning options that have no id", function () {

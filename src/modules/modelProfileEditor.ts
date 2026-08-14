@@ -1,18 +1,25 @@
 /**
  * Model parameter controls, rendered inline in a provider card's advanced row.
  *
- * Every heuristic for guessing what a model can do goes stale as models ship,
- * so the user gets the last word. This owns the parts of the advanced row that
- * back a `ModelProfileOverride`; temperature, max tokens, input cap, input mode
- * and the protocol override stay where they already were, and are deliberately
- * *not* duplicated here.
+ * The customization surface exists so a new model — or a new reasoning effort
+ * a provider ships tomorrow — works without waiting for a plugin release: the
+ * user edits the reasoning-level list and, when needed, the raw JSON escape
+ * hatch. Temperature, max tokens, input cap, input mode and the protocol
+ * override stay where they already were in the advanced row and are
+ * deliberately *not* duplicated here. Feature switches (tools, streaming,
+ * vision) are the plugin's job to detect, never the user's to declare, so
+ * they have no controls at all.
  *
  * **Reasoning levels are a list the user builds**, not a fixed ladder of
  * checkboxes. When nothing has been customized the list is seeded from the
  * detected profile — so the rows start out matching what the model actually
  * offers, complete with real parameters — and the user then edits, deletes or
- * adds rows. That keeps a level from ever existing without the request body
- * that gives it meaning.
+ * adds rows. Deleting every row is itself a statement: it stores an explicit
+ * "no reasoning" so the menu disappears, rather than silently reverting.
+ *
+ * **An override belongs to the model it was written for.** The stored value
+ * carries `forModel`; pointing the entry at a different model leaves the
+ * override dormant instead of deleting it, and renaming back restores it.
  *
  * **Absent stays distinguishable from empty.** `pruneProfileOverride` drops
  * empty sections so nothing is stored as `{}`, which is what makes Reset
@@ -20,16 +27,17 @@
  */
 
 import {
+  isValidReasoningLevelId,
   parseJsonObjectField,
   parseKeyValueField,
+  profileOverrideAppliesTo,
   pruneProfileOverride,
   stringifyJsonObjectField,
   stringifyKeyValueField,
   type ModelProfileOverride,
   type ResolvedModelCapabilities,
 } from "../modelCapabilities";
-
-const HTML_NS = "http://www.w3.org/1999/xhtml";
+import { el, iconBtn } from "../utils/domHelpers";
 
 /**
  * Suggestions only — the level id is free text.
@@ -48,12 +56,8 @@ export const SUGGESTED_REASONING_LEVEL_IDS = [
   "default",
 ] as const;
 
-/** Matches the pref-store validator in prefHelpers, so a level is remembered. */
-const LEVEL_ID_PATTERN = /^[a-z0-9][a-z0-9_-]{0,31}$/;
-
-const TRISTATE_AUTO = "";
-const TRISTATE_ON = "on";
-const TRISTATE_OFF = "off";
+/** Unique-per-editor datalist ids; a timestamp collides within one render pass. */
+let editorSequence = 0;
 
 export type ModelProfileEditorHandle = {
   element: HTMLElement;
@@ -68,6 +72,8 @@ type EditorDeps = {
   onChange: (next: ModelProfileOverride | undefined) => void;
   /** The profile as detected, used to seed the level list and for Reset. */
   getDetected: () => ResolvedModelCapabilities;
+  /** The model this entry currently points at; overrides are keyed to it. */
+  getModelName: () => string;
   t: (text: string) => string;
   styles: {
     input: string;
@@ -81,33 +87,10 @@ type EditorDeps = {
 type ReasoningRow = {
   wrap: HTMLElement;
   id: HTMLInputElement;
-  params: HTMLInputElement;
+  /** Read-only display of the parameter this level sends. */
+  sent: HTMLElement;
   warning: HTMLElement;
 };
-
-function el<K extends keyof HTMLElementTagNameMap>(
-  doc: Document,
-  tag: K,
-  style?: string,
-  text?: string,
-): HTMLElementTagNameMap[K] {
-  const node = doc.createElementNS(HTML_NS, tag) as HTMLElementTagNameMap[K];
-  if (style) node.setAttribute("style", style);
-  if (text !== undefined) node.textContent = text;
-  return node;
-}
-
-function readTristate(select: HTMLSelectElement): boolean | undefined {
-  if (select.value === TRISTATE_ON) return true;
-  if (select.value === TRISTATE_OFF) return false;
-  return undefined;
-}
-
-function tristateValue(value: boolean | undefined): string {
-  if (value === true) return TRISTATE_ON;
-  if (value === false) return TRISTATE_OFF;
-  return TRISTATE_AUTO;
-}
 
 type ComparableOption = {
   id: string;
@@ -127,6 +110,158 @@ function sameOptionSet(
   return shape(left) === shape(right);
 }
 
+export type EditorRowState = { id: string };
+
+export type ProfileOverrideDraft = {
+  override: ModelProfileOverride | undefined;
+  /** One entry per input row; null when the row is fine. */
+  rowWarnings: Array<string | null>;
+  extraError: string | null;
+};
+
+/**
+ * The parameter key this model's levels are sent with, read from whatever the
+ * detected profile sends: Ollama's options carry `think`, so that is the key;
+ * hosted profiles carry no controls, where `reasoning_effort` is right for
+ * chat-style APIs and the Responses API nests it (`reasoning.effort` — a dot
+ * path the key=value parser expands).
+ */
+export function resolveReasoningParameterKey(
+  detected: ResolvedModelCapabilities,
+): string {
+  for (const option of detected.reasoning.options) {
+    const key = Object.keys(option.controls?.body || {})[0];
+    if (key) return key;
+  }
+  return detected.identity.protocol === "responses_api"
+    ? "reasoning.effort"
+    : "reasoning_effort";
+}
+
+/**
+ * The level IS the only thing the user provides: typing `ultra` means
+ * `reasoning_effort=ultra` (or `think=ultra` on Ollama, `reasoning.effort`
+ * on the Responses API) — the plugin owns the encoding, the user owns the
+ * vocabulary, and the model is the judge of what is valid (the Test button
+ * tries every custom level and shows what the server said).
+ */
+export function deriveLevelParameters(
+  detected: ResolvedModelCapabilities,
+  id: string,
+): string {
+  return `${resolveReasoningParameterKey(detected)}=${id.trim() || "high"}`;
+}
+
+/**
+ * The editor's whole decision, as a pure function of its inputs — what gets
+ * stored, and which rows deserve a warning. The DOM layer only collects field
+ * values and paints the result, so this is where the behavior is tested.
+ */
+export function computeProfileOverrideDraft(input: {
+  rows: EditorRowState[];
+  extraJson: string;
+  detected: ResolvedModelCapabilities;
+  modelName: string;
+  t?: (text: string) => string;
+}): ProfileOverrideDraft {
+  const t = input.t || ((text: string) => text);
+  const detectedOptions = input.detected.reasoning.options;
+  const detectedLabelFor = (id: string) =>
+    detectedOptions.find((option) => option.id === id)?.label || "";
+
+  // Whether this profile declares its request bodies (Ollama's think options
+  // do; hosted profiles rely on the per-protocol legacy encoders instead).
+  // Declarative profile: any level without a declared body derives one from
+  // its name. Legacy profile: the suggested ids already have correct
+  // per-protocol encodings built in, so only ids outside that set derive.
+  const declarative = detectedOptions.some(
+    (option) => Object.keys(option.controls?.body || {}).length > 0,
+  );
+  const hasBuiltinEncoding = (id: string) =>
+    declarative
+      ? Object.keys(
+          detectedOptions.find((option) => option.id === id)?.controls?.body ||
+            {},
+        ).length > 0
+      : SUGGESTED_REASONING_LEVEL_IDS.includes(
+          id as (typeof SUGGESTED_REASONING_LEVEL_IDS)[number],
+        );
+
+  const options: NonNullable<ModelProfileOverride["reasoning"]>["options"] = [];
+  const rowWarnings: Array<string | null> = [];
+  const seenIds = new Set<string>();
+  for (const row of input.rows) {
+    const id = row.id.trim().toLowerCase();
+    if (!id) {
+      rowWarnings.push(null);
+      continue;
+    }
+    if (!isValidReasoningLevelId(id)) {
+      // Anything outside this shape is dropped by the pref-store validator,
+      // so the level would work once and be forgotten on restart.
+      rowWarnings.push(
+        t("Use letters, digits, - or _ so the level is remembered"),
+      );
+      continue;
+    }
+    if (seenIds.has(id)) {
+      rowWarnings.push(t("Duplicate level — ignored"));
+      continue;
+    }
+    rowWarnings.push(null);
+    // A detected level keeps the exact body the model declared (Ollama's
+    // minimal→think=false, default→think=true; registry entries likewise);
+    // a suggested id on a legacy profile keeps its per-protocol built-in
+    // encoding; anything else derives its body from its own name — the user
+    // provides only the id, the plugin does the encoding, and the model
+    // judges validity.
+    const body = hasBuiltinEncoding(id)
+      ? detectedOptions.find((option) => option.id === id)?.controls?.body
+      : parseKeyValueField(deriveLevelParameters(input.detected, id)).value;
+    seenIds.add(id);
+    options.push({
+      id,
+      // Carry the detected label rather than echoing the id. The menu keys
+      // its off/on styling off this string — `isReasoningDisplayLabelActive`
+      // treats "off" and "disabled" as inactive — so relabelling Ollama's
+      // `minimal` to "minimal" would make the button read as *on* while
+      // thinking was off.
+      label: detectedLabelFor(id) || id,
+      enabled: true,
+      ...(body && Object.keys(body).length ? { controls: { body } } : {}),
+    });
+  }
+
+  const extra = parseJsonObjectField(input.extraJson);
+
+  // Rows that still match what the model reports are not a customization.
+  // Storing them anyway would mark the entry "customized" for doing nothing,
+  // and would freeze it against future registry updates for that model.
+  const reasoningChanged = !sameOptionSet(options, detectedOptions);
+
+  // No rows left while the model offers levels is an explicit statement —
+  // "give this model no reasoning menu" — not an accident to undo.
+  const reasoning = options.length
+    ? reasoningChanged
+      ? { reasoning: { kind: "select" as const, options } }
+      : {}
+    : detectedOptions.length
+      ? { reasoning: { kind: "none" as const, options: [] } }
+      : {};
+
+  return {
+    override: pruneProfileOverride({
+      forModel: input.modelName,
+      ...reasoning,
+      ...(extra.value && Object.keys(extra.value).length
+        ? { extraBody: extra.value }
+        : {}),
+    }),
+    rowWarnings,
+    extraError: extra.error ? `${t("Invalid JSON: ")}${extra.error}` : null,
+  };
+}
+
 export function createModelProfileEditor(
   deps: EditorDeps,
 ): ModelProfileEditorHandle {
@@ -140,82 +275,34 @@ export function createModelProfileEditor(
   let detected = deps.getDetected();
   let suspendCommit = false;
 
-  /** The label detection gave this level, so the menu keeps its off/on wording. */
-  function detectedLabelFor(id: string): string {
-    return (
-      detected.reasoning.options.find((option) => option.id === id)?.label || ""
-    );
+  /** The stored override, but only when it belongs to the current model. */
+  function applicableOverride(): ModelProfileOverride | undefined {
+    const stored = deps.getOverride();
+    return stored && profileOverrideAppliesTo(stored, deps.getModelName())
+      ? stored
+      : undefined;
   }
 
   /**
-   * The parameter key this provider actually uses, read from whatever the
-   * detected profile sends. Ollama's options carry `think`, so a hint of
-   * `reasoning_effort=…` there would be wrong; hosted providers carry no
-   * controls at all, and `reasoning_effort` is the right guess for them.
+   * What this level sends — shown read-only beside the id, so the user sees
+   * the parameter without ever owning it. Detected levels show their declared
+   * body (think=false); everything else shows its derivation.
    */
-  function detectedParameterKey(): string {
-    for (const option of detected.reasoning.options) {
-      const key = Object.keys(option.controls?.body || {})[0];
-      if (key) return key;
+  function sentParameterTextFor(id: string): string {
+    const trimmed = id.trim().toLowerCase();
+    const detectedBody = detected.reasoning.options.find(
+      (option) => option.id === trimmed,
+    )?.controls?.body;
+    if (detectedBody && Object.keys(detectedBody).length) {
+      return stringifyKeyValueField(detectedBody);
     }
-    return "reasoning_effort";
-  }
-
-  /** Hint the shape for *this* row, not a fixed example. */
-  function paramsPlaceholderFor(id: string): string {
-    const level = id.trim() || "high";
-    return `${detectedParameterKey()}=${level}`;
+    return deriveLevelParameters(detected, trimmed);
   }
 
   const sectionLabel = (title: string) =>
     el(doc, "div", styles.sectionLabel, t(title));
 
   const hint = (text: string) => el(doc, "span", styles.helper, t(text));
-
-  // ── Capabilities ──────────────────────────────────────────────────────────
-  // Vision is intentionally absent: the existing "Input mode" control in this
-  // same row already governs it, and two controls for one thing invites them
-  // to disagree.
-  const capsRow = el(
-    doc,
-    "div",
-    "display: flex; gap: 10px; flex-wrap: wrap; align-items: flex-end;",
-  );
-
-  const tristateField = (labelText: string) => {
-    const wrap = el(
-      doc,
-      "div",
-      "display: flex; flex-direction: column; gap: 3px;",
-    );
-    wrap.append(
-      el(
-        doc,
-        "label",
-        "font-size: 10.5px; font-weight: 600; color: var(--fill-primary, inherit);",
-        t(labelText),
-      ),
-    );
-    const select = el(doc, "select", styles.inputSm) as HTMLSelectElement;
-    for (const [value, optionLabel] of [
-      [TRISTATE_AUTO, "Auto"],
-      [TRISTATE_ON, "Yes"],
-      [TRISTATE_OFF, "No"],
-    ]) {
-      const option = el(doc, "option") as HTMLOptionElement;
-      option.value = value;
-      option.textContent = t(optionLabel);
-      select.appendChild(option);
-    }
-    select.addEventListener("change", commit);
-    wrap.append(select);
-    return { wrap, select };
-  };
-
-  const toolsField = tristateField("Tools");
-  const streamingField = tristateField("Streaming");
-  const pdfField = tristateField("PDF");
-  capsRow.append(toolsField.wrap, streamingField.wrap, pdfField.wrap);
 
   // ── Reasoning levels ──────────────────────────────────────────────────────
   const reasoningWrap = el(
@@ -244,9 +331,7 @@ export function createModelProfileEditor(
   // A datalist rather than a dropdown: the common levels stay one keystroke
   // away, but a provider's newly-introduced level (ultra, and whatever comes
   // next) can be typed in without waiting for a plugin release.
-  const levelSuggestionsId = `llm-reasoning-levels-${Math.floor(
-    Date.now() % 1_000_000,
-  )}`;
+  const levelSuggestionsId = `llm-reasoning-levels-${++editorSequence}`;
   const levelSuggestions = el(doc, "datalist");
   levelSuggestions.id = levelSuggestionsId;
   for (const levelId of SUGGESTED_REASONING_LEVEL_IDS) {
@@ -258,12 +343,12 @@ export function createModelProfileEditor(
   reasoningWrap.append(
     reasoningHeader,
     hint(
-      "The levels the reasoning menu offers, and the parameters each one sends " +
-        "— for example reasoning_effort=high, or think=high on Ollama. " +
-        "For an off switch add a level named off that disables it: " +
-        "reasoning_effort=none, or think=false on Ollama. Leaving a level's " +
-        "parameters blank uses the provider's default, which is not the same " +
-        "as off.",
+      "Future-proofing: when a provider ships a new reasoning level, add it " +
+        "here yourself — no plugin update needed. Type only the level name " +
+        "— ultra, off, anything — and the plugin sends it in the provider's " +
+        "own parameter, shown next to the level. The model decides what is " +
+        "valid: use Test to try every custom level. Deleting every level " +
+        "hides the reasoning menu.",
     ),
     levelSuggestions,
     reasoningList,
@@ -271,7 +356,7 @@ export function createModelProfileEditor(
 
   let reasoningRows: ReasoningRow[] = [];
 
-  function addReasoningRow(seed?: { id: string; params: string }) {
+  function addReasoningRow(seed?: { id: string }) {
     const wrap = el(
       doc,
       "div",
@@ -284,45 +369,34 @@ export function createModelProfileEditor(
     idInput.placeholder = t("level");
     idInput.value = seed?.id || firstUnusedLevelId();
 
-    const params = el(
+    // Read-only: the id is the whole input; this just shows what it becomes
+    // on the wire, and follows the id as it is typed.
+    const sent = el(
       doc,
-      "input",
-      styles.inputSm + " width: 260px; font-family: monospace;",
-    ) as HTMLInputElement;
-    params.type = "text";
-    params.placeholder = paramsPlaceholderFor(idInput.value);
-    params.value = seed?.params || "";
-    params.addEventListener("input", commit);
+      "span",
+      styles.helper + " font-family: monospace;",
+      `→ ${sentParameterTextFor(idInput.value)}`,
+    );
 
     idInput.addEventListener("input", () => {
-      // The hint follows the level, so each row suggests its own value rather
-      // than repeating one example down the whole list.
-      params.placeholder = paramsPlaceholderFor(idInput.value);
+      sent.textContent = `→ ${sentParameterTextFor(idInput.value)}`;
       commit();
     });
 
-    const removeBtn = el(
-      doc,
-      "button",
-      "padding: 0; width: 22px; height: 22px; border: none; background: transparent;" +
-        " color: var(--fill-secondary, #888); font-size: 15px; cursor: pointer;" +
-        " border-radius: 4px; line-height: 1; flex-shrink: 0;",
-      "×",
-    ) as HTMLButtonElement;
-    removeBtn.type = "button";
-    removeBtn.title = t("Delete level");
+    const removeBtn = iconBtn(doc, "×", t("Delete level"));
+    removeBtn.style.fontSize = "15px";
 
     const warning = el(doc, "span", styles.helper + " color: #b45309;");
     warning.style.display = "none";
 
-    const row: ReasoningRow = { wrap, id: idInput, params, warning };
+    const row: ReasoningRow = { wrap, id: idInput, sent, warning };
     removeBtn.addEventListener("click", () => {
       reasoningRows = reasoningRows.filter((entry) => entry !== row);
       wrap.remove();
       commit();
     });
 
-    wrap.append(idInput, params, removeBtn, warning);
+    wrap.append(idInput, sent, removeBtn, warning);
     reasoningList.append(wrap);
     reasoningRows.push(row);
     return row;
@@ -379,6 +453,10 @@ export function createModelProfileEditor(
     t("Reset to detected"),
   ) as HTMLButtonElement;
   resetBtn.type = "button";
+  resetBtn.title = t("Discard changes and return to the detected profile");
+  // Always clickable: mid-edit state (a half-typed level, invalid JSON that
+  // never committed) is exactly what a user wants to bail out of, and none of
+  // that is visible in the stored override the badge reflects.
   resetBtn.addEventListener("click", () => {
     deps.onChange(undefined);
     render();
@@ -394,107 +472,30 @@ export function createModelProfileEditor(
   );
   resetRow.append(resetBtn, customizedBadge);
 
-  root.append(capsRow, reasoningWrap, extraWrap, resetRow);
+  root.append(reasoningWrap, extraWrap, resetRow);
 
   function commit() {
     if (suspendCommit) return;
-
-    const options: NonNullable<ModelProfileOverride["reasoning"]>["options"] =
-      [];
-    const seenIds = new Set<string>();
-    for (const row of reasoningRows) {
-      const id = row.id.value.trim().toLowerCase();
-      row.warning.style.display = "none";
-      row.warning.textContent = "";
-      if (!id) continue;
-      if (!LEVEL_ID_PATTERN.test(id)) {
-        // Anything outside this shape is dropped by the pref-store validator,
-        // so the level would work once and be forgotten on restart.
-        row.warning.style.display = "";
-        row.warning.textContent = t(
-          "Use letters, digits, - or _ so the level is remembered",
-        );
-        continue;
-      }
-      if (seenIds.has(id)) {
-        row.warning.style.display = "";
-        row.warning.textContent = t("Duplicate level — ignored");
-        continue;
-      }
-      const parsed = parseKeyValueField(row.params.value);
-      if (parsed.rejected.length) {
-        row.warning.style.display = "";
-        row.warning.textContent = `${t("Expected key=value: ")}${parsed.rejected.join("; ")}`;
-      } else if (
-        !Object.keys(parsed.value).length &&
-        !SUGGESTED_REASONING_LEVEL_IDS.includes(
-          id as (typeof SUGGESTED_REASONING_LEVEL_IDS)[number],
-        )
-      ) {
-        // A level the plugin has no built-in encoding for reaches the provider
-        // fallback, which for OpenAI-style profiles returns the *lowest*
-        // supported effort — so "ultra" without parameters would quietly mean
-        // "minimal". Only warn for ids the plugin cannot already encode.
-        row.warning.style.display = "";
-        row.warning.textContent = t(
-          "Unknown level — add parameters or the provider default is used",
-        );
-      }
-      seenIds.add(id);
-      options.push({
-        id,
-        // Carry the detected label rather than echoing the id. The menu keys
-        // its off/on styling off this string — `isReasoningDisplayLabelActive`
-        // treats "off" and "disabled" as inactive — so relabelling Ollama's
-        // `minimal` to "minimal" would make the button read as *on* while
-        // thinking was off.
-        label: detectedLabelFor(id) || id,
-        enabled: true,
-        ...(Object.keys(parsed.value).length
-          ? { controls: { body: parsed.value } }
-          : {}),
-      });
-    }
-
-    const features: Record<string, boolean> = {};
-    const tools = readTristate(toolsField.select);
-    const streaming = readTristate(streamingField.select);
-    if (tools !== undefined) features.tools = tools;
-    if (streaming !== undefined) features.streaming = streaming;
-
-    const inputs: Record<string, boolean> = {};
-    const pdf = readTristate(pdfField.select);
-    if (pdf !== undefined) inputs.pdf = pdf;
-
-    const extra = parseJsonObjectField(extraInput.value);
-    if (extra.error) {
+    const draft = computeProfileOverrideDraft({
+      rows: reasoningRows.map((row) => ({ id: row.id.value })),
+      extraJson: extraInput.value,
+      detected,
+      modelName: deps.getModelName(),
+      t,
+    });
+    reasoningRows.forEach((row, index) => {
+      const warning = draft.rowWarnings[index];
+      row.warning.style.display = warning ? "" : "none";
+      row.warning.textContent = warning || "";
+    });
+    if (draft.extraError) {
       extraError.style.display = "";
-      extraError.textContent = `${t("Invalid JSON: ")}${extra.error}`;
+      extraError.textContent = draft.extraError;
     } else {
       extraError.style.display = "none";
       extraError.textContent = "";
     }
-
-    // Rows that still match what the model reports are not a customization.
-    // Storing them anyway would mark the entry "customized" for doing nothing,
-    // and would freeze it against future registry updates for that model.
-    const reasoningChanged = !sameOptionSet(
-      options,
-      detected.reasoning.options,
-    );
-
-    deps.onChange(
-      pruneProfileOverride({
-        ...(options.length && reasoningChanged
-          ? { reasoning: { kind: "select" as const, options } }
-          : {}),
-        ...(Object.keys(inputs).length ? { inputs } : {}),
-        ...(Object.keys(features).length ? { features } : {}),
-        ...(extra.value && Object.keys(extra.value).length
-          ? { extraBody: extra.value }
-          : {}),
-      }),
-    );
+    deps.onChange(draft.override);
   }
 
   /**
@@ -503,23 +504,19 @@ export function createModelProfileEditor(
    */
   function render() {
     suspendCommit = true;
-    const override = deps.getOverride();
+    const override = applicableOverride();
 
     for (const row of reasoningRows) row.wrap.remove();
     reasoningRows = [];
-    const seedSource = override?.reasoning?.options?.length
-      ? override.reasoning.options
-      : detected.reasoning.options;
+    const seedSource =
+      override?.reasoning?.kind === "none"
+        ? []
+        : override?.reasoning?.options?.length
+          ? override.reasoning.options
+          : detected.reasoning.options;
     for (const option of seedSource) {
-      addReasoningRow({
-        id: option.id,
-        params: stringifyKeyValueField(option.controls?.body),
-      });
+      addReasoningRow({ id: option.id });
     }
-
-    toolsField.select.value = tristateValue(override?.features?.tools);
-    streamingField.select.value = tristateValue(override?.features?.streaming);
-    pdfField.select.value = tristateValue(override?.inputs?.pdf);
 
     extraInput.value = override?.extraBody
       ? stringifyJsonObjectField(override.extraBody)
@@ -527,11 +524,7 @@ export function createModelProfileEditor(
     extraInput.placeholder = '{"top_k": 40}';
     extraError.style.display = "none";
 
-    const customized = Boolean(override);
-    customizedBadge.style.display = customized ? "" : "none";
-    resetBtn.disabled = !customized;
-    resetBtn.style.opacity = customized ? "1" : "0.45";
-    resetBtn.style.cursor = customized ? "pointer" : "default";
+    customizedBadge.style.display = override ? "" : "none";
 
     suspendCommit = false;
   }

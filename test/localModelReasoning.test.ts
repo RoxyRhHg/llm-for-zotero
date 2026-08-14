@@ -71,6 +71,45 @@ describe("local model reasoning", function () {
     assert.equal(capabilities.provenance.reasoning, "live");
   });
 
+  it("resolves live capabilities when the user typed the short name for a :latest tag", async function () {
+    // /api/tags always reports the explicit tag (`qwen3:latest`) while the
+    // same weights answer to plain `qwen3` on every endpoint — the hand-typed
+    // short form must still find the thinking toggle and context window.
+    configureModelCapabilityRuntime({
+      fetch: (async (url: string) => {
+        if (String(url).endsWith("/api/tags")) {
+          return new Response(
+            JSON.stringify({ models: [{ name: "qwen3:latest" }] }),
+            { status: 200, headers: { "content-type": "application/json" } },
+          );
+        }
+        return new Response(
+          JSON.stringify({
+            capabilities: ["completion", "thinking"],
+            model_info: {
+              "general.architecture": "qwen3",
+              "qwen3.context_length": 40960,
+            },
+          }),
+          { status: 200, headers: { "content-type": "application/json" } },
+        );
+      }) as typeof fetch,
+    });
+    const identity = {
+      model: "qwen3",
+      apiBase: OLLAMA_BASE,
+      protocol: "ollama_native",
+    } as const;
+    await refreshModelCatalog(identity);
+    const capabilities = getModelCapabilities(identity);
+    assert.deepEqual(
+      capabilities.reasoning.options.map((o) => o.label),
+      ["Off", "On"],
+    );
+    assert.equal(capabilities.provenance.reasoning, "live");
+    assert.equal(capabilities.limits.contextWindowTokens, 40960);
+  });
+
   it("offers no reasoning control for a non-thinking model", async function () {
     const identity = await primeOllamaCatalog({
       model: "gemma3",

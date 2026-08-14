@@ -1,25 +1,37 @@
 /**
  * Agent adapter for Ollama's native `/api/chat` endpoint.
  *
- * Mirrors {@link OpenAIChatCompatAgentAdapter} in structure, with three wire
- * differences that make a separate adapter necessary:
+ * The wire handling lives in `llmClient.ts` and is shared with chat mode —
+ * `buildOllamaChatPayload` assembles the envelope (options merge, num_ctx,
+ * num_predict) and `parseOllamaChatStream` walks the NDJSON stream — so a
+ * fix to either applies to both modes at once. This adapter contributes only
+ * what is agent-specific:
  *
- *  - The stream is NDJSON (one JSON object per line), not SSE.
- *  - `message.thinking` is a distinct field from `message.content`. Ollama's
- *    OpenAI-compatible endpoint collapses these for some models and returns an
- *    empty answer (see #363); the native endpoint keeps them apart.
- *  - `tool_calls[].function.arguments` is already a JSON object rather than a
- *    JSON string, and tool results are correlated by `tool_name` instead of a
- *    server-issued `tool_call_id`.
+ *  - Message conversion carrying tool results (correlated by `tool_name`
+ *    rather than a server-issued `tool_call_id`) and `thinking` echoes.
+ *  - Tool-call collection: `tool_calls[].function.arguments` is already a
+ *    JSON object rather than a JSON string, and each call arrives complete in
+ *    one chunk.
+ *  - Tool support gating from the live catalog: `/api/show` states plainly
+ *    whether the loaded weights support tool calling, and sending tools to a
+ *    model without it is a hard 400 — the graceful no-tools fallback needs
+ *    the truth up front.
  */
 
 import {
+  buildOllamaChatPayload,
   buildReasoningPayload,
+  parseOllamaChatStream,
+  normalizeMaxTokensForRequest,
   postWithReasoningFallback,
+  resolveOllamaNumCtx,
+  resolveOllamaNumPredict,
   resolveRequestAuthState,
 } from "../../utils/llmClient";
 import { normalizeTemperature } from "../../utils/normalization";
+import { resolveContextWindowTokens } from "../../utils/modelInputCap";
 import { resolveProviderTransportEndpoint } from "../../utils/providerTransport";
+import { getModelCapabilities } from "../../modelCapabilities";
 import type {
   AgentModelCapabilities,
   AgentModelMessage,
@@ -46,20 +58,6 @@ type OllamaRequestMessage = {
   tool_calls?: Array<{
     function: { name: string; arguments: unknown };
   }>;
-};
-
-type OllamaStreamChunk = {
-  message?: {
-    content?: unknown;
-    thinking?: unknown;
-    tool_calls?: Array<{
-      function?: { name?: string; arguments?: unknown };
-    }>;
-  };
-  done?: boolean;
-  prompt_eval_count?: number;
-  eval_count?: number;
-  error?: string;
 };
 
 async function buildMessagesPayload(
@@ -135,14 +133,11 @@ async function flattenToText(message: AgentModelMessage): Promise<string> {
     .join("\n");
 }
 
-function toText(value: unknown): string {
-  return typeof value === "string" ? value : "";
-}
-
-function isPlainRecord(value: unknown): value is Record<string, unknown> {
-  return Boolean(value) && typeof value === "object" && !Array.isArray(value);
-}
-
+/**
+ * Thin agent-facing wrapper over the shared NDJSON parser: collects the raw
+ * tool calls into `AgentToolCall`s and accumulates the reasoning text the
+ * assistant echo needs.
+ */
 export async function parseOllamaChatCompletionStream(
   body: ReadableStream<Uint8Array>,
   onTextDelta?: (delta: string) => void | Promise<void>,
@@ -156,89 +151,51 @@ export async function parseOllamaChatCompletionStream(
   toolCalls: AgentToolCall[];
   reasoningText: string;
 }> {
-  const reader = body.getReader() as ReadableStreamDefaultReader<Uint8Array>;
-  const decoder = new TextDecoder("utf-8");
-  let buffer = "";
-  let fullText = "";
-  let reasoningText = "";
   const toolCalls: AgentToolCall[] = [];
+  let reasoningText = "";
+  const text = await parseOllamaChatStream(
+    body,
+    async (delta) => {
+      if (onTextDelta) await onTextDelta(delta);
+    },
+    async (event) => {
+      if (event.details) reasoningText += event.details;
+      if (onReasoning) await onReasoning(event);
+    },
+    onUsage,
+    (call) => {
+      toolCalls.push({
+        id: createFallbackToolCallId("ollama-tool", toolCalls.length),
+        name: call.name,
+        arguments: parseToolCallArguments(call.arguments),
+      });
+    },
+  );
+  return { text, toolCalls, reasoningText };
+}
 
-  const handleLine = async (line: string) => {
-    const trimmed = line.trim();
-    if (!trimmed) return;
-    let parsed: OllamaStreamChunk;
-    try {
-      parsed = JSON.parse(trimmed) as OllamaStreamChunk;
-    } catch (err) {
-      ztoolkit.log("LLM: Malformed NDJSON line in Ollama stream", err);
-      return;
-    }
-    if (parsed.error) throw new Error(`Ollama error: ${parsed.error}`);
-
-    const thinkingDelta = toText(parsed.message?.thinking);
-    if (thinkingDelta) {
-      reasoningText += thinkingDelta;
-      if (onReasoning) await onReasoning({ details: thinkingDelta });
-    }
-
-    const textDelta = toText(parsed.message?.content);
-    if (textDelta) {
-      fullText += textDelta;
-      if (onTextDelta) await onTextDelta(textDelta);
-    }
-
-    // Ollama emits each tool call complete in a single chunk, so there is no
-    // per-index accumulator to maintain the way the OpenAI stream needs.
-    if (Array.isArray(parsed.message?.tool_calls)) {
-      for (const call of parsed.message.tool_calls) {
-        const name = call?.function?.name?.trim();
-        if (!name) continue;
-        toolCalls.push({
-          id: createFallbackToolCallId("ollama-tool", toolCalls.length),
-          name,
-          arguments: parseToolCallArguments(call.function?.arguments),
-        });
-      }
-    }
-
-    if (parsed.done && onUsage) {
-      const promptTokens = parsed.prompt_eval_count ?? 0;
-      const completionTokens = parsed.eval_count ?? 0;
-      const totalTokens = promptTokens + completionTokens;
-      if (totalTokens > 0) {
-        await onUsage({
-          promptTokens,
-          completionTokens,
-          totalTokens,
-          contextTokens: promptTokens,
-          contextWindowIsAuthoritative: promptTokens > 0,
-        });
-      }
-    }
-  };
-
-  try {
-    while (true) {
-      const { value, done } = await reader.read();
-      if (done) break;
-      buffer += decoder.decode(value, { stream: true });
-      const lines = buffer.split("\n");
-      buffer = lines.pop() || "";
-      for (const line of lines) await handleLine(line);
-    }
-    if (buffer.trim()) await handleLine(buffer);
-  } finally {
-    reader.releaseLock();
-  }
-
-  return { text: fullText, toolCalls, reasoningText };
+/**
+ * Whether the loaded weights support tool calling, from the live catalog.
+ * Unknown (no catalog data) stays optimistic — the runtime's no-tools
+ * fallback is for models the server has *stated* cannot take tools.
+ */
+function resolveOllamaToolSupport(request: AgentRuntimeRequest): boolean {
+  return (
+    getModelCapabilities({
+      model: request.model || "",
+      apiBase: request.apiBase,
+      protocol: "ollama_native",
+      authMode: request.authMode,
+      profileOverride: request.advanced?.profileOverride,
+    }).features.tools !== false
+  );
 }
 
 export class OllamaNativeAgentAdapter implements AgentModelAdapter {
   getCapabilities(request: AgentRuntimeRequest): AgentModelCapabilities {
     return buildAgentModelCapabilities({
       streaming: true,
-      toolCalls: true,
+      toolCalls: resolveOllamaToolSupport(request),
       contentInputs: resolveRequestContentInputs(request),
       fileInputs: false,
       reasoning: true,
@@ -263,6 +220,32 @@ export class OllamaNativeAgentAdapter implements AgentModelAdapter {
     });
     const resolvedMessages = await buildMessagesPayload(params.messages);
     const tools = buildOpenAIFunctionTools(params.tools);
+    // Same sizing as chat mode: allocate the context window the prompt was
+    // trimmed against (Ollama's own default is far below the trained maximum
+    // and truncates silently), and honour an explicit output cap while
+    // leaving the untouched plugin default unlimited so a thinking model
+    // cannot burn the whole budget on thought.
+    const effectiveMaxTokens = normalizeMaxTokensForRequest({
+      value: request.advanced?.maxTokens,
+      model: request.model || "",
+      apiBase: request.apiBase,
+      protocol: "ollama_native",
+      authMode: request.authMode,
+      profileOverride: request.advanced?.profileOverride,
+    });
+    const numCtx = resolveOllamaNumCtx(
+      "ollama_native",
+      resolveContextWindowTokens(
+        request.model || "",
+        request.advanced?.inputTokenCap,
+        {
+          apiBase: request.apiBase,
+          protocol: "ollama_native",
+          authMode: request.authMode,
+          profileOverride: request.advanced?.profileOverride,
+        },
+      ),
+    );
     const response = await postWithReasoningFallback({
       url,
       auth,
@@ -277,33 +260,23 @@ export class OllamaNativeAgentAdapter implements AgentModelAdapter {
           "ollama_native",
           { profileOverride: request.advanced?.profileOverride },
         );
-        const options: Record<string, unknown> = {};
-        if (!reasoningPayload.omitTemperature) {
-          options.temperature = normalizeTemperature(
-            request.advanced?.temperature,
-          );
-        }
-        // num_predict is left unset so Ollama applies its own unlimited
-        // default: capping output makes a thinking model spend the budget on
-        // thought and return nothing.
-        const { options: extraOptions, ...extraTop } =
-          reasoningPayload.extra as { options?: unknown } & Record<
-            string,
-            unknown
-          >;
-        const mergedOptions = isPlainRecord(extraOptions)
-          ? { ...options, ...extraOptions }
-          : options;
-        return {
-          model: request.model,
+        return buildOllamaChatPayload({
+          model: request.model || "",
           messages: resolvedMessages,
+          messagesAreConverted: true,
           stream: true,
-          ...(tools.length ? { tools } : {}),
-          ...(Object.keys(mergedOptions).length
-            ? { options: mergedOptions }
-            : {}),
-          ...extraTop,
-        };
+          ...(reasoningPayload.omitTemperature
+            ? {}
+            : {
+                temperature: normalizeTemperature(
+                  request.advanced?.temperature,
+                ),
+              }),
+          numPredict: resolveOllamaNumPredict(effectiveMaxTokens),
+          numCtx,
+          tools,
+          reasoningExtra: reasoningPayload.extra,
+        });
       },
       signal: params.signal,
     });
