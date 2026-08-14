@@ -41,6 +41,7 @@ import {
   normalizeHistoryMessages,
 } from "./model/messageBuilder";
 import { classifyWriteNoteDestination } from "./writeNoteDestination";
+import { WRITE_NOTE_SKILL_ID } from "./skills/noteIntent";
 import { detectSkillIntent } from "./model/skillClassifier";
 import { getAllSkills, getMatchedSkillIds } from "./skills";
 import {
@@ -54,7 +55,7 @@ import {
   hydrateAgentCoverageLedger,
 } from "./context/coverageLedger";
 import {
-  buildNotesDirectoryWritePolicy,
+  getNotesDirectoryConfig,
   getNotesDirectoryNickname,
   isNotesDirectoryConfigured,
 } from "../utils/notesDirectoryConfig";
@@ -582,7 +583,7 @@ function isWriteNoteFileRequest(
     ...matchedSkills,
     ...(request.forcedSkillIds || []),
   ]);
-  if (!activeSkillIds.has("write-note")) return false;
+  if (!activeSkillIds.has(WRITE_NOTE_SKILL_ID)) return false;
   return (
     classifyWriteNoteDestination(
       request.userText,
@@ -906,7 +907,7 @@ export class AgentRuntime {
         matchedSkills,
       );
       const noteWritePolicy = requiresFileNoteWrite
-        ? buildNotesDirectoryWritePolicy({ userText: request.userText })
+        ? getNotesDirectoryConfig()
         : null;
       if (noteWritePolicy) {
         request.metadata = {

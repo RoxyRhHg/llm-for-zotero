@@ -1740,7 +1740,7 @@ describe("AgentRuntime", function () {
     }
   });
 
-  it("routes default file notes into the configured folder and creates it", async function () {
+  it("writes file notes at the exact path the agent chose, creating subfolders", async function () {
     const restoreDb = installMockDb();
     const originalIOUtils = (globalThis as { IOUtils?: unknown }).IOUtils;
     const createdDirs: string[] = [];
@@ -1813,7 +1813,8 @@ describe("AgentRuntime", function () {
                     name: "file_io",
                     arguments: {
                       action: "write",
-                      filePath: "/tmp/obsidian-vault/Figure 2.md",
+                      filePath:
+                        "/tmp/obsidian-vault/Stable Coding/Stable Coding.md",
                       content: "## Figure 2\nGrounded note.",
                     },
                   },
@@ -1827,7 +1828,8 @@ describe("AgentRuntime", function () {
                       name: "file_io",
                       arguments: {
                         action: "write",
-                        filePath: "/tmp/obsidian-vault/Figure 2.md",
+                        filePath:
+                          "/tmp/obsidian-vault/Stable Coding/Stable Coding.md",
                         content: "## Figure 2\nGrounded note.",
                       },
                     },
@@ -1868,11 +1870,11 @@ describe("AgentRuntime", function () {
       assert.equal(outcome.kind, "completed");
       assert.deepEqual(writes, [
         {
-          path: "/tmp/obsidian-vault/Zotero Notes/Figure 2.md",
+          path: "/tmp/obsidian-vault/Stable Coding/Stable Coding.md",
           text: "## Figure 2\nGrounded note.",
         },
       ]);
-      assert.include(createdDirs, "/tmp/obsidian-vault/Zotero Notes");
+      assert.include(createdDirs, "/tmp/obsidian-vault/Stable Coding");
     } finally {
       (globalThis as { IOUtils?: unknown }).IOUtils = originalIOUtils;
       restoreDb();

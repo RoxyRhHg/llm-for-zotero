@@ -449,7 +449,11 @@ describe("external bridge action approval handling", function () {
       );
       assert.include(
         customInstruction,
-        "Do not append Default folder to Default target path again",
+        "Default target path is the default destination, not a constraint",
+      );
+      assert.include(
+        customInstruction,
+        "do not append Default folder to Default target path again",
       );
       assert.include(
         customInstruction,

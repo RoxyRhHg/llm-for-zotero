@@ -17,7 +17,7 @@ import { createUpdateMetadataTool } from "../src/agent/tools/write/updateMetadat
 import { createRunCommandTool } from "../src/agent/tools/write/runCommand";
 import { createUndoLastActionTool } from "../src/agent/tools/write/undoLastAction";
 import { createZoteroScriptTool } from "../src/agent/tools/write/zoteroScript";
-import { buildNotesDirectoryWritePolicy } from "../src/utils/notesDirectoryConfig";
+import { getNotesDirectoryConfig } from "../src/utils/notesDirectoryConfig";
 import type { AgentModelMessage, AgentToolContext } from "../src/agent/types";
 import type { PaperContextRef } from "../src/shared/types";
 import type { PdfContext } from "../src/modules/contextPanel/types";
@@ -1004,7 +1004,7 @@ describe("primitive agent tools", function () {
     }
   });
 
-  it("file_io falls back to OS.File when creating a missing note folder", async function () {
+  it("file_io preserves custom note subfolders and creates them via OS.File fallback", async function () {
     const tool = createFileIOTool();
     const createdDirs = new Set<string>();
     const writes: Array<{ path: string; text: string }> = [];
@@ -1046,16 +1046,18 @@ describe("primitive agent tools", function () {
             attachmentsFolder: "Zotero Notes/imgs",
             attachmentsPath: "/tmp/obsidian-vault/Zotero Notes/imgs",
             nickname: "Obsidian",
-            enforceDefaultTarget: true,
           },
         },
       },
     };
 
     try {
+      // Folder-per-paper layout requested by a user skill customization:
+      // the path must be written verbatim, never flattened to the default
+      // target folder.
       const write = tool.validate({
         action: "write",
-        filePath: "/tmp/obsidian-vault/Figure 2.md",
+        filePath: "/tmp/obsidian-vault/Stable Coding/Stable Coding.md",
         content: "## Figure 2\nGrounded note.",
       });
       assert.isTrue(write.ok);
@@ -1068,20 +1070,80 @@ describe("primitive agent tools", function () {
 
       assert.deepEqual(writes, [
         {
-          path: "/tmp/obsidian-vault/Zotero Notes/Figure 2.md",
+          path: "/tmp/obsidian-vault/Stable Coding/Stable Coding.md",
           text: "## Figure 2\nGrounded note.",
         },
       ]);
+      assert.isTrue(createdDirs.has("/tmp/obsidian-vault/Stable Coding"));
       assert.deepInclude(result, {
         action: "write",
-        filePath: "/tmp/obsidian-vault/Zotero Notes/Figure 2.md",
-        requestedFilePath: "/tmp/obsidian-vault/Figure 2.md",
-        correctedToNotesDirectory: true,
+        filePath: "/tmp/obsidian-vault/Stable Coding/Stable Coding.md",
       });
+      assert.notProperty(result, "requestedFilePath");
+      assert.notProperty(result, "correctedToNotesDirectory");
     } finally {
       clearUndoStack(context.request.conversationKey);
       (globalThis as { IOUtils?: unknown }).IOUtils = originalIOUtils;
       (globalThis as { OS?: unknown }).OS = originalOS;
+    }
+  });
+
+  it("file_io writes note paths outside the notes directory verbatim", async function () {
+    const tool = createFileIOTool();
+    const fileContent = new Map<string, string>();
+    const originalIOUtils = (globalThis as { IOUtils?: unknown }).IOUtils;
+    (globalThis as { IOUtils?: unknown }).IOUtils = {
+      exists: async (path: string) => fileContent.has(path),
+      write: async (path: string, bytes: Uint8Array) => {
+        fileContent.set(path, new TextDecoder().decode(bytes));
+      },
+      makeDirectory: async () => undefined,
+    };
+    const context: AgentToolContext = {
+      ...baseContext,
+      request: {
+        ...baseContext.request,
+        conversationKey: 43_016,
+        metadata: {
+          fileNoteWritePolicy: {
+            directoryPath: "/tmp/obsidian-vault",
+            defaultFolder: "Zotero Notes",
+            defaultTargetPath: "/tmp/obsidian-vault/Zotero Notes",
+            attachmentsFolder: "Zotero Notes/imgs",
+            attachmentsPath: "/tmp/obsidian-vault/Zotero Notes/imgs",
+            nickname: "Obsidian",
+          },
+        },
+      },
+    };
+
+    try {
+      // User instruction (message or skill) is always honored: the notes
+      // directory is a default, not a boundary.
+      const write = tool.validate({
+        action: "write",
+        filePath: "/tmp/elsewhere/custom-note.md",
+        content: "Note outside the configured notes directory.",
+      });
+      assert.isTrue(write.ok);
+      if (!write.ok) return;
+
+      const result = (await tool.execute(write.value, context)) as Record<
+        string,
+        unknown
+      >;
+
+      assert.deepInclude(result, {
+        action: "write",
+        filePath: "/tmp/elsewhere/custom-note.md",
+      });
+      assert.equal(
+        fileContent.get("/tmp/elsewhere/custom-note.md"),
+        "Note outside the configured notes directory.",
+      );
+    } finally {
+      clearUndoStack(context.request.conversationKey);
+      (globalThis as { IOUtils?: unknown }).IOUtils = originalIOUtils;
     }
   });
 
@@ -1659,7 +1721,7 @@ describe("primitive agent tools", function () {
     }
   });
 
-  it("notes directory policy treats save-as paths as explicit targets", function () {
+  it("notes directory policy carries path information without enforcement fields", function () {
     const originalPrefs = globalScope.Zotero?.Prefs;
     if (!globalScope.Zotero) {
       throw new Error("Zotero test stub was not initialized");
@@ -1675,35 +1737,28 @@ describe("primitive agent tools", function () {
     };
 
     try {
-      const defaultPolicy = buildNotesDirectoryWritePolicy({
-        userText: "write this note to Obsidian",
-      });
-      const saveAsPolicy = buildNotesDirectoryWritePolicy({
-        userText: "save as /tmp/custom-note.md",
-      });
-      const writeAsHomePolicy = buildNotesDirectoryWritePolicy({
-        userText: "write as ~/notes/custom-note.md",
-      });
+      const policy = getNotesDirectoryConfig();
 
+      assert.equal(policy?.directoryPath, "/tmp/obsidian-vault");
       assert.equal(
-        defaultPolicy?.defaultTargetPath,
+        policy?.defaultTargetPath,
         "/tmp/obsidian-vault/Zotero Notes",
       );
-      assert.isTrue(defaultPolicy?.enforceDefaultTarget);
-      assert.isFalse(saveAsPolicy?.enforceDefaultTarget);
-      assert.isFalse(writeAsHomePolicy?.enforceDefaultTarget);
+      assert.equal(policy?.nickname, "Obsidian");
+      // Path information only — no enforcement fields survive.
+      assert.notProperty(policy || {}, "enforceDefaultTarget");
     } finally {
       globalScope.Zotero.Prefs = originalPrefs;
     }
   });
 
-  it("file_io gates redirected note overwrites and records undo", async function () {
+  it("file_io gates note overwrites at the requested path and records undo", async function () {
     const tool = createFileIOTool();
     const existingPaths = new Set<string>([
-      "/tmp/obsidian-vault/Zotero Notes/existing.md",
+      "/tmp/obsidian-vault/Papers/existing.md",
     ]);
     const fileContent = new Map<string, string>([
-      ["/tmp/obsidian-vault/Zotero Notes/existing.md", "Original note."],
+      ["/tmp/obsidian-vault/Papers/existing.md", "Original note."],
     ]);
     const originalIOUtils = (globalThis as { IOUtils?: unknown }).IOUtils;
     (globalThis as { IOUtils?: unknown }).IOUtils = {
@@ -1729,7 +1784,6 @@ describe("primitive agent tools", function () {
             attachmentsFolder: "Zotero Notes/imgs",
             attachmentsPath: "/tmp/obsidian-vault/Zotero Notes/imgs",
             nickname: "Obsidian",
-            enforceDefaultTarget: true,
           },
         },
       },
@@ -1738,7 +1792,7 @@ describe("primitive agent tools", function () {
     try {
       const overwrite = tool.validate({
         action: "write",
-        filePath: "/tmp/obsidian-vault/existing.md",
+        filePath: "/tmp/obsidian-vault/Papers/existing.md",
         content: "Updated note.",
       });
       assert.isTrue(overwrite.ok);
@@ -1751,14 +1805,14 @@ describe("primitive agent tools", function () {
       const deniedBypass = await tool.execute(overwrite.value, context);
       assert.deepInclude(deniedBypass as Record<string, unknown>, {
         action: "write",
-        filePath: "/tmp/obsidian-vault/Zotero Notes/existing.md",
+        filePath: "/tmp/obsidian-vault/Papers/existing.md",
       });
       assert.include(
         String((deniedBypass as { error?: unknown }).error || ""),
         "without confirmation",
       );
       assert.equal(
-        fileContent.get("/tmp/obsidian-vault/Zotero Notes/existing.md"),
+        fileContent.get("/tmp/obsidian-vault/Papers/existing.md"),
         "Original note.",
       );
 
@@ -1767,12 +1821,12 @@ describe("primitive agent tools", function () {
       if (!approved?.ok) return;
       await tool.execute(approved.value, context);
       assert.equal(
-        fileContent.get("/tmp/obsidian-vault/Zotero Notes/existing.md"),
+        fileContent.get("/tmp/obsidian-vault/Papers/existing.md"),
         "Updated note.",
       );
       await peekUndoEntry(context.request.conversationKey)?.revert();
       assert.equal(
-        fileContent.get("/tmp/obsidian-vault/Zotero Notes/existing.md"),
+        fileContent.get("/tmp/obsidian-vault/Papers/existing.md"),
         "Original note.",
       );
     } finally {
@@ -2095,7 +2149,6 @@ describe("primitive agent tools", function () {
             attachmentsFolder: "assets",
             attachmentsPath: "/tmp/obsidian-vault/assets",
             nickname: "vault",
-            enforceDefaultTarget: true,
           },
         },
       },

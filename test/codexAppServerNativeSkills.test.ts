@@ -357,4 +357,41 @@ describe("Codex native skills", function () {
       "",
     );
   });
+
+  it("flags user customizations after the managed block in the instruction block", function () {
+    const managedBegin = "<!-- LLM-FOR-ZOTERO:MANAGED-BEGIN -->";
+    const managedEnd = "<!-- LLM-FOR-ZOTERO:MANAGED-END -->";
+    const customized = makeSkill(
+      "write-note",
+      /note/i,
+      [
+        managedBegin,
+        "Default filename pattern: default-pattern.md",
+        managedEnd,
+        "",
+        "## Your customizations",
+        "",
+        "Path pattern: `{papertitle}/{papertitle}.md`",
+      ].join("\n"),
+    );
+    const plain = makeSkill(
+      "simple-paper-qa",
+      /summarize/i,
+      [managedBegin, "Managed-only instructions.", managedEnd].join("\n"),
+    );
+
+    const block = buildCodexNativeSkillInstructionBlock(
+      ["write-note", "simple-paper-qa"],
+      [customized, plain],
+    );
+
+    const customizedSection = block.slice(
+      block.indexOf("Skill: write-note"),
+      block.indexOf("Skill: simple-paper-qa"),
+    );
+    const plainSection = block.slice(block.indexOf("Skill: simple-paper-qa"));
+    assert.include(customizedSection, "USER CUSTOMIZATIONS");
+    assert.include(customizedSection, "OVERRIDE any conflicting defaults");
+    assert.notInclude(plainSection, "USER CUSTOMIZATIONS");
+  });
 });

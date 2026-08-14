@@ -8,7 +8,9 @@ import { AGENT_PERSONA_INSTRUCTIONS } from "./agentPersona";
 import { buildAgentMemoryBlock } from "../store/conversationMemory";
 import { getAllSkills } from "../skills";
 import type { AgentSkill } from "../skills";
+import { getSkillCustomizationNotice } from "../skills/managedBlock";
 import { classifyWriteNoteDestination } from "../writeNoteDestination";
+import { WRITE_NOTE_SKILL_ID } from "../skills/noteIntent";
 
 import { resolveProviderCapabilities } from "../../providers";
 import type { ProviderCapabilities } from "../../providers";
@@ -356,8 +358,10 @@ function formatSkillGuidanceBlock(
   skill: AgentSkill,
   activationSource: string,
 ): string {
+  const customizationNotice = getSkillCustomizationNotice(skill.instruction);
   const lines = [
     `### Skill: ${skill.id}`,
+    customizationNotice || "",
     `Description: ${skill.description || "No description provided."}`,
     `Activation: ${activationSource}`,
     "Instructions:",
@@ -476,7 +480,7 @@ function buildWriteNoteFileInstruction(
     ...matchedSkillIds,
     ...(request.forcedSkillIds || []),
   ]);
-  if (!activeSkillIds.has("write-note")) return "";
+  if (!activeSkillIds.has(WRITE_NOTE_SKILL_ID)) return "";
   const destination = classifyWriteNoteDestination(
     request.userText,
     getNotesDirectoryNickname(),

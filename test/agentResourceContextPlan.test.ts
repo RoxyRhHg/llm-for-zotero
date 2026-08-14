@@ -625,6 +625,71 @@ describe("agent resource context plan", function () {
     assert.include(userText, "Current-turn dynamic agent guidance");
   });
 
+  it("flags user customizations after the managed block in skill guidance", async function () {
+    const req = request({
+      conversationKey: 102,
+      userText: "Summarize this paper",
+      forcedSkillIds: ["customized-note-skill", "plain-skill"],
+    });
+    const managedBegin = "<!-- LLM-FOR-ZOTERO:MANAGED-BEGIN -->";
+    const managedEnd = "<!-- LLM-FOR-ZOTERO:MANAGED-END -->";
+    setUserSkills([
+      parseSkill(
+        [
+          "---",
+          "id: customized-note-skill",
+          "description: customized skill",
+          "---",
+          managedBegin,
+          "Default filename pattern: default-pattern.md",
+          managedEnd,
+          "",
+          "## Your customizations",
+          "",
+          "Path pattern: `{papertitle}/{papertitle}.md`",
+        ].join("\n"),
+      ),
+      parseSkill(
+        [
+          "---",
+          "id: plain-skill",
+          "description: unmodified skill",
+          "---",
+          managedBegin,
+          "Managed-only instructions.",
+          managedEnd,
+        ].join("\n"),
+      ),
+    ]);
+    let messages!: AgentModelMessage[];
+    try {
+      messages = await buildAgentInitialMessages(
+        req,
+        [],
+        ["customized-note-skill", "plain-skill"],
+        buildAgentResourceContextPlan(req),
+      );
+    } finally {
+      setUserSkills([]);
+    }
+    const userText = messageText(messages[messages.length - 1]);
+
+    const customizedBlock = userText.slice(
+      userText.indexOf("### Skill: customized-note-skill"),
+      userText.indexOf("### Skill: plain-skill"),
+    );
+    const plainBlock = userText.slice(
+      userText.indexOf("### Skill: plain-skill"),
+    );
+    assert.include(customizedBlock, "USER CUSTOMIZATIONS");
+    assert.include(customizedBlock, "OVERRIDE any conflicting defaults");
+    assert.include(
+      customizedBlock,
+      "Path pattern: `{papertitle}/{papertitle}.md`",
+    );
+    assert.notInclude(plainBlock, "USER CUSTOMIZATIONS");
+  });
+
   it("keys prompt-cache planning to stable resources instead of evidence or history", async function () {
     const manyPapers = Array.from({ length: 70 }, (_, index) =>
       paper(

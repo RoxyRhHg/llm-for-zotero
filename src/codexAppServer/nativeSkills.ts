@@ -11,6 +11,12 @@ import type {
 import type { AgentRuntimeRequest } from "../agent/types";
 import type { AgentSkill } from "../agent/skills";
 import { getAllSkills, getMatchedSkillIds } from "../agent/skills";
+import { getSkillCustomizationNotice } from "../agent/skills/managedBlock";
+import {
+  inferNoteIntent,
+  normalizeIntentText,
+  WRITE_NOTE_SKILL_ID,
+} from "../agent/skills/noteIntent";
 import { detectSkillIntent } from "../agent/model/skillClassifier";
 import { RAW_PDF_TRANSPORT_POLICY_BLOCK } from "../agent/context/rawPdfTransportPolicy";
 import {
@@ -18,17 +24,10 @@ import {
   type CodexNativeSkillRoutingMode,
 } from "./prefs";
 
-const WRITE_NOTE_SKILL_ID = "write-note";
 const CLASSIFIER_CACHE_MAX_ENTRIES = 200;
 
 const classifierCache = new Map<string, string[]>();
 
-const NOTE_OBJECT_PATTERN =
-  /\bnotes?\b|\bnota(?:s)?\b|\bnotiz(?:en)?\b|\bnote\b|\bnotes\b|\bnota\b|\bnotas\b|笔记|便签|札记|ノート|メモ|노트|메모|заметк\p{L}*|ملاحظة/iu;
-const NOTE_ACTION_PATTERN =
-  /\bsave\b|\bwrite\b|\bcreate\b|\bmake\b|\bedit\b|\bupdate\b|\brevise\b|\bpolish\b|\bappend\b|\binsert\b|\badd\b|\bguardar\b|\bescribir\b|\bcrear\b|\beditar\b|\bactualizar\b|\bmodificar\b|\bañadir\b|\bajouter\b|\benregistrer\b|\bécrire\b|\becrire\b|\bcréer\b|\bcreer\b|\bmodifier\b|\bspeichern\b|\bschreiben\b|\berstellen\b|\bbearbeiten\b|\baktualisieren\b|\bhinzuf\p{L}*\b|\bsalvar\b|\bescrever\b|\bcriar\b|\beditar\b|\batualizar\b|\bsalva\p{L}*\b|\bscrivere\b|\bcreare\b|\bmodificare\b|\baggiornare\b|保存|写|撰写|创建|新建|编辑|修改|更新|润色|加入|添加|追加|書|作成|編集|更新|保存|追加|저장|작성|생성|편집|수정|업데이트|추가/iu;
-const NOTE_EXPLICIT_PATTERN =
-  /\bsave\s+(?:it|this|that|them)?\s*(?:as|to)?\s*(?:my\s+)?notes?\b|\b(?:write|create|make|edit|update|append)\s+(?:a\s+|my\s+)?notes?\b|保存.*笔记|笔记.*保存|ノート.*保存|メモ.*保存|노트.*저장|메모.*저장/iu;
 const SKILL_CANDIDATE_PATTERN =
   /\bnote\b|\bnotes\b|\bcompare\b|\banaly[sz]e\b|\bfigure\b|\bliterature\b|\breview\b|\bcitation\b|\breference\b|\bimport\b|\bdraft\b|\bsummarize\b|\bsynthesi[sz]e\b|笔记|比较|分析|图|综述|文献|引用|参考|导入|总结|要約|比較|分析|図|レビュー|文献|引用|요약|비교|분석|그림|문헌|인용|nota|comparar|analizar|figura|revisión|literatura|cita|note|comparer|analyser|figure|revue|littérature|citation|notiz|vergleichen|analysieren|abbildung|literatur|zitat/iu;
 
@@ -97,14 +96,9 @@ export function resolveExplicitCodexNativeSkillIds(
   );
 }
 
-function normalizeTextForSignature(value: string): string {
-  return value
-    .normalize("NFKC")
-    .replace(/\s+/g, " ")
-    .trim()
-    .toLowerCase()
-    .slice(0, 2000);
-}
+// One normalizer serves intent matching and the classifier cache signature —
+// the two must never diverge, so nativeSkills reuses the noteIntent helper.
+const normalizeTextForSignature = normalizeIntentText;
 
 function hasNonAsciiText(value: string): boolean {
   return Array.from(value).some((char) => char.charCodeAt(0) > 0x7f);
@@ -127,32 +121,6 @@ function requestHasNoteSelection(request: AgentRuntimeRequest): boolean {
   );
 }
 
-export function inferCodexNativeNoteIntent(
-  request: Pick<
-    AgentRuntimeRequest,
-    "userText" | "activeNoteContext" | "selectedTextSources" | "selectedTexts"
-  >,
-): boolean {
-  const text = normalizeTextForSignature(request.userText || "");
-  if (!text) return false;
-  const hasNoteObject = NOTE_OBJECT_PATTERN.test(text);
-  const hasNoteAction = NOTE_ACTION_PATTERN.test(text);
-  if (NOTE_EXPLICIT_PATTERN.test(text)) return true;
-  if (hasNoteObject && hasNoteAction) return true;
-
-  const hasNoteContext = Boolean(request.activeNoteContext);
-  const hasNoteSelection = Boolean(
-    request.selectedTextSources?.some(
-      (source) => source === "note" || source === "note-edit",
-    ),
-  );
-  if (!hasNoteContext && !hasNoteSelection) return false;
-
-  if (hasNoteAction) return true;
-  if (hasNoteObject && text.length <= 240) return true;
-  return Boolean(request.selectedTexts?.length && text.length <= 160);
-}
-
 export function resolveDeterministicCodexNativeSkillIds(params: {
   request: AgentRuntimeRequest;
   allSkills?: ReadonlyArray<AgentSkill>;
@@ -160,8 +128,13 @@ export function resolveDeterministicCodexNativeSkillIds(params: {
   const allSkills = params.allSkills || getAllSkills();
   if (!allSkills.length) return [];
   const matched = new Set(getMatchedSkillIds(params.request));
+  // getMatchedSkillIds already forces write-note on the strong text-only
+  // signal (inferExplicitNoteIntent). This deliberately broader check adds
+  // inferNoteIntent's weak open-note branches for the codex deterministic
+  // route only: no classifier runs here, and with a note open a bare action
+  // verb usually is note intent.
   if (
-    inferCodexNativeNoteIntent(params.request) &&
+    inferNoteIntent(params.request) &&
     allSkills.some((skill) => skill.id === WRITE_NOTE_SKILL_ID)
   ) {
     matched.add(WRITE_NOTE_SKILL_ID);
@@ -356,7 +329,11 @@ export function buildCodexNativeSkillInstructionBlock(
     "LLM-for-Zotero skills active for this turn:",
     "The following skill instructions are provided because the user's message matches these workflows. Use them as workflow guidance for Zotero MCP tools; do not treat skills as additional MCP tools.",
     ...matchedSkills.map((skill) =>
-      [`Skill: ${skill.id}`, skill.instruction.trim()]
+      [
+        `Skill: ${skill.id}`,
+        getSkillCustomizationNotice(skill.instruction) || "",
+        skill.instruction.trim(),
+      ]
         .filter(Boolean)
         .join("\n"),
     ),

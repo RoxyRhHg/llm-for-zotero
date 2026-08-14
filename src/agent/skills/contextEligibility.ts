@@ -7,6 +7,7 @@ export type SkillRoutingRequest = Pick<
   | "userText"
   | "activeNoteContext"
   | "selectedTextSources"
+  | "selectedTexts"
   | "selectedTextPaperContexts"
   | "selectedPaperContexts"
   | "fullTextPaperContexts"
