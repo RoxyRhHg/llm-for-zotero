@@ -8,7 +8,8 @@ export type ReasoningProvider =
   | "mimo"
   | "qwen"
   | "grok"
-  | "anthropic";
+  | "anthropic"
+  | "local";
 export type ReasoningLevel =
   | "default"
   | "minimal"
@@ -882,6 +883,14 @@ const PROFILE_RULES: Record<
         profile: ANTHROPIC_MANUAL_THINKING_PROFILE,
       },
     ],
+    fallback: UNSUPPORTED_PROFILE,
+  },
+  // Locally-served models carry no hand-maintained profile: their options come
+  // from what the server reports plus whatever the user configures, resolved
+  // entirely through declarative ModelControlPatches. This entry exists so
+  // ReasoningConfig.provider stays type-safe and every lookup here is inert.
+  local: {
+    rules: [],
     fallback: UNSUPPORTED_PROFILE,
   },
 };

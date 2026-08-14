@@ -101,6 +101,7 @@ import { applyModelInputTokenCap } from "../../utils/modelInputCap";
 import { formatDisplayModelName } from "../../utils/modelDisplayLabel";
 import type { ProviderProtocol } from "../../utils/providerProtocol";
 import { inferLegacyProviderProtocol } from "../../utils/providerProtocol";
+import { isLocalModelApiBase } from "../../utils/providerPresets";
 import {
   PERSISTED_HISTORY_LIMIT,
   MAX_FULL_TEXT_PAPER_CONTEXTS,
@@ -2260,16 +2261,26 @@ const REASONING_PROVIDER_KINDS = new Set<ReasoningProviderKind>([
   "qwen",
   "grok",
   "anthropic",
+  "local",
 ]);
 
 export function detectReasoningProvider(
   modelName: string,
+  apiBase?: string,
 ): ReasoningProviderKind {
   const inferred = inferProviderFromModelName(modelName);
-  return inferred &&
+  if (
+    inferred &&
     REASONING_PROVIDER_KINDS.has(inferred as ReasoningProviderKind)
-    ? (inferred as ReasoningProviderKind)
-    : "unsupported";
+  ) {
+    return inferred as ReasoningProviderKind;
+  }
+  // Only as a last resort: a recognized family keeps its own profile even when
+  // served locally, because the level set belongs to the weights. This covers
+  // the models whose names match nothing — gemma, llama, mistral, or a custom
+  // Modelfile name — whose reasoning support the server reports directly.
+  if (apiBase && isLocalModelApiBase(apiBase)) return "local";
+  return "unsupported";
 }
 
 export function getReasoningOptions(
@@ -2397,7 +2408,7 @@ export function getSelectedReasoningForItem(
   apiBase?: string,
   providerProtocol?: ProviderProtocol,
 ): LLMReasoningConfig | undefined {
-  const detectedProvider = detectReasoningProvider(modelName);
+  const detectedProvider = detectReasoningProvider(modelName, apiBase);
   const resolvedCapabilityProvider = getModelCapabilities({
     provider: detectedProvider === "unsupported" ? undefined : detectedProvider,
     model: modelName,
@@ -2413,6 +2424,7 @@ export function getSelectedReasoningForItem(
     "qwen",
     "grok",
     "anthropic",
+    "local",
   ].includes(resolvedCapabilityProvider as ReasoningProviderKind)
     ? (resolvedCapabilityProvider as ReasoningProviderKind)
     : detectedProvider;
@@ -7727,6 +7739,7 @@ export async function retryLatestAssistantResponse(
       temperature: effectiveRequestConfig.advanced?.temperature,
       maxTokens: effectiveRequestConfig.advanced?.maxTokens,
       inputTokenCap: effectiveRequestConfig.advanced?.inputTokenCap,
+      profileOverride: effectiveRequestConfig.advanced?.profileOverride,
       inputMode: effectiveRequestConfig.advanced?.inputMode,
       contextCache: contextPlan.contextCache,
     };
@@ -10277,6 +10290,7 @@ export async function sendQuestion(
       temperature: effectiveRequestConfig.advanced?.temperature,
       maxTokens: effectiveRequestConfig.advanced?.maxTokens,
       inputTokenCap: effectiveRequestConfig.advanced?.inputTokenCap,
+      profileOverride: effectiveRequestConfig.advanced?.profileOverride,
       inputMode: effectiveRequestConfig.advanced?.inputMode,
       contextCache: contextPlan.contextCache,
     };

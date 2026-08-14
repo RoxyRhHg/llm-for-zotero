@@ -18,6 +18,12 @@ export type ModelCapabilityProvider =
   | "kimi"
   | "mimo"
   | "copilot"
+  /**
+   * A model served by a local runtime whose name matches no hosted family.
+   * Marks *where* the model is served, never overriding a recognized family —
+   * `deepseek-r1:8b` on Ollama is still DeepSeek's weights.
+   */
+  | "local"
   | "customized"
   | "unknown";
 
@@ -29,6 +35,12 @@ export type ModelCapabilityIdentity = {
   authMode?: string;
   /** Runtime scope, for example a Claude bridge profile signature. */
   scope?: string;
+  /**
+   * User-authored overrides for this model, applied on top of every detected
+   * source. Carried on the identity so capability resolution stays a pure
+   * function of its argument rather than reaching into preferences.
+   */
+  profileOverride?: unknown;
 };
 
 export type ModelCapabilityLimits = {
@@ -93,7 +105,12 @@ export type ModelFeatureCapabilities = {
   promptCache: boolean;
 };
 
-export type CapabilitySource = "live" | "remote" | "bundled" | "legacy";
+export type CapabilitySource =
+  | "user"
+  | "live"
+  | "remote"
+  | "bundled"
+  | "legacy";
 
 export type ResolvedModelCapabilities = {
   identity: ModelCapabilityIdentity;
@@ -143,6 +160,8 @@ export type DiscoveredModel = {
   created?: number;
   limits?: ModelCapabilityLimits;
   inputs?: Partial<ModelInputCapabilities>;
+  /** Server-declared feature support, e.g. Ollama's `capabilities: ["tools"]`. */
+  features?: Partial<ModelFeatureCapabilities>;
   reasoningSupported?: boolean;
   displayName?: string;
   source: "live";

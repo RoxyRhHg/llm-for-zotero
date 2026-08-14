@@ -34,20 +34,25 @@ import {
   CUSTOMIZED_MODEL_OPTION_VALUE,
   buildProviderModelSelectRows,
   canFetchProviderModels,
+  providerGroupRequiresApiKey,
   createSelectRebuildGate,
   resolveModelEntryMode,
   resolveProviderModelFetchStatus,
   runAfterSelectChangeDispatch,
 } from "../utils/providerModelPicker";
 import {
+  getModelCapabilities,
   getModelCatalogStatus,
   refreshModelCatalog,
+  type ModelProfileOverride,
 } from "../modelCapabilities";
+import { createModelProfileEditor } from "./modelProfileEditor";
 import {
   PROVIDER_PRESETS,
   detectProviderPreset,
   getProviderPreset,
   getProviderPresetProtocolOptions,
+  providerPresetRequiresApiKey,
   type ProviderPresetId,
 } from "../utils/providerPresets";
 import {
@@ -472,11 +477,14 @@ function attachProviderModelSelect(args: {
   const readSnapshot = () =>
     getModelCatalogStatus(buildProviderCatalogIdentity(group));
 
+  const requiresApiKey = providerGroupRequiresApiKey(group);
+
   const currentStatus = () =>
     resolveProviderModelFetchStatus({
       apiKey: group.apiKey,
       loading,
       snapshot: readSnapshot(),
+      requiresApiKey,
     });
 
   // The manual text input takes over while the catalog is unavailable, while
@@ -560,7 +568,7 @@ function attachProviderModelSelect(args: {
   };
 
   const refreshCatalog = async () => {
-    if (!group.apiKey.trim()) {
+    if (requiresApiKey && !group.apiKey.trim()) {
       updateStatus();
       return;
     }
@@ -1316,6 +1324,11 @@ export async function registerPrefsScripts(_window: Window | undefined | null) {
         group.authMode !== "codex_app_server" &&
         group.authMode !== "copilot_auth" &&
         selectedPresetId === "customized";
+      // Local runtimes serve unauthenticated, so the key field, the connection
+      // test and the model catalog must all work with the key left blank.
+      const presetRequiresApiKey =
+        group.authMode !== "api_key" ||
+        providerPresetRequiresApiKey(selectedPresetId);
       group.providerProtocol = resolveSelectedProtocol(group, selectedPresetId);
 
       // ── Provider preset ─────────────────────────────────────────
@@ -1410,7 +1423,10 @@ export async function registerPrefsScripts(_window: Window | undefined | null) {
         group.authMode !== "codex_auth" &&
         group.authMode !== "codex_app_server" &&
         group.authMode !== "copilot_auth" &&
-        !isCustomizedPreset;
+        !isCustomizedPreset &&
+        // Local presets ship a default host and port, but the server may run on
+        // another port or another machine on the LAN, so the URL stays editable.
+        presetRequiresApiKey;
       apiUrlInput.style.opacity = apiUrlInput.readOnly ? "0.85" : "1";
       apiUrlInput.style.cursor = apiUrlInput.readOnly ? "default" : "text";
       apiUrlInput.style.pointerEvents = apiUrlInput.readOnly ? "none" : "auto";
@@ -1442,12 +1458,19 @@ export async function registerPrefsScripts(_window: Window | undefined | null) {
         "div",
         "display: flex; flex-direction: column;",
       );
-      const apiKeyLabel = el(doc, "label", LABEL_STYLE, t("API Key"));
+      const apiKeyLabel = el(
+        doc,
+        "label",
+        LABEL_STYLE,
+        presetRequiresApiKey ? t("API Key") : t("API Key (optional)"),
+      );
       const apiKeyInput = el(doc, "input", INPUT_STYLE) as HTMLInputElement;
       apiKeyInput.id = `${config.addonRef}-api-key-${group.id}`;
       apiKeyLabel.setAttribute("for", apiKeyInput.id);
       apiKeyInput.type = "password";
-      apiKeyInput.placeholder = "sk-…";
+      apiKeyInput.placeholder = presetRequiresApiKey
+        ? "sk-…"
+        : t("Leave blank unless your server requires auth");
       apiKeyInput.value = group.apiKey;
       // Model dropdowns register here so a freshly pasted key refetches their
       // catalogs without reopening the pane. Debounced to sit out keystrokes.
@@ -1946,7 +1969,9 @@ export async function registerPrefsScripts(_window: Window | undefined | null) {
             group,
             modelEntry,
             onModelPicked: (modelId) => {
+              const previousModel = modelEntry.model;
               modelEntry.model = modelId;
+              onSelectedModelChanged(previousModel);
               persistGroups(groups);
               syncAddModelBtn();
               syncAddProviderBtn();
@@ -2121,6 +2146,68 @@ export async function registerPrefsScripts(_window: Window | undefined | null) {
           ),
         );
 
+        // ── Capability, reasoning and extra-parameter controls ───────────
+        // Part of the same advanced panel rather than a nested disclosure:
+        // one place lists everything customizable for this model, and the
+        // fields above (temperature, max tokens, input cap, input mode) are
+        // not repeated here.
+        const resolveDetectedProfile = () =>
+          getModelCapabilities({
+            model: modelEntry.model,
+            apiBase: group.apiBase,
+            protocol: resolveModelSelectedProtocol(
+              group,
+              selectedPresetId,
+              modelEntry,
+            ),
+            authMode: group.authMode,
+            scope: group.id,
+          });
+
+        const profileEditor = createModelProfileEditor({
+          doc,
+          t,
+          getOverride: () => modelEntry.profileOverride,
+          getDetected: resolveDetectedProfile,
+          onChange: (next: ModelProfileOverride | undefined) => {
+            if (next) {
+              modelEntry.profileOverride = next;
+            } else {
+              delete modelEntry.profileOverride;
+            }
+            persistGroups(groups);
+          },
+          styles: {
+            input: INPUT_STYLE,
+            inputSm: INPUT_SM_STYLE,
+            helper: HELPER_STYLE,
+            sectionLabel: SECTION_LABEL_STYLE,
+            outlineBtn: OUTLINE_BTN_STYLE,
+          },
+        });
+        advRow.append(
+          el(
+            doc,
+            "div",
+            "border-top: 1px solid var(--stroke-secondary, #c8c8c8);" +
+              " margin: 4px 0 2px; opacity: 0.6;",
+          ),
+          profileEditor.element,
+        );
+
+        /**
+         * Parameters are tuned for one specific model, so pointing this entry
+         * at a different one must not carry them across. Left in place, a
+         * `kimi-k2.6` override (thinking.type) would silently replace what
+         * `kimi-k3` actually wants (reasoning_effort), and the panel would show
+         * the old model's levels as if they were detected.
+         */
+        function onSelectedModelChanged(previousModel: string) {
+          if (previousModel.trim() === modelEntry.model.trim()) return;
+          if (modelEntry.profileOverride) delete modelEntry.profileOverride;
+          profileEditor.refresh(resolveDetectedProfile());
+        }
+
         const commitAdvanced = () => {
           modelEntry.temperature = normalizeTemperature(tempField.input.value);
           modelEntry.maxTokens = normalizeMaxTokensForModel(
@@ -2190,7 +2277,9 @@ export async function registerPrefsScripts(_window: Window | undefined | null) {
         });
 
         modelInput.addEventListener("input", () => {
+          const previousModel = modelEntry.model;
           modelEntry.model = modelInput.value;
+          onSelectedModelChanged(previousModel);
           persistGroups(groups);
           syncAddModelBtn();
           syncAddProviderBtn();
@@ -2250,7 +2339,7 @@ export async function registerPrefsScripts(_window: Window | undefined | null) {
             );
 
             if (!apiBase) throw new Error(t("API URL is required"));
-            if (!apiKey) {
+            if (!apiKey && presetRequiresApiKey) {
               throw new Error(
                 authMode === "codex_auth"
                   ? t("codex token missing. Run `codex login` first.")
@@ -2269,10 +2358,17 @@ export async function registerPrefsScripts(_window: Window | undefined | null) {
               apiKey,
               modelName,
             });
-            statusLine.textContent =
-              `${t("✓ Success — model says: ")}"${result.reply}"\n` +
-              `${t("Agent capability: ")}${result.capabilityLabel}`;
-            statusLine.style.color = "green";
+            if (result.warning) {
+              statusLine.textContent =
+                `${t("⚠ Connected, but no answer — ")}${t(result.warning)}\n` +
+                `${t("Agent capability: ")}${result.capabilityLabel}`;
+              statusLine.style.color = "darkorange";
+            } else {
+              statusLine.textContent =
+                `${t("✓ Success — model says: ")}"${result.reply}"\n` +
+                `${t("Agent capability: ")}${result.capabilityLabel}`;
+              statusLine.style.color = "green";
+            }
           } catch (error) {
             statusLine.textContent = `✗ ${(error as Error).message}`;
             statusLine.style.color = "red";

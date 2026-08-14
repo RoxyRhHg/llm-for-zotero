@@ -110,15 +110,27 @@ const GENERIC_FONT_FAMILIES = new Set([
   "math",
   "fangsong",
 ]);
-const REASONING_LEVEL_SELECTIONS = new Set<ReasoningLevelSelection>([
-  "none",
-  "default",
-  "minimal",
-  "low",
-  "medium",
-  "high",
-  "xhigh",
-]);
+/**
+ * A remembered reasoning level, validated by shape rather than by a fixed list.
+ *
+ * Providers introduce new effort values (`ultra`, and whatever comes next), and
+ * users can define their own levels in the per-model parameter editor. An
+ * allowlist of the seven levels the plugin happened to know about would let
+ * such a level be selected for one session and then silently forgotten on
+ * restart. The pattern keeps the sanitising intent — bounded length, safe
+ * charset, no injection into the pref store — without freezing the vocabulary.
+ */
+const REASONING_LEVEL_PATTERN = /^[a-z0-9][a-z0-9_-]{0,31}$/;
+
+function isReasoningLevelSelection(
+  value: string,
+): value is ReasoningLevelSelection {
+  return REASONING_LEVEL_PATTERN.test(value);
+}
+
+const REASONING_LEVEL_SELECTIONS = {
+  has: (value: string) => isReasoningLevelSelection(value),
+};
 const REASONING_PROVIDER_SELECTION_KEYS = new Set([
   "openai",
   "gemini",
@@ -127,6 +139,7 @@ const REASONING_PROVIDER_SELECTION_KEYS = new Set([
   "qwen",
   "grok",
   "anthropic",
+  "local",
 ]);
 
 const BUILTIN_SHORTCUT_IDS = new Set<string>(

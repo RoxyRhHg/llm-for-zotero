@@ -5,7 +5,7 @@
  */
 
 import { config } from "../../package.json";
-import { DEFAULT_SYSTEM_PROMPT } from "./llmDefaults";
+import { DEFAULT_MAX_TOKENS, DEFAULT_SYSTEM_PROMPT } from "./llmDefaults";
 import {
   getAnthropicReasoningProfileForModel,
   getDeepseekReasoningProfileForModel,
@@ -84,6 +84,7 @@ import {
   buildProviderTransportHeaders,
   resolveAnthropicMessagesEndpoint,
   resolveGeminiNativeEndpoint,
+  resolveOllamaNativeEndpoint,
   resolveProviderTransportEndpoint,
 } from "./providerTransport";
 import { parseDataUrl } from "../shared/dataUrl";
@@ -105,6 +106,8 @@ import {
   compileReasoningControls,
   ensureModelCapabilities,
   getModelCapabilities,
+  isReservedRequestKey,
+  type ModelProfileOverride,
 } from "../modelCapabilities";
 
 // =============================================================================
@@ -153,6 +156,12 @@ export type ChatParams = {
   providerProtocol?: ProviderProtocol;
   /** Provider-side prompt/context cache plan resolved by the context planner. */
   contextCache?: ContextCachePlan;
+  /**
+   * User-authored capability overrides for the selected model. Threaded through
+   * so capability resolution, token clamping and the request body all see the
+   * same picture the preferences pane showed.
+   */
+  profileOverride?: ModelProfileOverride;
 };
 
 export type ContextBudgetPlan = {
@@ -1422,6 +1431,7 @@ export function prepareChatRequest(params: ChatParams): PreparedChatRequest {
       apiBase,
       protocol: providerProtocol,
       authMode,
+      profileOverride: params.profileOverride,
     },
   );
   return {
@@ -1598,6 +1608,8 @@ function normalizeStreamText(value: unknown): string {
 type ThoughtTagState = {
   inThought: boolean;
   buffer: string;
+  /** Which tag opened the current block, so only its match can close it. */
+  openTagName?: string;
 };
 
 function getPartialTagTailLength(text: string, tag: string): number {
@@ -1612,12 +1624,58 @@ function getPartialTagTailLength(text: string, tag: string): number {
   return 0;
 }
 
+/**
+ * Reasoning tags that arrive inline in the content stream.
+ *
+ * `<thought>` is what the Codex prompt asks for. `<think>` and `<reasoning>`
+ * leak from local servers — llama.cpp and vLLM without a reasoning parser pass
+ * the model's raw template output straight through, so those tags would
+ * otherwise render inside the answer.
+ */
+const THOUGHT_TAG_NAMES = ["thought", "think", "reasoning"] as const;
+
+type ThoughtTagMatch = { index: number; length: number; name: string };
+
+/** Earliest opening tag at or after `from`, across every recognized name. */
+function findEarliestTag(
+  haystackLower: string,
+  from: number,
+  build: (name: string) => string,
+): ThoughtTagMatch | null {
+  let best: ThoughtTagMatch | null = null;
+  for (const name of THOUGHT_TAG_NAMES) {
+    const tag = build(name);
+    const index = haystackLower.indexOf(tag, from);
+    if (index === -1) continue;
+    if (!best || index < best.index) {
+      best = { index, length: tag.length, name };
+    }
+  }
+  return best;
+}
+
+/**
+ * Longest partial tag suffix across every recognized name, so a tag split
+ * across two stream chunks is held back rather than emitted as text.
+ */
+function longestPartialTagTail(
+  segment: string,
+  build: (name: string) => string,
+): number {
+  let longest = 0;
+  for (const name of THOUGHT_TAG_NAMES) {
+    const tail = getPartialTagTailLength(segment, build(name));
+    if (tail > longest) longest = tail;
+  }
+  return longest;
+}
+
 function splitThoughtTaggedText(
   chunk: string,
   state: ThoughtTagState,
 ): { answer: string; thought: string } {
-  const OPEN_TAG = "<thought>";
-  const CLOSE_TAG = "</thought>";
+  const openTag = (name: string) => `<${name}>`;
+  const closeTag = (name: string) => `</${name}>`;
   const input = `${state.buffer}${chunk}`;
   state.buffer = "";
   if (!input) return { answer: "", thought: "" };
@@ -1629,34 +1687,57 @@ function splitThoughtTaggedText(
 
   while (cursor < input.length) {
     if (state.inThought) {
-      const closeIdx = inputLower.indexOf(CLOSE_TAG, cursor);
+      // Only the tag that opened the block can close it, so a stray
+      // `</think>` inside a `<thought>` block does not end it early.
+      const closeName = state.openTagName || THOUGHT_TAG_NAMES[0];
+      const close = closeTag(closeName);
+      const closeIdx = inputLower.indexOf(close, cursor);
       if (closeIdx === -1) {
         const segment = input.slice(cursor);
-        const tailLen = getPartialTagTailLength(segment, CLOSE_TAG);
+        const tailLen = getPartialTagTailLength(segment, close);
         thought += segment.slice(0, segment.length - tailLen);
         state.buffer = segment.slice(segment.length - tailLen);
         break;
       }
       thought += input.slice(cursor, closeIdx);
-      cursor = closeIdx + CLOSE_TAG.length;
+      cursor = closeIdx + close.length;
       state.inThought = false;
+      state.openTagName = undefined;
       continue;
     }
 
-    const openIdx = inputLower.indexOf(OPEN_TAG, cursor);
-    if (openIdx === -1) {
+    const open = findEarliestTag(inputLower, cursor, openTag);
+    if (!open) {
       const segment = input.slice(cursor);
-      const tailLen = getPartialTagTailLength(segment, OPEN_TAG);
+      const tailLen = longestPartialTagTail(segment, openTag);
       answer += segment.slice(0, segment.length - tailLen);
       state.buffer = segment.slice(segment.length - tailLen);
       break;
     }
-    answer += input.slice(cursor, openIdx);
-    cursor = openIdx + OPEN_TAG.length;
+    answer += input.slice(cursor, open.index);
+    cursor = open.index + open.length;
     state.inThought = true;
+    state.openTagName = open.name;
   }
 
   return { answer, thought };
+}
+
+/**
+ * Flush whatever is left in the tag buffer when the stream ends.
+ *
+ * Only a partial tag suffix can be held back — text inside an open reasoning
+ * block is emitted as it arrives so the Thinking panel stays live. That means
+ * an unterminated block cannot be reclassified as the answer after the fact
+ * without showing the same text twice, so it is deliberately left as reasoning.
+ */
+function resolveUnterminatedThought(state: ThoughtTagState): {
+  asAnswer: boolean;
+  text: string;
+} {
+  const text = state.buffer;
+  if (!text) return { asAnswer: false, text: "" };
+  return { asAnswer: !state.inThought, text };
 }
 
 function buildTokenParam(model: string, maxTokens: number) {
@@ -1675,6 +1756,7 @@ function normalizeMaxTokensForRequest(params: {
   apiBase?: string;
   protocol?: ProviderProtocol;
   authMode?: ModelProviderAuthMode;
+  profileOverride?: ModelProfileOverride;
 }): number {
   const normalized = normalizeMaxTokensForModel(params.value, params.model, {
     provider: params.apiBase
@@ -1683,6 +1765,7 @@ function normalizeMaxTokensForRequest(params: {
     apiBase: params.apiBase,
     protocol: params.protocol,
     authMode: params.authMode,
+    profileOverride: params.profileOverride,
   });
   const discovered = getModelCapabilities({
     provider: params.apiBase
@@ -1692,6 +1775,7 @@ function normalizeMaxTokensForRequest(params: {
     apiBase: params.apiBase,
     protocol: params.protocol,
     authMode: params.authMode,
+    profileOverride: params.profileOverride,
   }).limits.outputTokens;
   return discovered ? Math.min(normalized, discovered) : normalized;
 }
@@ -2091,13 +2175,71 @@ export type AnthropicReasoningModeOverride = Exclude<
 export type ReasoningPayloadOptions = {
   maxTokens?: number;
   anthropicModeOverride?: AnthropicReasoningModeOverride;
+  /** User-authored capability overrides, including extra body parameters. */
+  profileOverride?: ModelProfileOverride;
 };
 
 export type ReasoningSelection = ReasoningConfig & {
   anthropicModeOverride?: AnthropicReasoningModeOverride;
 };
 
+/**
+ * Reasoning controls plus any user-authored extra request parameters.
+ *
+ * `extraBody` is not reasoning-specific, but this function's result is already
+ * spread into every payload builder, so it is the one hook that reaches all
+ * protocols. Reasoning controls are layered on top: the reasoning selector is
+ * a live per-message control, and static configuration must not silently
+ * override what the user just picked.
+ */
 export function buildReasoningPayload(
+  reasoning: ReasoningConfig | undefined,
+  useResponses: boolean,
+  modelName?: string,
+  apiBase?: string,
+  providerProtocol?: ProviderProtocol,
+  options?: ReasoningPayloadOptions,
+): { extra: Record<string, unknown>; omitTemperature: boolean } {
+  const base = buildReasoningControlPayload(
+    reasoning,
+    useResponses,
+    modelName,
+    apiBase,
+    providerProtocol,
+    options,
+  );
+  const extraBody = stripReservedRequestKeys(
+    options?.profileOverride?.extraBody,
+  );
+  if (!extraBody) return base;
+  return {
+    extra: { ...extraBody, ...base.extra },
+    omitTemperature: base.omitTemperature,
+  };
+}
+
+/**
+ * Last line of defence against a user parameter occupying an envelope key.
+ *
+ * The editor rejects these at input time with a visible message, so reaching
+ * here means a hand-edited or imported config. Silent by design: every payload
+ * builder spreads the reasoning extras into the body, most of them after the
+ * envelope, so an unfiltered `messages` or `tools` key would replace the
+ * conversation or drop every tool definition.
+ */
+function stripReservedRequestKeys(
+  extraBody: Record<string, unknown> | undefined,
+): Record<string, unknown> | undefined {
+  if (!extraBody) return undefined;
+  const kept: Record<string, unknown> = {};
+  for (const [key, value] of Object.entries(extraBody)) {
+    if (isReservedRequestKey(key)) continue;
+    kept[key] = value;
+  }
+  return Object.keys(kept).length ? kept : undefined;
+}
+
+function buildReasoningControlPayload(
   reasoning: ReasoningConfig | undefined,
   useResponses: boolean,
   modelName?: string,
@@ -2113,6 +2255,7 @@ export function buildReasoningPayload(
     model: modelName || "",
     apiBase,
     protocol: providerProtocol,
+    profileOverride: options?.profileOverride,
   });
   const declarativeControls = compileReasoningControls(capabilities, reasoning);
   if (declarativeControls) return declarativeControls;
@@ -2768,6 +2911,198 @@ async function parseGeminiNativeStreamResponse(
   return fullText;
 }
 
+// ── Ollama native (/api/chat) ────────────────────────────────────────────────
+
+/**
+ * Ollama's chat message shape. Unlike OpenAI, images are not content parts:
+ * they ride alongside the text as an array of bare base64 strings.
+ */
+type OllamaChatMessage = {
+  role: string;
+  content: string;
+  images?: string[];
+};
+
+function toOllamaChatMessages(messages: ChatMessage[]): OllamaChatMessage[] {
+  return messages.map((message) => {
+    if (typeof message.content === "string") {
+      return { role: message.role, content: message.content };
+    }
+    const textParts: string[] = [];
+    const images: string[] = [];
+    for (const part of message.content) {
+      if (part.type === "text") {
+        textParts.push(part.text);
+        continue;
+      }
+      // Ollama wants raw base64 with no data: prefix; a plain URL cannot be
+      // forwarded, so drop it rather than sending something unfetchable.
+      const parsed = parseDataUrl(part.image_url?.url || "");
+      if (parsed?.data) images.push(parsed.data);
+    }
+    return {
+      role: message.role,
+      content: textParts.join("\n"),
+      ...(images.length ? { images } : {}),
+    };
+  });
+}
+
+function buildOllamaChatPayload(params: {
+  model: string;
+  messages: ChatMessage[];
+  stream: boolean;
+  temperature?: number;
+  /**
+   * Output cap. Ollama's own default is unlimited (-1); a thinking model that
+   * inherits the plugin's 4096 default can spend the whole budget reasoning and
+   * return empty content, so callers pass -1 unless the user set a value.
+   */
+  numPredict?: number;
+  /** Runtime context window, so what we claim and what Ollama allocates agree. */
+  numCtx?: number;
+  reasoningExtra?: Record<string, unknown>;
+}): Record<string, unknown> {
+  const options: Record<string, unknown> = {};
+  if (params.temperature !== undefined)
+    options.temperature = params.temperature;
+  if (params.numPredict !== undefined) options.num_predict = params.numPredict;
+  if (params.numCtx !== undefined) options.num_ctx = params.numCtx;
+  const { options: extraOptions, ...extraTop } = (params.reasoningExtra ||
+    {}) as { options?: unknown } & Record<string, unknown>;
+  // `options` is merged rather than spread over: a user parameter such as
+  // `options.repeat_penalty` would otherwise replace the whole object and
+  // silently drop num_ctx, reinstating the context truncation this protocol
+  // exists to avoid. User keys win within the merge; the envelope does not.
+  const mergedOptions = isPlainRecord(extraOptions)
+    ? { ...options, ...extraOptions }
+    : options;
+  return {
+    model: params.model,
+    messages: toOllamaChatMessages(params.messages),
+    stream: params.stream,
+    ...(Object.keys(mergedOptions).length ? { options: mergedOptions } : {}),
+    ...extraTop,
+  };
+}
+
+function isPlainRecord(value: unknown): value is Record<string, unknown> {
+  return Boolean(value) && typeof value === "object" && !Array.isArray(value);
+}
+
+/**
+ * Ollama's own `num_predict` default is -1 (unlimited). The plugin's 4096
+ * default is a hazard here: a thinking model can spend the entire budget
+ * reasoning and return empty content. Treat the untouched plugin default as
+ * "unset" and let the server decide; any other value is the user's explicit
+ * choice and is honoured.
+ */
+function resolveOllamaNumPredict(effectiveMaxTokens: number): number {
+  return effectiveMaxTokens === DEFAULT_MAX_TOKENS ? -1 : effectiveMaxTokens;
+}
+
+/**
+ * Ollama's runtime context window defaults well below a model's trained
+ * maximum, so a prompt sized against the trained figure is silently truncated.
+ * Allocating exactly the cap the plugin trimmed to keeps the claim and the
+ * allocation in agreement.
+ */
+function resolveOllamaNumCtx(
+  protocol: ProviderProtocol,
+  limitTokens: number,
+): number | undefined {
+  if (protocol !== "ollama_native") return undefined;
+  return Number.isSafeInteger(limitTokens) && limitTokens > 0
+    ? limitTokens
+    : undefined;
+}
+
+type OllamaChatChunk = {
+  message?: { content?: unknown; thinking?: unknown };
+  done?: boolean;
+  done_reason?: string;
+  prompt_eval_count?: number;
+  eval_count?: number;
+  error?: string;
+};
+
+/**
+ * Parse Ollama's `/api/chat` stream.
+ *
+ * The framing is NDJSON — one complete JSON object per line, with no `data:`
+ * prefix — so `parseStreamResponse` cannot be reused: it skips every line that
+ * does not start with `data:` and would silently return "".
+ *
+ * `message.thinking` and `message.content` arrive as separate fields, which is
+ * the whole reason this protocol exists (see #363): over Ollama's
+ * OpenAI-compatible endpoint some models put the entire answer in the reasoning
+ * field and leave content empty.
+ */
+export async function parseOllamaChatStream(
+  body: ReadableStream<Uint8Array>,
+  onDelta: (delta: string) => void,
+  onReasoning?: (event: ReasoningEvent) => void,
+  onUsage?: (usage: UsageStats) => void,
+): Promise<string> {
+  const reader = body.getReader() as ReadableStreamDefaultReader<Uint8Array>;
+  const decoder = new TextDecoder("utf-8");
+  let buffer = "";
+  let fullText = "";
+
+  const handleLine = (line: string) => {
+    const trimmed = line.trim();
+    if (!trimmed) return;
+    let parsed: OllamaChatChunk;
+    try {
+      parsed = JSON.parse(trimmed) as OllamaChatChunk;
+    } catch (err) {
+      ztoolkit.log("Ollama stream parse error:", err);
+      return;
+    }
+    if (parsed.error) {
+      throw new Error(`Ollama error: ${parsed.error}`);
+    }
+    const thinking = normalizeStreamText(parsed.message?.thinking ?? "");
+    if (thinking && onReasoning) onReasoning({ details: thinking });
+    const content = normalizeStreamText(parsed.message?.content ?? "");
+    if (content) {
+      fullText += content;
+      onDelta(content);
+    }
+    if (parsed.done && onUsage) {
+      const promptTokens = parsed.prompt_eval_count ?? 0;
+      const completionTokens = parsed.eval_count ?? 0;
+      const totalTokens = promptTokens + completionTokens;
+      if (totalTokens > 0) {
+        onUsage({
+          promptTokens,
+          completionTokens,
+          totalTokens,
+          contextTokens: promptTokens,
+          contextWindowIsAuthoritative: promptTokens > 0,
+        });
+      }
+    }
+  };
+
+  try {
+    while (true) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      buffer += decoder.decode(value, { stream: true });
+      const lines = buffer.split("\n");
+      buffer = lines.pop() || "";
+      for (const line of lines) handleLine(line);
+    }
+    // Flush a trailing object that arrived without a closing newline.
+    if (buffer.trim()) handleLine(buffer);
+  } finally {
+    reader.releaseLock();
+  }
+
+  return fullText;
+}
+
 function createChatPayloadBuilder(params: {
   model: string;
   messages: ChatMessage[];
@@ -2780,6 +3115,7 @@ function createChatPayloadBuilder(params: {
   effectiveMaxTokens: number;
   stream: boolean;
   contextCache?: ContextCachePlan;
+  profileOverride?: ModelProfileOverride;
 }) {
   const {
     model,
@@ -2843,7 +3179,10 @@ function createChatPayloadBuilder(params: {
       model,
       apiBase,
       providerProtocol,
-      { maxTokens: effectiveMaxTokens },
+      {
+        maxTokens: effectiveMaxTokens,
+        profileOverride: params.profileOverride,
+      },
     );
     const temperatureParam = reasoningPayload.omitTemperature
       ? {}
@@ -3140,7 +3479,10 @@ function isReasoningErrorMessage(errorMessage: string): boolean {
     text.includes("chat_template_kwargs") ||
     text.includes("thinking_level") ||
     text.includes("thinking_budget") ||
-    text.includes("budget_tokens")
+    text.includes("budget_tokens") ||
+    // Ollama rejects an unsupported think level, e.g. a string level sent to a
+    // model that only accepts a boolean.
+    text.includes("think")
   );
 }
 
@@ -3320,11 +3662,11 @@ export async function resolveRequestAuthState(params: {
 // =============================================================================
 
 /**
- * Handles anthropic_messages and gemini_native protocols for both streaming and
- * non-streaming calls. Passing onDelta enables streaming.
+ * Handles anthropic_messages, gemini_native and ollama_native protocols for
+ * both streaming and non-streaming calls. Passing onDelta enables streaming.
  */
 async function callNativeProtocol(params: {
-  protocol: "anthropic_messages" | "gemini_native";
+  protocol: "anthropic_messages" | "gemini_native" | "ollama_native";
   apiBase: string;
   apiKey: string;
   model: string;
@@ -3339,6 +3681,9 @@ async function callNativeProtocol(params: {
   attachments?: ChatFileAttachment[];
   reasoning?: ReasoningConfig;
   contextCache?: ContextCachePlan;
+  /** ollama_native only: runtime context window to allocate. */
+  numCtx?: number;
+  profileOverride?: ModelProfileOverride;
 }): Promise<string> {
   const {
     protocol,
@@ -3357,7 +3702,9 @@ async function callNativeProtocol(params: {
   const url =
     protocol === "anthropic_messages"
       ? resolveAnthropicMessagesEndpoint(apiBase)
-      : resolveGeminiNativeEndpoint({ apiBase, model, stream: isStreaming });
+      : protocol === "ollama_native"
+        ? resolveOllamaNativeEndpoint(apiBase)
+        : resolveGeminiNativeEndpoint({ apiBase, model, stream: isStreaming });
   const headers = buildProviderTransportHeaders({ protocol, apiKey });
   const pdfParts: Array<{ base64: string }> = [];
   if (
@@ -3381,28 +3728,45 @@ async function callNativeProtocol(params: {
     }
   }
   const buildBody = (reasoningOverride: ReasoningSelection | undefined) =>
-    protocol === "anthropic_messages"
-      ? buildAnthropicMessagesPayload({
+    protocol === "ollama_native"
+      ? buildOllamaChatPayload({
           model,
           messages,
-          effectiveMaxTokens,
-          effectiveTemperature: normalizeTemperature(rawTemperature),
           stream: isStreaming,
-          reasoning: reasoningOverride,
-          apiBase,
-          anthropicModeOverride: reasoningOverride?.anthropicModeOverride,
-          pdfParts: pdfParts.length ? pdfParts : undefined,
-          contextCache: params.contextCache,
+          temperature: normalizeTemperature(rawTemperature),
+          numPredict: resolveOllamaNumPredict(effectiveMaxTokens),
+          numCtx: params.numCtx,
+          reasoningExtra: buildReasoningPayload(
+            reasoningOverride,
+            false,
+            model,
+            apiBase,
+            "ollama_native",
+            { profileOverride: params.profileOverride },
+          ).extra,
         })
-      : buildGeminiNativePayload({
-          model,
-          apiBase,
-          messages,
-          effectiveMaxTokens,
-          temperature: resolveGeminiTemperature(model, rawTemperature),
-          reasoning: reasoningOverride,
-          pdfParts: pdfParts.length ? pdfParts : undefined,
-        });
+      : protocol === "anthropic_messages"
+        ? buildAnthropicMessagesPayload({
+            model,
+            messages,
+            effectiveMaxTokens,
+            effectiveTemperature: normalizeTemperature(rawTemperature),
+            stream: isStreaming,
+            reasoning: reasoningOverride,
+            apiBase,
+            anthropicModeOverride: reasoningOverride?.anthropicModeOverride,
+            pdfParts: pdfParts.length ? pdfParts : undefined,
+            contextCache: params.contextCache,
+          })
+        : buildGeminiNativePayload({
+            model,
+            apiBase,
+            messages,
+            effectiveMaxTokens,
+            temperature: resolveGeminiTemperature(model, rawTemperature),
+            reasoning: reasoningOverride,
+            pdfParts: pdfParts.length ? pdfParts : undefined,
+          });
   const res = await postWithReasoningFallback({
     url,
     auth: { mode: "api_key", token: apiKey },
@@ -3423,12 +3787,23 @@ async function callNativeProtocol(params: {
     if (!res.body) return callNativeProtocol({ ...params, onDelta: undefined });
     return protocol === "anthropic_messages"
       ? parseAnthropicStreamResponse(res.body, onDelta!, onReasoning, onUsage)
-      : parseGeminiNativeStreamResponse(
-          res.body,
-          onDelta!,
-          onReasoning,
-          onUsage,
-        );
+      : protocol === "ollama_native"
+        ? parseOllamaChatStream(res.body, onDelta!, onReasoning, onUsage)
+        : parseGeminiNativeStreamResponse(
+            res.body,
+            onDelta!,
+            onReasoning,
+            onUsage,
+          );
+  }
+  if (protocol === "ollama_native") {
+    const data = (await res.json()) as OllamaChatChunk;
+    const thinking = normalizeStreamText(data?.message?.thinking ?? "");
+    if (thinking && onReasoning) onReasoning({ details: thinking });
+    // Deliberately no fallback to `thinking` when content is empty: if the
+    // server put the answer in the reasoning field that is the server's bug,
+    // and silently promoting it would hide a misconfiguration (see #363).
+    return normalizeStreamText(data?.message?.content ?? "");
   }
   if (protocol === "anthropic_messages") {
     const data = (await res.json()) as {
@@ -3469,7 +3844,8 @@ export async function callLLM(params: ChatParams): Promise<string> {
   } = prepared;
   if (
     providerProtocol === "anthropic_messages" ||
-    providerProtocol === "gemini_native"
+    providerProtocol === "gemini_native" ||
+    providerProtocol === "ollama_native"
   ) {
     return callNativeProtocol({
       protocol: providerProtocol,
@@ -3483,12 +3859,15 @@ export async function callLLM(params: ChatParams): Promise<string> {
         apiBase,
         protocol: providerProtocol,
         authMode,
+        profileOverride: params.profileOverride,
       }),
       rawTemperature: params.temperature,
       signal: params.signal,
       attachments: params.attachments,
       reasoning: params.reasoning,
       contextCache: params.contextCache,
+      numCtx: resolveOllamaNumCtx(providerProtocol, inputCap.limitTokens),
+      profileOverride: params.profileOverride,
     });
   }
   assertCodexAppServerUsesNativeRuntime(authMode);
@@ -3541,6 +3920,7 @@ export async function callLLM(params: ChatParams): Promise<string> {
     apiBase,
     protocol: providerProtocol,
     authMode,
+    profileOverride: params.profileOverride,
   });
 
   const url = resolveProviderTransportEndpoint({
@@ -3567,6 +3947,7 @@ export async function callLLM(params: ChatParams): Promise<string> {
     effectiveMaxTokens,
     stream: false,
     contextCache: params.contextCache,
+    profileOverride: params.profileOverride,
   });
   const res = await postWithReasoningFallback({
     url,
@@ -3614,7 +3995,8 @@ export async function callLLMStream(
   } = prepared;
   if (
     providerProtocol === "anthropic_messages" ||
-    providerProtocol === "gemini_native"
+    providerProtocol === "gemini_native" ||
+    providerProtocol === "ollama_native"
   ) {
     return callNativeProtocol({
       protocol: providerProtocol,
@@ -3628,6 +4010,7 @@ export async function callLLMStream(
         apiBase,
         protocol: providerProtocol,
         authMode,
+        profileOverride: params.profileOverride,
       }),
       rawTemperature: params.temperature,
       signal: params.signal,
@@ -3637,6 +4020,8 @@ export async function callLLMStream(
       attachments: params.attachments,
       reasoning: params.reasoning,
       contextCache: params.contextCache,
+      numCtx: resolveOllamaNumCtx(providerProtocol, inputCap.limitTokens),
+      profileOverride: params.profileOverride,
     });
   }
   assertCodexAppServerUsesNativeRuntime(authMode);
@@ -3686,6 +4071,7 @@ export async function callLLMStream(
     apiBase,
     protocol: providerProtocol,
     authMode,
+    profileOverride: params.profileOverride,
   });
 
   const url = resolveProviderTransportEndpoint({
@@ -3712,6 +4098,7 @@ export async function callLLMStream(
     effectiveMaxTokens,
     stream: true,
     contextCache: params.contextCache,
+    profileOverride: params.profileOverride,
   });
   const res = await postWithReasoningFallback({
     url,
@@ -3939,12 +4326,13 @@ export async function parseStreamResponse(
       }
     }
   } finally {
-    if (thoughtState.buffer) {
-      if (thoughtState.inThought && onReasoning) {
-        onReasoning({ details: thoughtState.buffer });
-      } else {
-        fullText += thoughtState.buffer;
-        onDelta(thoughtState.buffer);
+    const tail = resolveUnterminatedThought(thoughtState);
+    if (tail.text) {
+      if (tail.asAnswer) {
+        fullText += tail.text;
+        onDelta(tail.text);
+      } else if (onReasoning) {
+        onReasoning({ details: tail.text });
       }
     }
     reader.releaseLock();
@@ -4419,12 +4807,13 @@ async function parseResponsesStream(
       }
     }
   } finally {
-    if (thoughtState.buffer) {
-      if (thoughtState.inThought && onReasoning) {
-        onReasoning({ details: thoughtState.buffer });
-      } else {
-        fullText += thoughtState.buffer;
-        onDelta(thoughtState.buffer);
+    const tail = resolveUnterminatedThought(thoughtState);
+    if (tail.text) {
+      if (tail.asAnswer) {
+        fullText += tail.text;
+        onDelta(tail.text);
+      } else if (onReasoning) {
+        onReasoning({ details: tail.text });
       }
     }
     reader.releaseLock();

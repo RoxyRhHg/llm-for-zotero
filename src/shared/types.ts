@@ -49,6 +49,12 @@ export type AdvancedModelParams = {
   maxTokens: number;
   inputTokenCap?: number;
   inputMode?: ModelInputMode;
+  /**
+   * User-authored capability overrides for this model. Typed loosely here to
+   * keep `shared/` free of a dependency on the capability layer; it is
+   * validated by `normalizeProfileOverride` wherever it is consumed.
+   */
+  profileOverride?: Record<string, unknown>;
 };
 
 export type PaperContextRef = {

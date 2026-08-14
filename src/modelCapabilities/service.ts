@@ -15,6 +15,9 @@ import {
   inferProviderFromApiBase,
   inferProviderFromModelName,
 } from "./providerInference";
+import { fetchOllamaCatalog, usesOllamaCatalog } from "./localCatalog";
+import { isLocalModelApiBase } from "../utils/providerPresets";
+import { normalizeProfileOverride } from "./profileOverride";
 import {
   applyControlPatch,
   cloneRegistry,
@@ -176,6 +179,11 @@ function providerFromIdentity(
     // Relays and unrecognized hosts still serve recognizable models; the
     // model name keeps its provider family (and thus its reasoning profile).
     inferProviderFromModelName(normalize(identity.model)) ??
+    // Last resort only, so a recognized family is never shadowed by its host.
+    // Must mirror detectReasoningProvider's ordering: the two derive the same
+    // provider for the same model, and a mismatch would key the live catalog
+    // snapshot under one name while the capability lookup reads another.
+    (isLocalModelApiBase(identity.apiBase || "") ? "local" : null) ??
     "unknown"
   );
 }
@@ -328,11 +336,41 @@ function mergeLimits(
   return { limits, source };
 }
 
+/**
+ * Off/On for a thinking-capable Ollama model.
+ *
+ * A boolean `think` is accepted by every thinking model Ollama serves, so this
+ * is the one option set that is always safe. Graded levels (`"low"`…`"max"`)
+ * are model-dependent and are deliberately not guessed — the user adds them in
+ * the per-model parameter editor if their model supports them.
+ */
+function ollamaThinkOptions(): ModelReasoningCapability {
+  return {
+    kind: "select",
+    defaultOptionId: "default",
+    options: [
+      {
+        id: "minimal",
+        label: "Off",
+        enabled: true,
+        controls: { body: { think: false } },
+      },
+      {
+        id: "default",
+        label: "On",
+        enabled: true,
+        controls: { body: { think: true } },
+      },
+    ],
+  };
+}
+
 function mergeReasoning(
   provider: ModelCapabilityProvider,
   model: string,
   entry: RegistryModelEntry | null,
   live: DiscoveredModel | undefined,
+  protocol?: string,
 ): { reasoning: ModelReasoningCapability; source: CapabilitySource } {
   const legacy = legacyReasoning(provider, model);
   legacyReasoningProfiles(provider, model);
@@ -346,6 +384,12 @@ function mergeReasoning(
     };
   }
   if (live?.reasoningSupported) {
+    // The level set a hosted profile carries over is right, but its request
+    // body is not: `qwen3` on Ollama needs `think`, never DashScope's
+    // `chat_template_kwargs`. Only the encoding is local-specific.
+    if (protocol === "ollama_native") {
+      return { reasoning: ollamaThinkOptions(), source: "live" };
+    }
     return {
       reasoning: legacy.options.length
         ? legacy
@@ -497,7 +541,13 @@ export function getModelCapabilities(
     entry,
     live,
   );
-  const mergedReasoning = mergeReasoning(provider, model, entry, live);
+  const mergedReasoning = mergeReasoning(
+    provider,
+    model,
+    entry,
+    live,
+    identity.protocol,
+  );
   const source: CapabilitySource = live
     ? "live"
     : entry
@@ -522,6 +572,9 @@ export function getModelCapabilities(
       streaming: true,
       promptCache: false,
       ...(entry?.features || {}),
+      // A local server states plainly whether the loaded weights support tool
+      // calling, which beats both the registry and the optimistic default.
+      ...(live?.features || {}),
     },
     source,
     stale: Boolean(getCatalogSnapshot(identity)?.stale),
@@ -533,10 +586,63 @@ export function getModelCapabilities(
       ...(entry?.inputs || live?.inputs
         ? { inputs: live ? "live" : activeRegistrySource }
         : {}),
-      ...(entry?.features ? { features: activeRegistrySource } : {}),
+      ...(entry?.features || live?.features
+        ? { features: live?.features ? "live" : activeRegistrySource }
+        : {}),
     },
   };
-  return snapshot;
+  return applyProfileOverride(snapshot, identity.profileOverride);
+}
+
+/**
+ * The user's word is final: an override sits above legacy, registry and live.
+ *
+ * Applied per section and only where the override actually states something, so
+ * a user correcting one context window does not blank out everything the
+ * server reported. Clearing a field removes it from the stored override
+ * entirely (see `pruneProfileOverride`), which is what makes Reset
+ * indistinguishable from never having edited.
+ */
+function applyProfileOverride(
+  snapshot: ResolvedModelCapabilities,
+  rawOverride: unknown,
+): ResolvedModelCapabilities {
+  const override = normalizeProfileOverride(rawOverride);
+  if (!override) return snapshot;
+  const provenance = { ...snapshot.provenance };
+  const next: ResolvedModelCapabilities = { ...snapshot };
+
+  if (override.limits) {
+    next.limits = { ...snapshot.limits, ...override.limits };
+    provenance.limits = "user";
+  }
+  if (override.reasoning) {
+    next.reasoning = clone(override.reasoning);
+    provenance.reasoning = "user";
+  }
+  if (override.sampling) {
+    next.sampling = { ...snapshot.sampling, ...override.sampling };
+    provenance.sampling = "user";
+  }
+  if (override.inputs) {
+    next.inputs = { ...snapshot.inputs, ...override.inputs };
+    provenance.inputs = "user";
+  }
+  if (override.features) {
+    next.features = { ...snapshot.features, ...override.features };
+    provenance.features = "user";
+  }
+  next.provenance = provenance;
+  if (
+    override.limits ||
+    override.reasoning ||
+    override.sampling ||
+    override.inputs ||
+    override.features
+  ) {
+    next.source = "user";
+  }
+  return next;
 }
 
 export function compileReasoningControls(
@@ -744,8 +850,21 @@ function parseDiscoveredModels(value: unknown): DiscoveredModel[] {
     if (!id && typeof row.name === "string")
       id = row.name.trim().replace(/^models\//, "");
     if (!id || id.length > 256) continue;
+    // Local servers each name the context window differently:
+    // LM Studio uses max_context_length / loaded_context_length, vLLM uses
+    // max_model_len, and llama.cpp nests n_ctx / n_ctx_train under `meta`.
+    const meta = (
+      row.meta && typeof row.meta === "object" ? row.meta : {}
+    ) as Record<string, unknown>;
     const context = Number(
-      row.context_length ?? row.context_window ?? row.contextWindow,
+      row.context_length ??
+        row.context_window ??
+        row.contextWindow ??
+        row.max_context_length ??
+        row.loaded_context_length ??
+        row.max_model_len ??
+        meta.n_ctx ??
+        meta.n_ctx_train,
     );
     const input = Number(
       row.max_input_tokens ??
@@ -840,9 +959,34 @@ async function fetchModelCatalog(
   key: string,
   cached: CatalogSnapshot | undefined,
 ): Promise<DiscoveredModel[]> {
+  const fetchFn = getFetch();
+  // Ollama's native metadata endpoints report the real context window plus
+  // vision/tools/thinking, none of which its /v1/models mirror exposes.
+  if (usesOllamaCatalog(identity.protocol) && fetchFn && identity.apiBase) {
+    try {
+      const models = await fetchOllamaCatalog({
+        fetchFn,
+        apiBase: identity.apiBase,
+        apiKey: identity.apiKey,
+        detailModel: identity.model,
+        timeoutMs: options.timeoutMs || DEFAULT_REFRESH_TIMEOUT_MS,
+      });
+      catalogSnapshots.set(key, { models, fetchedAt: now(), stale: false });
+      notify();
+      return models;
+    } catch (error) {
+      const snapshot: CatalogSnapshot = {
+        models: cached?.models || [],
+        fetchedAt: cached?.fetchedAt || 0,
+        stale: true,
+        error: error instanceof Error ? error.message : String(error),
+      };
+      catalogSnapshots.set(key, snapshot);
+      return snapshot.models;
+    }
+  }
   const compatEndpoint = getAnthropicCompatCatalogEndpoint(identity);
   const endpoint = compatEndpoint || getCatalogEndpoint(identity);
-  const fetchFn = getFetch();
   if (!endpoint || !fetchFn) return cached?.models || [];
   let timer: ReturnType<typeof setTimeout> | null = null;
   try {

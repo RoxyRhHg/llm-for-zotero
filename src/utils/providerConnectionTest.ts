@@ -156,6 +156,20 @@ function buildConnectionRequestPayload(params: {
       },
     };
   }
+  if (params.protocol === "ollama_native") {
+    return {
+      expectsSse: false,
+      body: {
+        model: params.modelName,
+        messages: [{ role: "user", content: "Say OK" }],
+        stream: false,
+        // Thinking off: the test is about reachability, and a reasoning model
+        // would otherwise burn the whole reply on thought.
+        think: false,
+        options: { num_predict: 16 },
+      },
+    };
+  }
   return {
     expectsSse: false,
     body: {
@@ -204,7 +218,24 @@ function extractConnectionReply(params: {
   if (params.protocol === "anthropic_messages") {
     return extractAnthropicText(params.jsonData) || "OK";
   }
+  if (params.protocol === "ollama_native") {
+    return extractOllamaText(params.jsonData).content || "OK";
+  }
   return extractGeminiText(params.jsonData) || "OK";
+}
+
+function extractOllamaText(jsonData: unknown): {
+  content: string;
+  thinking: string;
+} {
+  const message = (
+    jsonData as { message?: { content?: unknown; thinking?: unknown } }
+  )?.message;
+  return {
+    content: typeof message?.content === "string" ? message.content.trim() : "",
+    thinking:
+      typeof message?.thinking === "string" ? message.thinking.trim() : "",
+  };
 }
 
 export function getProviderConnectionCapabilityLabel(params: {
@@ -305,7 +336,7 @@ export async function runProviderConnectionTest(params: {
   apiBase: string;
   apiKey: string;
   modelName: string;
-}): Promise<{ reply: string; capabilityLabel: string }> {
+}): Promise<{ reply: string; capabilityLabel: string; warning?: string }> {
   const { body, expectsSse } = buildConnectionRequestPayload({
     protocol: params.protocol,
     modelName: params.modelName,
@@ -347,5 +378,28 @@ export async function runProviderConnectionTest(params: {
       jsonData,
     }),
     capabilityLabel: getProviderConnectionCapabilityLabel(params),
+    ...(resolveEmptyAnswerWarning(params.protocol, jsonData) || {}),
+  };
+}
+
+/**
+ * The reply extractors fall back to a literal "OK" when a provider returns no
+ * text, which reads as success even though the model answered nothing. For
+ * Ollama we can tell the two apart: content empty while thinking is populated
+ * is the failure mode behind #363, and the user needs to see it rather than a
+ * green tick.
+ */
+function resolveEmptyAnswerWarning(
+  protocol: ProviderProtocol,
+  jsonData: unknown,
+): { warning: string } | null {
+  if (protocol !== "ollama_native") return null;
+  const { content, thinking } = extractOllamaText(jsonData);
+  if (content || !thinking) return null;
+  return {
+    warning:
+      "The model returned reasoning but no answer. Turn thinking off for " +
+      "this model, or pick a different one — some models only produce an " +
+      "answer with thinking disabled.",
   };
 }

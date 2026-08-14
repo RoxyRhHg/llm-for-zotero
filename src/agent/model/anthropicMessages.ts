@@ -809,6 +809,7 @@ export class AnthropicMessagesAgentAdapter implements AgentModelAdapter {
         {
           maxTokens,
           anthropicModeOverride: reasoningOverride?.anthropicModeOverride,
+          profileOverride: request.advanced?.profileOverride,
         },
       );
       const systemCacheControl =

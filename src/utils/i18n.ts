@@ -539,6 +539,41 @@ const zhCN: Record<string, string> = {
     "codex 令牌缺失。请先运行 `codex login`。",
   "Agent capability: ": "Agent 能力: ",
   "✓ Success — model says: ": "✓ 成功 — 模型回复: ",
+  "⚠ Connected, but no answer — ": "⚠ 已连接，但没有回答 — ",
+  "The model returned reasoning but no answer. Turn thinking off for this model, or pick a different one — some models only produce an answer with thinking disabled.":
+    "模型只返回了思考内容，没有回答。请关闭该模型的思考功能，或换一个模型——部分模型只有在关闭思考时才会给出回答。",
+  // ── Local providers ────────────────────────────────────────────────
+  "Ollama (local)": "Ollama（本地）",
+  "Local (OpenAI-compatible)": "本地（OpenAI 兼容）",
+  "API Key (optional)": "API 密钥（可选）",
+  "Leave blank unless your server requires auth":
+    "除非服务器需要认证，否则留空",
+  "Preset uses Ollama's native /api/chat endpoint, which separates thinking from the answer and honours the think parameter. No API key required.":
+    "预设使用 Ollama 原生 /api/chat 接口，可将思考与回答分开，并支持 think 参数。无需 API 密钥。",
+  "For LM Studio, llama.cpp, vLLM, Jan and other local OpenAI-compatible servers. No API key required.":
+    "适用于 LM Studio、llama.cpp、vLLM、Jan 等本地 OpenAI 兼容服务。无需 API 密钥。",
+  // ── Model parameter editor ─────────────────────────────────────────
+  Tools: "工具",
+  Streaming: "流式输出",
+  "Reasoning levels": "思考级别",
+  "The levels the reasoning menu offers, and the parameters each one sends — for example reasoning_effort=high, or think=high on Ollama. For an off switch add a level named off that disables it: reasoning_effort=none, or think=false on Ollama. Leaving a level's parameters blank uses the provider's default, which is not the same as off.":
+    "思考菜单中提供的级别，以及每个级别发送的参数——例如 reasoning_effort=high，在 Ollama 上则是 think=high。若需要关闭开关，请添加一个名为 off 的级别并填写用于关闭的参数：reasoning_effort=none，在 Ollama 上则是 think=false。留空参数将使用服务商的默认行为，这与关闭并不相同。",
+  "+ Add level": "+ 添加级别",
+  "Delete level": "删除级别",
+  level: "级别",
+  "Duplicate level — ignored": "级别重复 — 已忽略",
+  "Use letters, digits, - or _ so the level is remembered":
+    "请使用字母、数字、- 或 _，否则该级别不会被记住",
+  "Unknown level — add parameters or the provider default is used":
+    "未知级别 — 请填写参数，否则将使用服务商默认值",
+  "Expected key=value: ": "应为 key=value：",
+  "Extra request parameters": "额外请求参数",
+  'A JSON object merged into every request to this model, for example {"top_k": 40, "options": {"repeat_penalty": 1.1}}.':
+    '一个 JSON 对象，会合并进发往该模型的每次请求，例如 {"top_k": 40, "options": {"repeat_penalty": 1.1}}。',
+  "Invalid JSON: ": "JSON 无效：",
+  "Reset to detected": "恢复为检测值",
+  "customized for this model": "已为该模型自定义",
+  // Label / Auto / Yes / No are already defined above.
   "codex auth reuses local `codex login` credentials from ~/.codex/auth.json":
     "codex 认证复用本地 `codex login` 凭据（~/.codex/auth.json）",
   "GitHub Copilot": "GitHub Copilot",
@@ -613,6 +648,8 @@ const zhCN: Record<string, string> = {
   "Runtime defaults": "运行时默认值",
   Model: "模型",
   Auto: "自动",
+  Yes: "是",
+  No: "否",
   Low: "低",
   Medium: "中",
   High: "高",

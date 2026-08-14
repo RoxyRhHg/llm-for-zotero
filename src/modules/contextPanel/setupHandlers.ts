@@ -5432,7 +5432,10 @@ export function setupHandlers(
       };
     }
     const selectedProfile = getSelectedModelEntryForItem(item.id);
-    const provider = detectReasoningProvider(currentModel);
+    const provider = detectReasoningProvider(
+      currentModel,
+      selectedProfile?.apiBase,
+    );
     const options = getReasoningOptions(
       provider,
       currentModel,

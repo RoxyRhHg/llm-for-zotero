@@ -919,6 +919,7 @@ type EffectiveRequestConfigShape = {
     | "openai_chat_compat"
     | "anthropic_messages"
     | "gemini_native"
+    | "ollama_native"
     | "web_sync";
   modelEntryId?: string;
   modelProviderLabel?: string;
@@ -1098,6 +1099,7 @@ export type AgentEngineDeps = {
       | "openai_chat_compat"
       | "anthropic_messages"
       | "gemini_native"
+      | "ollama_native"
       | "web_sync";
     modelEntryId?: string;
     modelProviderLabel?: string;
@@ -1260,6 +1262,7 @@ export async function sendAgentTurn(
       | "openai_chat_compat"
       | "anthropic_messages"
       | "gemini_native"
+      | "ollama_native"
       | "web_sync";
     modelEntryId?: string;
     modelProviderLabel?: string;
@@ -1810,6 +1813,7 @@ export async function retryAgentTurn(
     | "openai_chat_compat"
     | "anthropic_messages"
     | "gemini_native"
+    | "ollama_native"
     | "web_sync"
     | undefined,
   modelEntryId: string | undefined,

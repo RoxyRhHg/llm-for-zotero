@@ -22,6 +22,8 @@ const ALLOWED_CONTROL_ROOTS = new Set([
   "enable_thinking",
   "chat_template_kwargs",
   "extra_body",
+  // Ollama's native thinking switch: false | true | "low".."max".
+  "think",
 ]);
 
 const ALLOWED_OMIT_ROOTS = new Set([
@@ -36,6 +38,7 @@ const ALLOWED_OMIT_ROOTS = new Set([
   "enable_thinking",
   "chat_template_kwargs",
   "extra_body",
+  "think",
 ]);
 const ALLOWED_INPUT_KEYS = new Set(["text", "image", "video", "pdf"]);
 const ALLOWED_FEATURE_KEYS = new Set(["tools", "streaming", "promptCache"]);

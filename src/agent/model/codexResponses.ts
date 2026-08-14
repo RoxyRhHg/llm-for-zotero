@@ -115,6 +115,7 @@ export class CodexResponsesAgentAdapter implements AgentModelAdapter {
           request.model,
           request.apiBase,
           "codex_responses",
+          { profileOverride: request.advanced?.profileOverride },
         );
         return {
           model: request.model,
