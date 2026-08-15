@@ -403,6 +403,7 @@ const DEFAULT_METHODS: LibraryRetrieveMethod[] = [
 ];
 
 export const QUICKSEARCH_MAX_PROBES = 8;
+export const LIBRARY_RETRIEVE_MIN_MATCHED_SHORTLIST = 5;
 
 // Normalized pool-BM25 contribution to a record's blended score: below a
 // title phrase match (10) so exact titles keep winning, above tag/creator
@@ -1395,11 +1396,29 @@ export class LibraryRetrieveService {
     const shouldUseBoundedSynthesisPool =
       readStrategyBase.resolvedStrategy === "deep_synthesis" &&
       scope.totalItems <= DEEP_SYNTHESIS_MAX_PAPERS;
+    const fallbackEligible =
+      shouldPreferMatchedLedger &&
+      scope.type !== "items" &&
+      !shouldUseBoundedSynthesisPool;
+    // A near-empty matched ledger must not silently produce zero candidates:
+    // fall back to the top-scored pool slice and say so.
+    const usedPoolFallback =
+      fallbackEligible &&
+      matchedRecords.length <
+        Math.min(LIBRARY_RETRIEVE_MIN_MATCHED_SHORTLIST, sorted.length) &&
+      sorted.length > matchedRecords.length;
     const candidateSource = shouldUseBoundedSynthesisPool
       ? sorted
-      : shouldPreferMatchedLedger && scope.type !== "items"
-        ? matchedRecords
+      : fallbackEligible
+        ? usedPoolFallback
+          ? sorted
+          : matchedRecords
         : sorted;
+    if (usedPoolFallback && input.depth !== "pool") {
+      warnings.push(
+        `Lexical/metadata matching found only ${matchedRecords.length} direct match(es) in this scope; returning the top-scored pool slice instead (LOW CONFIDENCE). Treat unmatched candidates as leads to verify, not evidence.`,
+      );
+    }
     const candidateRecords =
       input.depth === "pool"
         ? []

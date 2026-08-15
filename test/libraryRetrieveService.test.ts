@@ -1653,9 +1653,11 @@ describe("LibraryRetrieveService", function () {
     assert.isUndefined(quicksearchCalls[1]?.filters);
     assert.equal(result.resourcePool.type, "mixed");
     assert.equal(result.resourcePool.queryCoverage.indexedTextMatched, 1);
-    assert.deepEqual(
-      result.candidates.map((candidate) => candidate.itemId),
-      ["8"],
+    // With a single direct match the shortlist fallback widens candidates to
+    // the top-scored pool slice; the matched record must stay ranked first.
+    assert.equal(result.candidates[0]?.itemId, "8");
+    assert.isTrue(
+      result.warnings.some((warning) => warning.includes("LOW CONFIDENCE")),
     );
     const tagOnlyMatch = result.paperMatches.find(
       (match) => match.itemId === "8",
@@ -1967,5 +1969,107 @@ describe("LibraryRetrieveService pool BM25", function () {
     });
 
     assert.equal(result.resourcePool.queryCoverage.matchedMetadata, 0);
+  });
+});
+
+describe("LibraryRetrieveService shortlist fallback", function () {
+  const CJK_ENTRIES = () => [
+    makeItem(1, "论文一", "关于蛋白质折叠的研究。", { collectionIds: [3] }),
+    makeItem(2, "论文二", "细胞分裂机制综述。", { collectionIds: [3] }),
+    makeItem(3, "论文三", "神经元发育过程分析。", { collectionIds: [3] }),
+    makeItem(4, "论文四", "基因表达调控网络。", { collectionIds: [3] }),
+    makeItem(5, "论文五", "免疫系统应答机制。", { collectionIds: [3] }),
+    makeItem(6, "论文六", "代谢通路建模方法。", { collectionIds: [3] }),
+    makeItem(7, "论文七", "膜蛋白结构解析。", { collectionIds: [3] }),
+    makeItem(8, "论文八", "线粒体功能研究。", { collectionIds: [3] }),
+  ];
+
+  it("falls back to the top-scored pool slice with a low-confidence warning when nothing matches", async function () {
+    const entries = CJK_ENTRIES();
+    const service = new LibraryRetrieveService(
+      makeGateway(entries) as any,
+      { ensurePaperContext: async () => makePdfContext([]) } as any,
+      async () => [],
+    );
+
+    const result = await service.retrieve({
+      query: "quantum entanglement experiments",
+      depth: "metadata",
+      request: {
+        conversationKey: 1,
+        mode: "agent",
+        userText: "x",
+        libraryID: 1,
+        selectedCollectionContexts: [
+          { collectionId: 3, name: "Collection 3", libraryID: 1 },
+        ],
+      },
+    });
+
+    assert.isAbove(result.candidates.length, 0);
+    assert.isTrue(
+      result.warnings.some((warning) => warning.includes("LOW CONFIDENCE")),
+      `warnings were: ${JSON.stringify(result.warnings)}`,
+    );
+  });
+
+  it("keeps the matched ledger when enough records match", async function () {
+    const entries = [
+      makeItem(1, "Drift analysis one", "Representational drift analysis."),
+      makeItem(2, "Drift analysis two", "Representational drift analysis."),
+      makeItem(3, "Drift analysis three", "Representational drift analysis."),
+      makeItem(4, "Drift analysis four", "Representational drift analysis."),
+      makeItem(5, "Drift analysis five", "Representational drift analysis."),
+      makeItem(6, "Unrelated", "Protein folding kinetics."),
+    ];
+    const service = new LibraryRetrieveService(
+      makeGateway(entries) as any,
+      { ensurePaperContext: async () => makePdfContext([]) } as any,
+      async () => [],
+    );
+
+    const result = await service.retrieve({
+      query: "representational drift analysis",
+      depth: "metadata",
+      request: {
+        conversationKey: 1,
+        mode: "agent",
+        userText: "x",
+        libraryID: 1,
+      },
+    });
+
+    assert.isFalse(
+      result.warnings.some((warning) => warning.includes("LOW CONFIDENCE")),
+    );
+    assert.isFalse(
+      result.candidates.some((candidate) => candidate.itemId === "6"),
+    );
+  });
+
+  it("leaves explicit item scopes untouched", async function () {
+    const entries = CJK_ENTRIES();
+    const service = new LibraryRetrieveService(
+      makeGateway(entries) as any,
+      { ensurePaperContext: async () => makePdfContext([]) } as any,
+      async () => [],
+    );
+
+    const result = await service.retrieve({
+      query: "quantum entanglement experiments",
+      depth: "metadata",
+      scope: { itemIds: [1, 2, 3] },
+      request: {
+        conversationKey: 1,
+        mode: "agent",
+        userText: "x",
+        libraryID: 1,
+      },
+    });
+
+    assert.isAbove(result.candidates.length, 0);
+    assert.isFalse(
+      result.warnings.some((warning) => warning.includes("LOW CONFIDENCE")),
+    );
   });
 });
