@@ -1258,6 +1258,15 @@ export class LibraryRetrieveService {
   ): Promise<LibraryRetrieveResult> {
     const requestedIntent = params.intent;
     const requestedDepth = params.depth;
+    // Resolve the scope before planning (it only reads scope/budget inputs)
+    // so the query planner can see corpus samples for language and
+    // vocabulary matching.
+    const provisionalInput = normalizeInput(params, params.request);
+    const scope = await this.resolveScope(
+      provisionalInput,
+      params.request,
+      params.item,
+    );
     const queryPlan = await resolveRetrievalQueryPlan({
       query: params.query,
       queryVariants: params.queryVariants,
@@ -1271,11 +1280,14 @@ export class LibraryRetrieveService {
         params.providerProtocol || params.request?.providerProtocol,
       reasoning: params.reasoning || params.request?.reasoning,
       signal: params.signal,
+      sourceSamples: this.buildScopeSourceSamples(scope),
     });
     let input = normalizeInput(params, params.request, queryPlan);
     const warnings: string[] = [];
+    for (const note of new Set(input.queryPlan.notes)) {
+      warnings.push(`Query planner: ${note}`);
+    }
     const methodsUsed = new Set<LibraryRetrieveMethod>();
-    const scope = await this.resolveScope(input, params.request, params.item);
     const readStrategyBase = resolveLibraryChatReadStrategy({
       query: input.query,
       intent: input.intent,
@@ -1535,6 +1547,27 @@ export class LibraryRetrieveService {
         : undefined,
       warnings,
     };
+  }
+
+  private buildScopeSourceSamples(scope: ScopeResolution): string[] {
+    const withAbstract: string[] = [];
+    const titleOnly: string[] = [];
+    for (const target of scope.items.slice(0, 20)) {
+      if (withAbstract.length >= 3) break;
+      const metadata = this.zoteroGateway.getEditableArticleMetadata(
+        this.zoteroGateway.getItem(target.itemId),
+      );
+      const abstract = normalizeText(metadata?.fields.abstractNote).slice(
+        0,
+        240,
+      );
+      const sample = [normalizeText(target.title), abstract]
+        .filter(Boolean)
+        .join("\n");
+      if (!sample) continue;
+      (abstract ? withAbstract : titleOnly).push(sample);
+    }
+    return [...withAbstract, ...titleOnly].slice(0, 3);
   }
 
   private async resolveScope(

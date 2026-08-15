@@ -1,7 +1,9 @@
 import { assert } from "chai";
 import {
+  buildRetrievalPlannerPrompt,
   buildRetrievalQueryPlan,
   detectExplicitFullReadIntent,
+  RETRIEVAL_QUERY_PLAN_TIMEOUT_MS,
   RETRIEVAL_QUERY_VARIANT_DEFAULT_LIMIT,
   reconcilePlannerReadIntent,
   resolveRetrievalQueryPlan,
@@ -308,5 +310,30 @@ describe("retrievalQueryPlan", function () {
       reconcilePlannerReadIntent("Read the complete Lee paper.", "targeted"),
       "targeted",
     );
+  });
+});
+
+describe("retrieval planner prompt", function () {
+  it("includes bounded source samples and the bilingual-probe instruction", function () {
+    const prompt = buildRetrievalPlannerPrompt({
+      query: "哪些论文讨论了表征漂移？",
+      sourceSamples: [
+        "Representational drift in neocortex\nNeurons change tuning across days.",
+      ],
+    });
+
+    assert.include(prompt, "Representational drift in neocortex");
+    assert.include(prompt, "include at least one probe in each language");
+    assert.include(prompt, "哪些论文讨论了表征漂移？");
+  });
+
+  it("omits the samples block when no samples are supplied", function () {
+    const prompt = buildRetrievalPlannerPrompt({ query: "calcium imaging" });
+
+    assert.notInclude(prompt, "Bounded document samples:");
+  });
+
+  it("uses a ten second default planner timeout", function () {
+    assert.equal(RETRIEVAL_QUERY_PLAN_TIMEOUT_MS, 10_000);
   });
 });

@@ -37,7 +37,9 @@ export const RETRIEVAL_QUERY_VARIANT_DEFAULT_LIMIT = 6;
 export const RETRIEVAL_QUERY_VARIANT_HARD_LIMIT = 8;
 const RETRIEVAL_QUERY_VARIANT_MAX_CHARS = 160;
 const RETRIEVAL_SEMANTIC_QUERY_MAX_CHARS = 700;
-const RETRIEVAL_QUERY_PLAN_TIMEOUT_MS = 2500;
+// Generous enough for slower OpenAI-compatible providers to return first
+// tokens; the parse-retry loop makes the worst case roughly twice this.
+export const RETRIEVAL_QUERY_PLAN_TIMEOUT_MS = 10_000;
 
 function normalizeQueryText(value: unknown, maxChars = 0): string {
   const normalized = `${value ?? ""}`.replace(/\s+/g, " ").trim();
@@ -458,7 +460,7 @@ export function shouldAutoGenerateQueryVariants(params: {
   return !isLikelyExactLookupQuery(query);
 }
 
-async function callWithTimeout(
+export async function callLLMWithTimeout(
   params: Omit<ChatParams, "signal"> & {
     parentSignal?: AbortSignal;
     timeoutMs?: number;
@@ -482,6 +484,35 @@ async function callWithTimeout(
   }
 }
 
+export function buildRetrievalPlannerPrompt(params: {
+  query: string;
+  sourceSamples?: string[];
+}): string {
+  const sourceSamples = (params.sourceSamples || [])
+    .map((sample) => normalizeQueryText(sample, 800))
+    .filter(Boolean)
+    .slice(0, 3);
+  return [
+    "Plan document retrieval for a user's Zotero papers.",
+    'Return strict JSON only in this shape: {"readIntent":"targeted|full-once","variants":["..."]}.',
+    "Generate search probes, not an answer.",
+    "Preserve the user's intent.",
+    'Use readIntent "full-once" only when the user explicitly asks to read, use, analyze, or send the complete document.',
+    "Keep readIntent targeted when complete, entire, or whole describes an explanation, mechanism, argument, figure, table, section, or other requested answer rather than the document itself.",
+    "Generate variants in the language used by the supplied document samples, including translation when query and source languages differ.",
+    "If the user query language differs from the document samples' language, include at least one probe in each language.",
+    "Include common acronyms, notation variants, and technical equivalents when useful.",
+    "Preserve literal figure and table identifiers exactly.",
+    "Avoid broad conceptual drift and do not invent paper-specific claims.",
+    `Return at most ${RETRIEVAL_QUERY_VARIANT_DEFAULT_LIMIT} variants.`,
+    "",
+    `User query: ${params.query}`,
+    ...(sourceSamples.length
+      ? ["", "Bounded document samples:", ...sourceSamples]
+      : []),
+  ].join("\n");
+}
+
 export async function generateRetrievalQueryPlanWithModel(params: {
   query: string;
   hasRetrievalContext: boolean;
@@ -499,33 +530,15 @@ export async function generateRetrievalQueryPlanWithModel(params: {
   if (!shouldAutoGenerateQueryVariants(params)) return fallback;
   if (!params.apiBase && !params.apiKey) return fallback;
 
-  const sourceSamples = (params.sourceSamples || [])
-    .map((sample) => normalizeQueryText(sample, 800))
-    .filter(Boolean)
-    .slice(0, 3);
-  const prompt = [
-    "Plan document retrieval for a user's Zotero papers.",
-    'Return strict JSON only in this shape: {"readIntent":"targeted|full-once","variants":["..."]}.',
-    "Generate search probes, not an answer.",
-    "Preserve the user's intent.",
-    'Use readIntent "full-once" only when the user explicitly asks to read, use, analyze, or send the complete document.',
-    "Keep readIntent targeted when complete, entire, or whole describes an explanation, mechanism, argument, figure, table, section, or other requested answer rather than the document itself.",
-    "Generate variants in the language used by the supplied document samples, including translation when query and source languages differ.",
-    "Include common acronyms, notation variants, and technical equivalents when useful.",
-    "Preserve literal figure and table identifiers exactly.",
-    "Avoid broad conceptual drift and do not invent paper-specific claims.",
-    `Return at most ${RETRIEVAL_QUERY_VARIANT_DEFAULT_LIMIT} variants.`,
-    "",
-    `User query: ${params.query}`,
-    ...(sourceSamples.length
-      ? ["", "Bounded document samples:", ...sourceSamples]
-      : []),
-  ].join("\n");
+  const prompt = buildRetrievalPlannerPrompt({
+    query: params.query,
+    sourceSamples: params.sourceSamples,
+  });
 
   try {
     let parsed: ReturnType<typeof extractJsonObject> = null;
     for (let attempt = 0; attempt < 2; attempt += 1) {
-      const raw = await callWithTimeout({
+      const raw = await callLLMWithTimeout({
         prompt,
         model: params.model,
         apiBase: params.apiBase,

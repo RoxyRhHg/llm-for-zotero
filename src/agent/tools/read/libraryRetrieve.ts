@@ -351,6 +351,7 @@ export function createLibraryRetrieveTool(
         authMode: context.request.authMode,
         providerProtocol: context.request.providerProtocol,
         reasoning: context.request.reasoning,
+        signal: context.signal,
       });
     },
   };

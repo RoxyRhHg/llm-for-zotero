@@ -1827,3 +1827,59 @@ describe("LibraryRetrieveService quicksearch probes", function () {
     assert.isAbove(probes.length, 0);
   });
 });
+
+describe("LibraryRetrieveService planner integration", function () {
+  it("surfaces query-planner notes into result warnings", async function () {
+    const entries = [makeItem(1, "Calcium imaging")];
+    const service = new LibraryRetrieveService(
+      makeGateway(entries) as any,
+      { ensurePaperContext: async () => makePdfContext([]) } as any,
+      async () => [],
+    );
+
+    const result = await service.retrieve({
+      query: "calcium imaging",
+      queryVariants: ["two-photon imaging"],
+      depth: "metadata",
+      request: {
+        conversationKey: 1,
+        mode: "agent",
+        userText: "x",
+        libraryID: 1,
+      },
+    });
+
+    assert.isTrue(
+      result.warnings.some((warning) => warning.startsWith("Query planner: ")),
+      `warnings were: ${JSON.stringify(result.warnings)}`,
+    );
+  });
+
+  it("still fails fast when no library is available after the scope-first reorder", async function () {
+    const gateway = makeGateway([makeItem(1, "A")]) as any;
+    gateway.resolveLibraryID = () => 0;
+    const service = new LibraryRetrieveService(
+      gateway,
+      { ensurePaperContext: async () => makePdfContext([]) } as any,
+      async () => [],
+    );
+
+    try {
+      await service.retrieve({
+        query: "anything",
+        request: {
+          conversationKey: 1,
+          mode: "agent",
+          userText: "x",
+          libraryID: 1,
+        },
+      });
+      assert.fail("expected retrieve to throw");
+    } catch (error) {
+      assert.match(
+        error instanceof Error ? error.message : String(error),
+        /No active library/,
+      );
+    }
+  });
+});
