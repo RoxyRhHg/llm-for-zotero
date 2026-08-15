@@ -1,4 +1,8 @@
-import { buildPaperRetrievalCandidates } from "../../modules/contextPanel/pdfContext";
+import {
+  buildChunkIndex,
+  buildPaperRetrievalCandidates,
+  scoreChunkBM25,
+} from "../../modules/contextPanel/pdfContext";
 import {
   buildRetrievalQueryPlan,
   resolveRetrievalQueryPlan,
@@ -373,6 +377,8 @@ type ResourceRecord = {
   queryState: Set<LibraryRetrieveQueryState>;
   metadataScore: number;
   ftsScore: number;
+  bm25Score: number;
+  bm25TermHits: number;
   quicksearchMatched: boolean;
   matchedQueryVariants: Set<string>;
   score: number;
@@ -397,6 +403,22 @@ const DEFAULT_METHODS: LibraryRetrieveMethod[] = [
 ];
 
 export const QUICKSEARCH_MAX_PROBES = 8;
+
+// Normalized pool-BM25 contribution to a record's blended score: below a
+// title phrase match (10) so exact titles keep winning, above tag/creator
+// term weights so distinctive-vocabulary overlap outranks generic noise.
+const BM25_BLEND_WEIGHT = 8;
+
+function recordBm25Matched(
+  record: ResourceRecord,
+  queryPlan: RetrievalQueryPlan,
+): boolean {
+  // A single shared token (often one CJK bigram) is noise, not a match.
+  return (
+    record.bm25Score > 0 &&
+    record.bm25TermHits >= Math.min(2, queryPlan.lexicalTerms.length)
+  );
+}
 const CJK_FULL_PHRASE_PROBE_MAX_CHARS = 12;
 const CJK_KEYWORD_PROBES_PER_QUERY = 4;
 
@@ -1333,12 +1355,22 @@ export class LibraryRetrieveService {
       if (input.methods.includes("fts")) methodsUsed.add("fts");
     }
 
+    this.applyPoolBm25Scores(records, input.queryPlan);
+
+    const maxBm25 = records.reduce(
+      (max, record) => Math.max(max, record.bm25Score),
+      0,
+    );
     for (const record of records) {
       record.score =
         record.metadataScore +
         record.ftsScore +
+        (maxBm25 > 0 ? (record.bm25Score / maxBm25) * BM25_BLEND_WEIGHT : 0) +
         (record.paperContext ? 0.5 : 0);
-      if (record.metadataScore > 0) {
+      if (
+        record.metadataScore > 0 ||
+        recordBm25Matched(record, input.queryPlan)
+      ) {
         record.queryState.add("matched_metadata");
       }
     }
@@ -1351,7 +1383,10 @@ export class LibraryRetrieveService {
     });
 
     const matchedRecords = sorted.filter(
-      (record) => record.metadataScore > 0 || record.ftsScore > 0,
+      (record) =>
+        record.metadataScore > 0 ||
+        record.ftsScore > 0 ||
+        recordBm25Matched(record, input.queryPlan),
     );
     const shouldPreferMatchedLedger =
       input.intent === "enumerate" ||
@@ -1547,6 +1582,39 @@ export class LibraryRetrieveService {
         : undefined,
       warnings,
     };
+  }
+
+  private applyPoolBm25Scores(
+    records: ResourceRecord[],
+    queryPlan: RetrievalQueryPlan,
+  ): void {
+    if (!queryPlan.lexicalTerms.length || !records.length) return;
+    // Treat each record's title+abstract as one BM25 document; reusing the
+    // chunk index means pool scoring shares the CJK-aware tokenizer. Cost is
+    // one tokenize pass per record, the same class as scoreMetadata.
+    const docs = records.map((record) =>
+      [record.target.title, record.abstractText].filter(Boolean).join("\n"),
+    );
+    const { chunkStats, docFreq, avgChunkLength } = buildChunkIndex(docs);
+    records.forEach((record, index) => {
+      const stats = chunkStats[index];
+      if (!stats) return;
+      record.bm25Score = scoreChunkBM25(
+        stats,
+        queryPlan.lexicalTerms,
+        docFreq,
+        records.length,
+        avgChunkLength || 1,
+      );
+      const hits = queryPlan.lexicalTerms.filter((term) => stats.tf[term]);
+      record.bm25TermHits = hits.length;
+      if (recordBm25Matched(record, queryPlan)) {
+        // The "abstract " prefix keeps recordHasAbstractMatch attributing
+        // this basis correctly in the paper-match ledger.
+        const why = `abstract bm25 match: ${hits.slice(0, 4).join(", ")}`;
+        if (!record.why.includes(why)) record.why.push(why);
+      }
+    });
   }
 
   private buildScopeSourceSamples(scope: ScopeResolution): string[] {
@@ -1807,6 +1875,8 @@ export class LibraryRetrieveService {
         queryState: new Set<LibraryRetrieveQueryState>(),
         metadataScore: scored.score,
         ftsScore: 0,
+        bm25Score: 0,
+        bm25TermHits: 0,
         quicksearchMatched: false,
         matchedQueryVariants: new Set(scored.matchedQueryVariants),
         score: scored.score,

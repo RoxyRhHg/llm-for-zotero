@@ -1883,3 +1883,89 @@ describe("LibraryRetrieveService planner integration", function () {
     }
   });
 });
+
+describe("LibraryRetrieveService pool BM25", function () {
+  it("matches records via normalized tokens that substring scoring misses", async function () {
+    const entries = [
+      // Full-width text: substring metadata scoring (no NFKC) misses every
+      // term; the shared retrieval tokenizer normalizes and matches.
+      makeItem(1, "Paper one", "ＧＰＴ４ ｍｏｄｅｌｓ ｄｒｉｆｔ"),
+      makeItem(2, "Paper two", "Protein folding kinetics."),
+    ];
+    const service = new LibraryRetrieveService(
+      makeGateway(entries) as any,
+      { ensurePaperContext: async () => makePdfContext([]) } as any,
+      async () => [],
+    );
+
+    const result = await service.retrieve({
+      query: "gpt4 models drift",
+      depth: "metadata",
+      request: {
+        conversationKey: 1,
+        mode: "agent",
+        userText: "x",
+        libraryID: 1,
+      },
+    });
+
+    assert.isAtLeast(result.resourcePool.queryCoverage.matchedMetadata, 1);
+    const match = result.candidates.find(
+      (candidate) => candidate.itemId === "1",
+    );
+    assert.isOk(
+      match,
+      `candidates were: ${JSON.stringify(
+        result.candidates.map((candidate) => candidate.itemId),
+      )}`,
+    );
+    assert.include(match?.whyMatched || "", "bm25");
+  });
+
+  it("keeps exact title-phrase matches ranked above bm25-only overlap", async function () {
+    const entries = [
+      makeItem(1, "Calcium imaging analysis", "Detailed pipeline."),
+      makeItem(2, "Paper two", "ｃａｌｃｉｕｍ ｉｍａｇｉｎｇ ａｎａｌｙｓｉｓ"),
+    ];
+    const service = new LibraryRetrieveService(
+      makeGateway(entries) as any,
+      { ensurePaperContext: async () => makePdfContext([]) } as any,
+      async () => [],
+    );
+
+    const result = await service.retrieve({
+      query: "calcium imaging analysis",
+      depth: "metadata",
+      request: {
+        conversationKey: 1,
+        mode: "agent",
+        userText: "x",
+        libraryID: 1,
+      },
+    });
+
+    assert.equal(result.candidates[0].itemId, "1");
+  });
+
+  it("does not count a single weak shared token as a bm25 match", async function () {
+    const entries = [makeItem(1, "Paper one", "ｄｒｉｆｔ")];
+    const service = new LibraryRetrieveService(
+      makeGateway(entries) as any,
+      { ensurePaperContext: async () => makePdfContext([]) } as any,
+      async () => [],
+    );
+
+    const result = await service.retrieve({
+      query: "representational drift dynamics",
+      depth: "metadata",
+      request: {
+        conversationKey: 1,
+        mode: "agent",
+        userText: "x",
+        libraryID: 1,
+      },
+    });
+
+    assert.equal(result.resourcePool.queryCoverage.matchedMetadata, 0);
+  });
+});

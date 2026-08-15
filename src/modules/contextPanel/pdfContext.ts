@@ -1596,7 +1596,7 @@ function tokenizeText(text: string): string[] {
   return tokenizeRetrievalText(text);
 }
 
-function buildChunkIndex(chunks: string[]): {
+export function buildChunkIndex(chunks: string[]): {
   chunkStats: ChunkStat[];
   docFreq: Record<string, number>;
   avgChunkLength: number;
@@ -1658,7 +1658,7 @@ function matchedQueryVariantsForText(
   return Array.from(new Set(matches));
 }
 
-function scoreChunkBM25(
+export function scoreChunkBM25(
   chunk: ChunkStat,
   terms: string[],
   docFreq: Record<string, number>,
