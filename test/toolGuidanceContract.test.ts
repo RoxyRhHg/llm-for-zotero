@@ -324,3 +324,22 @@ describe("tool guidance contracts", function () {
     assert.deepEqual(failures, []);
   });
 });
+
+describe("persona reading strategy contract", function () {
+  it("keeps the collection-scope evidence floor and drops the global answer-immediately rule", function () {
+    const persona = AGENT_PERSONA_INSTRUCTIONS.join("\n");
+
+    assert.include(persona, "EVIDENCE FLOOR FOR COLLECTION/TAG SCOPES");
+    assert.include(persona, "papersBodyRead > 0");
+    assert.include(persona, "naming what's missing");
+    assert.notInclude(persona, "If yes, answer immediately.");
+  });
+
+  it("organizes the persona into titled sections", function () {
+    const persona = AGENT_PERSONA_INSTRUCTIONS.join("\n");
+
+    assert.include(persona, "## Reading strategy");
+    assert.include(persona, "## Tool routing");
+    assert.include(persona, "## Evidence and citations");
+  });
+});
