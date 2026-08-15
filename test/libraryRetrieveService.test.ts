@@ -2203,3 +2203,194 @@ describe("LibraryRetrieveService probe loop", function () {
     );
   });
 });
+
+describe("LibraryRetrieveService evidence triage", function () {
+  const POOL_ENTRIES = () =>
+    Array.from({ length: 8 }, (_, index) =>
+      makeItem(index + 1, `论文${index + 1}`, "与查询无关的摘要内容。", {
+        collectionIds: [3],
+      }),
+    );
+  const REQUEST = {
+    conversationKey: 1,
+    mode: "agent" as const,
+    userText: "x",
+    libraryID: 1,
+    selectedCollectionContexts: [
+      { collectionId: 3, name: "Collection 3", libraryID: 1 },
+    ],
+  };
+  const NOOP_REFORMULATOR = (async () => ({
+    variants: [],
+    notes: [],
+  })) as any;
+
+  it("reorders snippet expansion and threads per-paper queries from triage", async function () {
+    const builderCalls: Array<{ itemId: number; question: string }> = [];
+    const service = new LibraryRetrieveService(
+      makeGateway(POOL_ENTRIES(), { quicksearchItemIds: [] }) as any,
+      {
+        ensurePaperContext: async () => makePdfContext(["Body chunk text."]),
+      } as any,
+      (async (
+        paperContext: PaperContextRef,
+        _pdfContext: unknown,
+        question: string,
+      ): Promise<PaperContextCandidate[]> => {
+        builderCalls.push({ itemId: paperContext.itemId, question });
+        return [
+          {
+            paperKey: `${paperContext.itemId}:${paperContext.contextItemId}`,
+            itemId: paperContext.itemId,
+            contextItemId: paperContext.contextItemId,
+            title: paperContext.title,
+            chunkIndex: 1,
+            chunkText: "Body chunk text.",
+            chunkKind: "methods",
+            sectionLabel: "Methods",
+            estimatedTokens: 10,
+            bm25Score: 1,
+            embeddingScore: 0,
+            hybridScore: 1,
+            evidenceScore: 1,
+          },
+        ];
+      }) as any,
+      NOOP_REFORMULATOR,
+      (async () => ({
+        selectedItemIds: ["7", "2"],
+        perPaperQueries: { "7": "look for the stimulation protocol" },
+      })) as any,
+    );
+
+    const result = await service.retrieve({
+      query: "stimulation protocols in these papers",
+      queryVariants: ["stimulation protocol"],
+      depth: "evidence",
+      maxFullTextPapers: 2,
+      apiBase: "https://example.invalid",
+      apiKey: "test-key",
+      request: REQUEST,
+    });
+
+    assert.deepEqual(
+      builderCalls.map((call) => call.itemId),
+      [7, 2],
+    );
+    assert.equal(builderCalls[0].question, "look for the stimulation protocol");
+    assert.equal(
+      builderCalls[1].question,
+      "stimulation protocols in these papers",
+    );
+    assert.equal(result.candidates[0].itemId, "7");
+    assert.isTrue(
+      result.warnings.some((warning) =>
+        warning.includes("Candidate triage refined selection"),
+      ),
+    );
+  });
+
+  it("skips triage when the matched ledger is confident", async function () {
+    const entries = Array.from({ length: 6 }, (_, index) =>
+      makeItem(index + 1, `Drift analysis ${index + 1}`, "Drift analysis."),
+    );
+    const service = new LibraryRetrieveService(
+      makeGateway(entries, { quicksearchItemIds: [] }) as any,
+      { ensurePaperContext: async () => makePdfContext([]) } as any,
+      async () => [],
+      NOOP_REFORMULATOR,
+      (async () => {
+        throw new Error("triage must not run for a confident ledger");
+      }) as any,
+    );
+
+    const result = await service.retrieve({
+      query: "drift analysis",
+      queryVariants: ["representational drift"],
+      depth: "evidence",
+      apiBase: "https://example.invalid",
+      apiKey: "test-key",
+      request: {
+        conversationKey: 1,
+        mode: "agent",
+        userText: "x",
+        libraryID: 1,
+      },
+    });
+
+    assert.isFalse(
+      result.warnings.some((warning) => warning.includes("triage")),
+    );
+  });
+
+  it("keeps lexical order with a warning when triage returns null", async function () {
+    const builderCalls: number[] = [];
+    const service = new LibraryRetrieveService(
+      makeGateway(POOL_ENTRIES(), { quicksearchItemIds: [] }) as any,
+      {
+        ensurePaperContext: async () => makePdfContext(["Body chunk text."]),
+      } as any,
+      (async (paperContext: PaperContextRef): Promise<
+        PaperContextCandidate[]
+      > => {
+        builderCalls.push(paperContext.itemId);
+        return [];
+      }) as any,
+      NOOP_REFORMULATOR,
+      (async () => null) as any,
+    );
+
+    const result = await service.retrieve({
+      query: "stimulation protocols in these papers",
+      queryVariants: ["stimulation protocol"],
+      depth: "evidence",
+      maxFullTextPapers: 2,
+      apiBase: "https://example.invalid",
+      apiKey: "test-key",
+      request: REQUEST,
+    });
+
+    assert.deepEqual(builderCalls, [1, 2]);
+    assert.isTrue(
+      result.warnings.some((warning) =>
+        warning.includes("LLM triage unavailable"),
+      ),
+    );
+  });
+
+  it("runs one bounded rescan from triage-suggested probes", async function () {
+    const quicksearchCalls: Array<{ query?: string }> = [];
+    const service = new LibraryRetrieveService(
+      makeGateway(POOL_ENTRIES(), {
+        quicksearchCalls,
+        quicksearchItemIds: (query) => (query === "新探针" ? [5] : []),
+      }) as any,
+      {
+        ensurePaperContext: async () => makePdfContext(["Body chunk text."]),
+      } as any,
+      async () => [],
+      NOOP_REFORMULATOR,
+      (async () => ({
+        selectedItemIds: ["1"],
+        suggestedProbes: ["新探针"],
+      })) as any,
+    );
+
+    const result = await service.retrieve({
+      query: "stimulation protocols in these papers",
+      queryVariants: ["stimulation protocol"],
+      depth: "evidence",
+      maxFullTextPapers: 1,
+      apiBase: "https://example.invalid",
+      apiKey: "test-key",
+      request: REQUEST,
+    });
+
+    assert.include(
+      quicksearchCalls.map((call) => call.query),
+      "新探针",
+    );
+    assert.equal(result.resourcePool.queryCoverage.probeRounds, 1);
+    assert.isAtLeast(result.resourcePool.queryCoverage.indexedTextMatched, 1);
+  });
+});

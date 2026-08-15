@@ -173,8 +173,7 @@ export function tokenizeRetrievalQuery(query: string): string[] {
 const TERMINAL_PUNCTUATION_PATTERN = /[\s?？!！。．.;；:：,，、]+$/u;
 const PROTECTED_TERM_EXACT_PATTERN =
   /^[\p{L}\p{N}]+(?:[-‐‑‒–—_./:+#][\p{L}\p{N}]+)+$/u;
-const ASCII_COMPOUND_CORE_PATTERN =
-  /[0-9a-z]+(?:[-‐‑‒–—_./:+#][0-9a-z]+)+/g;
+const ASCII_COMPOUND_CORE_PATTERN = /[0-9a-z]+(?:[-‐‑‒–—_./:+#][0-9a-z]+)+/g;
 
 export function stripTerminalPunctuation(text: string): string {
   return (text || "").trim().replace(TERMINAL_PUNCTUATION_PATTERN, "");

@@ -40,6 +40,7 @@ import {
   queryHasExplicitSectionPreference,
 } from "../../shared/libraryChatEvidencePolicy";
 import { buildLibraryRetrieveEvidencePack } from "./libraryRetrieveEvidencePack";
+import { triageCandidatesWithModel } from "./libraryRetrieveTriage";
 import {
   formatPaperCitationLabel,
   formatPaperSourceLabel,
@@ -418,6 +419,7 @@ export const LIBRARY_RETRIEVE_MIN_MATCHED_SHORTLIST = 5;
 const PROBE_WEAK_MATCH_THRESHOLD = 3;
 const MAX_EXTRA_PROBE_ROUNDS = 2;
 const PROBE_LOOP_DEADLINE_MS = 15_000;
+const TRIAGE_MAX_CANDIDATES = 40;
 
 // Normalized pool-BM25 contribution to a record's blended score: below a
 // title phrase match (10) so exact titles keep winning, above tag/creator
@@ -444,7 +446,9 @@ const CJK_KEYWORD_PROBES_PER_QUERY = 4;
  * punctuation everywhere, and for CJK-dominant queries send segmented
  * keyword probes rather than the full sentence.
  */
-export function buildQuicksearchProbes(queryPlan: RetrievalQueryPlan): string[] {
+export function buildQuicksearchProbes(
+  queryPlan: RetrievalQueryPlan,
+): string[] {
   const probes: string[] = [];
   const seen = new Set<string>();
   const push = (value: string) => {
@@ -1279,6 +1283,7 @@ export class LibraryRetrieveService {
     private readonly pdfService: PdfService,
     private readonly candidateBuilder: CandidateBuilder = buildPaperRetrievalCandidates,
     private readonly probeReformulator: typeof generateRetrievalProbeReformulation = generateRetrievalProbeReformulation,
+    private readonly triage: typeof triageCandidatesWithModel = triageCandidatesWithModel,
   ) {}
 
   async retrieve(
@@ -1365,6 +1370,12 @@ export class LibraryRetrieveService {
         probe.toLowerCase(),
       ),
     );
+    const hasModelConfig = Boolean(
+      params.apiBase ||
+      params.apiKey ||
+      params.request?.apiBase ||
+      params.request?.apiKey,
+    );
     if (
       input.depth !== "pool" &&
       input.depth !== "metadata" &&
@@ -1378,12 +1389,6 @@ export class LibraryRetrieveService {
       );
       if (input.methods.includes("fts")) methodsUsed.add("fts");
 
-      const hasModelConfig = Boolean(
-        params.apiBase ||
-          params.apiKey ||
-          params.request?.apiBase ||
-          params.request?.apiKey,
-      );
       const probeDeadline = Date.now() + PROBE_LOOP_DEADLINE_MS;
       while (
         hasModelConfig &&
@@ -1533,6 +1538,94 @@ export class LibraryRetrieveService {
         : candidateSource.slice(0, input.maxCandidatePapers);
     candidateRecords.forEach((record) => record.queryState.add("shortlisted"));
 
+    // Evidence triage: when the lexical ordering is known-unreliable (pool
+    // fallback, or far more matches than expansion slots), one bounded LLM
+    // call picks which papers get the snippet slots and what to look for in
+    // each. Null keeps today's ordering.
+    let triagePerPaperQueries: Record<string, string> | undefined;
+    const shouldTriage =
+      input.depth !== "pool" &&
+      candidateRecords.length > 1 &&
+      (usedPoolFallback ||
+        matchedRecords.length > input.maxFullTextPapers * 2) &&
+      hasModelConfig;
+    if (shouldTriage) {
+      const triageResult = await this.triage({
+        query: input.query,
+        intent: input.intent,
+        candidates: candidateRecords
+          .slice(0, TRIAGE_MAX_CANDIDATES)
+          .map((record) => ({
+            itemId: String(record.target.itemId),
+            title: record.target.title,
+            abstract: truncateText(record.abstractText, 300),
+            matchedVia: record.why.slice(0, 2).join("; "),
+          })),
+        maxSelect: input.maxFullTextPapers,
+        model: params.model || params.request?.model,
+        apiBase: params.apiBase || params.request?.apiBase,
+        apiKey: params.apiKey || params.request?.apiKey,
+        authMode: params.authMode || params.request?.authMode,
+        providerProtocol:
+          params.providerProtocol || params.request?.providerProtocol,
+        reasoning: params.reasoning || params.request?.reasoning,
+        signal: params.signal,
+      });
+      if (triageResult) {
+        const rank = new Map(
+          triageResult.selectedItemIds.map((itemId, index) => [itemId, index]),
+        );
+        // Stable sort: selected papers first in triage order, the rest keep
+        // their lexical relative order.
+        candidateRecords.sort((left, right) => {
+          const leftRank = rank.get(String(left.target.itemId));
+          const rightRank = rank.get(String(right.target.itemId));
+          if (leftRank !== undefined && rightRank !== undefined) {
+            return leftRank - rightRank;
+          }
+          if (leftRank !== undefined) return -1;
+          if (rightRank !== undefined) return 1;
+          return 0;
+        });
+        triagePerPaperQueries = triageResult.perPaperQueries;
+        warnings.push("Candidate triage refined selection by LLM.");
+        const triageProbes = (triageResult.suggestedProbes || [])
+          .map((probe) => stripTerminalPunctuation(probe))
+          .filter(Boolean)
+          .filter((probe) => !variantsTried.has(probe.toLowerCase()));
+        if (
+          triageProbes.length &&
+          input.depth !== "metadata" &&
+          probeRounds < MAX_EXTRA_PROBE_ROUNDS &&
+          this.countMatchedRecords(records, input.queryPlan) <
+            PROBE_WEAK_MATCH_THRESHOLD &&
+          !params.signal?.aborted
+        ) {
+          probeRounds += 1;
+          for (const probe of triageProbes) {
+            variantsTried.add(probe.toLowerCase());
+          }
+          const rescan = await this.addQuicksearchMatches(
+            scope,
+            records,
+            input,
+            warnings,
+            { probesOverride: triageProbes },
+          );
+          indexedScan = {
+            available: Math.max(indexedScan.available, rescan.available),
+            scanned: Math.max(indexedScan.scanned, rescan.scanned),
+            matched: records.filter((record) => record.quicksearchMatched)
+              .length,
+            truncated: indexedScan.truncated || rescan.truncated,
+          };
+          this.applyPoolBm25Scores(records, input.queryPlan);
+        }
+      } else {
+        warnings.push("LLM triage unavailable; kept lexical ranking.");
+      }
+    }
+
     const snippets: LibraryRetrieveSnippet[] = [];
     let snippetPapersExpanded = 0;
     let evidencePapers = 0;
@@ -1554,6 +1647,7 @@ export class LibraryRetrieveService {
           input,
           maxSnippets: Math.min(input.perPaperTopK, remaining),
           preferBodyEvidence,
+          queryOverride: triagePerPaperQueries?.[String(record.target.itemId)],
           apiBase: params.apiBase,
           apiKey: params.apiKey,
           methodsUsed,
@@ -2136,6 +2230,8 @@ export class LibraryRetrieveService {
     input: NormalizedLibraryRetrieveInput;
     maxSnippets: number;
     preferBodyEvidence?: boolean;
+    /** Triage-provided per-paper question; falls back to the main query. */
+    queryOverride?: string;
     apiBase?: string;
     apiKey?: string;
     methodsUsed: Set<LibraryRetrieveMethod>;
@@ -2178,27 +2274,34 @@ export class LibraryRetrieveService {
       const candidateTopK = params.preferBodyEvidence
         ? Math.max(params.maxSnippets, 5)
         : params.maxSnippets;
+      const retrievalQuestion = params.queryOverride || params.input.query;
+      // With a per-paper override the builder must tokenize the override
+      // itself — the shared plan's lexicalTerms would otherwise win and make
+      // the override a no-op.
+      const paperQueryPlan = params.queryOverride
+        ? undefined
+        : params.input.queryPlan;
       const candidates = await this.candidateBuilder(
         paperContext,
         pdfContext,
-        params.input.query,
+        retrievalQuestion,
         {
           apiBase: params.apiBase,
           apiKey: params.apiKey,
           disableEmbeddings: !params.input.methods.includes("semantic"),
-          queryPlan: params.input.queryPlan,
+          queryPlan: paperQueryPlan,
         },
         {
           topK: candidateTopK,
           mode: "evidence",
           disableEmbeddings: !params.input.methods.includes("semantic"),
-          queryPlan: params.input.queryPlan,
+          queryPlan: paperQueryPlan,
         },
       ).then((rows) =>
         params.preferBodyEvidence
           ? rows.sort(
               compareEvidenceCandidatesForQuestion(
-                params.input.query,
+                retrievalQuestion,
                 (candidate) =>
                   candidate.evidenceScore || candidate.hybridScore || 0,
               ),
