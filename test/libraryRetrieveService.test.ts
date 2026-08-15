@@ -2073,3 +2073,133 @@ describe("LibraryRetrieveService shortlist fallback", function () {
     );
   });
 });
+
+describe("LibraryRetrieveService probe loop", function () {
+  const UNMATCHED_ENTRIES = () => [
+    makeItem(1, "论文甲", "脉冲神经网络芯片研究。"),
+    makeItem(2, "论文乙", "蛋白质折叠动力学。"),
+  ];
+  const REQUEST = {
+    conversationKey: 1,
+    mode: "agent" as const,
+    userText: "x",
+    libraryID: 1,
+  };
+
+  it("runs one reformulation round when the first pass matches nothing", async function () {
+    const quicksearchCalls: Array<{ query?: string }> = [];
+    const reformulatorCalls: Array<{ triedProbes: string[] }> = [];
+    const entries = [
+      ...UNMATCHED_ENTRIES(),
+      makeItem(3, "论文丙", "神经形态处理器设计。"),
+      makeItem(4, "论文丁", "脉冲编码研究。"),
+    ];
+    const service = new LibraryRetrieveService(
+      makeGateway(entries, {
+        quicksearchCalls,
+        quicksearchItemIds: (query) =>
+          query === "spiking networks" ? [1, 3, 4] : [],
+      }) as any,
+      { ensurePaperContext: async () => makePdfContext([]) } as any,
+      async () => [],
+      (async (params: { triedProbes: string[] }) => {
+        reformulatorCalls.push({ triedProbes: params.triedProbes });
+        return { variants: ["spiking networks"], notes: [] };
+      }) as any,
+    );
+
+    const result = await service.retrieve({
+      query: "neuromorphic hardware accelerators",
+      queryVariants: ["brain-inspired chips"],
+      depth: "evidence",
+      apiBase: "https://example.invalid",
+      apiKey: "test-key",
+      request: REQUEST,
+    });
+
+    assert.lengthOf(reformulatorCalls, 1);
+    assert.isAbove(reformulatorCalls[0].triedProbes.length, 0);
+    assert.include(
+      quicksearchCalls.map((call) => call.query),
+      "spiking networks",
+    );
+    assert.equal(result.resourcePool.queryCoverage.probeRounds, 1);
+    assert.isAtLeast(result.resourcePool.queryCoverage.variantsTried, 3);
+    assert.isTrue(
+      result.candidates.some((candidate) => candidate.itemId === "1"),
+    );
+  });
+
+  it("stops after two extra rounds when nothing ever matches", async function () {
+    let calls = 0;
+    const service = new LibraryRetrieveService(
+      makeGateway(UNMATCHED_ENTRIES(), { quicksearchItemIds: [] }) as any,
+      { ensurePaperContext: async () => makePdfContext([]) } as any,
+      async () => [],
+      (async () => {
+        calls += 1;
+        return { variants: [`fresh probe ${calls}`], notes: [] };
+      }) as any,
+    );
+
+    const result = await service.retrieve({
+      query: "neuromorphic hardware accelerators",
+      queryVariants: ["brain-inspired chips"],
+      depth: "evidence",
+      apiBase: "https://example.invalid",
+      apiKey: "test-key",
+      request: REQUEST,
+    });
+
+    assert.equal(calls, 2);
+    assert.equal(result.resourcePool.queryCoverage.probeRounds, 2);
+  });
+
+  it("skips the loop entirely without model config", async function () {
+    const service = new LibraryRetrieveService(
+      makeGateway(UNMATCHED_ENTRIES(), { quicksearchItemIds: [] }) as any,
+      { ensurePaperContext: async () => makePdfContext([]) } as any,
+      async () => [],
+      (async () => {
+        throw new Error("reformulator must not be called without model config");
+      }) as any,
+    );
+
+    const result = await service.retrieve({
+      query: "neuromorphic hardware accelerators",
+      queryVariants: ["brain-inspired chips"],
+      depth: "evidence",
+      request: REQUEST,
+    });
+
+    assert.equal(result.resourcePool.queryCoverage.probeRounds, 0);
+  });
+
+  it("degrades silently when reformulation fails", async function () {
+    const service = new LibraryRetrieveService(
+      makeGateway(UNMATCHED_ENTRIES(), { quicksearchItemIds: [] }) as any,
+      { ensurePaperContext: async () => makePdfContext([]) } as any,
+      async () => [],
+      (async () => ({
+        variants: [],
+        notes: ["Probe reformulation failed; kept the existing probes."],
+      })) as any,
+    );
+
+    const result = await service.retrieve({
+      query: "neuromorphic hardware accelerators",
+      queryVariants: ["brain-inspired chips"],
+      depth: "evidence",
+      apiBase: "https://example.invalid",
+      apiKey: "test-key",
+      request: REQUEST,
+    });
+
+    assert.equal(result.resourcePool.queryCoverage.probeRounds, 0);
+    assert.isTrue(
+      result.warnings.some((warning) =>
+        warning.includes("Probe reformulation failed"),
+      ),
+    );
+  });
+});

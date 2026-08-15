@@ -484,6 +484,88 @@ export async function callLLMWithTimeout(
   }
 }
 
+const RETRIEVAL_PROBE_REFORMULATION_TIMEOUT_MS = 6000;
+
+/**
+ * Ask the model for fresh corpus-language search probes after a weak
+ * quicksearch pass. Any failure degrades to an empty variant list with an
+ * explanatory note — callers must treat that as "keep the existing probes".
+ */
+export async function generateRetrievalProbeReformulation(params: {
+  query: string;
+  triedProbes: string[];
+  matchedProbes: string[];
+  scopeTitles: string[];
+  model?: string;
+  apiBase?: string;
+  apiKey?: string;
+  authMode?: ChatParams["authMode"];
+  providerProtocol?: ProviderProtocol;
+  reasoning?: ReasoningConfig;
+  signal?: AbortSignal;
+  timeoutMs?: number;
+}): Promise<{ variants: string[]; notes: string[] }> {
+  const failure = {
+    variants: [] as string[],
+    notes: ["Probe reformulation failed; kept the existing probes."],
+  };
+  if (!params.apiBase && !params.apiKey) return failure;
+  const scopeTitles = params.scopeTitles
+    .map((title) => normalizeQueryText(title, 160))
+    .filter(Boolean)
+    .slice(0, 8);
+  const prompt = [
+    "Reformulate library search probes for a Zotero corpus search that found too few matches.",
+    'Return strict JSON only in this shape: {"variants":["..."]}.',
+    "Propose at most 4 NEW short keyword probes that were not tried before.",
+    "Use the corpus language(s) shown by the sample titles, including translations of the query's key terms when languages differ.",
+    "Prefer distinctive technical vocabulary over generic words.",
+    "",
+    `User query: ${params.query}`,
+    `Probes already tried: ${params.triedProbes.slice(0, 16).join(" | ") || "none"}`,
+    `Probes that matched documents: ${
+      params.matchedProbes.slice(0, 8).join(" | ") || "none"
+    }`,
+    ...(scopeTitles.length
+      ? [
+          "Sample titles from the search scope:",
+          ...scopeTitles.map((title) => `- ${title}`),
+        ]
+      : []),
+  ].join("\n");
+  try {
+    const raw = await callLLMWithTimeout({
+      prompt,
+      model: params.model,
+      apiBase: params.apiBase,
+      apiKey: params.apiKey,
+      authMode: params.authMode,
+      providerProtocol: params.providerProtocol,
+      reasoning: params.reasoning,
+      maxTokens: 200,
+      temperature: 0,
+      parentSignal: params.signal,
+      timeoutMs: params.timeoutMs || RETRIEVAL_PROBE_REFORMULATION_TIMEOUT_MS,
+      systemMessages: [
+        "You are a search probe reformulator. Return JSON only. Do not answer the user's question.",
+      ],
+    });
+    const parsed = extractJsonObject(raw);
+    const variants = Array.isArray(
+      (parsed as { variants?: unknown[] } | null)?.variants,
+    )
+      ? ((parsed as { variants: unknown[] }).variants || [])
+          .map((variant) => normalizeQueryText(variant, 120))
+          .filter(Boolean)
+          .slice(0, 4)
+      : [];
+    if (!variants.length) return failure;
+    return { variants, notes: [] };
+  } catch {
+    return failure;
+  }
+}
+
 export function buildRetrievalPlannerPrompt(params: {
   query: string;
   sourceSamples?: string[];

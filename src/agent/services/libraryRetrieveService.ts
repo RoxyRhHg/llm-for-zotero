@@ -5,7 +5,9 @@ import {
 } from "../../modules/contextPanel/pdfContext";
 import {
   buildRetrievalQueryPlan,
+  generateRetrievalProbeReformulation,
   resolveRetrievalQueryPlan,
+  RETRIEVAL_QUERY_VARIANT_HARD_LIMIT,
   type RetrievalQueryPlan,
 } from "../../modules/contextPanel/retrievalQueryPlan";
 import {
@@ -234,6 +236,10 @@ export type LibraryRetrieveResult = {
       indexedTextAvailable: number;
       indexedTextScanned: number;
       indexedTextMatched: number;
+      /** Extra model-driven probe reformulation rounds that ran. */
+      probeRounds: number;
+      /** Distinct search probes tried across all quicksearch passes. */
+      variantsTried: number;
       snippetPapersExpanded: number;
       /** Deprecated compatibility alias for snippetPapersExpanded. */
       fullTextSearched: number;
@@ -404,6 +410,14 @@ const DEFAULT_METHODS: LibraryRetrieveMethod[] = [
 
 export const QUICKSEARCH_MAX_PROBES = 8;
 export const LIBRARY_RETRIEVE_MIN_MATCHED_SHORTLIST = 5;
+
+// In-service probe iteration: when the first quicksearch pass matches fewer
+// records than this, ask the model for fresh corpus-language probes and
+// rescan, bounded by rounds and wall clock. The initial query-plan LLM call
+// has its own separate 10s budget.
+const PROBE_WEAK_MATCH_THRESHOLD = 3;
+const MAX_EXTRA_PROBE_ROUNDS = 2;
+const PROBE_LOOP_DEADLINE_MS = 15_000;
 
 // Normalized pool-BM25 contribution to a record's blended score: below a
 // title phrase match (10) so exact titles keep winning, above tag/creator
@@ -1264,6 +1278,7 @@ export class LibraryRetrieveService {
     private readonly zoteroGateway: ZoteroGateway,
     private readonly pdfService: PdfService,
     private readonly candidateBuilder: CandidateBuilder = buildPaperRetrievalCandidates,
+    private readonly probeReformulator: typeof generateRetrievalProbeReformulation = generateRetrievalProbeReformulation,
   ) {}
 
   async retrieve(
@@ -1342,6 +1357,14 @@ export class LibraryRetrieveService {
       truncated: false,
     };
 
+    this.applyPoolBm25Scores(records, input.queryPlan);
+
+    let probeRounds = 0;
+    const variantsTried = new Set(
+      buildQuicksearchProbes(input.queryPlan).map((probe) =>
+        probe.toLowerCase(),
+      ),
+    );
     if (
       input.depth !== "pool" &&
       input.depth !== "metadata" &&
@@ -1354,9 +1377,94 @@ export class LibraryRetrieveService {
         warnings,
       );
       if (input.methods.includes("fts")) methodsUsed.add("fts");
-    }
 
-    this.applyPoolBm25Scores(records, input.queryPlan);
+      const hasModelConfig = Boolean(
+        params.apiBase ||
+          params.apiKey ||
+          params.request?.apiBase ||
+          params.request?.apiKey,
+      );
+      const probeDeadline = Date.now() + PROBE_LOOP_DEADLINE_MS;
+      while (
+        hasModelConfig &&
+        probeRounds < MAX_EXTRA_PROBE_ROUNDS &&
+        this.countMatchedRecords(records, input.queryPlan) <
+          PROBE_WEAK_MATCH_THRESHOLD &&
+        Date.now() < probeDeadline &&
+        !params.signal?.aborted
+      ) {
+        const matchedProbes = Array.from(
+          new Set(
+            records.flatMap((record) =>
+              Array.from(record.matchedQueryVariants),
+            ),
+          ),
+        ).slice(0, 8);
+        const reformulation = await this.probeReformulator({
+          query: input.query,
+          triedProbes: Array.from(variantsTried),
+          matchedProbes,
+          scopeTitles: scope.items
+            .slice(0, 8)
+            .map((item) => item.title)
+            .filter(Boolean),
+          model: params.model || params.request?.model,
+          apiBase: params.apiBase || params.request?.apiBase,
+          apiKey: params.apiKey || params.request?.apiKey,
+          authMode: params.authMode || params.request?.authMode,
+          providerProtocol:
+            params.providerProtocol || params.request?.providerProtocol,
+          reasoning: params.reasoning || params.request?.reasoning,
+          signal: params.signal,
+        });
+        warnings.push(...reformulation.notes);
+        const freshVariants = Array.from(
+          new Set(
+            reformulation.variants
+              .map((variant) => variant.trim())
+              .filter(Boolean),
+          ),
+        ).filter((variant) => !variantsTried.has(variant.toLowerCase()));
+        if (!freshVariants.length) break;
+        probeRounds += 1;
+        for (const variant of freshVariants) {
+          variantsTried.add(variant.toLowerCase());
+        }
+        // Fresh variants go first so the variant cap trims older ones.
+        input = {
+          ...input,
+          queryPlan: buildRetrievalQueryPlan({
+            query: input.query,
+            queryVariants: [...freshVariants, ...input.queryPlan.variants],
+            maxVariants: RETRIEVAL_QUERY_VARIANT_HARD_LIMIT,
+            notes: input.queryPlan.notes,
+            readIntent: input.queryPlan.readIntent,
+          }),
+        };
+        const rescan = await this.addQuicksearchMatches(
+          scope,
+          records,
+          input,
+          warnings,
+          {
+            probesOverride: freshVariants
+              .map((variant) => stripTerminalPunctuation(variant))
+              .filter(Boolean),
+          },
+        );
+        indexedScan = {
+          available: Math.max(indexedScan.available, rescan.available),
+          scanned: Math.max(indexedScan.scanned, rescan.scanned),
+          matched: indexedScan.matched,
+          truncated: indexedScan.truncated || rescan.truncated,
+        };
+        this.applyPoolBm25Scores(records, input.queryPlan);
+      }
+      indexedScan = {
+        ...indexedScan,
+        matched: records.filter((record) => record.quicksearchMatched).length,
+      };
+    }
 
     const maxBm25 = records.reduce(
       (max, record) => Math.max(max, record.bm25Score),
@@ -1578,6 +1686,8 @@ export class LibraryRetrieveService {
           indexedTextAvailable,
           indexedTextScanned: indexedScan.scanned,
           indexedTextMatched: indexedScan.matched,
+          probeRounds,
+          variantsTried: variantsTried.size,
           snippetPapersExpanded,
           fullTextSearched: snippetPapersExpanded,
           snippetsReturned: dedupedSnippets.length,
@@ -1601,6 +1711,18 @@ export class LibraryRetrieveService {
         : undefined,
       warnings,
     };
+  }
+
+  private countMatchedRecords(
+    records: ResourceRecord[],
+    queryPlan: RetrievalQueryPlan,
+  ): number {
+    return records.filter(
+      (record) =>
+        record.metadataScore > 0 ||
+        record.ftsScore > 0 ||
+        recordBm25Matched(record, queryPlan),
+    ).length;
   }
 
   private applyPoolBm25Scores(

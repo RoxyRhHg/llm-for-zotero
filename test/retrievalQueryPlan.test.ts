@@ -2,6 +2,7 @@ import { assert } from "chai";
 import {
   buildRetrievalPlannerPrompt,
   buildRetrievalQueryPlan,
+  generateRetrievalProbeReformulation,
   detectExplicitFullReadIntent,
   RETRIEVAL_QUERY_PLAN_TIMEOUT_MS,
   RETRIEVAL_QUERY_VARIANT_DEFAULT_LIMIT,
@@ -335,5 +336,21 @@ describe("retrieval planner prompt", function () {
 
   it("uses a ten second default planner timeout", function () {
     assert.equal(RETRIEVAL_QUERY_PLAN_TIMEOUT_MS, 10_000);
+  });
+});
+
+describe("probe reformulation", function () {
+  it("degrades to empty variants with a note when no model config is available", async function () {
+    const result = await generateRetrievalProbeReformulation({
+      query: "neuromorphic hardware",
+      triedProbes: ["neuromorphic hardware"],
+      matchedProbes: [],
+      scopeTitles: [],
+    });
+
+    assert.deepEqual(result.variants, []);
+    assert.isTrue(
+      result.notes.some((note) => note.includes("Probe reformulation failed")),
+    );
   });
 });
