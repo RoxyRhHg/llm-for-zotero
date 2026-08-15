@@ -45,7 +45,45 @@ const RETRIEVE_FAMILY_TOOLS = new Set([
   "library_retrieve",
   "paper_read",
   "library_search",
+  "library_read",
+  "literature_search",
 ]);
+
+const CORRECTION_MARKER = "Correction for this turn:";
+const CHECKPOINT_TOOLS_MARKER = "Earlier tools used:";
+
+/**
+ * Did earlier turns of this conversation already read evidence? Checks raw
+ * tool messages, the compaction checkpoint's tool summary line, and prior
+ * shallow-correction markers — a follow-up answered from transcript evidence
+ * must not be rolled back again.
+ */
+export function transcriptShowsEvidenceReads(
+  messages: ReadonlyArray<{
+    role: string;
+    name?: string;
+    content?: unknown;
+  }>,
+): boolean {
+  for (const message of messages) {
+    if (
+      message.role === "tool" &&
+      message.name &&
+      RETRIEVE_FAMILY_TOOLS.has(message.name)
+    ) {
+      return true;
+    }
+    const content = typeof message.content === "string" ? message.content : "";
+    if (!content) continue;
+    if (content.includes(CORRECTION_MARKER)) return true;
+    if (content.includes(CHECKPOINT_TOOLS_MARKER)) {
+      for (const tool of RETRIEVE_FAMILY_TOOLS) {
+        if (content.includes(tool)) return true;
+      }
+    }
+  }
+  return false;
+}
 
 export function findLibraryRetrieveShallowSignal(
   records: ReadonlyArray<{ name: string; ok: boolean; content?: unknown }>,

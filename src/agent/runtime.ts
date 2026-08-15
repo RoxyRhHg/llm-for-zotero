@@ -45,6 +45,7 @@ import { detectTurnIntent } from "./model/skillClassifier";
 import {
   findLibraryRetrieveShallowSignal,
   isEvidenceSeekingTurn,
+  transcriptShowsEvidenceReads,
 } from "./model/libraryAnswerGuard";
 import { getAllSkills, getMatchedSkillIds } from "./skills";
 import {
@@ -1831,7 +1832,14 @@ export class AgentRuntime {
           if (
             libraryScoped &&
             !shallowLibraryCorrectionUsed &&
-            isEvidenceSeekingTurn(request)
+            // On the last round a correction could never be acted on — the
+            // loop would exit into the round-exhaustion failure, discarding
+            // a usable streamed answer.
+            round < maxRounds &&
+            isEvidenceSeekingTurn(request) &&
+            // Follow-up turns legitimately answer from evidence gathered in
+            // earlier turns; do not roll those back.
+            !transcriptShowsEvidenceReads(transcriptMessagesForPrompt)
           ) {
             const shallowSignal =
               findLibraryRetrieveShallowSignal(toolExecutionRecords);

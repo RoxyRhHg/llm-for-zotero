@@ -3430,6 +3430,13 @@ describe("AgentRuntime", function () {
 });
 
 describe("shallow library answer guard", function () {
+  beforeEach(function () {
+    clearAgentReadLedger();
+    clearAgentCoverageLedger();
+    clearAgentTranscriptStore();
+    clearAgentToolResultHandleStore();
+  });
+
   const GUARD_CAPS = {
     streaming: false,
     toolCalls: true,
@@ -3634,6 +3641,88 @@ describe("shallow library answer guard", function () {
       assert.equal(outcome.kind, "completed");
       if (outcome.kind !== "completed") return;
       assert.equal(outcome.text, "Still metadata.");
+    } finally {
+      restoreDb();
+    }
+  });
+});
+
+describe("shallow guard round-limit safety", function () {
+  beforeEach(function () {
+    clearAgentReadLedger();
+    clearAgentCoverageLedger();
+    clearAgentTranscriptStore();
+    clearAgentToolResultHandleStore();
+  });
+
+  it("does not roll back a final answer on the last allowed round", async function () {
+    const restoreDb = installMockDb();
+    try {
+      const registry = new AgentToolRegistry();
+      registry.register({
+        spec: {
+          name: "noop_probe",
+          description: "noop",
+          inputSchema: { type: "object" },
+          mutability: "read",
+          requiresConfirmation: false,
+        },
+        validate: () => ({ ok: true, value: {} }),
+        execute: async () => ({ ok: true }),
+      });
+      const steps: AgentModelStep[] = [];
+      for (let index = 0; index < 23; index += 1) {
+        steps.push({
+          kind: "tool_calls",
+          calls: [
+            { id: `noop-${index}`, name: "noop_probe", arguments: {} },
+          ],
+          assistantMessage: {
+            role: "assistant",
+            content: "",
+            tool_calls: [
+              { id: `noop-${index}`, name: "noop_probe", arguments: {} },
+            ],
+          },
+        });
+      }
+      steps.push({
+        kind: "final",
+        text: "Answer on the last round.",
+        assistantMessage: {
+          role: "assistant",
+          content: "Answer on the last round.",
+        },
+      });
+      const runtime = new AgentRuntime({
+        registry,
+        adapterFactory: () =>
+          new MockAdapter(steps, {
+            streaming: false,
+            toolCalls: true,
+            multimodal: false,
+            fileInputs: false,
+            reasoning: true,
+          }),
+      });
+      const outcome = await runtime.runTurn({
+        request: {
+          conversationKey: 1,
+          mode: "agent",
+          userText: "What methods do these papers share?",
+          model: "gpt-4o-mini",
+          apiBase: "https://api.openai.com/v1/chat/completions",
+          apiKey: "test",
+          selectedCollectionContexts: [
+            { collectionId: 3, name: "C", libraryID: 1 },
+          ],
+        },
+        onEvent: () => {},
+      });
+
+      assert.equal(outcome.kind, "completed");
+      if (outcome.kind !== "completed") return;
+      assert.equal(outcome.text, "Answer on the last round.");
     } finally {
       restoreDb();
     }

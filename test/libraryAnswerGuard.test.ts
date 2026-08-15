@@ -2,6 +2,7 @@ import { assert } from "chai";
 import {
   findLibraryRetrieveShallowSignal,
   isEvidenceSeekingTurn,
+  transcriptShowsEvidenceReads,
 } from "../src/agent/model/libraryAnswerGuard";
 
 describe("libraryAnswerGuard", function () {
@@ -91,5 +92,62 @@ describe("libraryAnswerGuard", function () {
 
       assert.isFalse(signal.lastRetrieveShallow);
     });
+  });
+});
+
+describe("guard false-positive fixes", function () {
+  it("counts library_read and literature_search as evidence-read tools", function () {
+    const signal = findLibraryRetrieveShallowSignal([
+      { name: "library_read", ok: true },
+    ]);
+    assert.isTrue(signal.ranRetrieveFamily);
+
+    const literature = findLibraryRetrieveShallowSignal([
+      { name: "literature_search", ok: true },
+    ]);
+    assert.isTrue(literature.ranRetrieveFamily);
+  });
+
+  it("detects prior evidence reads in the raw transcript", function () {
+    assert.isTrue(
+      transcriptShowsEvidenceReads([
+        {
+          role: "tool",
+          name: "library_retrieve",
+          tool_call_id: "c1",
+          content: "{}",
+        },
+      ] as any),
+    );
+    assert.isFalse(
+      transcriptShowsEvidenceReads([
+        { role: "user", content: "hello" },
+        { role: "assistant", content: "hi" },
+      ] as any),
+    );
+  });
+
+  it("detects evidence reads in a compacted checkpoint summary", function () {
+    assert.isTrue(
+      transcriptShowsEvidenceReads([
+        {
+          role: "user",
+          content:
+            "Agent transcript compact checkpoint:\nEarlier tools used: library_retrieve x3, paper_read",
+        },
+      ] as any),
+    );
+  });
+
+  it("detects a prior shallow correction to avoid repeating it", function () {
+    assert.isTrue(
+      transcriptShowsEvidenceReads([
+        {
+          role: "user",
+          content:
+            "Correction for this turn: the question targets the selected collection/tag scope and needs library evidence.",
+        },
+      ] as any),
+    );
   });
 });
