@@ -2607,3 +2607,37 @@ describe("LibraryRetrieveService body-evidence defaults", function () {
     assert.equal(result.snippets[0]?.sectionLabel, "Methods");
   });
 });
+
+describe("LibraryRetrieveService prototype-key safety", function () {
+  it("scores queries containing the token 'constructor' without NaN poisoning", async function () {
+    const entries = [
+      // Full-width text defeats substring metadata scoring, so the match can
+      // only come from BM25 — which prototype-key pollution used to NaN out.
+      makeItem(1, "Paper one", "ｃｏｎｓｔｒｕｃｔｏｒ ｎｅｔｗｏｒｋｓ"),
+      makeItem(2, "Paper two", "Protein folding kinetics."),
+    ];
+    const service = new LibraryRetrieveService(
+      makeGateway(entries) as any,
+      { ensurePaperContext: async () => makePdfContext([]) } as any,
+      async () => [],
+    );
+
+    const result = await service.retrieve({
+      query: "constructor networks",
+      depth: "metadata",
+      request: {
+        conversationKey: 1,
+        mode: "agent",
+        userText: "x",
+        libraryID: 1,
+      },
+    });
+
+    const match = result.candidates.find(
+      (candidate) => candidate.itemId === "1",
+    );
+    assert.isOk(match);
+    assert.include(match?.whyMatched || "", "bm25");
+    assert.isTrue(Number.isFinite(match?.score));
+  });
+});

@@ -1601,13 +1601,15 @@ export function buildChunkIndex(chunks: string[]): {
   docFreq: Record<string, number>;
   avgChunkLength: number;
 } {
-  const docFreq: Record<string, number> = {};
+  // Prototype-less records: tokens like "constructor" must hit own
+  // properties, not Object.prototype, or term counts turn into NaN.
+  const docFreq: Record<string, number> = Object.create(null);
   const chunkStats: ChunkStat[] = [];
   let totalLength = 0;
 
   chunks.forEach((chunk, index) => {
     const tokens = tokenizeText(chunk);
-    const tf: Record<string, number> = {};
+    const tf: Record<string, number> = Object.create(null);
     for (const term of tokens) {
       tf[term] = (tf[term] || 0) + 1;
     }
