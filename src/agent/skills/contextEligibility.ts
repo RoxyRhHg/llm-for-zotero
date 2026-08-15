@@ -13,6 +13,7 @@ export type SkillRoutingRequest = Pick<
   | "pinnedPaperContexts"
   | "selectedCollectionContexts"
   | "selectedTagContexts"
+  | "classifiedIntent"
 >;
 
 export type SkillRequestContext = {

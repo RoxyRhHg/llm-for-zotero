@@ -1,8 +1,11 @@
 import { assert } from "chai";
 import {
   canUseSkillClassifierModel,
+  detectTurnIntent,
+  parseClassifiedTurnIntent,
   parseClassifierResponse,
 } from "../src/agent/model/skillClassifier";
+import { resolveSkillRouting } from "../src/agent/skills/routing";
 import type { AgentSkill } from "../src/agent/skills/skillLoader";
 
 const SKILLS: AgentSkill[] = [
@@ -95,5 +98,126 @@ describe("parseClassifierResponse", function () {
         authMode: "api_key",
       }),
     );
+  });
+});
+
+describe("parseClassifierResponse unmatched pseudo-skill", function () {
+  it("maps a lone unmatched to a positive empty match", function () {
+    assert.deepEqual(
+      parseClassifierResponse('{"skillIds": ["unmatched"]}', SKILLS),
+      [],
+    );
+  });
+
+  it("lets real picks win over a hedged unmatched", function () {
+    assert.deepEqual(
+      parseClassifierResponse(
+        '{"skillIds": ["unmatched", "write-note"]}',
+        SKILLS,
+      ),
+      ["write-note"],
+    );
+  });
+
+  it("collapses hallucinated-only IDs to an empty match", function () {
+    assert.deepEqual(
+      parseClassifierResponse('{"skillIds": ["bogus-only"]}', SKILLS),
+      [],
+    );
+  });
+});
+
+describe("parseClassifiedTurnIntent", function () {
+  it("parses a valid full intent object", function () {
+    const result = parseClassifiedTurnIntent(
+      '{"skillIds":[],"retrievalIntent":"summarize","wantedSections":["methods"],"queryLanguage":"zh"}',
+    );
+
+    assert.deepEqual(result, {
+      retrievalIntent: "summarize",
+      wantedSections: ["methods"],
+      queryLanguage: "zh",
+    });
+  });
+
+  it("returns null when retrievalIntent is missing or invalid", function () {
+    assert.isNull(parseClassifiedTurnIntent('{"skillIds":[]}'));
+    assert.isNull(
+      parseClassifiedTurnIntent('{"retrievalIntent":"browse"}'),
+    );
+    assert.isNull(parseClassifiedTurnIntent("not json"));
+  });
+
+  it("filters unknown wantedSections entries", function () {
+    const result = parseClassifiedTurnIntent(
+      '{"retrievalIntent":"enumerate","wantedSections":["methods","bogus"]}',
+    );
+
+    assert.deepEqual(result?.wantedSections, ["methods"]);
+  });
+});
+
+describe("detectTurnIntent", function () {
+  it("falls back to regex skills with a null intent when no model config is available", async function () {
+    const result = await detectTurnIntent(
+      {
+        userText: "compare these papers",
+        model: "some-model",
+        apiBase: "",
+      } as any,
+      SKILLS,
+    );
+
+    assert.deepEqual(result, { skillIds: [], classifiedIntent: null });
+  });
+});
+
+describe("resolveSkillRouting classified summarize force", function () {
+  const LIBRARY_ANALYSIS_SKILL: AgentSkill = {
+    id: "library-analysis",
+    description: "Analyze your whole library or collection with statistics",
+    version: 1,
+    patterns: [],
+    contexts: ["library-corpus"],
+    activation: "auto",
+    instruction: "",
+    source: "system",
+  };
+
+  it("forces library-analysis for a classified summarize over a selected collection", function () {
+    const resolution = resolveSkillRouting(
+      {
+        userText: "总结这个文件夹的研究主题",
+        selectedCollectionContexts: [
+          { collectionId: 1, name: "C", libraryID: 1 },
+        ],
+        classifiedIntent: {
+          retrievalIntent: "summarize",
+          wantedSections: [],
+        },
+        forcedSkillIds: [],
+      } as any,
+      [LIBRARY_ANALYSIS_SKILL],
+      [],
+    );
+
+    assert.include(resolution.matchedSkillIds, "library-analysis");
+  });
+
+  it("does not force library-analysis without a selected scope", function () {
+    const resolution = resolveSkillRouting(
+      {
+        userText: "总结这个文件夹的研究主题",
+        classifiedIntent: {
+          retrievalIntent: "summarize",
+          wantedSections: [],
+        },
+        forcedSkillIds: [],
+      } as any,
+      [LIBRARY_ANALYSIS_SKILL],
+      [],
+    );
+
+    assert.notInclude(resolution.matchedSkillIds, "library-analysis");
   });
 });

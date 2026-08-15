@@ -2394,3 +2394,54 @@ describe("LibraryRetrieveService evidence triage", function () {
     assert.isAtLeast(result.resourcePool.queryCoverage.indexedTextMatched, 1);
   });
 });
+
+describe("LibraryRetrieveService classified intent defaults", function () {
+  const run = async (params: {
+    intent?: "enumerate" | "verify" | "summarize";
+    classifiedIntent?: unknown;
+  }) => {
+    const entries = [makeItem(1, "Drift paper", "Representational drift.")];
+    const service = new LibraryRetrieveService(
+      makeGateway(entries) as any,
+      { ensurePaperContext: async () => makePdfContext([]) } as any,
+      async () => [],
+    );
+    return service.retrieve({
+      query: "papers about drift",
+      intent: params.intent,
+      depth: "metadata",
+      request: {
+        conversationKey: 1,
+        mode: "agent",
+        userText: "x",
+        libraryID: 1,
+        ...(params.classifiedIntent
+          ? { classifiedIntent: params.classifiedIntent }
+          : {}),
+      } as any,
+    });
+  };
+
+  it("uses the classified retrieval intent as the default", async function () {
+    const result = await run({
+      classifiedIntent: { retrievalIntent: "summarize", wantedSections: [] },
+    });
+
+    assert.equal(result.intent, "summarize");
+  });
+
+  it("lets explicit tool-arg intent beat the classified intent", async function () {
+    const result = await run({
+      intent: "verify",
+      classifiedIntent: { retrievalIntent: "summarize", wantedSections: [] },
+    });
+
+    assert.equal(result.intent, "verify");
+  });
+
+  it("keeps regex defaulting when no classified intent is present", async function () {
+    const result = await run({});
+
+    assert.equal(result.intent, "enumerate");
+  });
+});

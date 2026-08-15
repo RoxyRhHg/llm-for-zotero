@@ -290,7 +290,8 @@ function computeContextForcedSkillIds(
   if (
     (request.selectedCollectionContexts?.length ||
       request.selectedTagContexts?.length) &&
-    COLLECTION_ANALYSIS_INTENT_PATTERN.test(request.userText || "")
+    (COLLECTION_ANALYSIS_INTENT_PATTERN.test(request.userText || "") ||
+      request.classifiedIntent?.retrievalIntent === "summarize")
   ) {
     forced.add(LIBRARY_ANALYSIS_SKILL_ID);
   }

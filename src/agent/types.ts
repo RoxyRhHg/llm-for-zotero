@@ -494,9 +494,21 @@ export type ExhaustiveReadBackend =
   | "codex_responses"
   | "unavailable";
 
+/**
+ * Language-independent turn intent produced by the per-turn classifier LLM
+ * call, used as a default (never an override) by retrieval and routing.
+ */
+export type ClassifiedTurnIntent = {
+  retrievalIntent: "enumerate" | "verify" | "summarize" | "none";
+  wantedSections: Array<"methods" | "results" | "limitations">;
+  queryLanguage?: string;
+};
+
 export type AgentRuntimeRequest = AgentRequest & {
   /** Generation captured when this turn started; Clear advances it. */
   conversationGeneration?: number;
+  /** Set by the runtime after per-turn classification; absent on fallback. */
+  classifiedIntent?: ClassifiedTurnIntent;
   item?: Zotero.Item | null;
   history?: ChatMessage[];
   authMode?: ModelProviderAuthMode;

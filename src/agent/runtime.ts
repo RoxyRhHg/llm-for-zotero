@@ -41,7 +41,7 @@ import {
   normalizeHistoryMessages,
 } from "./model/messageBuilder";
 import { classifyWriteNoteDestination } from "./writeNoteDestination";
-import { detectSkillIntent } from "./model/skillClassifier";
+import { detectTurnIntent } from "./model/skillClassifier";
 import { getAllSkills, getMatchedSkillIds } from "./skills";
 import {
   buildAgentResourceContextPlan,
@@ -885,9 +885,11 @@ export class AgentRuntime {
 
       // Intent/skill selection runs ONCE per user turn, before the system
       // prompt is built. The flow:
-      //   1. detectSkillIntent — one LLM call against the primary model,
-      //      returns which skills the user's message is asking for. Falls
-      //      back to regex `match:` patterns on any error.
+      //   1. detectTurnIntent — one bounded LLM call against the primary
+      //      model, returns which skills apply plus the language-independent
+      //      retrieval intent (stored on request.classifiedIntent as a
+      //      default for retrieval/routing). Falls back to regex `match:`
+      //      patterns with a null intent on any error.
       //   2. getMatchedSkillIds — unions classifier output with explicit
       //      forcedSkillIds (slash menu) and runtime-context forces
       //      (e.g. notes-directory nickname mention).
@@ -896,11 +898,13 @@ export class AgentRuntime {
       //      and emitted as trace events for UI visibility.
       // The resulting prompt package is reused across every model inference
       // inside the agent loop — no per-step classification cost.
-      const classifiedSkillIds = await detectSkillIntent(
-        request,
-        getAllSkills(),
-      );
-      const matchedSkills = getMatchedSkillIds(request, classifiedSkillIds);
+      const turnIntent = await detectTurnIntent(request, getAllSkills(), {
+        signal: params.signal,
+      });
+      if (turnIntent.classifiedIntent) {
+        request.classifiedIntent = turnIntent.classifiedIntent;
+      }
+      const matchedSkills = getMatchedSkillIds(request, turnIntent.skillIds);
       const requiresFileNoteWrite = isWriteNoteFileRequest(
         request,
         matchedSkills,

@@ -506,12 +506,19 @@ function normalizeIntent(
   value: unknown,
   depth: LibraryRetrieveDepth,
   query: string,
+  request?: AgentRuntimeRequest,
 ): LibraryRetrieveIntent {
   if (value === "enumerate" || value === "verify" || value === "summarize") {
     return value;
   }
   if (value === "discover") return "enumerate";
   if (depth === "verify") return "verify";
+  // Language-independent classifier default: beats the English regexes below,
+  // loses to explicit tool args and verify depth above.
+  const classified = request?.classifiedIntent;
+  if (classified && classified.retrievalIntent !== "none") {
+    return classified.retrievalIntent;
+  }
   const normalized = query.toLowerCase();
   if (
     /\b(?:all|which|how many|list|enumerate|papers?\s+that|contain|contains|containing|use|uses|using|discuss|discusses|mention|mentions)\b/.test(
@@ -570,7 +577,7 @@ function normalizeInput(
           ),
         )
       : DEFAULT_METHODS;
-  const intent = normalizeIntent(input.intent, depth, input.query);
+  const intent = normalizeIntent(input.intent, depth, input.query, request);
   const collectionLikeScope = hasCollectionLikeScope(input, request);
   const comprehensiveIntent =
     intent === "enumerate" || intent === "verify" || intent === "summarize";

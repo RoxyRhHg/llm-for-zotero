@@ -13,11 +13,11 @@
  * — network failure, malformed JSON, unconfigured model — it falls back to
  * the per-skill regex `match:` patterns so the agent still works.
  */
-import { callLLM } from "../../utils/llmClient";
+import { callLLMWithTimeout } from "../../modules/contextPanel/retrievalQueryPlan";
 import { resolveSkillRequestContext } from "../skills/contextEligibility";
 import { matchesSkill } from "../skills/skillLoader";
 import type { AgentSkill } from "../skills/skillLoader";
-import type { AgentRuntimeRequest } from "../types";
+import type { AgentRuntimeRequest, ClassifiedTurnIntent } from "../types";
 
 /**
  * Pseudo-skill ID the classifier can return when none of the real skills
@@ -28,29 +28,38 @@ import type { AgentRuntimeRequest } from "../types";
  */
 const UNMATCHED_ID = "unmatched";
 
+const TURN_INTENT_TIMEOUT_MS = 8000;
+
+export type DetectTurnIntentResult = {
+  skillIds: string[];
+  /** Null whenever classification degraded — callers keep regex behavior. */
+  classifiedIntent: ClassifiedTurnIntent | null;
+};
+
 /**
- * Classify which skills apply to the given request.
- *
- * Returns a list of skill IDs drawn from `skills`. Never throws — any
- * failure falls back to regex matching.
+ * Classify skills AND language-independent turn intent in one bounded LLM
+ * call. Never throws — any failure falls back to regex skill matching with a
+ * null intent, which downstream consumers treat as exactly today's behavior.
  */
-export async function detectSkillIntent(
+export async function detectTurnIntent(
   request: AgentRuntimeRequest,
   skills: AgentSkill[],
-  signal?: AbortSignal,
-): Promise<string[]> {
-  if (skills.length === 0) return [];
+  options: { signal?: AbortSignal; timeoutMs?: number } = {},
+): Promise<DetectTurnIntentResult> {
+  if (skills.length === 0) return { skillIds: [], classifiedIntent: null };
   const userText = (request.userText || "").trim();
-  if (!userText) return regexFallback(skills, request);
+  if (!userText) {
+    return { skillIds: regexFallback(skills, request), classifiedIntent: null };
+  }
   if (!canUseSkillClassifierModel(request)) {
-    return regexFallback(skills, request);
+    return { skillIds: regexFallback(skills, request), classifiedIntent: null };
   }
 
   const prompt = buildClassifierPrompt(skills, request);
 
   let raw: string;
   try {
-    raw = await callLLM({
+    raw = await callLLMWithTimeout({
       prompt,
       model: request.model,
       apiBase: request.apiBase,
@@ -58,8 +67,9 @@ export async function detectSkillIntent(
       authMode: request.authMode,
       providerProtocol: request.providerProtocol,
       temperature: 0,
-      maxTokens: 200,
-      signal,
+      maxTokens: 300,
+      parentSignal: options.signal,
+      timeoutMs: options.timeoutMs || TURN_INTENT_TIMEOUT_MS,
     });
   } catch (err) {
     Zotero.debug?.(
@@ -67,17 +77,33 @@ export async function detectSkillIntent(
         err instanceof Error ? err.message : String(err)
       }`,
     );
-    return regexFallback(skills, request);
+    return { skillIds: regexFallback(skills, request), classifiedIntent: null };
   }
 
+  const classifiedIntent = parseClassifiedTurnIntent(raw);
   const parsed = parseClassifierResponse(raw, skills);
   if (parsed === null) {
     Zotero.debug?.(
       `[llm-for-zotero] Skill classifier returned malformed JSON, falling back to regex. Raw: ${raw.slice(0, 200)}`,
     );
-    return regexFallback(skills, request);
+    return { skillIds: regexFallback(skills, request), classifiedIntent };
   }
-  return parsed;
+  return { skillIds: parsed, classifiedIntent };
+}
+
+/**
+ * Classify which skills apply to the given request.
+ *
+ * Returns a list of skill IDs drawn from `skills`. Never throws — any
+ * failure falls back to regex matching. Thin wrapper kept for consumers that
+ * only need skill routing (e.g. the Codex native-skills path).
+ */
+export async function detectSkillIntent(
+  request: AgentRuntimeRequest,
+  skills: AgentSkill[],
+  signal?: AbortSignal,
+): Promise<string[]> {
+  return (await detectTurnIntent(request, skills, { signal })).skillIds;
 }
 
 export function canUseSkillClassifierModel(
@@ -143,6 +169,9 @@ function buildClassifierPrompt(
     `• Use ["${UNMATCHED_ID}"] when the user's task is a direct Zotero operation or does not clearly require any skill's playbook. This is the correct answer for most turns.`,
     "• Only include a specific skill ID when the user's message unambiguously aligns with that skill's primary purpose. Do not include a skill just because its description shares a word with the user's message.",
     '• When the user\'s message genuinely combines multiple distinct subtasks (e.g. "read this paper, analyze figure 1, and write a note"), return every skill ID that maps to a distinct subtask. Do NOT pad the list with tangentially related skills.',
+    '• retrievalIntent: how the question should read the library, in any language — "enumerate" for which/all/list/find-evidence questions, "verify" for exact presence/absence checks, "summarize" for themes/commonalities/comparisons/overviews across papers, "none" for pure operations (tagging, moving, editing) or single-paper reads.',
+    "• wantedSections: only the sections the user explicitly asks about (methods, results, limitations); otherwise an empty array.",
+    '• queryLanguage: short language code of the user message, e.g. "en", "zh", "ja".',
     "",
     "Available skills:",
     skillList,
@@ -155,8 +184,63 @@ function buildClassifierPrompt(
     request.userText,
     `"""`,
     "",
-    'Reply with ONLY a JSON object in this exact shape, no prose, no code fences: {"skillIds": ["id1", "id2"]}',
+    'Reply with ONLY a JSON object in this exact shape, no prose, no code fences: {"skillIds": ["id1", "id2"], "retrievalIntent": "enumerate|verify|summarize|none", "wantedSections": [], "queryLanguage": "en"}',
   ].join("\n");
+}
+
+const VALID_RETRIEVAL_INTENTS = new Set([
+  "enumerate",
+  "verify",
+  "summarize",
+  "none",
+]);
+const VALID_WANTED_SECTIONS = new Set(["methods", "results", "limitations"]);
+
+/**
+ * Parse the language-independent intent fields out of the classifier reply.
+ * Strict on the enum: anything unexpected returns null so downstream
+ * consumers keep exactly the pre-classifier behavior. Unknown wantedSections
+ * entries are dropped (they are additive hints, not a contract).
+ */
+export function parseClassifiedTurnIntent(
+  raw: string,
+): ClassifiedTurnIntent | null {
+  if (!raw) return null;
+  const match = raw.match(/\{[\s\S]*\}/);
+  if (!match) return null;
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(match[0]);
+  } catch {
+    return null;
+  }
+  if (!parsed || typeof parsed !== "object") return null;
+  const record = parsed as {
+    retrievalIntent?: unknown;
+    wantedSections?: unknown;
+    queryLanguage?: unknown;
+  };
+  const retrievalIntent =
+    typeof record.retrievalIntent === "string"
+      ? record.retrievalIntent.trim()
+      : "";
+  if (!VALID_RETRIEVAL_INTENTS.has(retrievalIntent)) return null;
+  const wantedSections = Array.isArray(record.wantedSections)
+    ? record.wantedSections
+        .map((value) => (typeof value === "string" ? value.trim() : ""))
+        .filter((value): value is "methods" | "results" | "limitations" =>
+          VALID_WANTED_SECTIONS.has(value),
+        )
+    : [];
+  const queryLanguage =
+    typeof record.queryLanguage === "string" && record.queryLanguage.trim()
+      ? record.queryLanguage.trim().toLowerCase().slice(0, 12)
+      : undefined;
+  return {
+    retrievalIntent: retrievalIntent as ClassifiedTurnIntent["retrievalIntent"],
+    wantedSections,
+    queryLanguage,
+  };
 }
 
 /**
