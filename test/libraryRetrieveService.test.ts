@@ -1915,7 +1915,10 @@ describe("LibraryRetrieveService pool BM25", function () {
       },
     });
 
-    assert.isAtLeast(result.resourcePool.queryCoverage.matchedMetadata, 1);
+    // BM25 token overlap is reported as its own state, not as a literal
+    // metadata match.
+    assert.equal(result.resourcePool.queryCoverage.matchedMetadata, 0);
+    assert.isAtLeast(result.resourcePool.queryCoverage.matchedBm25, 1);
     const match = result.candidates.find(
       (candidate) => candidate.itemId === "1",
     );
@@ -2234,7 +2237,11 @@ describe("LibraryRetrieveService evidence triage", function () {
   })) as any;
 
   it("reorders snippet expansion and threads per-paper queries from triage", async function () {
-    const builderCalls: Array<{ itemId: number; question: string }> = [];
+    const builderCalls: Array<{
+      itemId: number;
+      question: string;
+      queryPlan?: { lexicalTerms: string[] };
+    }> = [];
     const service = new LibraryRetrieveService(
       makeGateway(POOL_ENTRIES(), { quicksearchItemIds: [] }) as any,
       {
@@ -2244,8 +2251,13 @@ describe("LibraryRetrieveService evidence triage", function () {
         paperContext: PaperContextRef,
         _pdfContext: unknown,
         question: string,
+        apiOptions?: { queryPlan?: { lexicalTerms: string[] } },
       ): Promise<PaperContextCandidate[]> => {
-        builderCalls.push({ itemId: paperContext.itemId, question });
+        builderCalls.push({
+          itemId: paperContext.itemId,
+          question,
+          queryPlan: apiOptions?.queryPlan,
+        });
         return [
           {
             paperKey: `${paperContext.itemId}:${paperContext.contextItemId}`,
@@ -2267,13 +2279,13 @@ describe("LibraryRetrieveService evidence triage", function () {
       NOOP_REFORMULATOR,
       (async () => ({
         selectedItemIds: ["7", "2"],
-        perPaperQueries: { "7": "look for the stimulation protocol" },
+        perPaperQueries: { "7": "locate the electrode stimulation protocol" },
       })) as any,
     );
 
     const result = await service.retrieve({
       query: "stimulation protocols in these papers",
-      queryVariants: ["stimulation protocol"],
+      queryVariants: ["optogenetic stimulation"],
       depth: "evidence",
       maxFullTextPapers: 2,
       apiBase: "https://example.invalid",
@@ -2285,10 +2297,22 @@ describe("LibraryRetrieveService evidence triage", function () {
       builderCalls.map((call) => call.itemId),
       [7, 2],
     );
-    assert.equal(builderCalls[0].question, "look for the stimulation protocol");
+    assert.equal(
+      builderCalls[0].question,
+      "locate the electrode stimulation protocol",
+    );
     assert.equal(
       builderCalls[1].question,
       "stimulation protocols in these papers",
+    );
+    // The per-paper override must keep the shared plan's variants: both the
+    // override's own terms and the corpus-language variant terms drive the
+    // chunk ranking.
+    assert.isOk(builderCalls[0].queryPlan);
+    assert.include(builderCalls[0].queryPlan?.lexicalTerms || [], "electrode");
+    assert.include(
+      builderCalls[0].queryPlan?.lexicalTerms || [],
+      "optogenetic",
     );
     assert.equal(result.candidates[0].itemId, "7");
     assert.isTrue(
@@ -2400,6 +2424,15 @@ describe("LibraryRetrieveService evidence triage", function () {
     );
     assert.equal(result.resourcePool.queryCoverage.probeRounds, 1);
     assert.isAtLeast(result.resourcePool.queryCoverage.indexedTextMatched, 1);
+    // A paper matched only by the triage-suggested probe must actually enter
+    // the returned ledger, not just bump counters.
+    assert.isTrue(
+      result.candidates.some((candidate) => candidate.itemId === "5"),
+      `candidates were: ${JSON.stringify(
+        result.candidates.map((candidate) => candidate.itemId),
+      )}`,
+    );
+    assert.isTrue(result.paperMatches.some((match) => match.itemId === "5"));
   });
 });
 
@@ -2639,5 +2672,100 @@ describe("LibraryRetrieveService prototype-key safety", function () {
     assert.isOk(match);
     assert.include(match?.whyMatched || "", "bm25");
     assert.isTrue(Number.isFinite(match?.score));
+  });
+});
+
+describe("LibraryRetrieveService review fixes", function () {
+  const REQUEST = {
+    conversationKey: 1,
+    mode: "agent" as const,
+    userText: "x",
+    libraryID: 1,
+  };
+
+  it("sends the long CJK literal verbatim as a probe in verify mode", async function () {
+    const quicksearchCalls: Array<{ query?: string }> = [];
+    const literal = "这段文字包含一个很长的中文句子作为验证目标";
+    const service = new LibraryRetrieveService(
+      makeGateway([makeItem(1, "论文甲", "验证目标研究。")], {
+        quicksearchCalls,
+        quicksearchItemIds: [],
+      }) as any,
+      { ensurePaperContext: async () => makePdfContext([]) } as any,
+      async () => [],
+    );
+
+    await service.retrieve({
+      query: literal,
+      depth: "verify",
+      request: REQUEST,
+    });
+
+    assert.include(
+      quicksearchCalls.map((call) => call.query),
+      literal,
+    );
+  });
+
+  it("segments long CJK probes returned by the reformulator", async function () {
+    const quicksearchCalls: Array<{ query?: string }> = [];
+    const longPhrase = "神经形态计算的硬件加速器研究";
+    const service = new LibraryRetrieveService(
+      makeGateway([makeItem(1, "论文甲", "蛋白质折叠研究。")], {
+        quicksearchCalls,
+        quicksearchItemIds: [],
+      }) as any,
+      { ensurePaperContext: async () => makePdfContext([]) } as any,
+      async () => [],
+      (async () => ({ variants: [longPhrase], notes: [] })) as any,
+    );
+
+    await service.retrieve({
+      query: "unrelated english query",
+      queryVariants: ["another probe"],
+      depth: "evidence",
+      apiBase: "https://example.invalid",
+      apiKey: "test-key",
+      request: REQUEST,
+    });
+
+    const recorded = quicksearchCalls.map((call) => call.query || "");
+    assert.notInclude(recorded, longPhrase);
+    assert.isTrue(
+      recorded.some((query) => /[一-鿿]/.test(query) && query.length <= 6),
+      `recorded probes were: ${JSON.stringify(recorded)}`,
+    );
+  });
+
+  it("does not count ubiquitous shared tokens as a bm25 match", async function () {
+    const entries = Array.from({ length: 6 }, (_, index) =>
+      makeItem(
+        index + 1,
+        `Paper ${index + 1}`,
+        `ｓｔｕｄｙ ｒｅｓｕｌｔｓ ｕｎｉｑｕｅ${index}`,
+        { collectionIds: [3] },
+      ),
+    );
+    const service = new LibraryRetrieveService(
+      makeGateway(entries) as any,
+      { ensurePaperContext: async () => makePdfContext([]) } as any,
+      async () => [],
+    );
+
+    const result = await service.retrieve({
+      query: "study results comparison",
+      depth: "metadata",
+      request: {
+        ...REQUEST,
+        selectedCollectionContexts: [
+          { collectionId: 3, name: "C", libraryID: 1 },
+        ],
+      } as any,
+    });
+
+    assert.isTrue(
+      result.warnings.some((warning) => warning.includes("LOW CONFIDENCE")),
+      `warnings were: ${JSON.stringify(result.warnings)}`,
+    );
   });
 });

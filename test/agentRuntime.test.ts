@@ -3674,9 +3674,7 @@ describe("shallow guard round-limit safety", function () {
       for (let index = 0; index < 23; index += 1) {
         steps.push({
           kind: "tool_calls",
-          calls: [
-            { id: `noop-${index}`, name: "noop_probe", arguments: {} },
-          ],
+          calls: [{ id: `noop-${index}`, name: "noop_probe", arguments: {} }],
           assistantMessage: {
             role: "assistant",
             content: "",

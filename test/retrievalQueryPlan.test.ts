@@ -358,7 +358,9 @@ describe("probe reformulation", function () {
 
 describe("callLLMWithTimeout runtime safety", function () {
   it("enforces the timeout even when AbortController is unavailable", async function () {
-    const globalRef = globalThis as { AbortController?: typeof AbortController };
+    const globalRef = globalThis as {
+      AbortController?: typeof AbortController;
+    };
     const originalCtor = globalRef.AbortController;
     delete globalRef.AbortController;
     try {

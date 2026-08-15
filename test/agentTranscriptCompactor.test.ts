@@ -79,8 +79,14 @@ describe("CJK summary budget", function () {
       { length: 12 },
       (_, index) =>
         index % 2 === 0
-          ? { role: "user" as const, content: `问题${index}：${"神经科学研究进展。".repeat(40)}` }
-          : { role: "assistant" as const, content: `回答${index}：${"表征漂移的证据分析。".repeat(40)}` },
+          ? {
+              role: "user" as const,
+              content: `问题${index}：${"神经科学研究进展。".repeat(40)}`,
+            }
+          : {
+              role: "assistant" as const,
+              content: `回答${index}：${"表征漂移的证据分析。".repeat(40)}`,
+            },
     );
     messages.push({ role: "user", content: "最后的问题" });
 

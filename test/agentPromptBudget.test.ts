@@ -540,9 +540,7 @@ describe("CJK convergence", function () {
       {
         role: "assistant",
         content: "",
-        tool_calls: [
-          { id: "call-1", name: "library_retrieve", arguments: {} },
-        ],
+        tool_calls: [{ id: "call-1", name: "library_retrieve", arguments: {} }],
       },
       {
         role: "tool",

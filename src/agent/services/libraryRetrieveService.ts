@@ -103,6 +103,7 @@ export type LibraryRetrieveResourceState =
 
 export type LibraryRetrieveQueryState =
   | "matched_metadata"
+  | "matched_bm25"
   | "shortlisted"
   | "content_loaded"
   | "snippet_returned"
@@ -234,6 +235,8 @@ export type LibraryRetrieveResult = {
       metadataInspected: number;
       abstractsInspected: number;
       matchedMetadata: number;
+      /** Records matched via abstract/title BM25 token overlap only. */
+      matchedBm25: number;
       shortlisted: number;
       indexedTextAvailable: number;
       indexedTextScanned: number;
@@ -387,6 +390,7 @@ type ResourceRecord = {
   ftsScore: number;
   bm25Score: number;
   bm25TermHits: number;
+  bm25DistinctiveHits: number;
   quicksearchMatched: boolean;
   matchedQueryVariants: Set<string>;
   score: number;
@@ -427,14 +431,16 @@ const TRIAGE_MAX_CANDIDATES = 40;
 // term weights so distinctive-vocabulary overlap outranks generic noise.
 const BM25_BLEND_WEIGHT = 8;
 
-function recordBm25Matched(
-  record: ResourceRecord,
-  queryPlan: RetrievalQueryPlan,
-): boolean {
-  // A single shared token (often one CJK bigram) is noise, not a match.
+const BM25_MIN_TERM_HITS = 2;
+
+function recordBm25Matched(record: ResourceRecord): boolean {
+  // A single shared token (often one CJK bigram) is noise, and tokens shared
+  // by most of the pool (generic vocabulary) carry no signal either — at
+  // least one hit must be distinctive to the pool.
   return (
     record.bm25Score > 0 &&
-    record.bm25TermHits >= Math.min(2, queryPlan.lexicalTerms.length)
+    record.bm25TermHits >= BM25_MIN_TERM_HITS &&
+    record.bm25DistinctiveHits >= 1
   );
 }
 const CJK_FULL_PHRASE_PROBE_MAX_CHARS = 12;
@@ -447,8 +453,22 @@ const CJK_KEYWORD_PROBES_PER_QUERY = 4;
  * punctuation everywhere, and for CJK-dominant queries send segmented
  * keyword probes rather than the full sentence.
  */
+/** Bounded quicksearch probes for one query/variant string. */
+export function expandProbeText(text: string): string[] {
+  const stripped = stripTerminalPunctuation(text);
+  if (!stripped) return [];
+  if (!isCjkDominantText(stripped)) return [stripped];
+  const probes: string[] = [];
+  if (stripped.length <= CJK_FULL_PHRASE_PROBE_MAX_CHARS) probes.push(stripped);
+  probes.push(
+    ...extractCjkKeywordProbes(stripped, CJK_KEYWORD_PROBES_PER_QUERY),
+  );
+  return probes;
+}
+
 export function buildQuicksearchProbes(
   queryPlan: RetrievalQueryPlan,
+  options: { includeFullPhrases?: boolean } = {},
 ): string[] {
   const probes: string[] = [];
   const seen = new Set<string>();
@@ -462,19 +482,13 @@ export function buildQuicksearchProbes(
   };
   for (const query of queryPlan.effectiveQueries) {
     if (probes.length >= QUICKSEARCH_MAX_PROBES) break;
-    const stripped = stripTerminalPunctuation(query);
-    if (!stripped) continue;
-    if (isCjkDominantText(stripped)) {
-      if (stripped.length <= CJK_FULL_PHRASE_PROBE_MAX_CHARS) push(stripped);
-      for (const probe of extractCjkKeywordProbes(
-        stripped,
-        CJK_KEYWORD_PROBES_PER_QUERY,
-      )) {
-        push(probe);
-      }
-    } else {
-      push(stripped);
+    if (options.includeFullPhrases) {
+      // verify/requireExact callers need the literal scanned pool-wide even
+      // when it is a long CJK phrase the keyword probes would replace.
+      const stripped = stripTerminalPunctuation(query);
+      if (stripped) push(stripped);
     }
+    for (const probe of expandProbeText(query)) push(probe);
   }
   return probes.slice(0, QUICKSEARCH_MAX_PROBES);
 }
@@ -1461,8 +1475,8 @@ export class LibraryRetrieveService {
           warnings,
           {
             probesOverride: freshVariants
-              .map((variant) => stripTerminalPunctuation(variant))
-              .filter(Boolean),
+              .flatMap((variant) => expandProbeText(variant))
+              .slice(0, QUICKSEARCH_MAX_PROBES),
           },
         );
         indexedScan = {
@@ -1489,11 +1503,11 @@ export class LibraryRetrieveService {
         record.ftsScore +
         (maxBm25 > 0 ? (record.bm25Score / maxBm25) * BM25_BLEND_WEIGHT : 0) +
         (record.paperContext ? 0.5 : 0);
-      if (
-        record.metadataScore > 0 ||
-        recordBm25Matched(record, input.queryPlan)
-      ) {
+      if (record.metadataScore > 0) {
         record.queryState.add("matched_metadata");
+      }
+      if (recordBm25Matched(record)) {
+        record.queryState.add("matched_bm25");
       }
     }
 
@@ -1508,7 +1522,7 @@ export class LibraryRetrieveService {
       (record) =>
         record.metadataScore > 0 ||
         record.ftsScore > 0 ||
-        recordBm25Matched(record, input.queryPlan),
+        recordBm25Matched(record),
     );
     const shouldPreferMatchedLedger =
       input.intent === "enumerate" ||
@@ -1597,10 +1611,11 @@ export class LibraryRetrieveService {
         });
         triagePerPaperQueries = triageResult.perPaperQueries;
         warnings.push("Candidate triage refined selection by LLM.");
-        const triageProbes = (triageResult.suggestedProbes || [])
-          .map((probe) => stripTerminalPunctuation(probe))
-          .filter(Boolean)
-          .filter((probe) => !variantsTried.has(probe.toLowerCase()));
+        const suggestedProbes = triageResult.suggestedProbes || [];
+        const triageProbes = suggestedProbes
+          .flatMap((probe) => expandProbeText(probe))
+          .filter((probe) => !variantsTried.has(probe.toLowerCase()))
+          .slice(0, QUICKSEARCH_MAX_PROBES);
         if (
           triageProbes.length &&
           input.depth !== "metadata" &&
@@ -1613,6 +1628,23 @@ export class LibraryRetrieveService {
           for (const probe of triageProbes) {
             variantsTried.add(probe.toLowerCase());
           }
+          // Mirror the reformulation loop: fold the probes into the plan so
+          // BM25 rescoring and downstream chunk retrieval see the new terms.
+          input = {
+            ...input,
+            queryPlan: buildRetrievalQueryPlan({
+              query: input.query,
+              queryVariants: [...suggestedProbes, ...input.queryPlan.variants],
+              maxVariants: RETRIEVAL_QUERY_VARIANT_HARD_LIMIT,
+              notes: input.queryPlan.notes,
+              readIntent: input.queryPlan.readIntent,
+            }),
+          };
+          const previouslyMatched = new Set(
+            records
+              .filter((record) => record.quicksearchMatched)
+              .map((record) => record.target.itemId),
+          );
           const rescan = await this.addQuicksearchMatches(
             scope,
             records,
@@ -1628,6 +1660,21 @@ export class LibraryRetrieveService {
             truncated: indexedScan.truncated || rescan.truncated,
           };
           this.applyPoolBm25Scores(records, input.queryPlan);
+          // Papers matched only by the rescan must be able to reach the
+          // ledger and snippet expansion — counters alone would overstate
+          // coverage the answer never saw.
+          const candidateIds = new Set(
+            candidateRecords.map((record) => record.target.itemId),
+          );
+          for (const record of records) {
+            if (candidateRecords.length >= input.maxCandidatePapers) break;
+            if (!record.quicksearchMatched) continue;
+            if (previouslyMatched.has(record.target.itemId)) continue;
+            if (candidateIds.has(record.target.itemId)) continue;
+            record.queryState.add("shortlisted");
+            candidateRecords.push(record);
+            candidateIds.add(record.target.itemId);
+          }
         }
       } else {
         warnings.push("LLM triage unavailable; kept lexical ranking.");
@@ -1793,6 +1840,9 @@ export class LibraryRetrieveService {
           matchedMetadata: records.filter((record) =>
             record.queryState.has("matched_metadata"),
           ).length,
+          matchedBm25: records.filter((record) =>
+            record.queryState.has("matched_bm25"),
+          ).length,
           shortlisted: candidateRecords.length,
           indexedTextAvailable,
           indexedTextScanned: indexedScan.scanned,
@@ -1832,7 +1882,7 @@ export class LibraryRetrieveService {
       (record) =>
         record.metadataScore > 0 ||
         record.ftsScore > 0 ||
-        recordBm25Matched(record, queryPlan),
+        recordBm25Matched(record),
     ).length;
   }
 
@@ -1860,7 +1910,11 @@ export class LibraryRetrieveService {
       );
       const hits = queryPlan.lexicalTerms.filter((term) => stats.tf[term]);
       record.bm25TermHits = hits.length;
-      if (recordBm25Matched(record, queryPlan)) {
+      const distinctiveCeiling = Math.max(1, Math.floor(records.length / 2));
+      record.bm25DistinctiveHits = hits.filter(
+        (term) => (docFreq[term] || 0) <= distinctiveCeiling,
+      ).length;
+      if (recordBm25Matched(record)) {
         // The "abstract " prefix keeps recordHasAbstractMatch attributing
         // this basis correctly in the paper-match ledger.
         const why = `abstract bm25 match: ${hits.slice(0, 4).join(", ")}`;
@@ -2129,6 +2183,7 @@ export class LibraryRetrieveService {
         ftsScore: 0,
         bm25Score: 0,
         bm25TermHits: 0,
+        bm25DistinctiveHits: 0,
         quicksearchMatched: false,
         matchedQueryVariants: new Set(scored.matchedQueryVariants),
         score: scored.score,
@@ -2146,7 +2201,9 @@ export class LibraryRetrieveService {
   ): Promise<IndexedTextScanResult> {
     const probes = options.probesOverride?.length
       ? options.probesOverride
-      : buildQuicksearchProbes(input.queryPlan);
+      : buildQuicksearchProbes(input.queryPlan, {
+          includeFullPhrases: input.requireExact || input.depth === "verify",
+        });
     const scan: IndexedTextScanResult = {
       available: records.filter((record) =>
         record.resourceState.has("text_available"),
@@ -2294,11 +2351,18 @@ export class LibraryRetrieveService {
         ? Math.max(params.maxSnippets, 5)
         : params.maxSnippets;
       const retrievalQuestion = params.queryOverride || params.input.query;
-      // With a per-paper override the builder must tokenize the override
-      // itself — the shared plan's lexicalTerms would otherwise win and make
-      // the override a no-op.
+      // With a per-paper override, build a per-paper plan around it: the
+      // shared plan's lexicalTerms would otherwise win (queryPlanTerms
+      // precedence) and make the override a no-op, while dropping the plan
+      // entirely would lose the corpus-language variants on exactly the
+      // papers triage prioritized.
       const paperQueryPlan = params.queryOverride
-        ? undefined
+        ? buildRetrievalQueryPlan({
+            query: retrievalQuestion,
+            queryVariants: params.input.queryPlan.variants,
+            maxVariants: RETRIEVAL_QUERY_VARIANT_HARD_LIMIT,
+            readIntent: params.input.queryPlan.readIntent,
+          })
         : params.input.queryPlan;
       const candidates = await this.candidateBuilder(
         paperContext,
