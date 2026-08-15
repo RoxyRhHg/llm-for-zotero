@@ -38,6 +38,7 @@ import {
   compareEvidenceCandidatesForQuestion,
   isBodyEvidenceSection,
   queryHasExplicitSectionPreference,
+  type WantedEvidenceSection,
 } from "../../shared/libraryChatEvidencePolicy";
 import { buildLibraryRetrieveEvidencePack } from "./libraryRetrieveEvidencePack";
 import { triageCandidatesWithModel } from "./libraryRetrieveTriage";
@@ -1636,11 +1637,19 @@ export class LibraryRetrieveService {
     const snippets: LibraryRetrieveSnippet[] = [];
     let snippetPapersExpanded = 0;
     let evidencePapers = 0;
+    const wantedSections = params.request?.classifiedIntent?.wantedSections
+      ?.length
+      ? params.request.classifiedIntent.wantedSections
+      : undefined;
+    // Evidence depth defaults to body-first ranking: BM25 loves term-dense
+    // abstracts/intros, which is exactly the "answers from the introduction"
+    // failure this counteracts.
     const preferBodyEvidence =
+      input.depth === "evidence" ||
       readStrategyBase.resolvedStrategy === "deep_synthesis" ||
       (readStrategyBase.resolvedStrategy === "evidence_overview" &&
         input.intent === "summarize") ||
-      queryHasExplicitSectionPreference(input.query);
+      queryHasExplicitSectionPreference(input.query, wantedSections);
 
     if (input.depth === "evidence" || input.depth === "verify") {
       const fullTextRecords = candidateRecords
@@ -1654,6 +1663,7 @@ export class LibraryRetrieveService {
           input,
           maxSnippets: Math.min(input.perPaperTopK, remaining),
           preferBodyEvidence,
+          wantedSections,
           queryOverride: triagePerPaperQueries?.[String(record.target.itemId)],
           apiBase: params.apiBase,
           apiKey: params.apiKey,
@@ -2237,6 +2247,8 @@ export class LibraryRetrieveService {
     input: NormalizedLibraryRetrieveInput;
     maxSnippets: number;
     preferBodyEvidence?: boolean;
+    /** Classifier-provided sections to prefer, language-independent. */
+    wantedSections?: WantedEvidenceSection[];
     /** Triage-provided per-paper question; falls back to the main query. */
     queryOverride?: string;
     apiBase?: string;
@@ -2311,6 +2323,7 @@ export class LibraryRetrieveService {
                 retrievalQuestion,
                 (candidate) =>
                   candidate.evidenceScore || candidate.hybridScore || 0,
+                params.wantedSections,
               ),
             )
           : rows,
@@ -2320,15 +2333,15 @@ export class LibraryRetrieveService {
           .map((snippet) => snippetChunkKey(snippet))
           .filter((key): key is string => Boolean(key)),
       );
-      for (const candidate of candidates) {
-        if (snippets.length >= params.maxSnippets) break;
+      const admitCandidate = (candidate: PaperContextCandidate): boolean => {
+        if (snippets.length >= params.maxSnippets) return false;
         const matchMethod = matchMethodFromCandidate(
           candidate,
           params.input.methods.includes("semantic"),
         );
         if (matchMethod === "semantic") params.methodsUsed.add("semantic");
         const key = candidateChunkKey(candidate);
-        if (seenChunks.has(key)) continue;
+        if (seenChunks.has(key)) return false;
         seenChunks.add(key);
         for (const query of candidate.matchedQueryVariants || []) {
           params.record.matchedQueryVariants.add(query);
@@ -2356,6 +2369,31 @@ export class LibraryRetrieveService {
               ? "Semantic retrieval ranked this passage highly"
               : "Full-text BM25 retrieval ranked this passage highly",
         });
+        return true;
+      };
+      if (params.preferBodyEvidence) {
+        // Body evidence fills the slots first; front matter (abstract/intro)
+        // is capped at one snippet and only when slots remain. Exact-match
+        // snippets above are exempt — verify mode keeps literal hits.
+        const isFrontMatterCandidate = (candidate: PaperContextCandidate) =>
+          !isBodyEvidenceSection(candidate.sectionLabel, candidate.chunkKind);
+        for (const candidate of candidates) {
+          if (isFrontMatterCandidate(candidate)) continue;
+          if (snippets.length >= params.maxSnippets) break;
+          admitCandidate(candidate);
+        }
+        let frontMatterAdmitted = 0;
+        for (const candidate of candidates) {
+          if (!isFrontMatterCandidate(candidate)) continue;
+          if (frontMatterAdmitted >= 1) break;
+          if (snippets.length >= params.maxSnippets) break;
+          if (admitCandidate(candidate)) frontMatterAdmitted += 1;
+        }
+      } else {
+        for (const candidate of candidates) {
+          if (snippets.length >= params.maxSnippets) break;
+          admitCandidate(candidate);
+        }
       }
     }
     return snippets;

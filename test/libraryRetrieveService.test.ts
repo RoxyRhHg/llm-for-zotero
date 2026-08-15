@@ -2445,3 +2445,154 @@ describe("LibraryRetrieveService classified intent defaults", function () {
     assert.equal(result.intent, "enumerate");
   });
 });
+
+describe("LibraryRetrieveService body-evidence defaults", function () {
+  const REQUEST = {
+    conversationKey: 1,
+    mode: "agent" as const,
+    userText: "x",
+    libraryID: 1,
+  };
+  const makeCandidate = (
+    paperContext: PaperContextRef,
+    input: {
+      chunkIndex: number;
+      chunkKind: string;
+      sectionLabel: string;
+      evidenceScore: number;
+    },
+  ): PaperContextCandidate =>
+    ({
+      paperKey: `${paperContext.itemId}:${paperContext.contextItemId}`,
+      itemId: paperContext.itemId,
+      contextItemId: paperContext.contextItemId,
+      title: paperContext.title,
+      chunkIndex: input.chunkIndex,
+      chunkText: `${input.sectionLabel} text ${input.chunkIndex}`,
+      chunkKind: input.chunkKind,
+      sectionLabel: input.sectionLabel,
+      estimatedTokens: 10,
+      bm25Score: 1,
+      embeddingScore: 0,
+      hybridScore: 1,
+      evidenceScore: input.evidenceScore,
+    }) as PaperContextCandidate;
+
+  it("caps front-matter to one snippet when body evidence exists at evidence depth", async function () {
+    const entries = [makeItem(1, "Drift paper", "Representational drift.")];
+    const service = new LibraryRetrieveService(
+      makeGateway(entries) as any,
+      {
+        ensurePaperContext: async () => makePdfContext(["chunk a", "chunk b"]),
+      } as any,
+      (async (paperContext: PaperContextRef): Promise<
+        PaperContextCandidate[]
+      > => [
+        makeCandidate(paperContext, {
+          chunkIndex: 0,
+          chunkKind: "abstract",
+          sectionLabel: "Abstract",
+          evidenceScore: 1,
+        }),
+        makeCandidate(paperContext, {
+          chunkIndex: 3,
+          chunkKind: "methods",
+          sectionLabel: "Methods",
+          evidenceScore: 0.8,
+        }),
+        makeCandidate(paperContext, {
+          chunkIndex: 4,
+          chunkKind: "results",
+          sectionLabel: "Results",
+          evidenceScore: 0.7,
+        }),
+      ]) as any,
+    );
+
+    const result = await service.retrieve({
+      query: "drift paper stimulation details",
+      depth: "evidence",
+      perPaperTopK: 2,
+      request: REQUEST,
+    });
+
+    assert.isAbove(result.snippets.length, 0);
+    for (const snippet of result.snippets) {
+      assert.notEqual(snippet.chunkKind, "abstract");
+    }
+  });
+
+  it("still returns front-matter when a paper has no body candidates", async function () {
+    const entries = [makeItem(1, "Drift paper", "Representational drift.")];
+    const service = new LibraryRetrieveService(
+      makeGateway(entries) as any,
+      {
+        ensurePaperContext: async () => makePdfContext(["chunk a"]),
+      } as any,
+      (async (paperContext: PaperContextRef): Promise<
+        PaperContextCandidate[]
+      > => [
+        makeCandidate(paperContext, {
+          chunkIndex: 0,
+          chunkKind: "abstract",
+          sectionLabel: "Abstract",
+          evidenceScore: 1,
+        }),
+        makeCandidate(paperContext, {
+          chunkIndex: 1,
+          chunkKind: "abstract",
+          sectionLabel: "Abstract",
+          evidenceScore: 0.9,
+        }),
+      ]) as any,
+    );
+
+    const result = await service.retrieve({
+      query: "drift paper stimulation details",
+      depth: "evidence",
+      perPaperTopK: 2,
+      request: REQUEST,
+    });
+
+    assert.lengthOf(result.snippets, 1);
+    assert.equal(result.snippets[0].chunkKind, "abstract");
+  });
+
+  it("steers section ranking from classifier wantedSections for a CJK query", async function () {
+    const entries = [makeItem(1, "Drift paper", "Representational drift.")];
+    const service = new LibraryRetrieveService(
+      makeGateway(entries) as any,
+      {
+        ensurePaperContext: async () => makePdfContext(["chunk a", "chunk b"]),
+      } as any,
+      (async (paperContext: PaperContextRef): Promise<
+        PaperContextCandidate[]
+      > => [
+        makeCandidate(paperContext, {
+          chunkIndex: 2,
+          chunkKind: "results",
+          sectionLabel: "Results",
+          evidenceScore: 1,
+        }),
+        makeCandidate(paperContext, {
+          chunkIndex: 5,
+          chunkKind: "methods",
+          sectionLabel: "Methods",
+          evidenceScore: 0.5,
+        }),
+      ]) as any,
+    );
+
+    const result = await service.retrieve({
+      query: "这些论文用了什么实验手段",
+      depth: "evidence",
+      perPaperTopK: 1,
+      request: {
+        ...REQUEST,
+        classifiedIntent: { retrievalIntent: "enumerate", wantedSections: ["methods"] },
+      } as any,
+    });
+
+    assert.equal(result.snippets[0]?.sectionLabel, "Methods");
+  });
+});
