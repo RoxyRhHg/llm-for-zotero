@@ -93,7 +93,9 @@ describe("wantedSections (classifier-provided, language-independent)", function 
   });
 
   it("treats non-empty wantedSections as an explicit section preference", function () {
-    assert.isTrue(queryHasExplicitSectionPreference("这些论文的方法", ["methods"]));
+    assert.isTrue(
+      queryHasExplicitSectionPreference("这些论文的方法", ["methods"]),
+    );
     assert.isFalse(queryHasExplicitSectionPreference("这些论文的方法"));
   });
 

@@ -142,9 +142,7 @@ describe("parseClassifiedTurnIntent", function () {
 
   it("returns null when retrievalIntent is missing or invalid", function () {
     assert.isNull(parseClassifiedTurnIntent('{"skillIds":[]}'));
-    assert.isNull(
-      parseClassifiedTurnIntent('{"retrievalIntent":"browse"}'),
-    );
+    assert.isNull(parseClassifiedTurnIntent('{"retrievalIntent":"browse"}'));
     assert.isNull(parseClassifiedTurnIntent("not json"));
   });
 

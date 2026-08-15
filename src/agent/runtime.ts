@@ -42,6 +42,10 @@ import {
 } from "./model/messageBuilder";
 import { classifyWriteNoteDestination } from "./writeNoteDestination";
 import { detectTurnIntent } from "./model/skillClassifier";
+import {
+  findLibraryRetrieveShallowSignal,
+  isEvidenceSeekingTurn,
+} from "./model/libraryAnswerGuard";
 import { getAllSkills, getMatchedSkillIds } from "./skills";
 import {
   buildAgentResourceContextPlan,
@@ -1019,6 +1023,7 @@ export class AgentRuntime {
       );
       let noteWriteCorrectionUsed = false;
       let fullReadCorrectionUsed = false;
+      let shallowLibraryCorrectionUsed = false;
       const hasSuccessfulFileWrite = () =>
         toolExecutionRecords.some((record) => isSuccessfulFileIoWrite(record));
       const hasFullReadAttempt = () =>
@@ -1803,6 +1808,50 @@ export class AgentRuntime {
               `I could not complete the ${targetLabel} write because the model did not call \`file_io({ action:'write', filePath, content })\` after being corrected.`,
               "failed",
             );
+          }
+          // Shallow-answer guard: a collection/tag-scoped evidence question
+          // must not finalize without library evidence. One correction turn,
+          // then the next final is accepted unconditionally (no failure
+          // branch — unlike the full-read guard, a degraded answer with
+          // disclosed coverage beats an aborted run).
+          const libraryScoped = Boolean(
+            request.selectedCollectionContexts?.length ||
+            request.selectedTagContexts?.length,
+          );
+          if (
+            libraryScoped &&
+            !shallowLibraryCorrectionUsed &&
+            isEvidenceSeekingTurn(request)
+          ) {
+            const shallowSignal =
+              findLibraryRetrieveShallowSignal(toolExecutionRecords);
+            const classifiedRetrieval =
+              request.classifiedIntent?.retrievalIntent;
+            const answeredShallow =
+              !shallowSignal.ranRetrieveFamily ||
+              (shallowSignal.lastRetrieveShallow &&
+                (classifiedRetrieval === "summarize" ||
+                  classifiedRetrieval === "verify"));
+            if (answeredShallow) {
+              shallowLibraryCorrectionUsed = true;
+              await rollbackCommittedStreamedText(stepStreamedText);
+              const assistantCorrectionMessage: AgentModelMessage =
+                step.assistantMessage ?? {
+                  role: "assistant",
+                  content: step.text || stepStreamedText,
+                };
+              const userCorrectionMessage: AgentModelMessage = {
+                role: "user",
+                content:
+                  "Correction for this turn: the question targets the selected collection/tag scope and needs library evidence. Call `library_retrieve` scoped to the selected collections/tags now (intent:'summarize' for synthesis or theme questions, 'enumerate' for which-papers questions; depth:'evidence'), then answer from the returned evidence. Include the coverage line (papers planned / body evidence read / metadata-only) in the final answer; if coverage is partial, name what is missing instead of generalizing.",
+              };
+              messages.push(assistantCorrectionMessage, userCorrectionMessage);
+              newTranscriptMessages.push(
+                assistantCorrectionMessage,
+                userCorrectionMessage,
+              );
+              continue;
+            }
           }
           return emitFinalStep(step, stepStreamedText);
         }

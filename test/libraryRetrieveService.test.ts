@@ -1226,9 +1226,7 @@ describe("LibraryRetrieveService", function () {
     // The raw CJK sentence is no longer sent verbatim; segmented keyword
     // probes derived from it are.
     assert.notInclude(recordedQueries, result.queryPlan.originalQuery);
-    assert.isTrue(
-      recordedQueries.some((query) => /[一-鿿]/.test(query)),
-    );
+    assert.isTrue(recordedQueries.some((query) => /[一-鿿]/.test(query)));
     assert.equal(result.resourcePool.queryCoverage.indexedTextMatched, 1);
     assert.include(result.candidates[0].matchedQueryVariants || [], variant);
     const indexedMatch = result.paperMatches.find(
@@ -1761,7 +1759,10 @@ describe("LibraryRetrieveService quicksearch probes", function () {
     ];
     const quicksearchCalls: Array<{ query?: string }> = [];
     const service = new LibraryRetrieveService(
-      makeGateway(entries, { quicksearchCalls, quicksearchItemIds: [1] }) as any,
+      makeGateway(entries, {
+        quicksearchCalls,
+        quicksearchItemIds: [1],
+      }) as any,
       { ensurePaperContext: async () => makePdfContext([]) } as any,
       async () => [],
     );
@@ -1790,7 +1791,10 @@ describe("LibraryRetrieveService quicksearch probes", function () {
     const entries = [makeItem(1, "Calcium imaging analysis")];
     const quicksearchCalls: Array<{ query?: string }> = [];
     const service = new LibraryRetrieveService(
-      makeGateway(entries, { quicksearchCalls, quicksearchItemIds: [1] }) as any,
+      makeGateway(entries, {
+        quicksearchCalls,
+        quicksearchItemIds: [1],
+      }) as any,
       { ensurePaperContext: async () => makePdfContext([]) } as any,
       async () => [],
     );
@@ -1927,7 +1931,11 @@ describe("LibraryRetrieveService pool BM25", function () {
   it("keeps exact title-phrase matches ranked above bm25-only overlap", async function () {
     const entries = [
       makeItem(1, "Calcium imaging analysis", "Detailed pipeline."),
-      makeItem(2, "Paper two", "ｃａｌｃｉｕｍ ｉｍａｇｉｎｇ ａｎａｌｙｓｉｓ"),
+      makeItem(
+        2,
+        "Paper two",
+        "ｃａｌｃｉｕｍ ｉｍａｇｉｎｇ ａｎａｌｙｓｉｓ",
+      ),
     ];
     const service = new LibraryRetrieveService(
       makeGateway(entries) as any,
@@ -2330,9 +2338,9 @@ describe("LibraryRetrieveService evidence triage", function () {
       {
         ensurePaperContext: async () => makePdfContext(["Body chunk text."]),
       } as any,
-      (async (paperContext: PaperContextRef): Promise<
-        PaperContextCandidate[]
-      > => {
+      (async (
+        paperContext: PaperContextRef,
+      ): Promise<PaperContextCandidate[]> => {
         builderCalls.push(paperContext.itemId);
         return [];
       }) as any,
@@ -2485,9 +2493,9 @@ describe("LibraryRetrieveService body-evidence defaults", function () {
       {
         ensurePaperContext: async () => makePdfContext(["chunk a", "chunk b"]),
       } as any,
-      (async (paperContext: PaperContextRef): Promise<
-        PaperContextCandidate[]
-      > => [
+      (async (
+        paperContext: PaperContextRef,
+      ): Promise<PaperContextCandidate[]> => [
         makeCandidate(paperContext, {
           chunkIndex: 0,
           chunkKind: "abstract",
@@ -2529,9 +2537,9 @@ describe("LibraryRetrieveService body-evidence defaults", function () {
       {
         ensurePaperContext: async () => makePdfContext(["chunk a"]),
       } as any,
-      (async (paperContext: PaperContextRef): Promise<
-        PaperContextCandidate[]
-      > => [
+      (async (
+        paperContext: PaperContextRef,
+      ): Promise<PaperContextCandidate[]> => [
         makeCandidate(paperContext, {
           chunkIndex: 0,
           chunkKind: "abstract",
@@ -2565,9 +2573,9 @@ describe("LibraryRetrieveService body-evidence defaults", function () {
       {
         ensurePaperContext: async () => makePdfContext(["chunk a", "chunk b"]),
       } as any,
-      (async (paperContext: PaperContextRef): Promise<
-        PaperContextCandidate[]
-      > => [
+      (async (
+        paperContext: PaperContextRef,
+      ): Promise<PaperContextCandidate[]> => [
         makeCandidate(paperContext, {
           chunkIndex: 2,
           chunkKind: "results",
@@ -2589,7 +2597,10 @@ describe("LibraryRetrieveService body-evidence defaults", function () {
       perPaperTopK: 1,
       request: {
         ...REQUEST,
-        classifiedIntent: { retrievalIntent: "enumerate", wantedSections: ["methods"] },
+        classifiedIntent: {
+          retrievalIntent: "enumerate",
+          wantedSections: ["methods"],
+        },
       } as any,
     });
 

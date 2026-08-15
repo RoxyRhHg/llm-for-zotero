@@ -3428,3 +3428,214 @@ describe("AgentRuntime", function () {
     }
   });
 });
+
+describe("shallow library answer guard", function () {
+  const GUARD_CAPS = {
+    streaming: false,
+    toolCalls: true,
+    multimodal: false,
+    fileInputs: false,
+    reasoning: true,
+  };
+  const GUARD_REQUEST = {
+    conversationKey: 1,
+    mode: "agent" as const,
+    userText: "What methods do these papers share?",
+    model: "gpt-4o-mini",
+    apiBase: "https://api.openai.com/v1/chat/completions",
+    apiKey: "test",
+    selectedCollectionContexts: [{ collectionId: 3, name: "C", libraryID: 1 }],
+  };
+  const registerGuardRetrieve = (
+    registry: AgentToolRegistry,
+    result: unknown,
+  ) => {
+    registry.register({
+      spec: {
+        name: "library_retrieve",
+        description: "retrieve",
+        inputSchema: { type: "object" },
+        mutability: "read",
+        requiresConfirmation: false,
+      },
+      validate: () => ({ ok: true, value: {} }),
+      execute: async () => result,
+    });
+  };
+  const finalStep = (text: string) => ({
+    kind: "final" as const,
+    text,
+    assistantMessage: { role: "assistant" as const, content: text },
+  });
+  const retrieveCallStep = (id: string) => ({
+    kind: "tool_calls" as const,
+    calls: [{ id, name: "library_retrieve", arguments: {} }],
+    assistantMessage: {
+      role: "assistant" as const,
+      content: "",
+      tool_calls: [{ id, name: "library_retrieve", arguments: {} }],
+    },
+  });
+
+  it("injects one correction when a collection-scoped evidence question skips retrieval", async function () {
+    const restoreDb = installMockDb();
+    try {
+      const registry = new AgentToolRegistry();
+      registerGuardRetrieve(registry, {
+        answerContract: { papersBodyRead: 3, papersPlanned: 5 },
+        resourcePool: { states: { textAvailable: 5 }, queryCoverage: {} },
+        snippets: [],
+        warnings: [],
+      });
+      const stepMessages: AgentModelMessage[][] = [];
+      const steps = [
+        finalStep("Shallow answer."),
+        retrieveCallStep("call-guard-1"),
+        finalStep("Grounded answer."),
+      ];
+      let stepIndex = 0;
+      const runtime = new AgentRuntime({
+        registry,
+        adapterFactory: () => ({
+          getCapabilities: () => GUARD_CAPS,
+          supportsTools: () => true,
+          async runStep(params: AgentStepParams): Promise<AgentModelStep> {
+            stepMessages.push(params.messages.slice());
+            const step = steps[stepIndex];
+            stepIndex += 1;
+            return step;
+          },
+        }),
+      });
+      const outcome = await runtime.runTurn({
+        request: { ...GUARD_REQUEST },
+        onEvent: () => {},
+      });
+
+      assert.equal(outcome.kind, "completed");
+      if (outcome.kind !== "completed") return;
+      assert.equal(outcome.text, "Grounded answer.");
+      const lastMessages = stepMessages[stepMessages.length - 1];
+      const corrections = lastMessages.filter(
+        (message) =>
+          message.role === "user" &&
+          typeof message.content === "string" &&
+          message.content.includes("Correction for this turn"),
+      );
+      assert.lengthOf(corrections, 1);
+    } finally {
+      restoreDb();
+    }
+  });
+
+  it("accepts the next final unconditionally after one correction", async function () {
+    const restoreDb = installMockDb();
+    try {
+      const runtime = new AgentRuntime({
+        registry: new AgentToolRegistry(),
+        adapterFactory: () =>
+          new MockAdapter(
+            [finalStep("First answer."), finalStep("Second answer.")],
+            GUARD_CAPS,
+          ),
+      });
+      const outcome = await runtime.runTurn({
+        request: { ...GUARD_REQUEST },
+        onEvent: () => {},
+      });
+
+      assert.equal(outcome.kind, "completed");
+      if (outcome.kind !== "completed") return;
+      assert.equal(outcome.text, "Second answer.");
+    } finally {
+      restoreDb();
+    }
+  });
+
+  it("suppresses the guard when the classifier says the turn needs no retrieval", async function () {
+    const restoreDb = installMockDb();
+    try {
+      const runtime = new AgentRuntime({
+        registry: new AgentToolRegistry(),
+        adapterFactory: () =>
+          new MockAdapter([finalStep("Direct answer.")], GUARD_CAPS),
+      });
+      const outcome = await runtime.runTurn({
+        request: {
+          ...GUARD_REQUEST,
+          classifiedIntent: { retrievalIntent: "none", wantedSections: [] },
+        },
+        onEvent: () => {},
+      });
+
+      assert.equal(outcome.kind, "completed");
+      if (outcome.kind !== "completed") return;
+      assert.equal(outcome.text, "Direct answer.");
+    } finally {
+      restoreDb();
+    }
+  });
+
+  it("does not correct without a selected library scope", async function () {
+    const restoreDb = installMockDb();
+    try {
+      const runtime = new AgentRuntime({
+        registry: new AgentToolRegistry(),
+        adapterFactory: () =>
+          new MockAdapter([finalStep("Direct answer.")], GUARD_CAPS),
+      });
+      const outcome = await runtime.runTurn({
+        request: { ...GUARD_REQUEST, selectedCollectionContexts: [] },
+        onEvent: () => {},
+      });
+
+      assert.equal(outcome.kind, "completed");
+      if (outcome.kind !== "completed") return;
+      assert.equal(outcome.text, "Direct answer.");
+    } finally {
+      restoreDb();
+    }
+  });
+
+  it("corrects a metadata-only retrieve for a classified summarize turn", async function () {
+    const restoreDb = installMockDb();
+    try {
+      const registry = new AgentToolRegistry();
+      registerGuardRetrieve(registry, {
+        answerContract: { papersBodyRead: 0, papersPlanned: 5 },
+        resourcePool: { states: { textAvailable: 5 }, queryCoverage: {} },
+        snippets: [],
+        warnings: [],
+      });
+      const runtime = new AgentRuntime({
+        registry,
+        adapterFactory: () =>
+          new MockAdapter(
+            [
+              retrieveCallStep("call-guard-2"),
+              finalStep("Metadata-only answer."),
+              retrieveCallStep("call-guard-3"),
+              finalStep("Still metadata."),
+            ],
+            GUARD_CAPS,
+          ),
+      });
+      const outcome = await runtime.runTurn({
+        request: {
+          ...GUARD_REQUEST,
+          classifiedIntent: {
+            retrievalIntent: "summarize",
+            wantedSections: [],
+          },
+        },
+        onEvent: () => {},
+      });
+
+      assert.equal(outcome.kind, "completed");
+      if (outcome.kind !== "completed") return;
+      assert.equal(outcome.text, "Still metadata.");
+    } finally {
+      restoreDb();
+    }
+  });
+});
