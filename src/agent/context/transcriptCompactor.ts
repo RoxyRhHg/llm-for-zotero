@@ -1,5 +1,8 @@
 import type { AgentModelMessage, AgentToolMessage } from "../types";
-import { estimateContextMessagesTokens } from "../../utils/modelInputCap";
+import {
+  estimateContextMessagesTokens,
+  sliceTextToTokenBudget,
+} from "../../utils/modelInputCap";
 import type { AgentContextBudgetState } from "./budgetPolicy";
 import {
   createAgentToolResultHandleRecord,
@@ -117,7 +120,17 @@ function buildSummaryMessage(
   summaryTokens: number,
   toolHandleLines: string[] = [],
 ): AgentModelMessage {
-  const summaryChars = Math.max(600, summaryTokens * 4);
+  // Char cap derived from the real token weight of the (whitespace-normalized)
+  // summary text; a flat tokens * 4 inverse let CJK checkpoints exceed their
+  // token budget 2x. The 600-char floor keeps tiny budgets minimally useful.
+  const buildBudgetChars = (candidate: string): number =>
+    Math.max(
+      600,
+      sliceTextToTokenBudget(
+        candidate.replace(/\s+/g, " ").trim(),
+        summaryTokens,
+      ).length,
+    );
   const userLines: string[] = [];
   const assistantLines: string[] = [];
   const toolCounts = new Map<string, number>();
@@ -151,9 +164,10 @@ function buildSummaryMessage(
       ? `Stored compacted tool-result handles:\n${toolHandleLines.join("\n")}`
       : "",
   ].filter(Boolean);
+  const summaryText = sections.join("\n\n");
   return {
     role: "user",
-    content: truncateText(sections.join("\n\n"), summaryChars),
+    content: truncateText(summaryText, buildBudgetChars(summaryText)),
   };
 }
 

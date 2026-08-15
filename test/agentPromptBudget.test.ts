@@ -531,3 +531,34 @@ describe("agent prompt budget", function () {
     );
   });
 });
+
+describe("CJK convergence", function () {
+  it("converges instead of throwing for CJK-heavy oversized tool results", function () {
+    const messages: AgentModelMessage[] = [
+      { role: "system", content: "System prompt" },
+      { role: "user", content: "总结这些论文" },
+      {
+        role: "assistant",
+        content: "",
+        tool_calls: [
+          { id: "call-1", name: "library_retrieve", arguments: {} },
+        ],
+      },
+      {
+        role: "tool",
+        name: "library_retrieve",
+        tool_call_id: "call-1",
+        content: JSON.stringify({ text: "神经网络研究综述。".repeat(20000) }),
+      },
+      { role: "user", content: "继续" },
+    ];
+
+    const result = enforceAgentPromptBudget({
+      messages,
+      model: "gpt-4o-mini",
+      inputTokenCap: 24_000,
+    });
+
+    assert.isAtMost(result.estimatedAfterTokens, result.softLimitTokens);
+  });
+});

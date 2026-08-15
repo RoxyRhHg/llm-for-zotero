@@ -11,6 +11,7 @@ import {
   estimateContextMessagesTokens,
   estimateTextTokens,
   resolveContextWindowTokens,
+  sliceTextToTokenBudget,
 } from "../../utils/modelInputCap";
 
 const AGENT_PROMPT_SOFT_LIMIT_RATIO = 0.9;
@@ -149,11 +150,13 @@ function estimateMessageTokens(message: AgentModelMessage): number {
 }
 
 function truncateStringToTokenBudget(value: string, maxTokens: number): string {
-  const maxChars = Math.max(64, Math.floor(maxTokens * 4));
   if (estimateTextTokens(value) <= maxTokens) return value;
   const notice = "\n\n[Content truncated to fit the model context budget.]";
-  const bodyChars = Math.max(0, maxChars - notice.length);
-  return `${value.slice(0, bodyChars).trimEnd()}${notice}`;
+  // Slice by real token weight (CJK counts double) so the truncated result
+  // actually fits the budget it claims — a chars = tokens * 4 inverse never
+  // converges for CJK-heavy content.
+  const bodyTokens = Math.max(16, maxTokens - estimateTextTokens(notice));
+  return `${sliceTextToTokenBudget(value, bodyTokens).trimEnd()}${notice}`;
 }
 
 function compactScalar(value: unknown, maxChars = 240): unknown {

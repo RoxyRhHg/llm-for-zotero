@@ -1,5 +1,6 @@
 import { assert } from "chai";
 import { buildAgentContextBudgetState } from "../src/agent/context/budgetPolicy";
+import { estimateTextTokens } from "../src/utils/modelInputCap";
 import { compactAgentTranscript } from "../src/agent/context/transcriptCompactor";
 import type { AgentModelMessage } from "../src/agent/types";
 
@@ -68,6 +69,39 @@ describe("agent transcript compactor", function () {
     assert.include(
       String(result.summaryMessage?.content),
       result.handleRecords[0].handle,
+    );
+  });
+});
+
+describe("CJK summary budget", function () {
+  it("keeps the compact checkpoint within its token budget for CJK content", function () {
+    const messages: AgentModelMessage[] = Array.from(
+      { length: 12 },
+      (_, index) =>
+        index % 2 === 0
+          ? { role: "user" as const, content: `问题${index}：${"神经科学研究进展。".repeat(40)}` }
+          : { role: "assistant" as const, content: `回答${index}：${"表征漂移的证据分析。".repeat(40)}` },
+    );
+    messages.push({ role: "user", content: "最后的问题" });
+
+    const result = compactAgentTranscript({
+      messages,
+      budget: {
+        policy: { minRecentMessages: 2 } as any,
+        recentTailTokens: 200,
+        summaryTokens: 400,
+      } as any,
+      force: true,
+    });
+
+    assert.isTrue(result.compacted);
+    const summary = result.summaryMessage;
+    assert.isOk(summary);
+    assert.isAtMost(
+      estimateTextTokens(
+        typeof summary?.content === "string" ? summary.content : "",
+      ),
+      400,
     );
   });
 });

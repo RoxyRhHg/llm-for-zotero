@@ -3,7 +3,10 @@ import type {
   AgentToolDefinition,
   AgentToolInputValidation,
 } from "../../types";
-import { estimateTextTokens } from "../../../utils/modelInputCap";
+import {
+  estimateTextTokens,
+  sliceTextToTokenBudget,
+} from "../../../utils/modelInputCap";
 import { getAgentToolResultHandle } from "../../store/toolResultHandles";
 import { fail, ok } from "../shared";
 
@@ -98,9 +101,9 @@ function truncateToTokenBudget(
   if (estimateTextTokens(text) <= maxTokens) {
     return { value };
   }
-  const maxChars = Math.max(256, maxTokens * 4);
+  const excerptBody = sliceTextToTokenBudget(text, Math.max(64, maxTokens));
   return {
-    excerpt: `${text.slice(0, maxChars).trimEnd()}\n\n[Section truncated to fit maxTokens.]`,
+    excerpt: `${excerptBody.trimEnd()}\n\n[Section truncated to fit maxTokens.]`,
     truncated: true,
   };
 }

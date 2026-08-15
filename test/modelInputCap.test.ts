@@ -5,6 +5,7 @@ import {
   estimateConversationTokens,
   estimateTextTokens,
   getModelInputTokenLimit,
+  sliceTextToTokenBudget,
   resolveContextWindowTokens,
   type InputCapMessage,
 } from "../src/utils/modelInputCap";
@@ -206,5 +207,27 @@ describe("estimateTextTokens per-script estimation", function () {
 
   it("returns zero for an empty string", function () {
     assert.equal(estimateTextTokens(""), 0);
+  });
+});
+
+describe("sliceTextToTokenBudget", function () {
+  it("slices ASCII at four chars per token", function () {
+    assert.equal(sliceTextToTokenBudget("a".repeat(40), 5), "a".repeat(20));
+  });
+
+  it("slices CJK at two chars per token", function () {
+    assert.equal(sliceTextToTokenBudget("神".repeat(8), 2), "神神神神");
+  });
+
+  it("keeps the estimate of the slice within the budget for mixed text", function () {
+    const text = `${"a".repeat(100)}${"神".repeat(100)}`;
+    const sliced = sliceTextToTokenBudget(text, 30);
+
+    assert.isAtMost(estimateTextTokens(sliced), 30);
+    assert.isBelow(sliced.length, text.length);
+  });
+
+  it("returns the whole text when it fits", function () {
+    assert.equal(sliceTextToTokenBudget("short", 100), "short");
   });
 });

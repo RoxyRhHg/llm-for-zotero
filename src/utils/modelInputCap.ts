@@ -309,6 +309,27 @@ function isCjkLikeCharCode(code: number): boolean {
   );
 }
 
+/**
+ * Largest prefix of `text` whose estimateTextTokens result stays within
+ * `maxTokens`. Exact against the per-script estimator (CJK-like chars weigh
+ * 1/2 token, everything else 1/4), single O(n) pass. Char-count inverses of
+ * the estimator (tokens * 4) are wrong for CJK — use this instead.
+ */
+export function sliceTextToTokenBudget(
+  text: string,
+  maxTokens: number,
+): string {
+  if (!text) return "";
+  const budget = Math.max(0, maxTokens);
+  if (!budget) return "";
+  let weight = 0;
+  for (let index = 0; index < text.length; index += 1) {
+    weight += isCjkLikeCharCode(text.charCodeAt(index)) ? 0.5 : 0.25;
+    if (weight > budget) return text.slice(0, index);
+  }
+  return text;
+}
+
 export function estimateTextTokens(text: string): number {
   if (!text) return 0;
   // CJK scripts tokenize at roughly 2 chars/token versus ~4 for ASCII; the
