@@ -4,6 +4,11 @@ import {
   resolveRetrievalQueryPlan,
   type RetrievalQueryPlan,
 } from "../../modules/contextPanel/retrievalQueryPlan";
+import {
+  extractCjkKeywordProbes,
+  isCjkDominantText,
+  stripTerminalPunctuation,
+} from "../../modules/contextPanel/retrievalTokenizer";
 import type {
   PaperContextCandidate,
   PdfContext,
@@ -390,6 +395,47 @@ const DEFAULT_METHODS: LibraryRetrieveMethod[] = [
   "fts",
   "semantic",
 ];
+
+export const QUICKSEARCH_MAX_PROBES = 8;
+const CJK_FULL_PHRASE_PROBE_MAX_CHARS = 12;
+const CJK_KEYWORD_PROBES_PER_QUERY = 4;
+
+/**
+ * Zotero's quicksearch treats a whitespace-free query as one literal
+ * substring, so a raw CJK question (often ending in ？) matches nothing.
+ * Derive bounded probes from the query plan instead: strip terminal
+ * punctuation everywhere, and for CJK-dominant queries send segmented
+ * keyword probes rather than the full sentence.
+ */
+export function buildQuicksearchProbes(queryPlan: RetrievalQueryPlan): string[] {
+  const probes: string[] = [];
+  const seen = new Set<string>();
+  const push = (value: string) => {
+    const trimmed = value.trim();
+    if (!trimmed) return;
+    const key = trimmed.toLowerCase();
+    if (seen.has(key)) return;
+    seen.add(key);
+    probes.push(trimmed);
+  };
+  for (const query of queryPlan.effectiveQueries) {
+    if (probes.length >= QUICKSEARCH_MAX_PROBES) break;
+    const stripped = stripTerminalPunctuation(query);
+    if (!stripped) continue;
+    if (isCjkDominantText(stripped)) {
+      if (stripped.length <= CJK_FULL_PHRASE_PROBE_MAX_CHARS) push(stripped);
+      for (const probe of extractCjkKeywordProbes(
+        stripped,
+        CJK_KEYWORD_PROBES_PER_QUERY,
+      )) {
+        push(probe);
+      }
+    } else {
+      push(stripped);
+    }
+  }
+  return probes.slice(0, QUICKSEARCH_MAX_PROBES);
+}
 
 const DEFAULT_INTENT: LibraryRetrieveIntent = "enumerate";
 
@@ -1741,7 +1787,11 @@ export class LibraryRetrieveService {
     records: ResourceRecord[],
     input: NormalizedLibraryRetrieveInput,
     warnings: string[],
+    options: { probesOverride?: string[] } = {},
   ): Promise<IndexedTextScanResult> {
+    const probes = options.probesOverride?.length
+      ? options.probesOverride
+      : buildQuicksearchProbes(input.queryPlan);
     const scan: IndexedTextScanResult = {
       available: records.filter((record) =>
         record.resourceState.has("text_available"),
@@ -1796,7 +1846,7 @@ export class LibraryRetrieveService {
       };
 
       if (scope.collectionIds.length) {
-        for (const query of input.queryPlan.effectiveQueries) {
+        for (const query of probes) {
           for (const collectionId of scope.collectionIds) {
             await runQuicksearch(query, {
               filters: { collectionId },
@@ -1805,7 +1855,7 @@ export class LibraryRetrieveService {
         }
       }
       if (scope.tagContexts.length) {
-        for (const query of input.queryPlan.effectiveQueries) {
+        for (const query of probes) {
           if (scope.tagItemIds.length) {
             await runQuicksearch(query, {
               allowedItemIds: scope.tagItemIds,
@@ -1818,7 +1868,7 @@ export class LibraryRetrieveService {
         return scan;
       }
       const explicit = new Set(scope.explicitItemIds);
-      for (const query of input.queryPlan.effectiveQueries) {
+      for (const query of probes) {
         await runQuicksearch(
           query,
           explicit.size ? { allowedItemIds: allRecordItemIds } : {},

@@ -1,5 +1,10 @@
 import { assert } from "chai";
-import { LibraryRetrieveService } from "../src/agent/services/libraryRetrieveService";
+import {
+  LibraryRetrieveService,
+  QUICKSEARCH_MAX_PROBES,
+  buildQuicksearchProbes,
+} from "../src/agent/services/libraryRetrieveService";
+import { buildRetrievalQueryPlan } from "../src/modules/contextPanel/retrievalQueryPlan";
 import type {
   EditableArticleMetadataSnapshot,
   LibraryItemTarget,
@@ -1216,9 +1221,13 @@ describe("LibraryRetrieveService", function () {
     });
 
     assert.deepEqual(result.queryPlan.variants, [variant]);
-    assert.deepEqual(
-      quicksearchCalls.map((call) => call.query),
-      [result.queryPlan.originalQuery, variant],
+    const recordedQueries = quicksearchCalls.map((call) => call.query || "");
+    assert.include(recordedQueries, variant);
+    // The raw CJK sentence is no longer sent verbatim; segmented keyword
+    // probes derived from it are.
+    assert.notInclude(recordedQueries, result.queryPlan.originalQuery);
+    assert.isTrue(
+      recordedQueries.some((query) => /[一-鿿]/.test(query)),
     );
     assert.equal(result.resourcePool.queryCoverage.indexedTextMatched, 1);
     assert.include(result.candidates[0].matchedQueryVariants || [], variant);
@@ -1740,5 +1749,81 @@ describe("LibraryRetrieveService", function () {
     });
 
     assert.equal(input?.intent, "enumerate");
+  });
+});
+
+describe("LibraryRetrieveService quicksearch probes", function () {
+  it("sends segmented keyword probes for a CJK question, never the raw sentence", async function () {
+    const entries = [
+      makeItem(1, "神经形态计算综述", "关于神经形态计算的研究。"),
+    ];
+    const quicksearchCalls: Array<{ query?: string }> = [];
+    const service = new LibraryRetrieveService(
+      makeGateway(entries, { quicksearchCalls, quicksearchItemIds: [1] }) as any,
+      { ensurePaperContext: async () => makePdfContext([]) } as any,
+      async () => [],
+    );
+
+    await service.retrieve({
+      query: "这个文件夹里哪些论文讨论了神经形态计算？",
+      depth: "evidence",
+      request: {
+        conversationKey: 1,
+        mode: "agent",
+        userText: "x",
+        libraryID: 1,
+      },
+    });
+
+    const queries = quicksearchCalls.map((call) => call.query || "");
+    assert.isAbove(queries.length, 0);
+    for (const query of queries) {
+      assert.notMatch(query, /[？?]$/);
+      assert.notEqual(query, "这个文件夹里哪些论文讨论了神经形态计算？");
+      assert.notEqual(query, "这个文件夹里哪些论文讨论了神经形态计算");
+    }
+  });
+
+  it("sends English queries whole with terminal punctuation stripped", async function () {
+    const entries = [makeItem(1, "Calcium imaging analysis")];
+    const quicksearchCalls: Array<{ query?: string }> = [];
+    const service = new LibraryRetrieveService(
+      makeGateway(entries, { quicksearchCalls, quicksearchItemIds: [1] }) as any,
+      { ensurePaperContext: async () => makePdfContext([]) } as any,
+      async () => [],
+    );
+
+    await service.retrieve({
+      query: "Which papers use calcium imaging?",
+      depth: "evidence",
+      request: {
+        conversationKey: 1,
+        mode: "agent",
+        userText: "x",
+        libraryID: 1,
+      },
+    });
+
+    const queries = quicksearchCalls.map((call) => call.query || "");
+    assert.include(queries, "Which papers use calcium imaging");
+    assert.notInclude(queries, "Which papers use calcium imaging?");
+  });
+
+  it("caps the derived probe list at QUICKSEARCH_MAX_PROBES", function () {
+    const plan = buildRetrievalQueryPlan({
+      query: "神经形态计算的最新研究进展有哪些？",
+      queryVariants: [
+        "neuromorphic computing",
+        "spiking neural networks",
+        "类脑计算芯片的研究",
+        "brain-inspired chips",
+        "event-driven processing",
+      ],
+    });
+
+    const probes = buildQuicksearchProbes(plan);
+
+    assert.isAtMost(probes.length, QUICKSEARCH_MAX_PROBES);
+    assert.isAbove(probes.length, 0);
   });
 });
