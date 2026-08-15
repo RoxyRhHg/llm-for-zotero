@@ -294,9 +294,36 @@ function buildFallbackMessages(
   return messages.length ? [messages[messages.length - 1]] : [];
 }
 
+const CJK_CHARS_PER_TOKEN = 2;
+
+function isCjkLikeCharCode(code: number): boolean {
+  return (
+    (code >= 0x1100 && code <= 0x11ff) || // Hangul Jamo
+    (code >= 0x3000 && code <= 0x30ff) || // CJK punctuation + kana
+    (code >= 0x3130 && code <= 0x318f) || // Hangul compatibility Jamo
+    (code >= 0x3400 && code <= 0x4dbf) || // CJK extension A
+    (code >= 0x4e00 && code <= 0x9fff) || // CJK unified ideographs
+    (code >= 0xac00 && code <= 0xd7af) || // Hangul syllables
+    (code >= 0xf900 && code <= 0xfaff) || // CJK compatibility ideographs
+    (code >= 0xff00 && code <= 0xffef) // full/half-width forms
+  );
+}
+
 export function estimateTextTokens(text: string): number {
   if (!text) return 0;
-  return Math.ceil(text.length / TOKEN_ESTIMATE_CHARS_PER_TOKEN);
+  // CJK scripts tokenize at roughly 2 chars/token versus ~4 for ASCII; the
+  // flat /4 estimate undercounted CJK 2-4x, so budgets and compaction
+  // triggers fired far too late for Chinese/Japanese/Korean transcripts.
+  // Surrogate-pair CJK extensions and emoji fall into the /4 bucket, which
+  // stays an undercount but a rare one. Single O(n) pass, no allocation.
+  let cjkLikeChars = 0;
+  for (let index = 0; index < text.length; index += 1) {
+    if (isCjkLikeCharCode(text.charCodeAt(index))) cjkLikeChars += 1;
+  }
+  return Math.ceil(
+    cjkLikeChars / CJK_CHARS_PER_TOKEN +
+      (text.length - cjkLikeChars) / TOKEN_ESTIMATE_CHARS_PER_TOKEN,
+  );
 }
 
 export function estimateConversationTokens(

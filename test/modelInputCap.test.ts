@@ -3,6 +3,7 @@ import {
   applyModelInputTokenCap,
   estimateContextMessagesTokens,
   estimateConversationTokens,
+  estimateTextTokens,
   getModelInputTokenLimit,
   resolveContextWindowTokens,
   type InputCapMessage,
@@ -182,5 +183,28 @@ describe("modelInputCap", function () {
       assert.isFalse(result.capped);
       assert.equal(result.estimatedAfterTokens, result.estimatedBeforeTokens);
     });
+  });
+});
+
+describe("estimateTextTokens per-script estimation", function () {
+  it("keeps the ASCII estimate at length/4", function () {
+    assert.equal(estimateTextTokens("a".repeat(40)), 10);
+  });
+
+  it("counts CJK characters at two chars per token", function () {
+    assert.equal(estimateTextTokens("神".repeat(8)), 4);
+  });
+
+  it("counts kana and hangul as CJK-like", function () {
+    assert.equal(estimateTextTokens("ありがとう"), 3);
+    assert.equal(estimateTextTokens("안녕하세요"), 3);
+  });
+
+  it("sums mixed scripts per bucket", function () {
+    assert.equal(estimateTextTokens("abcd神经"), 2);
+  });
+
+  it("returns zero for an empty string", function () {
+    assert.equal(estimateTextTokens(""), 0);
   });
 });
