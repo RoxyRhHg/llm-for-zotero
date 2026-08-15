@@ -28,12 +28,19 @@ import type { AgentRuntimeRequest, ClassifiedTurnIntent } from "../types";
  */
 const UNMATCHED_ID = "unmatched";
 
-const TURN_INTENT_TIMEOUT_MS = 8000;
+// Generous enough for reasoning providers whose hidden thinking regularly
+// exceeds 10s to completion; the runtime abort signal still cancels early.
+export const TURN_INTENT_TIMEOUT_MS = 20_000;
 
 export type DetectTurnIntentResult = {
   skillIds: string[];
   /** Null whenever classification degraded — callers keep regex behavior. */
   classifiedIntent: ClassifiedTurnIntent | null;
+  /**
+   * True when a usable model config was present but the LLM call failed or
+   * returned malformed output — the silent-regression case worth surfacing.
+   */
+  degraded: boolean;
 };
 
 /**
@@ -46,13 +53,23 @@ export async function detectTurnIntent(
   skills: AgentSkill[],
   options: { signal?: AbortSignal; timeoutMs?: number } = {},
 ): Promise<DetectTurnIntentResult> {
-  if (skills.length === 0) return { skillIds: [], classifiedIntent: null };
+  if (skills.length === 0) {
+    return { skillIds: [], classifiedIntent: null, degraded: false };
+  }
   const userText = (request.userText || "").trim();
   if (!userText) {
-    return { skillIds: regexFallback(skills, request), classifiedIntent: null };
+    return {
+      skillIds: regexFallback(skills, request),
+      classifiedIntent: null,
+      degraded: false,
+    };
   }
   if (!canUseSkillClassifierModel(request)) {
-    return { skillIds: regexFallback(skills, request), classifiedIntent: null };
+    return {
+      skillIds: regexFallback(skills, request),
+      classifiedIntent: null,
+      degraded: false,
+    };
   }
 
   const prompt = buildClassifierPrompt(skills, request);
@@ -77,7 +94,11 @@ export async function detectTurnIntent(
         err instanceof Error ? err.message : String(err)
       }`,
     );
-    return { skillIds: regexFallback(skills, request), classifiedIntent: null };
+    return {
+      skillIds: regexFallback(skills, request),
+      classifiedIntent: null,
+      degraded: true,
+    };
   }
 
   const classifiedIntent = parseClassifiedTurnIntent(raw);
@@ -86,9 +107,13 @@ export async function detectTurnIntent(
     Zotero.debug?.(
       `[llm-for-zotero] Skill classifier returned malformed JSON, falling back to regex. Raw: ${raw.slice(0, 200)}`,
     );
-    return { skillIds: regexFallback(skills, request), classifiedIntent };
+    return {
+      skillIds: regexFallback(skills, request),
+      classifiedIntent,
+      degraded: true,
+    };
   }
-  return { skillIds: parsed, classifiedIntent };
+  return { skillIds: parsed, classifiedIntent, degraded: false };
 }
 
 /**

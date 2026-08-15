@@ -2,6 +2,7 @@ import { assert } from "chai";
 import {
   buildRetrievalPlannerPrompt,
   buildRetrievalQueryPlan,
+  callLLMWithTimeout,
   generateRetrievalProbeReformulation,
   detectExplicitFullReadIntent,
   RETRIEVAL_QUERY_PLAN_TIMEOUT_MS,
@@ -352,5 +353,51 @@ describe("probe reformulation", function () {
     assert.isTrue(
       result.notes.some((note) => note.includes("Probe reformulation failed")),
     );
+  });
+});
+
+describe("callLLMWithTimeout runtime safety", function () {
+  it("enforces the timeout even when AbortController is unavailable", async function () {
+    const globalRef = globalThis as { AbortController?: typeof AbortController };
+    const originalCtor = globalRef.AbortController;
+    delete globalRef.AbortController;
+    try {
+      const started = Date.now();
+      let timedOut = false;
+      try {
+        await callLLMWithTimeout({
+          prompt: "x",
+          model: "m",
+          apiBase: "https://example.invalid",
+          apiKey: "k",
+          timeoutMs: 40,
+          llmCall: () => new Promise<string>(() => {}),
+        });
+      } catch {
+        timedOut = true;
+      }
+      assert.isTrue(timedOut);
+      assert.isBelow(Date.now() - started, 2000);
+    } finally {
+      globalRef.AbortController = originalCtor;
+    }
+  });
+
+  it("passes an abort signal to the call when AbortController exists", async function () {
+    let receivedSignal: unknown = null;
+    const result = await callLLMWithTimeout({
+      prompt: "x",
+      model: "m",
+      apiBase: "https://example.invalid",
+      apiKey: "k",
+      timeoutMs: 5000,
+      llmCall: async (params: { signal?: AbortSignal }) => {
+        receivedSignal = params.signal;
+        return "ok";
+      },
+    });
+
+    assert.equal(result, "ok");
+    assert.isOk(receivedSignal);
   });
 });

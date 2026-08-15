@@ -166,7 +166,11 @@ describe("detectTurnIntent", function () {
       SKILLS,
     );
 
-    assert.deepEqual(result, { skillIds: [], classifiedIntent: null });
+    assert.deepEqual(result, {
+      skillIds: [],
+      classifiedIntent: null,
+      degraded: false,
+    });
   });
 });
 

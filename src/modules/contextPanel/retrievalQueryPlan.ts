@@ -464,23 +464,42 @@ export async function callLLMWithTimeout(
   params: Omit<ChatParams, "signal"> & {
     parentSignal?: AbortSignal;
     timeoutMs?: number;
+    /** Test seam: replaces callLLM. */
+    llmCall?: (chatParams: ChatParams) => Promise<string>;
   },
 ): Promise<string> {
-  const controller = new AbortController();
-  const timeout = setTimeout(
-    () => controller.abort(),
-    params.timeoutMs || RETRIEVAL_QUERY_PLAN_TIMEOUT_MS,
-  );
-  const onAbort = () => controller.abort();
-  params.parentSignal?.addEventListener("abort", onAbort, { once: true });
+  const { parentSignal, timeoutMs, llmCall, ...chatParams } = params;
+  const budgetMs = timeoutMs || RETRIEVAL_QUERY_PLAN_TIMEOUT_MS;
+  // Zotero's Gecko chrome scope has no dependable bare AbortController (see
+  // the guarded constructors in mineruClient/chat.ts), so construct it only
+  // when present and enforce the bound with a raced timer either way — the
+  // request just cannot be cancelled mid-flight without abort support.
+  const AbortControllerCtor = (
+    globalThis as { AbortController?: typeof AbortController }
+  ).AbortController;
+  const controller = AbortControllerCtor ? new AbortControllerCtor() : null;
+  const onAbort = () => controller?.abort();
+  parentSignal?.addEventListener("abort", onAbort, { once: true });
+  let timeoutHandle: ReturnType<typeof setTimeout> | undefined;
+  const timeoutPromise = new Promise<never>((_, reject) => {
+    timeoutHandle = setTimeout(() => {
+      controller?.abort();
+      reject(new Error(`LLM call timed out after ${budgetMs}ms`));
+    }, budgetMs);
+  });
   try {
-    return await callLLM({
-      ...params,
-      signal: controller.signal,
-    });
+    const invoke = llmCall || callLLM;
+    const call = invoke({
+      ...chatParams,
+      signal: controller?.signal,
+    } as ChatParams);
+    // Keep a handler attached so a late rejection after a timeout loss does
+    // not surface as an unhandled rejection.
+    call.catch(() => {});
+    return await Promise.race([call, timeoutPromise]);
   } finally {
-    clearTimeout(timeout);
-    params.parentSignal?.removeEventListener("abort", onAbort);
+    if (timeoutHandle !== undefined) clearTimeout(timeoutHandle);
+    parentSignal?.removeEventListener("abort", onAbort);
   }
 }
 

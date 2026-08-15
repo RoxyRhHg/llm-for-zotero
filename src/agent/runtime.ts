@@ -908,6 +908,16 @@ export class AgentRuntime {
       if (turnIntent.classifiedIntent) {
         request.classifiedIntent = turnIntent.classifiedIntent;
       }
+      if (turnIntent.degraded) {
+        // Surface the silent-regression case: a usable model config was
+        // present but classification fell back to regex matching, reverting
+        // every classifier-driven default for this turn.
+        await emit({
+          type: "provider_event",
+          providerType: "turn_intent_classifier",
+          payload: { status: "degraded_to_regex" },
+        });
+      }
       const matchedSkills = getMatchedSkillIds(request, turnIntent.skillIds);
       const requiresFileNoteWrite = isWriteNoteFileRequest(
         request,
