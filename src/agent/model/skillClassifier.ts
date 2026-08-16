@@ -194,6 +194,7 @@ function buildClassifierPrompt(
     `• Use ["${UNMATCHED_ID}"] when the user's task is a direct Zotero operation or does not clearly require any skill's playbook. This is the correct answer for most turns.`,
     "• Only include a specific skill ID when the user's message unambiguously aligns with that skill's primary purpose. Do not include a skill just because its description shares a word with the user's message.",
     '• When the user\'s message genuinely combines multiple distinct subtasks (e.g. "read this paper, analyze figure 1, and write a note"), return every skill ID that maps to a distinct subtask. Do NOT pad the list with tangentially related skills.',
+    '• The user\'s message may be in any language (Chinese, Japanese, Korean, Spanish, French, German, Russian, Arabic, …). Match intent language-independently: a note request like "为这篇论文写阅读笔记" maps to the note-writing skill exactly as its English equivalent would.',
     '• retrievalIntent: how the question should read the library, in any language — "enumerate" for which/all/list/find-evidence questions, "verify" for exact presence/absence checks, "summarize" for themes/commonalities/comparisons/overviews across papers, "none" for pure operations (tagging, moving, editing) or single-paper reads.',
     "• wantedSections: only the sections the user explicitly asks about (methods, results, limitations); otherwise an empty array.",
     '• queryLanguage: short language code of the user message, e.g. "en", "zh", "ja".',

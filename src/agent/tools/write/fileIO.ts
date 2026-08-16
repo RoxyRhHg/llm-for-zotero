@@ -9,11 +9,7 @@ import {
   formatPaperSourceLabel,
 } from "../../../modules/contextPanel/paperAttribution";
 import { ok, fail, validateObject } from "../shared";
-import { getLocalParentPath, joinLocalPath } from "../../../utils/localPath";
-import {
-  getLocalPathBasename,
-  parseNotesDirectoryWritePolicy,
-} from "../../../utils/notesDirectoryConfig";
+import { getLocalParentPath } from "../../../utils/localPath";
 import { pushUndoEntry } from "../../store/undoStore";
 import { FILE_IO_CONTENT_FIELDS } from "../../toolArgumentFields";
 import { isMalformedToolArgumentsDiagnostic } from "../../toolArgumentDiagnostics";
@@ -28,11 +24,6 @@ type FileIOInput = {
   offset?: number;
   length?: number;
   allowOverwrite?: boolean;
-};
-
-type ResolvedWriteInput = {
-  input: FileIOInput;
-  requestedFilePath?: string;
 };
 
 type FileIOAction = FileIOInput["action"];
@@ -266,10 +257,6 @@ async function ensureDirectoryExists(directoryPath: string): Promise<void> {
   if (ioUtilsError) throw ioUtilsError;
 }
 
-function isMarkdownWritePath(filePath: string): boolean {
-  return /\.(?:md|markdown)$/i.test(filePath.trim());
-}
-
 function getRequestMineruPaperContexts(context: AgentToolContext) {
   return collectRequestPaperContexts(context.request).filter((paperContext) =>
     Boolean(paperContext.mineruCacheDir?.trim()),
@@ -286,31 +273,6 @@ function getRequestMineruCacheDirs(
         : "",
     )
     .filter(Boolean);
-}
-
-function resolveFileNoteWriteInput(
-  input: FileIOInput,
-  context: AgentToolContext,
-): ResolvedWriteInput {
-  if (input.action !== "write" || !isMarkdownWritePath(input.filePath)) {
-    return { input };
-  }
-  const policy = parseNotesDirectoryWritePolicy(
-    context.request.metadata?.fileNoteWritePolicy,
-  );
-  if (!policy) return { input };
-  if (!policy.enforceDefaultTarget) return { input };
-  const fileName = getLocalPathBasename(input.filePath);
-  if (!fileName) return { input };
-  const resolvedPath = joinLocalPath(policy.defaultTargetPath, fileName);
-  if (resolvedPath === input.filePath) return { input };
-  return {
-    input: {
-      ...input,
-      filePath: resolvedPath,
-    },
-    requestedFilePath: input.filePath,
-  };
 }
 
 function buildCodexMineruPaperSourceMetadata(
@@ -598,12 +560,7 @@ export function createFileIOTool(): AgentToolDefinition<FileIOInput, unknown> {
       });
     },
 
-    createPendingAction(input, context) {
-      const { input: effectiveInput } = resolveFileNoteWriteInput(
-        input,
-        context,
-      );
-      input = effectiveInput;
+    createPendingAction(input) {
       const fileName = input.filePath.split(/[\\/]/).pop() || input.filePath;
       if (input.action === "read") {
         return {
@@ -654,11 +611,7 @@ export function createFileIOTool(): AgentToolDefinition<FileIOInput, unknown> {
     async shouldRequireConfirmation(input, _context) {
       // Read operations are safe — auto-approve
       if (input.action === "read") return false;
-      const { input: effectiveInput } = resolveFileNoteWriteInput(
-        input,
-        _context,
-      );
-      const exists = await fileExists(effectiveInput.filePath);
+      const exists = await fileExists(input.filePath);
       // New file writes are reversible by deleting the created file, so they
       // can run directly. Unknown existence is treated like an overwrite.
       if (exists === false) return false;
@@ -667,18 +620,11 @@ export function createFileIOTool(): AgentToolDefinition<FileIOInput, unknown> {
       return true;
     },
 
-    applyConfirmation(input, _resolutionData, context) {
-      const { input: effectiveInput } = resolveFileNoteWriteInput(
-        input,
-        context,
-      );
-      return ok({ ...effectiveInput, allowOverwrite: true });
+    applyConfirmation(input) {
+      return ok({ ...input, allowOverwrite: true });
     },
 
     async execute(input, context) {
-      const { input: effectiveInput, requestedFilePath } =
-        resolveFileNoteWriteInput(input, context);
-      input = effectiveInput;
       const paperSourceMetadata = buildCodexMineruPaperSourceMetadata(
         input.filePath,
         context.request,
@@ -834,12 +780,6 @@ export function createFileIOTool(): AgentToolDefinition<FileIOInput, unknown> {
         return {
           action: "write",
           filePath: input.filePath,
-          ...(requestedFilePath
-            ? {
-                requestedFilePath,
-                correctedToNotesDirectory: true,
-              }
-            : {}),
           bytesWritten: (input.content || "").length,
         };
       } catch (error) {
