@@ -14,6 +14,7 @@ import {
 import {
   findMatchingTrustedQuoteCitation,
   MIN_NEAR_COMPLETE_QUOTE_SUPPORT_COVERAGE,
+  MIN_NEAR_COMPLETE_QUOTE_SUPPORTED_TOKENS,
   normalizeQuoteCitations,
   QUOTE_CITATION_PATTERN,
   stripQuoteCitationAnchorsFromDisplayText,
@@ -66,10 +67,14 @@ import {
   warmPageTextCache,
   warmQuoteLocationCacheForAttachment,
 } from "./livePdfSelectionLocator";
-import { resolveQuoteEvidenceProvenance } from "./quoteEvidenceProvenance";
+import {
+  resolveQuoteEvidenceProvenance,
+  type QuoteEvidenceProvenance,
+} from "./quoteEvidenceProvenance";
 import {
   resolveVerifiedQuoteTarget,
   type QuoteTargetCandidate,
+  type QuoteTargetResolution,
   type QuoteTargetVerification,
 } from "./quoteCitationTargetResolver";
 import { resolveConversationBaseItem } from "./portalScope";
@@ -157,8 +162,29 @@ export function collectCitationScopeCollectionIds(
   const out = new Set<number>();
   for (const context of pairedUserMessage?.selectedCollectionContexts || []) {
     const collectionId = Math.floor(Number(context?.collectionId));
-    if (Number.isFinite(collectionId) && collectionId > 0) {
-      out.add(collectionId);
+    if (!Number.isFinite(collectionId) || collectionId <= 0) continue;
+    out.add(collectionId);
+    // A chat scoped to a collection covers what is filed beneath it, and
+    // Zotero records only a paper's direct parents, so the descendants have to
+    // be named explicitly or the nested layout most libraries use never
+    // matches.
+    try {
+      const collection = Zotero.Collections.get(collectionId) as
+        | { getDescendents?: (nested?: boolean, type?: string) => unknown[] }
+        | undefined;
+      for (const descendant of collection?.getDescendents?.(
+        false,
+        "collection",
+      ) || []) {
+        const descendantId = Math.floor(
+          Number((descendant as { id?: unknown })?.id),
+        );
+        if (Number.isFinite(descendantId) && descendantId > 0) {
+          out.add(descendantId);
+        }
+      }
+    } catch (_err) {
+      void _err;
     }
   }
   return out;
@@ -2456,13 +2482,16 @@ async function resolveCitationCandidatesFromLibrarySearch(
       displayCache,
       "library-search",
     );
+    const added = candidates[candidates.length - 1];
     if (
+      added &&
+      added.contextItemId === Math.floor(attachment.contextItemId) &&
       scopeCollectionIds?.size &&
       group.collectionIds.some((collectionId) =>
         scopeCollectionIds.has(Math.floor(collectionId)),
       )
     ) {
-      inScope.add(buildCitationCandidateKey(candidates[candidates.length - 1]));
+      inScope.add(buildCitationCandidateKey(added));
     }
   }
   if (!candidates.length) return [];
@@ -2674,16 +2703,42 @@ type ResolvedQuoteCitationMatch = {
 };
 
 /**
- * How much of the quote the document accounts for.  Falls back to the single
- * span's coverage for results produced before the pooled figure existed, and
- * treats a complete alignment (which reports neither figure) as full support.
+ * A quote must have one substantial passage in common with a paper before that
+ * paper can be called its source.  Coverage alone cannot tell a real passage
+ * from several stock phrases unioned together: a same-field paper sharing
+ * "we recorded from hippocampal CA1", "population activity was not stable" and
+ * "behavioural performance remained unchanged" reaches 0.82 coverage while its
+ * longest common run is under a third of the quote.
  */
-function quoteSupportCoverage(result: LivePdfSelectionLocateResult): number {
+const MIN_QUOTE_SOURCE_ANCHOR_TOKENS = 12;
+
+/**
+ * Whether a located result is strong enough to call this paper the quote's
+ * source.  A complete alignment answers yes on its own; anything partial has
+ * to clear the answer-time gate's own bars — the same coverage ratio, the same
+ * minimum of supported tokens — plus one substantial contiguous passage.
+ */
+function locatedResultIdentifiesQuoteSource(
+  result: LivePdfSelectionLocateResult,
+): boolean {
   const pooled = Number(result.sourceMatchQuoteTokenSupportCoverage);
-  if (Number.isFinite(pooled)) return pooled;
-  const span = Number(result.sourceMatchQuoteTokenCoverage);
-  return Number.isFinite(span) ? span : 1;
+  if (!Number.isFinite(pooled)) {
+    // No pooled figure means the whole quote aligned as one span.
+    return true;
+  }
+  const supportedTokens = Number(result.sourceMatchSupportedQuoteTokenCount);
+  const longestRun = Number(result.sourceMatchLongestRunTokenCount);
+  return (
+    pooled >= MIN_NEAR_COMPLETE_QUOTE_SUPPORT_COVERAGE &&
+    (!Number.isFinite(supportedTokens) ||
+      supportedTokens >= MIN_NEAR_COMPLETE_QUOTE_SUPPORTED_TOKENS) &&
+    (!Number.isFinite(longestRun) ||
+      longestRun >= MIN_QUOTE_SOURCE_ANCHOR_TOKENS)
+  );
 }
+
+export const locatedResultIdentifiesQuoteSourceForTests =
+  locatedResultIdentifiesQuoteSource;
 
 /**
  * Read a candidate's PDF text in the background to decide whether it really
@@ -2710,7 +2765,7 @@ async function verifyQuoteInCitationCandidate(
   if (
     result.status === "resolved" &&
     !candidate.authoritative &&
-    quoteSupportCoverage(result) < MIN_NEAR_COMPLETE_QUOTE_SUPPORT_COVERAGE
+    !locatedResultIdentifiesQuoteSource(result)
   ) {
     return {
       status: "not-found",
@@ -2815,36 +2870,42 @@ function buildCandidateForContextItemId(
 }
 
 /**
- * The paper the answer's own run recorded this quote against, if any.
+ * The papers the answer's own run recorded this quote against.
  *
  * This is the shortcut the rest of the function exists to avoid needing: the
  * agent was shown each passage together with the paper it came from, and that
  * pairing is persisted, so a click can read the answer instead of searching
  * the library and guessing from a citation label.
+ *
+ * More than one can come back — a preprint and its published copy record the
+ * same text — so all of them are returned and the ordinary ranking, which puts
+ * citation-label agreement first, decides between them.
  */
-async function resolveRecordedQuoteSourceCandidate(params: {
+async function resolveRecordedQuoteSourceCandidates(params: {
   button: HTMLButtonElement;
   searchTexts: string[];
-}): Promise<AssistantCitationPaperCandidate | null> {
+}): Promise<AssistantCitationPaperCandidate[]> {
   const agentRunId = citationButtonAgentRunIdCache.get(params.button);
-  if (!agentRunId) return null;
+  if (!agentRunId) return [];
   for (const quoteText of params.searchTexts) {
-    let provenance: Awaited<ReturnType<typeof resolveQuoteEvidenceProvenance>> =
-      null;
+    let recorded: QuoteEvidenceProvenance[] = [];
     try {
-      provenance = await resolveQuoteEvidenceProvenance({
+      recorded = await resolveQuoteEvidenceProvenance({
         agentRunId,
         quoteText,
       });
     } catch (_err) {
       void _err;
-      return null;
+      return [];
     }
-    if (!provenance) continue;
-    const candidate = buildCandidateForContextItemId(provenance.contextItemId);
-    if (candidate) return candidate;
+    const candidates = recorded
+      .map((entry) => buildCandidateForContextItemId(entry.contextItemId))
+      .filter((candidate): candidate is AssistantCitationPaperCandidate =>
+        Boolean(candidate),
+      );
+    if (candidates.length) return candidates;
   }
-  return null;
+  return [];
 }
 
 function buildQuoteTargetCandidates(
@@ -2878,34 +2939,39 @@ async function navigateUntrustedQuoteCitation(params: {
         .filter(Boolean),
     ),
   );
+  if (params.status) {
+    setStatus(params.status, "Locating cited quote...", "sending");
+  }
   // Ask the answer before searching for it.  When the turn recorded which
-  // paper each passage came from, that is the source — no label matching, no
-  // library search, and only the one paper is ever read.
-  const recordedCandidate = await resolveRecordedQuoteSourceCandidate({
+  // paper each passage came from, that is the source — no label matching and
+  // no library search.
+  const recordedCandidates = await resolveRecordedQuoteSourceCandidates({
     button: params.button,
     searchTexts,
   });
   markCitationNavigationTiming(params.timing, "recorded provenance", {
-    resolved: Boolean(recordedCandidate),
-    contextItemId: recordedCandidate?.contextItemId,
+    resolvedCount: recordedCandidates.length,
+    contextItemIds: recordedCandidates.map(
+      (candidate) => candidate.contextItemId,
+    ),
   });
 
   // Otherwise fall back to finding the paper: the conversation's own papers
   // first, then a library-wide lookup by citation label, since in library chat
   // the answer's sources are discovered at runtime and are not attached to the
   // message.  Every hit still has to contain the quote before the reader moves.
-  const resolvedCandidates = recordedCandidate
-    ? [recordedCandidate]
-    : await resolveCandidatesForCitationNavigation({
-        panelItem: params.panelItem,
-        extractedCitation: params.extractedCitation,
-        staticCandidates: params.staticCandidates,
-        quoteText: params.quoteText,
-        allowLibrarySearch: true,
-        scopeCollectionIds: citationButtonScopeCollectionCache.get(
-          params.button,
-        ),
-      });
+  const searchForCandidates = () =>
+    resolveCandidatesForCitationNavigation({
+      panelItem: params.panelItem,
+      extractedCitation: params.extractedCitation,
+      staticCandidates: params.staticCandidates,
+      quoteText: params.quoteText,
+      allowLibrarySearch: true,
+      scopeCollectionIds: citationButtonScopeCollectionCache.get(params.button),
+    });
+  const resolvedCandidates = recordedCandidates.length
+    ? recordedCandidates
+    : await searchForCandidates();
   const pdfCandidates = resolvedCandidates.filter((candidate) =>
     isPdfBackedCitationCandidate(candidate),
   );
@@ -2927,21 +2993,41 @@ async function navigateUntrustedQuoteCitation(params: {
     return false;
   }
 
-  if (params.status) {
-    setStatus(params.status, "Locating cited quote...", "sending");
-  }
-
-  const candidatesByContextItemId = new Map(
+  let candidatesByContextItemId = new Map(
     pdfCandidates.map((candidate) => [candidate.contextItemId, candidate]),
   );
-  const resolution = await resolveVerifiedQuoteTarget({
-    candidates: buildQuoteTargetCandidates(
-      pdfCandidates,
-      params.extractedCitation,
-    ),
-    searchTexts,
-    verify: verifyQuoteInCitationCandidate,
-  });
+  const verifyCandidates = (
+    candidates: AssistantCitationPaperCandidate[],
+  ): Promise<QuoteTargetResolution> =>
+    resolveVerifiedQuoteTarget({
+      candidates: buildQuoteTargetCandidates(
+        candidates,
+        params.extractedCitation,
+      ),
+      searchTexts,
+      verify: verifyQuoteInCitationCandidate,
+    });
+  let resolution = await verifyCandidates(pdfCandidates);
+  if (resolution.status !== "resolved" && recordedCandidates.length) {
+    // The recorded paper did not hold the quote after all — its item id may
+    // have been reused, or its text may not extract.  Rather than dead-end on
+    // provenance, fall back to looking the paper up like any other quote.
+    const searched = (await searchForCandidates()).filter((candidate) =>
+      isPdfBackedCitationCandidate(candidate),
+    );
+    const fallbackCandidates = searched.filter(
+      (candidate) => !candidatesByContextItemId.has(candidate.contextItemId),
+    );
+    if (fallbackCandidates.length) {
+      candidatesByContextItemId = new Map(
+        [...pdfCandidates, ...fallbackCandidates].map((candidate) => [
+          candidate.contextItemId,
+          candidate,
+        ]),
+      );
+      resolution = await verifyCandidates(fallbackCandidates);
+    }
+  }
   markCitationNavigationTiming(params.timing, "quote verification", {
     status: resolution.status,
     // How many PDFs this click had to read. A jump to a paper the answer

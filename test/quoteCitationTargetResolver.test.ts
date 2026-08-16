@@ -353,7 +353,7 @@ describe("untrusted quote navigation contract", function () {
     assert.include(verifySection, "!candidate.authoritative");
     assert.include(
       verifySection,
-      "quoteSupportCoverage(result) < MIN_NEAR_COMPLETE_QUOTE_SUPPORT_COVERAGE",
+      "!locatedResultIdentifiesQuoteSource(result)",
     );
     assert.notInclude(verifySection, "sourceMatchQuoteTokenCoverage < 1");
     assert.include(verifySection, 'status: "not-found"');

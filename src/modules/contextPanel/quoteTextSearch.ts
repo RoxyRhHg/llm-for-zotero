@@ -821,6 +821,14 @@ export type QuoteTextSupportSummary = {
   supportedQuoteTokenCount: number;
   /** Supported fraction of the quote, 0..1. */
   coverage: number;
+  /**
+   * Longest single contiguous run, in tokens.  Coverage alone cannot tell a
+   * real passage from several stock phrases unioned together, so callers that
+   * decide "is this the source?" need to see this too.
+   */
+  longestRunTokenCount: number;
+  /** That run as a fraction of the quote, 0..1. */
+  longestRunCoverage: number;
 };
 
 /**
@@ -852,9 +860,16 @@ export function summarizeQuoteTextSupport(
   const quoteIndex = buildQuoteTextIndex(cleanQuote);
   const quoteTokenCount = quoteIndex.tokens.length;
   if (!quoteTokenCount || !normalizedEntries.length) {
-    return { quoteTokenCount, supportedQuoteTokenCount: 0, coverage: 0 };
+    return {
+      quoteTokenCount,
+      supportedQuoteTokenCount: 0,
+      coverage: 0,
+      longestRunTokenCount: 0,
+      longestRunCoverage: 0,
+    };
   }
   const supported = new Set<number>();
+  let longestRunTokenCount = 0;
   for (const candidate of collectQuoteTokenRunCandidates(
     normalizedEntries,
     quoteIndex,
@@ -864,6 +879,10 @@ export function summarizeQuoteTextSupport(
     },
   )) {
     if (!runCountsAsQuoteSupport(candidate)) continue;
+    longestRunTokenCount = Math.max(
+      longestRunTokenCount,
+      candidate.matchedTokenCount,
+    );
     for (
       let tokenIndex = candidate.run.quoteTokenStart;
       tokenIndex < candidate.run.quoteTokenEnd;
@@ -876,6 +895,8 @@ export function summarizeQuoteTextSupport(
     quoteTokenCount,
     supportedQuoteTokenCount: supported.size,
     coverage: supported.size / quoteTokenCount,
+    longestRunTokenCount,
+    longestRunCoverage: longestRunTokenCount / quoteTokenCount,
   };
 }
 

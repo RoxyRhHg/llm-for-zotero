@@ -39,6 +39,9 @@ const MAX_TOOL_CONTENT_DEPTH = 8;
  */
 const MAX_EVIDENCE_PASSAGES = 1000;
 
+/** Runs kept in memory at once; passage text is not small. */
+const MAX_CACHED_RUNS = 8;
+
 const runEvidenceCache = new Map<string, EvidencePassage[]>();
 
 function normalizePositiveInt(value: unknown): number {
@@ -55,7 +58,7 @@ function normalizePositiveInt(value: unknown): number {
 function readPassageTexts(record: Record<string, unknown>): string[] {
   const out: string[] = [];
   const seen = new Set<string>();
-  for (const key of ["snippet", "text", "surroundingText"]) {
+  for (const key of ["snippet", "text", "surroundingText", "textContent"]) {
     const value = record[key];
     if (typeof value !== "string") continue;
     const text = value.trim();
@@ -67,45 +70,62 @@ function readPassageTexts(record: Record<string, unknown>): string[] {
 }
 
 /**
- * Collect every recorded passage that names both the paper and the attachment
- * it came from.  The shape differs per tool — `library_retrieve` exposes them
- * on `snippets`, `paper_read` on `results` — so this walks the payload rather
- * than a list of key names that goes stale as tools gain result shapes.
+ * Collect every recorded passage that can name the paper and attachment it
+ * came from.
+ *
+ * Tools disagree about where those ids live.  `library_retrieve` puts them on
+ * the snippet itself; `paper_read` puts them on a `paperContext` beside the
+ * text, or on a parent whose children carry the passages.  So an id pair found
+ * at any level is inherited by everything below it until a nearer pair
+ * overrides it, rather than requiring ids and text on one record.
  */
 function collectEvidencePassages(content: unknown): EvidencePassage[] {
   const out: EvidencePassage[] = [];
   const seen = new WeakSet<object>();
-  const visit = (value: unknown, depth: number) => {
+  const visit = (
+    value: unknown,
+    depth: number,
+    inherited: { itemId: number; contextItemId: number } | null,
+  ) => {
     if (depth > MAX_TOOL_CONTENT_DEPTH || !value || typeof value !== "object") {
       return;
     }
-    if (out.length >= MAX_EVIDENCE_PASSAGES) return;
     if (seen.has(value)) return;
     seen.add(value);
     if (Array.isArray(value)) {
-      for (const entry of value) visit(entry, depth + 1);
+      for (const entry of value) visit(entry, depth + 1, inherited);
       return;
     }
     const record = value as Record<string, unknown>;
-    const itemId = normalizePositiveInt(record.itemId);
-    const contextItemId = normalizePositiveInt(record.contextItemId);
-    if (itemId && contextItemId) {
+    const own = readIdPair(record) || readIdPair(record.paperContext);
+    const scope = own || inherited;
+    if (scope) {
       for (const text of readPassageTexts(record)) {
-        out.push({ itemId, contextItemId, text });
+        out.push({ ...scope, text });
       }
     }
-    for (const nested of Object.values(record)) visit(nested, depth + 1);
+    for (const nested of Object.values(record)) visit(nested, depth + 1, scope);
   };
-  visit(content, 0);
+  visit(content, 0, null);
   return out;
+}
+
+function readIdPair(
+  value: unknown,
+): { itemId: number; contextItemId: number } | null {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+  const record = value as Record<string, unknown>;
+  const itemId = normalizePositiveInt(record.itemId);
+  const contextItemId = normalizePositiveInt(record.contextItemId);
+  return itemId && contextItemId ? { itemId, contextItemId } : null;
 }
 
 async function loadRunEvidencePassages(
   agentRunId: string,
-): Promise<EvidencePassage[]> {
+): Promise<EvidencePassage[] | null> {
   const cached = runEvidenceCache.get(agentRunId);
   if (cached) return cached;
-  let passages: EvidencePassage[] = [];
+  const passages: EvidencePassage[] = [];
   try {
     const events = await listAgentRunEvents(agentRunId);
     for (const event of events) {
@@ -115,19 +135,26 @@ async function loadRunEvidencePassages(
       if (!record || record.ok === false) continue;
       passages.push(...collectEvidencePassages(record.content));
       passages.push(...collectEvidencePassages(record.artifacts));
-      if (passages.length >= MAX_EVIDENCE_PASSAGES) {
-        passages = passages.slice(0, MAX_EVIDENCE_PASSAGES);
-        break;
-      }
     }
   } catch (error) {
-    // A missing or unreadable trace is normal for old or pruned runs; the
-    // caller falls back to searching for the paper.
+    // A locked or busy database is transient.  Caching the empty result would
+    // silently disable provenance for the rest of the session, so this stays
+    // uncached and the next click tries again.
     ztoolkit.log("LLM quote provenance: could not read agent run trace", error);
-    passages = [];
+    return null;
   }
-  runEvidenceCache.set(agentRunId, passages);
-  return passages;
+  // The quote is likelier to have come from a later round than an earlier one,
+  // so an over-long run keeps its most recent evidence.
+  const bounded =
+    passages.length > MAX_EVIDENCE_PASSAGES
+      ? passages.slice(-MAX_EVIDENCE_PASSAGES)
+      : passages;
+  if (runEvidenceCache.size >= MAX_CACHED_RUNS) {
+    const oldest = runEvidenceCache.keys().next();
+    if (!oldest.done) runEvidenceCache.delete(oldest.value);
+  }
+  runEvidenceCache.set(agentRunId, bounded);
+  return bounded;
 }
 
 export function clearQuoteEvidenceProvenanceCacheForTests(): void {
@@ -135,23 +162,26 @@ export function clearQuoteEvidenceProvenanceCacheForTests(): void {
 }
 
 /**
- * Resolve a displayed quote to the paper the agent actually read it from.
+ * Every paper whose recorded passages account for the quote, best first.
+ *
+ * More than one is unusual but real — a library holding both a preprint and
+ * its published version records the same text twice.  Returning all of them
+ * lets the caller break the tie with the citation label instead of taking
+ * whichever the retrieval happened to return first.
  *
  * Passages are pooled per paper before judging, so a quote stitched from two
- * passages of one paper is recognised as fully accounted for by that paper.
- * The threshold is the one the answer-time quote gate already uses, so a quote
- * and its source are judged the same way wherever the question is asked.
+ * passages of one paper is recognised as fully accounted for by it.
  */
 export async function resolveQuoteEvidenceProvenance(params: {
   agentRunId: string | undefined | null;
   quoteText: string;
-}): Promise<QuoteEvidenceProvenance | null> {
+}): Promise<QuoteEvidenceProvenance[]> {
   const agentRunId = sanitizeText(params.agentRunId || "").trim();
   const quoteText = sanitizeText(params.quoteText || "").trim();
-  if (!agentRunId || !quoteText) return null;
+  if (!agentRunId || !quoteText) return [];
 
   const passages = await loadRunEvidencePassages(agentRunId);
-  if (!passages.length) return null;
+  if (!passages?.length) return [];
 
   const byPaper = new Map<string, EvidencePassage[]>();
   for (const passage of passages) {
@@ -161,7 +191,7 @@ export async function resolveQuoteEvidenceProvenance(params: {
     else byPaper.set(key, [passage]);
   }
 
-  let best: QuoteEvidenceProvenance | null = null;
+  const out: QuoteEvidenceProvenance[] = [];
   for (const group of byPaper.values()) {
     const support = summarizeQuoteTextSupport(
       group.map((passage, index) => ({
@@ -171,12 +201,11 @@ export async function resolveQuoteEvidenceProvenance(params: {
       quoteText,
     );
     if (support.coverage < MIN_NEAR_COMPLETE_QUOTE_SUPPORT_COVERAGE) continue;
-    if (best && best.coverage >= support.coverage) continue;
-    best = {
+    out.push({
       itemId: group[0].itemId,
       contextItemId: group[0].contextItemId,
       coverage: support.coverage,
-    };
+    });
   }
-  return best;
+  return out.sort((left, right) => right.coverage - left.coverage);
 }

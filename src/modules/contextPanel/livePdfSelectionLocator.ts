@@ -65,6 +65,10 @@ export type LivePdfSelectionLocateResult = {
    * above and high here; this is the one to judge "is this the paper?" by.
    */
   sourceMatchQuoteTokenSupportCoverage?: number;
+  /** Absolute count behind the coverage above. */
+  sourceMatchSupportedQuoteTokenCount?: number;
+  /** Longest single contiguous run this document shares with the quote. */
+  sourceMatchLongestRunTokenCount?: number;
   excerpt?: string;
   reason?: string;
   debugSummary?: string[];
@@ -606,47 +610,87 @@ type EllipsisSegmentLocation = {
   occurrenceIndex: number;
 };
 
+/** Drop the quotation marks a displayed quote is wrapped in. */
+function stripOuterQuoteMarks(value: string): string {
+  const text = (value || "").trim();
+  const paired =
+    (text.startsWith('"') && text.endsWith('"')) ||
+    (text.startsWith("\u201c") && text.endsWith("\u201d"));
+  return paired ? text.slice(1, -1).trim() : text;
+}
+
+/**
+ * A displayed quote often ends with a full stop the source sentence does not
+ * have, and the span matcher fails closed on a terminal sentence boundary.
+ * Retrying without it recovers the ordinary case without loosening matching.
+ */
+function segmentMatchVariants(segment: string): string[] {
+  const trimmed = segment.trim();
+  const withoutTerminal = trimmed.replace(/[.,;:!?]+$/u, "").trim();
+  return withoutTerminal && withoutTerminal !== trimmed
+    ? [trimmed, withoutTerminal]
+    : [trimmed];
+}
+
 /**
  * Locate a quote that declares its own pieces with an ellipsis.
  *
- * Each piece must appear exactly once in the document, and the pieces must
- * appear in the order the quote gives them — the same rule the answer-time
- * gate applies in `hasAllDisplayedEllipsisSegmentsSupported`.  Together those
- * make a coincidental assembly from unrelated parts of the paper very unlikely,
- * which is what lets the reader be moved on the strength of pieces alone.
+ * Each piece must appear exactly once in the document and the pieces must
+ * appear in the order the quote gives them, compared by position within the
+ * page as well as across pages — same-page stitching is the common case, so an
+ * order rule that only compared page numbers would be vacuous exactly when it
+ * matters.  Together those make a coincidental assembly out of unrelated parts
+ * of a paper unlikely.
  *
- * The reader lands on the first piece, since that is where the quote starts.
+ * Being an assembly is not by itself proof that this is the right paper: the
+ * caller still measures how much of the quote the document accounts for.  The
+ * reader lands on the first piece, since that is where the quote starts.
  */
 function locateEllipsisSegmentsInIndexedPageTexts(
   indexedPages: IndexedLivePdfPageText[],
   quoteText: string,
 ): EllipsisSegmentLocation | null {
-  const segments = splitQuoteAtEllipsisInOrder(quoteText);
+  const segments = splitQuoteAtEllipsisInOrder(stripOuterQuoteMarks(quoteText));
   if (segments.length < 2) return null;
 
   const located: Array<{
     pageIndex: number;
+    sourceStart: number;
     text: string;
     occurrenceIndex: number;
   }> = [];
   for (const segment of segments) {
-    const hits = indexedPages.flatMap((entry) =>
-      findQuoteSourceSpansAllowingLayoutArtifacts(entry.textIndex, segment).map(
-        (span) => ({
-          pageIndex: entry.page.pageIndex,
-          text: span.text.trim(),
-          occurrenceIndex: span.occurrenceIndex,
-        }),
-      ),
-    );
+    const hits = segmentMatchVariants(segment)
+      .map((variant) =>
+        indexedPages.flatMap((entry) =>
+          findQuoteSourceSpansAllowingLayoutArtifacts(
+            entry.textIndex,
+            variant,
+          ).map((span) => ({
+            pageIndex: entry.page.pageIndex,
+            sourceStart: span.sourceStart,
+            text: span.text.trim(),
+            occurrenceIndex: span.occurrenceIndex,
+          })),
+        ),
+      )
+      .find((found) => found.length > 0);
     // Ambiguous or missing pieces make the assembly unverifiable, so the
     // caller falls through to the weaker single-run rescue rather than guess.
-    if (hits.length !== 1) return null;
+    if (!hits || hits.length !== 1) return null;
     located.push(hits[0]);
   }
 
   for (let index = 1; index < located.length; index += 1) {
-    if (located[index].pageIndex < located[index - 1].pageIndex) return null;
+    const previous = located[index - 1];
+    const current = located[index];
+    if (current.pageIndex < previous.pageIndex) return null;
+    if (
+      current.pageIndex === previous.pageIndex &&
+      current.sourceStart < previous.sourceStart
+    ) {
+      return null;
+    }
   }
   const first = located[0];
   return {
@@ -704,6 +748,16 @@ function locateQuoteInIndexedPageTexts(
         text: page.text,
       };
     });
+    // Pooled over every page, so a quote stitched across a page break is
+    // summarised for the document rather than for whichever page won.
+    const documentSupport = summarizeQuoteTextSupport(
+      searchEntries,
+      cleanQuote,
+      {
+        minQueryLength: 24,
+        rejectWeakQueries: true,
+      },
+    );
     // A quote written with an ellipsis declares its own pieces.  Locate them
     // individually before falling back to "largest single run", which cannot
     // resolve a quote whose longest piece happens to repeat in the document.
@@ -726,8 +780,14 @@ function locateQuoteInIndexedPageTexts(
         sourceMatchText: segmentLocation.sourceMatchText,
         sourceMatchKind: "ellipsis-segment",
         sourceMatchPageOccurrence: segmentLocation.occurrenceIndex,
-        sourceMatchQuoteTokenCoverage: 1,
-        sourceMatchQuoteTokenSupportCoverage: 1,
+        // Measured on the same filtered basis as every other branch.  Assuming
+        // completeness here would hand the caller's guard a number it never
+        // computed, which is the whole failure this rewrite exists to remove.
+        sourceMatchQuoteTokenCoverage: documentSupport.longestRunCoverage,
+        sourceMatchQuoteTokenSupportCoverage: documentSupport.coverage,
+        sourceMatchSupportedQuoteTokenCount:
+          documentSupport.supportedQuoteTokenCount,
+        sourceMatchLongestRunTokenCount: documentSupport.longestRunTokenCount,
         reason:
           "Every piece of the ellipsized quote matched exactly once, in order, in the live PDF text.",
         debugSummary: [
@@ -748,19 +808,7 @@ function locateQuoteInIndexedPageTexts(
       : undefined;
     // Pooled over every page, so a quote stitched across a page break is
     // summarised for the document rather than for whichever page won.
-    const documentSupport = summarizeQuoteTextSupport(
-      searchEntries,
-      cleanQuote,
-      {
-        minQueryLength: 24,
-        rejectWeakQueries: true,
-      },
-    );
     if (sourceMatch && matchedPage) {
-      const spanOccurrence = findQuoteSourceSpansAllowingLayoutArtifacts(
-        buildQuoteTextIndex(matchedPage.text),
-        sourceMatch.query,
-      )[0]?.occurrenceIndex;
       return {
         status: "resolved",
         confidence: sourceMatch.confidence,
@@ -774,13 +822,14 @@ function locateQuoteInIndexedPageTexts(
         pagesScanned: pages.length,
         sourceMatchText: sourceMatch.query,
         sourceMatchKind: sourceMatch.matchKind,
-        // Derived rather than assumed to be the first: the rescue only accepts
-        // a span unique in the document today, but a highlight that depends on
-        // that invariant should not be the thing that silently breaks if the
-        // uniqueness rule is ever relaxed.
-        sourceMatchPageOccurrence: spanOccurrence ?? 0,
+        // The rescue only accepts a span that occurs once in the document, so
+        // its position on its own page is necessarily the first.
+        sourceMatchPageOccurrence: 0,
         sourceMatchQuoteTokenCoverage: sourceMatch.quoteTokenCoverage,
         sourceMatchQuoteTokenSupportCoverage: documentSupport.coverage,
+        sourceMatchSupportedQuoteTokenCount:
+          documentSupport.supportedQuoteTokenCount,
+        sourceMatchLongestRunTokenCount: documentSupport.longestRunTokenCount,
         reason:
           "The complete quote did not align, but its largest strong contiguous source span matched exactly once in the live PDF text.",
         debugSummary: [
@@ -801,6 +850,9 @@ function locateQuoteInIndexedPageTexts(
       totalMatches,
       pagesScanned: pages.length,
       sourceMatchQuoteTokenSupportCoverage: documentSupport.coverage,
+      sourceMatchSupportedQuoteTokenCount:
+        documentSupport.supportedQuoteTokenCount,
+      sourceMatchLongestRunTokenCount: documentSupport.longestRunTokenCount,
       reason: "The complete quote was not found in the live PDF text.",
     };
   }

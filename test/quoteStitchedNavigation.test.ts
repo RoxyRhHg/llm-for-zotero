@@ -2,6 +2,7 @@ import { assert } from "chai";
 import { readFileSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import { locatedResultIdentifiesQuoteSourceForTests as identifiesQuoteSource } from "../src/modules/contextPanel/assistantCitationLinks";
 import { locateQuoteInPageTexts } from "../src/modules/contextPanel/livePdfSelectionLocator";
 import { summarizeQuoteTextSupport } from "../src/modules/contextPanel/quoteTextSearch";
 
@@ -123,15 +124,76 @@ describe("stitched quote navigation", function () {
     it("refuses a paper that merely quotes one of the passages", function () {
       const result = locateQuoteInPageTexts(DECOY_PAPER, STITCHED_QUOTE, null);
 
-      const coverage =
-        result.sourceMatchQuoteTokenSupportCoverage ??
-        result.sourceMatchQuoteTokenCoverage ??
-        1;
-      assert.isBelow(
-        coverage,
-        0.8,
+      assert.isFalse(
+        identifiesQuoteSource(result),
         "a shared passage must not authorise a jump",
       );
+    });
+
+    it("accepts the paper that actually holds the stitched quote", function () {
+      const result = locateQuoteInPageTexts(SOURCE_PAPER, STITCHED_QUOTE, null);
+
+      assert.isTrue(identifiesQuoteSource(result));
+    });
+
+    it("refuses a paper credited only by unioning disjoint stock phrases", function () {
+      // Coverage alone cannot tell a real passage from several stock phrases
+      // stitched together, which is why the longest run has a floor too.
+      const quote =
+        '"we recorded from hippocampal CA1 across sessions and found that population activity was not stable while behavioural performance remained unchanged over weeks"';
+      const sameFieldPaper = [
+        page(
+          0,
+          "Methods. we recorded from hippocampal CA1 across sessions using chronically implanted probes.",
+        ),
+        page(
+          1,
+          "Results. In this preparation population activity was not stable across the window.",
+        ),
+        page(
+          2,
+          "Discussion. Throughout training behavioural performance remained unchanged over weeks.",
+        ),
+      ];
+
+      const result = locateQuoteInPageTexts(sameFieldPaper, quote, null);
+
+      assert.isAtLeast(
+        result.sourceMatchQuoteTokenSupportCoverage ?? 0,
+        0.8,
+        "coverage alone would have accepted it",
+      );
+      assert.isFalse(
+        identifiesQuoteSource(result),
+        "no single passage is substantial enough to call this the source",
+      );
+    });
+
+    it("does not claim full coverage merely because the pieces matched", function () {
+      // Reporting a hard-coded 1 here would hand the guard a number nobody
+      // measured, which is the failure this whole change exists to remove.
+      const first = "drift was confined to the null coding space throughout";
+      const second =
+        "behavioural readout remained accurate over the full recording period";
+      const pages = [
+        page(0, `Results. We show that ${first}.`),
+        page(1, `Discussion. Consequently ${second}.`),
+      ];
+
+      const result = locateQuoteInPageTexts(
+        pages,
+        `"${first}… ${second}… a third piece this paper does not contain at all."`,
+        null,
+      );
+
+      const pooled = result.sourceMatchQuoteTokenSupportCoverage;
+      if (pooled !== undefined) {
+        assert.isBelow(
+          pooled,
+          1,
+          "a piece the paper lacks must lower the reported coverage",
+        );
+      }
     });
 
     it("verifies an ellipsized quote piece by piece, landing on the first piece", function () {
@@ -170,6 +232,28 @@ describe("stitched quote navigation", function () {
       const pages = [
         page(0, `Discussion. Consequently ${second}.`),
         page(1, `Results. We show that ${first}.`),
+      ];
+
+      const result = locateQuoteInPageTexts(
+        pages,
+        `"${first}… ${second}."`,
+        null,
+      );
+
+      assert.notInclude(
+        result.reason || "",
+        "Every piece of the ellipsized quote",
+      );
+    });
+
+    it("does not treat same-page pieces in reverse order as an assembly", function () {
+      // Same-page stitching is the common case, so an order rule that only
+      // compared page numbers would be vacuous exactly where it matters.
+      const first = "drift was confined to the null coding space throughout";
+      const second =
+        "behavioural readout remained accurate over the full recording period";
+      const pages = [
+        page(0, `Discussion. Consequently ${second}, even though ${first}.`),
       ];
 
       const result = locateQuoteInPageTexts(
@@ -225,16 +309,14 @@ describe("citation navigation contracts", function () {
       ),
     );
 
-    assert.include(navigateSection, "resolveRecordedQuoteSourceCandidate");
-    // The recorded paper replaces the candidate list outright; nothing else is
-    // read when the answer already said where the quote came from.
-    assert.include(
-      navigateSection,
-      "recordedCandidate\n    ? [recordedCandidate]",
-    );
+    assert.include(navigateSection, "resolveRecordedQuoteSourceCandidates");
+    // Recorded papers are used instead of a search, and the search is still
+    // there as a fallback when none of them holds the quote.
+    assert.include(navigateSection, "recordedCandidates.length");
+    assert.include(navigateSection, "searchForCandidates()");
     assert.isBelow(
-      navigateSection.indexOf("resolveRecordedQuoteSourceCandidate"),
-      navigateSection.indexOf("resolveCandidatesForCitationNavigation"),
+      navigateSection.indexOf("resolveRecordedQuoteSourceCandidates"),
+      navigateSection.indexOf("searchForCandidates"),
     );
   });
 
@@ -257,7 +339,7 @@ describe("citation navigation contracts", function () {
 
   it("judges a candidate on how much of the quote it accounts for", function () {
     const verifySection = source.slice(
-      source.indexOf("function quoteSupportCoverage("),
+      source.indexOf("function locatedResultIdentifiesQuoteSource("),
       source.indexOf("async function locateQuoteByOpeningCitationCandidates("),
     );
 
@@ -267,5 +349,7 @@ describe("citation navigation contracts", function () {
       "the pooled figure, not the single longest span",
     );
     assert.include(verifySection, "MIN_NEAR_COMPLETE_QUOTE_SUPPORT_COVERAGE");
+    assert.include(verifySection, "MIN_NEAR_COMPLETE_QUOTE_SUPPORTED_TOKENS");
+    assert.include(verifySection, "MIN_QUOTE_SOURCE_ANCHOR_TOKENS");
   });
 });

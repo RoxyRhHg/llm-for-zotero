@@ -86,22 +86,72 @@ describe("quote evidence provenance", function () {
     });
 
     assert.deepEqual(
-      { itemId: resolved?.itemId, contextItemId: resolved?.contextItemId },
-      { itemId: 2242, contextItemId: 2241 },
+      resolved.map((entry) => [entry.itemId, entry.contextItemId]),
+      [[2242, 2241]],
     );
   });
 
-  it("ignores the citation label entirely, so a mislabelled quote still lands", async function () {
-    installRun([libraryRetrieveEvent(DEFAULT_SNIPPETS)]);
+  it("returns every paper that accounts for the quote, best first", async function () {
+    // A library holding a preprint and the published copy records the same
+    // text twice; the caller breaks the tie with the citation label, so both
+    // have to come back rather than whichever the retrieval returned first.
+    installRun([
+      libraryRetrieveEvent([
+        {
+          itemId: "900",
+          contextItemId: "901",
+          title: "Preprint copy",
+          snippet: `Abstract. We show that ${KEINATH_PASSAGE}.`,
+        },
+        ...DEFAULT_SNIPPETS,
+      ]),
+    ]);
 
-    // The model attributed this passage to the wrong author; the recorded
-    // evidence is what decides.
     const resolved = await resolveQuoteEvidenceProvenance({
       agentRunId: "run-1",
       quoteText: `"${KEINATH_PASSAGE}."`,
     });
 
-    assert.equal(resolved?.itemId, 2242);
+    assert.sameMembers(
+      resolved.map((entry) => entry.contextItemId),
+      [901, 2241],
+      "both copies are offered to the caller",
+    );
+  });
+
+  it("finds passages whose ids sit on a parent rather than beside the text", async function () {
+    // paper_read nests the ids under paperContext and puts the text on a
+    // sibling; library_retrieve puts both on one record.
+    installRun([
+      {
+        type: "tool_result",
+        callId: "call_2",
+        name: "paper_read",
+        ok: true,
+        content: {
+          results: [
+            {
+              paperContext: {
+                itemId: 2242,
+                contextItemId: 2241,
+                title: "The representation of context in mouse hippocampus",
+              },
+              passages: [{ text: `Results. We show that ${KEINATH_PASSAGE}.` }],
+            },
+          ],
+        },
+      },
+    ]);
+
+    const resolved = await resolveQuoteEvidenceProvenance({
+      agentRunId: "run-1",
+      quoteText: `"${KEINATH_PASSAGE}."`,
+    });
+
+    assert.deepEqual(
+      resolved.map((entry) => entry.contextItemId),
+      [2241],
+    );
   });
 
   it("credits the paper holding both halves of a stitched quote", async function () {
@@ -130,8 +180,11 @@ describe("quote evidence provenance", function () {
         '"One solution might be that target networks are relatively unaffected by drift if it occurs in a null-space… spatial map drift in the posterior parietal cortex occurs in part outside of null-space dimensions."',
     });
 
-    assert.equal(resolved?.contextItemId, 3604);
-    assert.isAtLeast(resolved?.coverage ?? 0, 0.8);
+    assert.deepEqual(
+      resolved.map((entry) => entry.contextItemId),
+      [3604],
+    );
+    assert.isAtLeast(resolved[0].coverage, 0.8);
   });
 
   it("resolves nothing for a quote the run never recorded", async function () {
@@ -143,7 +196,7 @@ describe("quote evidence provenance", function () {
         '"The hippocampus encodes grocery lists in a dedicated shopping subspace that is stable across decades."',
     });
 
-    assert.isNull(resolved);
+    assert.isEmpty(resolved);
   });
 
   it("does not trust the result of a failed tool call", async function () {
@@ -154,7 +207,7 @@ describe("quote evidence provenance", function () {
       quoteText: `"${KEINATH_PASSAGE}."`,
     });
 
-    assert.isNull(resolved);
+    assert.isEmpty(resolved);
   });
 
   it("degrades quietly when the run trace cannot be read", async function () {
@@ -165,19 +218,61 @@ describe("quote evidence provenance", function () {
       quoteText: `"${KEINATH_PASSAGE}."`,
     });
 
-    assert.isNull(resolved, "the caller falls back to searching for the paper");
+    assert.isEmpty(resolved, "the caller falls back to searching");
+  });
+
+  it("retries after a transient database failure instead of giving up for good", async function () {
+    let shouldFail = true;
+    globalScope.ztoolkit = { log: () => undefined };
+    globalScope.Zotero = {
+      DB: {
+        queryAsync: async () => {
+          if (shouldFail) throw new Error("database is locked");
+          return [
+            {
+              runId: "run-1",
+              seq: 1,
+              eventType: "tool_result",
+              payloadJson: JSON.stringify(
+                libraryRetrieveEvent(DEFAULT_SNIPPETS),
+              ),
+              createdAt: 1,
+            },
+          ];
+        },
+      },
+    };
+    clearQuoteEvidenceProvenanceCacheForTests();
+
+    const quoteText = `"${KEINATH_PASSAGE}."`;
+    assert.isEmpty(
+      await resolveQuoteEvidenceProvenance({ agentRunId: "run-1", quoteText }),
+    );
+
+    // A locked database during sync is transient; caching that failure would
+    // disable provenance for the rest of the session.
+    shouldFail = false;
+    const recovered = await resolveQuoteEvidenceProvenance({
+      agentRunId: "run-1",
+      quoteText,
+    });
+
+    assert.deepEqual(
+      recovered.map((entry) => entry.contextItemId),
+      [2241],
+    );
   });
 
   it("resolves nothing without a run to ask", async function () {
     installRun([libraryRetrieveEvent(DEFAULT_SNIPPETS)]);
 
-    assert.isNull(
+    assert.isEmpty(
       await resolveQuoteEvidenceProvenance({
         agentRunId: "",
         quoteText: `"${KEINATH_PASSAGE}."`,
       }),
     );
-    assert.isNull(
+    assert.isEmpty(
       await resolveQuoteEvidenceProvenance({
         agentRunId: "run-1",
         quoteText: "   ",
@@ -201,7 +296,7 @@ describe("quote evidence provenance", function () {
       quoteText: `"${KEINATH_PASSAGE}."`,
     });
 
-    assert.isNull(resolved);
+    assert.isEmpty(resolved);
   });
 
   it("reads the run once and reuses it for later clicks", async function () {
