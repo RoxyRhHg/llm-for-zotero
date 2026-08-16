@@ -159,6 +159,30 @@ describe("quote card UI contract", function () {
     );
   });
 
+  it("falls back to the quote text when the prerendered body has no content", function () {
+    const renderSource = source(
+      "src/modules/contextPanel/assistantCitationLinks.ts",
+    );
+    const appendStart = renderSource.indexOf(
+      "function appendQuoteCardBodyContent(",
+    );
+    const appendEnd = renderSource.indexOf(
+      "function createQuoteCardElement(",
+      appendStart,
+    );
+    const appendSource = renderSource.slice(appendStart, appendEnd);
+
+    assert.isAtLeast(appendStart, 0);
+    assert.isAbove(appendEnd, appendStart);
+    assert.include(appendSource, "const movedRenderableContent =");
+    assert.include(appendSource, "body.textContent?.trim()");
+    assert.include(appendSource, "if (!movedRenderableContent) {");
+    assert.include(
+      appendSource,
+      'body.classList.remove("llm-rendered-markdown")',
+    );
+  });
+
   it("renders collapsed quote-card previews as lightweight plain text", function () {
     const renderSource = source(
       "src/modules/contextPanel/assistantCitationLinks.ts",

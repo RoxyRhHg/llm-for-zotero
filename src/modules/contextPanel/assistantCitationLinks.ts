@@ -3923,6 +3923,7 @@ function appendQuoteCardBodyContent(
   quoteContent: ParentNode | null | undefined,
 ): boolean {
   if (!quoteContent?.firstChild) return false;
+  const existingChildCount = body.childNodes.length;
   body.classList.add("llm-rendered-markdown");
   const firstElement =
     "firstElementChild" in quoteContent ? quoteContent.firstElementChild : null;
@@ -3933,6 +3934,16 @@ function appendQuoteCardBodyContent(
     hasSingleParagraph && firstElement ? firstElement : quoteContent;
   while (moveSource.firstChild) {
     body.appendChild(moveSource.firstChild);
+  }
+  const movedRenderableContent =
+    Boolean(body.textContent?.trim()) ||
+    Boolean(body.querySelector("img, svg"));
+  if (!movedRenderableContent) {
+    while (body.childNodes.length > existingChildCount) {
+      body.removeChild(body.lastChild as ChildNode);
+    }
+    body.classList.remove("llm-rendered-markdown");
+    return false;
   }
   return true;
 }
