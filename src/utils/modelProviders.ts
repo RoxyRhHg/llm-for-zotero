@@ -18,9 +18,11 @@ import {
   CATALOG_EXCLUDED_AUTH_MODES,
   refreshConfiguredModelCatalogs,
 } from "../modelCapabilities";
+import { normalizeProfileOverride } from "../modelCapabilities";
 import type {
   ModelCapabilityIdentity,
   ModelCatalogIdentity,
+  ModelProfileOverride,
 } from "../modelCapabilities";
 
 export type LegacyModelSlotKey =
@@ -34,6 +36,12 @@ export type AdvancedModelConfig = {
   maxTokens: number;
   inputTokenCap?: number;
   inputMode?: ModelInputMode;
+  /**
+   * User-authored capability overrides for this model. Absent when the user has
+   * not edited anything — never `{}`, so that Reset is indistinguishable from
+   * never having edited.
+   */
+  profileOverride?: ModelProfileOverride;
 };
 
 export type ModelProviderModel = AdvancedModelConfig & {
@@ -92,6 +100,7 @@ type AdvancedModelConfigInput = {
   maxTokens?: number | string | null;
   inputTokenCap?: number | string | null;
   inputMode?: unknown;
+  profileOverride?: unknown;
 };
 
 type ZoteroPrefsAPI = {
@@ -165,6 +174,12 @@ function normalizeAdvancedModelConfig(
     value?.inputMode,
     runtimeMode,
   );
+  // Validated but NOT gated by forModel here: this normalization also feeds
+  // the storage round-trip, and gating at this layer would silently drop a
+  // dormant override from the pref store on the next save. Dormancy is
+  // enforced where the override is consumed — `applyProfileOverride` for
+  // capabilities, `resolveUserExtraBody` for request parameters.
+  const profileOverride = normalizeProfileOverride(value?.profileOverride);
   return {
     temperature: normalizeTemperature(
       `${value?.temperature ?? DEFAULT_TEMPERATURE}`,
@@ -172,10 +187,15 @@ function normalizeAdvancedModelConfig(
     maxTokens: normalizeMaxTokensForModel(
       `${value?.maxTokens ?? DEFAULT_MAX_TOKENS}`,
       modelName,
-      capabilityIdentity,
+      // The override can raise or lower the output limit, so it has to be part
+      // of the identity used to clamp maxTokens.
+      capabilityIdentity
+        ? { ...capabilityIdentity, profileOverride }
+        : undefined,
     ),
     inputTokenCap: normalizeOptionalInputTokenCap(value?.inputTokenCap),
     ...(inputMode ? { inputMode } : {}),
+    ...(profileOverride ? { profileOverride } : {}),
   };
 }
 
@@ -304,6 +324,7 @@ function normalizeGroupModel(
     inputTokenCap?: unknown;
     inputMode?: unknown;
     providerProtocol?: unknown;
+    profileOverride?: unknown;
   };
   const modelName = normalizeString(rawModel.model);
   const advanced = normalizeAdvancedModelConfig(
@@ -312,6 +333,7 @@ function normalizeGroupModel(
       maxTokens: Number(rawModel.maxTokens),
       inputTokenCap: rawModel.inputTokenCap as number | string | undefined,
       inputMode: rawModel.inputMode,
+      profileOverride: rawModel.profileOverride,
     },
     modelName,
     authMode,
@@ -686,6 +708,7 @@ export function getRuntimeModelEntries(): RuntimeModelEntry[] {
             protocol: providerProtocol,
             authMode,
             scope: group.id,
+            profileOverride: modelEntry.profileOverride,
           },
         ),
       });

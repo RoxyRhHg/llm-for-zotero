@@ -94,6 +94,7 @@ import {
 } from "../../utils/llmClient";
 import {
   getModelCapabilities,
+  type ModelProfileOverride,
   getRuntimeReasoningOptions as getCatalogReasoningOptions,
   inferProviderFromModelName,
 } from "../../modelCapabilities";
@@ -101,6 +102,7 @@ import { applyModelInputTokenCap } from "../../utils/modelInputCap";
 import { formatDisplayModelName } from "../../utils/modelDisplayLabel";
 import type { ProviderProtocol } from "../../utils/providerProtocol";
 import { inferLegacyProviderProtocol } from "../../utils/providerProtocol";
+import { isLocalModelApiBase } from "../../utils/providerPresets";
 import {
   PERSISTED_HISTORY_LIMIT,
   MAX_FULL_TEXT_PAPER_CONTEXTS,
@@ -2260,16 +2262,26 @@ const REASONING_PROVIDER_KINDS = new Set<ReasoningProviderKind>([
   "qwen",
   "grok",
   "anthropic",
+  "local",
 ]);
 
 export function detectReasoningProvider(
   modelName: string,
+  apiBase?: string,
 ): ReasoningProviderKind {
   const inferred = inferProviderFromModelName(modelName);
-  return inferred &&
+  if (
+    inferred &&
     REASONING_PROVIDER_KINDS.has(inferred as ReasoningProviderKind)
-    ? (inferred as ReasoningProviderKind)
-    : "unsupported";
+  ) {
+    return inferred as ReasoningProviderKind;
+  }
+  // Only as a last resort: a recognized family keeps its own profile even when
+  // served locally, because the level set belongs to the weights. This covers
+  // the models whose names match nothing — gemma, llama, mistral, or a custom
+  // Modelfile name — whose reasoning support the server reports directly.
+  if (apiBase && isLocalModelApiBase(apiBase)) return "local";
+  return "unsupported";
 }
 
 export function getReasoningOptions(
@@ -2277,6 +2289,7 @@ export function getReasoningOptions(
   modelName: string,
   apiBase?: string,
   providerProtocol?: ProviderProtocol,
+  profileOverride?: ModelProfileOverride,
 ): ReasoningOption[] {
   if (provider === "anthropic") {
     const resolvedProtocol =
@@ -2287,11 +2300,14 @@ export function getReasoningOptions(
       });
     if (resolvedProtocol !== "anthropic_messages") return [];
   }
+  // The user's override is part of the identity: the menu must offer exactly
+  // the levels the request builder will encode, custom ones included.
   return getCatalogReasoningOptions({
     provider: provider === "unsupported" ? undefined : provider,
     model: modelName,
     apiBase,
     protocol: providerProtocol,
+    profileOverride,
   }).map((option) => ({
     level: option.level as LLMReasoningLevel,
     enabled: option.enabled,
@@ -2396,13 +2412,15 @@ export function getSelectedReasoningForItem(
   modelName: string,
   apiBase?: string,
   providerProtocol?: ProviderProtocol,
+  profileOverride?: ModelProfileOverride,
 ): LLMReasoningConfig | undefined {
-  const detectedProvider = detectReasoningProvider(modelName);
+  const detectedProvider = detectReasoningProvider(modelName, apiBase);
   const resolvedCapabilityProvider = getModelCapabilities({
     provider: detectedProvider === "unsupported" ? undefined : detectedProvider,
     model: modelName,
     apiBase,
     protocol: providerProtocol,
+    profileOverride,
   }).provider;
   const provider: ReasoningProviderKind = [
     "openai",
@@ -2413,6 +2431,7 @@ export function getSelectedReasoningForItem(
     "qwen",
     "grok",
     "anthropic",
+    "local",
   ].includes(resolvedCapabilityProvider as ReasoningProviderKind)
     ? (resolvedCapabilityProvider as ReasoningProviderKind)
     : detectedProvider;
@@ -2421,6 +2440,7 @@ export function getSelectedReasoningForItem(
     modelName,
     apiBase,
     providerProtocol,
+    profileOverride,
   )
     .filter((option) => option.enabled)
     .map((option) => option.level);
@@ -3379,6 +3399,8 @@ function resolveEffectiveRequestConfig(params: {
     params.providerProtocol ||
     explicitEntry?.providerProtocol ||
     fallbackEntry?.providerProtocol;
+  const advanced =
+    params.advanced || explicitEntry?.advanced || fallbackEntry?.advanced;
   const reasoning =
     params.reasoning ||
     getSelectedReasoningForItem(
@@ -3386,9 +3408,8 @@ function resolveEffectiveRequestConfig(params: {
       model,
       apiBase,
       providerProtocol,
+      advanced?.profileOverride,
     );
-  const advanced =
-    params.advanced || explicitEntry?.advanced || fallbackEntry?.advanced;
   return {
     model,
     apiBase,
@@ -7727,6 +7748,7 @@ export async function retryLatestAssistantResponse(
       temperature: effectiveRequestConfig.advanced?.temperature,
       maxTokens: effectiveRequestConfig.advanced?.maxTokens,
       inputTokenCap: effectiveRequestConfig.advanced?.inputTokenCap,
+      profileOverride: effectiveRequestConfig.advanced?.profileOverride,
       inputMode: effectiveRequestConfig.advanced?.inputMode,
       contextCache: contextPlan.contextCache,
     };
@@ -10277,6 +10299,7 @@ export async function sendQuestion(
       temperature: effectiveRequestConfig.advanced?.temperature,
       maxTokens: effectiveRequestConfig.advanced?.maxTokens,
       inputTokenCap: effectiveRequestConfig.advanced?.inputTokenCap,
+      profileOverride: effectiveRequestConfig.advanced?.profileOverride,
       inputMode: effectiveRequestConfig.advanced?.inputMode,
       contextCache: contextPlan.contextCache,
     };

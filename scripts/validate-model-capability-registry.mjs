@@ -15,6 +15,9 @@ const allowedRoots = new Set([
   "enable_thinking",
   "chat_template_kwargs",
   "extra_body",
+  // Ollama's native thinking switch. Keep in sync with ALLOWED_CONTROL_ROOTS
+  // in src/modelCapabilities/registry.ts.
+  "think",
 ]);
 const allowedOmitRoots = new Set(["temperature", "top_p", ...allowedRoots]);
 const allowedInputKeys = new Set(["text", "image", "video", "pdf"]);

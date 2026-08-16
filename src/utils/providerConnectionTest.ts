@@ -1,4 +1,10 @@
 import { usesMaxCompletionTokens } from "./apiHelpers";
+import {
+  isRecord,
+  normalizeProfileOverride,
+  profileOverrideAppliesTo,
+} from "../modelCapabilities";
+import { resolveUserExtraBody } from "./llmClient";
 import type { ModelProviderAuthMode } from "./modelProviders";
 import {
   describeAgentCapabilityClass,
@@ -156,6 +162,20 @@ function buildConnectionRequestPayload(params: {
       },
     };
   }
+  if (params.protocol === "ollama_native") {
+    return {
+      expectsSse: false,
+      body: {
+        model: params.modelName,
+        messages: [{ role: "user", content: "Say OK" }],
+        stream: false,
+        // Thinking off: the test is about reachability, and a reasoning model
+        // would otherwise burn the whole reply on thought.
+        think: false,
+        options: { num_predict: 16 },
+      },
+    };
+  }
   return {
     expectsSse: false,
     body: {
@@ -204,7 +224,24 @@ function extractConnectionReply(params: {
   if (params.protocol === "anthropic_messages") {
     return extractAnthropicText(params.jsonData) || "OK";
   }
+  if (params.protocol === "ollama_native") {
+    return extractOllamaText(params.jsonData).content || "OK";
+  }
   return extractGeminiText(params.jsonData) || "OK";
+}
+
+function extractOllamaText(jsonData: unknown): {
+  content: string;
+  thinking: string;
+} {
+  const message = (
+    jsonData as { message?: { content?: unknown; thinking?: unknown } }
+  )?.message;
+  return {
+    content: typeof message?.content === "string" ? message.content.trim() : "",
+    thinking:
+      typeof message?.thinking === "string" ? message.thinking.trim() : "",
+  };
 }
 
 export function getProviderConnectionCapabilityLabel(params: {
@@ -305,7 +342,7 @@ export async function runProviderConnectionTest(params: {
   apiBase: string;
   apiKey: string;
   modelName: string;
-}): Promise<{ reply: string; capabilityLabel: string }> {
+}): Promise<{ reply: string; capabilityLabel: string; warning?: string }> {
   const { body, expectsSse } = buildConnectionRequestPayload({
     protocol: params.protocol,
     modelName: params.modelName,
@@ -347,5 +384,174 @@ export async function runProviderConnectionTest(params: {
       jsonData,
     }),
     capabilityLabel: getProviderConnectionCapabilityLabel(params),
+    ...(resolveEmptyAnswerWarning(params.protocol, jsonData) || {}),
+  };
+}
+
+// ── Custom-settings checks ───────────────────────────────────────────────────
+
+export type ConnectionSettingsCheck = {
+  /** "extra" = the JSON parameter object; "level" = one reasoning level. */
+  kind: "extra" | "level";
+  /** The level id for kind "level". */
+  id?: string;
+  ok: boolean;
+  /** Server-reported failure, truncated for the status line. */
+  error?: string;
+};
+
+/**
+ * One-level-deep merge so a patch lands inside nested envelopes (`options`,
+ * `reasoning`, `generationConfig`) instead of replacing them — mirroring how
+ * the real payload builders fold user parameters in.
+ */
+function mergeBodyPatch(
+  base: Record<string, unknown>,
+  patch: Record<string, unknown>,
+): Record<string, unknown> {
+  const merged: Record<string, unknown> = { ...base };
+  for (const [key, value] of Object.entries(patch)) {
+    const existing = merged[key];
+    merged[key] =
+      isRecord(value) && isRecord(existing) ? { ...existing, ...value } : value;
+  }
+  return merged;
+}
+
+function truncateErrorText(text: string): string {
+  const compact = text.replace(/\s+/g, " ").trim();
+  return compact.length > 240 ? `${compact.slice(0, 240)}…` : compact;
+}
+
+/** POST one probe request with a body patch; report pass/fail, never throw. */
+async function postConnectionProbe(params: {
+  fetchFn: typeof fetch;
+  protocol: ProviderProtocol;
+  authMode: ModelProviderAuthMode;
+  apiBase: string;
+  apiKey: string;
+  modelName: string;
+  patch: Record<string, unknown>;
+}): Promise<{ ok: boolean; error?: string }> {
+  const { body, expectsSse } = buildConnectionRequestPayload({
+    protocol: params.protocol,
+    modelName: params.modelName,
+  });
+  const url = resolveProviderTransportEndpoint({
+    protocol: params.protocol,
+    apiBase: params.apiBase,
+    model: params.modelName,
+    stream: expectsSse,
+    authMode: params.authMode,
+  });
+  try {
+    const response = await params.fetchFn(url, {
+      method: "POST",
+      headers: buildProviderTransportHeaders({
+        protocol: params.protocol,
+        apiKey: params.apiKey,
+        authMode: params.authMode,
+      }),
+      body: JSON.stringify(mergeBodyPatch(body, params.patch)),
+    });
+    const rawText = await response.text();
+    if (!response.ok) {
+      return {
+        ok: false,
+        error: truncateErrorText(`HTTP ${response.status}: ${rawText}`),
+      };
+    }
+    // Ollama reports some request errors inside a 200 body.
+    try {
+      const parsed = JSON.parse(rawText) as { error?: unknown };
+      if (typeof parsed?.error === "string" && parsed.error) {
+        return { ok: false, error: truncateErrorText(parsed.error) };
+      }
+    } catch {
+      // SSE or non-JSON success bodies are fine.
+    }
+    return { ok: true };
+  } catch (error) {
+    return {
+      ok: false,
+      error: truncateErrorText(
+        error instanceof Error ? error.message : String(error),
+      ),
+    };
+  }
+}
+
+/**
+ * Try the user's customized settings against the live server, one request per
+ * item, and report which pass. The editor deliberately validates nothing about
+ * a level's meaning — users provide ids, the plugin encodes them, and the
+ * model is the judge — so this is where the judgement is fetched and shown.
+ *
+ * Attribution stays clean: the extra JSON is probed alone first, and level
+ * probes include it only when it passed, so one bad parameter cannot make
+ * every level read as broken.
+ */
+export async function runProviderSettingsChecks(params: {
+  fetchFn: typeof fetch;
+  protocol: ProviderProtocol;
+  authMode: ModelProviderAuthMode;
+  apiBase: string;
+  apiKey: string;
+  modelName: string;
+  profileOverride?: unknown;
+}): Promise<ConnectionSettingsCheck[]> {
+  const override = normalizeProfileOverride(params.profileOverride);
+  if (!override || !profileOverrideAppliesTo(override, params.modelName)) {
+    return [];
+  }
+  const checks: ConnectionSettingsCheck[] = [];
+  const probe = (patch: Record<string, unknown>) =>
+    postConnectionProbe({ ...params, patch });
+
+  const extraBody = resolveUserExtraBody(override, params.modelName);
+  let extraUsable = false;
+  if (extraBody) {
+    const result = await probe(extraBody);
+    extraUsable = result.ok;
+    checks.push({ kind: "extra", ok: result.ok, error: result.error });
+  }
+
+  const options =
+    override.reasoning?.kind === "select" ? override.reasoning.options : [];
+  for (const option of options) {
+    const body = option.controls?.body;
+    if (!body || !Object.keys(body).length) continue;
+    const result = await probe(
+      extraBody && extraUsable ? mergeBodyPatch(extraBody, body) : body,
+    );
+    checks.push({
+      kind: "level",
+      id: option.id,
+      ok: result.ok,
+      error: result.error,
+    });
+  }
+  return checks;
+}
+
+/**
+ * The reply extractors fall back to a literal "OK" when a provider returns no
+ * text, which reads as success even though the model answered nothing. For
+ * Ollama we can tell the two apart: content empty while thinking is populated
+ * is the failure mode behind #363, and the user needs to see it rather than a
+ * green tick.
+ */
+function resolveEmptyAnswerWarning(
+  protocol: ProviderProtocol,
+  jsonData: unknown,
+): { warning: string } | null {
+  if (protocol !== "ollama_native") return null;
+  const { content, thinking } = extractOllamaText(jsonData);
+  if (content || !thinking) return null;
+  return {
+    warning:
+      "The model returned reasoning but no answer. Turn thinking off for " +
+      "this model, or pick a different one — some models only produce an " +
+      "answer with thinking disabled.",
   };
 }

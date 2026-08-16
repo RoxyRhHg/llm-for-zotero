@@ -539,6 +539,41 @@ const zhCN: Record<string, string> = {
     "codex 令牌缺失。请先运行 `codex login`。",
   "Agent capability: ": "Agent 能力: ",
   "✓ Success — model says: ": "✓ 成功 — 模型回复: ",
+  "⚠ Connected, but no answer — ": "⚠ 已连接，但没有回答 — ",
+  "The model returned reasoning but no answer. Turn thinking off for this model, or pick a different one — some models only produce an answer with thinking disabled.":
+    "模型只返回了思考内容，没有回答。请关闭该模型的思考功能，或换一个模型——部分模型只有在关闭思考时才会给出回答。",
+  // ── Local providers ────────────────────────────────────────────────
+  "Ollama (local)": "Ollama（本地）",
+  "Local (OpenAI-compatible)": "本地（OpenAI 兼容）",
+  "API Key (optional)": "API 密钥（可选）",
+  "Leave blank unless your server requires auth":
+    "除非服务器需要认证，否则留空",
+  "Preset uses Ollama's native /api/chat endpoint, which separates thinking from the answer and honours the think parameter. No API key required.":
+    "预设使用 Ollama 原生 /api/chat 接口，可将思考与回答分开，并支持 think 参数。无需 API 密钥。",
+  "For LM Studio, llama.cpp, vLLM, Jan and other local OpenAI-compatible servers. No API key required.":
+    "适用于 LM Studio、llama.cpp、vLLM、Jan 等本地 OpenAI 兼容服务。无需 API 密钥。",
+  // ── Model parameter editor ─────────────────────────────────────────
+  "Reasoning levels": "思考级别",
+  "Future-proofing: when a provider ships a new reasoning level, add it here yourself — no plugin update needed. Type only the level name — ultra, off, anything — and the plugin sends it in the provider's own parameter, shown next to the level. The model decides what is valid: use Test to try every custom level. Deleting every level hides the reasoning menu.":
+    "面向未来的设计：当服务商推出新的思考级别时，你可以自行在此添加，无需等待插件更新。只需输入级别名称——ultra、off 或任何名称——插件会以该服务商自己的参数发送（显示在级别旁边）。级别是否有效由模型决定：点击 Test 可逐一验证自定义级别。删除所有级别会完全隐藏思考菜单。",
+  "Discard changes and return to the detected profile":
+    "放弃更改并恢复为检测到的配置",
+  "+ Add level": "+ 添加级别",
+  "Delete level": "删除级别",
+  level: "级别",
+  "Duplicate level — ignored": "级别重复 — 已忽略",
+  "Use letters, digits, - or _ so the level is remembered":
+    "请使用字母、数字、- 或 _，否则该级别不会被记住",
+  "Testing custom settings…": "正在测试自定义设置…",
+  "extra parameters": "额外参数",
+  rejected: "被拒绝",
+  "Extra request parameters": "额外请求参数",
+  'A JSON object merged into every request to this model, for example {"top_k": 40, "options": {"repeat_penalty": 1.1}}.':
+    '一个 JSON 对象，会合并进发往该模型的每次请求，例如 {"top_k": 40, "options": {"repeat_penalty": 1.1}}。',
+  "Invalid JSON: ": "JSON 无效：",
+  "Reset to detected": "恢复为检测值",
+  "customized for this model": "已为该模型自定义",
+  // Label / Auto / Yes / No are already defined above.
   "codex auth reuses local `codex login` credentials from ~/.codex/auth.json":
     "codex 认证复用本地 `codex login` 凭据（~/.codex/auth.json）",
   "GitHub Copilot": "GitHub Copilot",

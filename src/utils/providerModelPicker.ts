@@ -8,7 +8,10 @@
 
 import type { DiscoveredModel } from "../modelCapabilities";
 import type { ModelProviderGroup } from "./modelProviders";
-import { detectProviderPreset } from "./providerPresets";
+import {
+  detectProviderPreset,
+  providerPresetRequiresApiKey,
+} from "./providerPresets";
 import type { ProviderPresetId } from "./providerPresets";
 
 export type ProviderModelPickerGroup = Pick<
@@ -34,6 +37,17 @@ export function canFetchProviderModels(
   group: ProviderModelPickerGroup,
 ): boolean {
   return resolveProviderPickerPresetId(group) !== "customized";
+}
+
+/**
+ * Whether this group must have an API key before its catalog can be fetched.
+ * Local runtimes serve unauthenticated, so their dropdown populates with the
+ * key field left blank.
+ */
+export function providerGroupRequiresApiKey(
+  group: ProviderModelPickerGroup,
+): boolean {
+  return providerPresetRequiresApiKey(resolveProviderPickerPresetId(group));
 }
 
 export function sortModelOptions(models: DiscoveredModel[]): DiscoveredModel[] {
@@ -158,8 +172,11 @@ export function resolveProviderModelFetchStatus(args: {
   apiKey: string;
   loading: boolean;
   snapshot: { models: DiscoveredModel[]; error?: string } | null;
+  /** Absent means required, matching the preset default. */
+  requiresApiKey?: boolean;
 }): ProviderModelFetchStatus {
-  if (!args.apiKey.trim()) return { kind: "needs_api_key" };
+  const keyRequired = args.requiresApiKey !== false;
+  if (keyRequired && !args.apiKey.trim()) return { kind: "needs_api_key" };
   const models = args.snapshot?.models || [];
   if (!models.length) {
     if (args.loading) return { kind: "loading" };

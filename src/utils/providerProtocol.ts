@@ -7,6 +7,7 @@ export type ProviderProtocol =
   | "openai_chat_compat"
   | "anthropic_messages"
   | "gemini_native"
+  | "ollama_native"
   | "web_sync"; // [webchat]
 
 export type ProviderProtocolSpec = {
@@ -74,6 +75,18 @@ export const PROVIDER_PROTOCOL_SPECS: ProviderProtocolSpec[] = [
     label: "Gemini Native",
     helperText:
       "Use Gemini's native generateContent API with streaming tool calls and image input.",
+    streaming: true,
+    toolCalls: true,
+    multimodal: true,
+    fileInputs: false,
+    reasoning: true,
+  },
+  {
+    id: "ollama_native",
+    label: "Ollama Native",
+    helperText:
+      "Use Ollama's native /api/chat endpoint. Keeps thinking separate from the " +
+      "answer and can turn it off, which the OpenAI-compatible endpoint cannot.",
     streaming: true,
     toolCalls: true,
     multimodal: true,

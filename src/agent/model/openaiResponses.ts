@@ -124,6 +124,7 @@ export class OpenAIResponsesAgentAdapter implements AgentModelAdapter {
           request.model,
           request.apiBase,
           "responses_api",
+          { profileOverride: request.advanced?.profileOverride },
         );
         return {
           model: request.model,

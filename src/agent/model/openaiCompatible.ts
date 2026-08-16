@@ -374,6 +374,7 @@ export class OpenAIChatCompatAgentAdapter implements AgentModelAdapter {
           request.model,
           request.apiBase,
           "openai_chat_compat",
+          { profileOverride: request.advanced?.profileOverride },
         );
         return {
           model: request.model,

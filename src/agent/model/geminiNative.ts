@@ -1,6 +1,11 @@
-import { getGeminiReasoningProfile } from "../../utils/llmClient";
+import {
+  getGeminiReasoningProfile,
+  resolveUserExtraBody,
+} from "../../utils/llmClient";
 import {
   compileReasoningControls,
+  isRecord,
+  normalizeProfileOverride,
   getModelCapabilities,
 } from "../../modelCapabilities";
 import {
@@ -237,6 +242,7 @@ function resolveGeminiReasoningConfig(request: AgentRuntimeRequest) {
       model: request.model || "",
       apiBase: request.apiBase,
       protocol: "gemini_native",
+      profileOverride: request.advanced?.profileOverride,
     }),
     request.reasoning,
   );
@@ -811,7 +817,20 @@ export class GeminiNativeAgentAdapter implements AgentModelAdapter {
       ? [...conversationBase, ...continuation]
       : conversationBase;
 
+    // User extra parameters ride along like on every other protocol; a user
+    // generationConfig merges under the envelope so the dedicated
+    // temperature/max-token fields keep the last word on a collision.
+    const extraBody = resolveUserExtraBody(
+      normalizeProfileOverride(request.advanced?.profileOverride),
+      request.model,
+    );
+    const { generationConfig: extraGenerationConfig, ...extraTop } =
+      (extraBody || {}) as { generationConfig?: unknown } & Record<
+        string,
+        unknown
+      >;
     const payload = {
+      ...extraTop,
       ...(this.systemInstruction
         ? { systemInstruction: this.systemInstruction }
         : {}),
@@ -823,6 +842,7 @@ export class GeminiNativeAgentAdapter implements AgentModelAdapter {
         },
       },
       generationConfig: {
+        ...(isRecord(extraGenerationConfig) ? extraGenerationConfig : {}),
         ...(() => {
           const temperature = resolveGeminiTemperature(
             request.model,
@@ -837,6 +857,7 @@ export class GeminiNativeAgentAdapter implements AgentModelAdapter {
             apiBase: request.apiBase,
             protocol: "gemini_native",
             authMode: request.authMode,
+            profileOverride: request.advanced?.profileOverride,
           },
         ),
         ...(resolveGeminiReasoningConfig(request)

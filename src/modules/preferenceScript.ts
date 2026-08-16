@@ -6,7 +6,7 @@ import {
   DEFAULT_SYSTEM_PROMPT,
   DEFAULT_TEMPERATURE,
 } from "../utils/llmDefaults";
-import { HTML_NS } from "../utils/domHelpers";
+import { HTML_NS, el, iconBtn } from "../utils/domHelpers";
 import { registerAddonDialog } from "../utils/dialogRegistry";
 import {
   normalizeMaxTokensForModel,
@@ -34,20 +34,26 @@ import {
   CUSTOMIZED_MODEL_OPTION_VALUE,
   buildProviderModelSelectRows,
   canFetchProviderModels,
+  providerGroupRequiresApiKey,
   createSelectRebuildGate,
   resolveModelEntryMode,
   resolveProviderModelFetchStatus,
   runAfterSelectChangeDispatch,
 } from "../utils/providerModelPicker";
 import {
+  getModelCapabilities,
   getModelCatalogStatus,
   refreshModelCatalog,
+  subscribeModelCapabilities,
+  type ModelProfileOverride,
 } from "../modelCapabilities";
+import { createModelProfileEditor } from "./modelProfileEditor";
 import {
   PROVIDER_PRESETS,
   detectProviderPreset,
   getProviderPreset,
   getProviderPresetProtocolOptions,
+  providerPresetRequiresApiKey,
   type ProviderPresetId,
 } from "../utils/providerPresets";
 import {
@@ -58,6 +64,7 @@ import {
 } from "../utils/providerProtocol";
 import {
   runProviderConnectionTest,
+  runProviderSettingsChecks,
   runCodexAppServerConnectionTest,
 } from "../utils/providerConnectionTest";
 import { normalizeAgentPermissionMode } from "../shared/agentPermissionMode";
@@ -395,37 +402,42 @@ function resolveModelSelectedProtocol(
 }
 
 // ── DOM helpers ────────────────────────────────────────────────────
+// `el` and `iconBtn` live in utils/domHelpers so the profile editor and this
+// pane render identical controls from one definition.
 
-function el<K extends keyof HTMLElementTagNameMap>(
-  doc: Document,
-  tag: K,
-  style?: string,
-  text?: string,
-): HTMLElementTagNameMap[K] {
-  const node = doc.createElementNS(HTML_NS, tag) as HTMLElementTagNameMap[K];
-  if (style) node.setAttribute("style", style);
-  if (text !== undefined) node.textContent = text;
-  return node;
-}
+// ── Live profile editors ───────────────────────────────────────────
+// Capability data (context window, thinking support) arrives asynchronously
+// from the model catalog, so profile editors repaint when it lands instead of
+// freezing whatever was cached when the pane mounted. One shared subscription
+// serves every editor; disconnected editors are pruned on each notify, and
+// the subscription retires itself when the last one is gone — the pane has no
+// teardown hook, so lifecycle is keyed to the DOM. An editor the user is
+// typing in is skipped: a repaint would eat the in-progress edit.
 
-function iconBtn(
-  doc: Document,
-  label: string,
-  title: string,
-): HTMLButtonElement {
-  const btn = el(
-    doc,
-    "button",
-    "padding: 0; width: 22px; height: 22px; border: none; background: transparent;" +
-      " color: var(--fill-secondary, #888); font-size: 16px; font-weight: 500;" +
-      " display: inline-flex; align-items: center; justify-content: center;" +
-      " cursor: pointer; flex-shrink: 0; border-radius: 4px; line-height: 1;",
-    label,
-  ) as HTMLButtonElement;
-  btn.type = "button";
-  btn.title = title;
-  btn.setAttribute("aria-label", title);
-  return btn;
+type LiveProfileEditor = { element: HTMLElement; refresh: () => void };
+const liveProfileEditors: LiveProfileEditor[] = [];
+let unsubscribeCapabilityUpdates: (() => void) | null = null;
+
+function registerLiveProfileEditor(entry: LiveProfileEditor) {
+  liveProfileEditors.push(entry);
+  if (unsubscribeCapabilityUpdates) return;
+  unsubscribeCapabilityUpdates = subscribeModelCapabilities(() => {
+    for (let index = liveProfileEditors.length - 1; index >= 0; index -= 1) {
+      if (!liveProfileEditors[index].element.isConnected) {
+        liveProfileEditors.splice(index, 1);
+      }
+    }
+    if (!liveProfileEditors.length) {
+      unsubscribeCapabilityUpdates?.();
+      unsubscribeCapabilityUpdates = null;
+      return;
+    }
+    for (const editor of liveProfileEditors) {
+      const active = editor.element.ownerDocument?.activeElement;
+      if (active && editor.element.contains(active)) continue;
+      editor.refresh();
+    }
+  });
 }
 
 // ── Provider model select (fetch & choose) ─────────────────────────
@@ -472,11 +484,14 @@ function attachProviderModelSelect(args: {
   const readSnapshot = () =>
     getModelCatalogStatus(buildProviderCatalogIdentity(group));
 
+  const requiresApiKey = providerGroupRequiresApiKey(group);
+
   const currentStatus = () =>
     resolveProviderModelFetchStatus({
       apiKey: group.apiKey,
       loading,
       snapshot: readSnapshot(),
+      requiresApiKey,
     });
 
   // The manual text input takes over while the catalog is unavailable, while
@@ -560,7 +575,7 @@ function attachProviderModelSelect(args: {
   };
 
   const refreshCatalog = async () => {
-    if (!group.apiKey.trim()) {
+    if (requiresApiKey && !group.apiKey.trim()) {
       updateStatus();
       return;
     }
@@ -1316,6 +1331,11 @@ export async function registerPrefsScripts(_window: Window | undefined | null) {
         group.authMode !== "codex_app_server" &&
         group.authMode !== "copilot_auth" &&
         selectedPresetId === "customized";
+      // Local runtimes serve unauthenticated, so the key field, the connection
+      // test and the model catalog must all work with the key left blank.
+      const presetRequiresApiKey =
+        group.authMode !== "api_key" ||
+        providerPresetRequiresApiKey(selectedPresetId);
       group.providerProtocol = resolveSelectedProtocol(group, selectedPresetId);
 
       // ── Provider preset ─────────────────────────────────────────
@@ -1410,7 +1430,10 @@ export async function registerPrefsScripts(_window: Window | undefined | null) {
         group.authMode !== "codex_auth" &&
         group.authMode !== "codex_app_server" &&
         group.authMode !== "copilot_auth" &&
-        !isCustomizedPreset;
+        !isCustomizedPreset &&
+        // Local presets ship a default host and port, but the server may run on
+        // another port or another machine on the LAN, so the URL stays editable.
+        presetRequiresApiKey;
       apiUrlInput.style.opacity = apiUrlInput.readOnly ? "0.85" : "1";
       apiUrlInput.style.cursor = apiUrlInput.readOnly ? "default" : "text";
       apiUrlInput.style.pointerEvents = apiUrlInput.readOnly ? "none" : "auto";
@@ -1442,12 +1465,19 @@ export async function registerPrefsScripts(_window: Window | undefined | null) {
         "div",
         "display: flex; flex-direction: column;",
       );
-      const apiKeyLabel = el(doc, "label", LABEL_STYLE, t("API Key"));
+      const apiKeyLabel = el(
+        doc,
+        "label",
+        LABEL_STYLE,
+        presetRequiresApiKey ? t("API Key") : t("API Key (optional)"),
+      );
       const apiKeyInput = el(doc, "input", INPUT_STYLE) as HTMLInputElement;
       apiKeyInput.id = `${config.addonRef}-api-key-${group.id}`;
       apiKeyLabel.setAttribute("for", apiKeyInput.id);
       apiKeyInput.type = "password";
-      apiKeyInput.placeholder = "sk-…";
+      apiKeyInput.placeholder = presetRequiresApiKey
+        ? "sk-…"
+        : t("Leave blank unless your server requires auth");
       apiKeyInput.value = group.apiKey;
       // Model dropdowns register here so a freshly pasted key refetches their
       // catalogs without reopening the pane. Debounced to sit out keystrokes.
@@ -1946,7 +1976,9 @@ export async function registerPrefsScripts(_window: Window | undefined | null) {
             group,
             modelEntry,
             onModelPicked: (modelId) => {
+              const previousModel = modelEntry.model;
               modelEntry.model = modelId;
+              onSelectedModelChanged(previousModel);
               persistGroups(groups);
               syncAddModelBtn();
               syncAddProviderBtn();
@@ -2121,6 +2153,76 @@ export async function registerPrefsScripts(_window: Window | undefined | null) {
           ),
         );
 
+        // ── Capability, reasoning and extra-parameter controls ───────────
+        // Part of the same advanced panel rather than a nested disclosure:
+        // one place lists everything customizable for this model, and the
+        // fields above (temperature, max tokens, input cap, input mode) are
+        // not repeated here.
+        const resolveDetectedProfile = () =>
+          getModelCapabilities({
+            model: modelEntry.model,
+            apiBase: group.apiBase,
+            protocol: resolveModelSelectedProtocol(
+              group,
+              selectedPresetId,
+              modelEntry,
+            ),
+            authMode: group.authMode,
+            scope: group.id,
+          });
+
+        const profileEditor = createModelProfileEditor({
+          doc,
+          t,
+          getOverride: () => modelEntry.profileOverride,
+          getDetected: resolveDetectedProfile,
+          getModelName: () => modelEntry.model,
+          onChange: (next: ModelProfileOverride | undefined) => {
+            if (next) {
+              modelEntry.profileOverride = next;
+            } else {
+              delete modelEntry.profileOverride;
+            }
+            persistGroups(groups);
+          },
+          styles: {
+            input: INPUT_STYLE,
+            inputSm: INPUT_SM_STYLE,
+            helper: HELPER_STYLE,
+            sectionLabel: SECTION_LABEL_STYLE,
+            outlineBtn: OUTLINE_BTN_STYLE,
+          },
+        });
+        advRow.append(
+          el(
+            doc,
+            "div",
+            "border-top: 1px solid var(--stroke-secondary, #c8c8c8);" +
+              " margin: 4px 0 2px; opacity: 0.6;",
+          ),
+          profileEditor.element,
+        );
+        // The detected profile arrives asynchronously (catalog fetch), so the
+        // editor repaints when capability data lands rather than seeding once
+        // from whatever was cached at mount time.
+        registerLiveProfileEditor({
+          element: profileEditor.element,
+          refresh: () => profileEditor.refresh(resolveDetectedProfile()),
+        });
+
+        /**
+         * Parameters are tuned for one specific model, so pointing this entry
+         * at a different one must not apply them there — the override carries
+         * the model it was authored for and goes dormant on a mismatch (see
+         * `forModel`), so a rename never destroys it and renaming back
+         * restores it. The repaint swaps the panel to the new model's
+         * detected profile.
+         */
+        function onSelectedModelChanged(previousModel: string) {
+          if (previousModel.trim() === modelEntry.model.trim()) return;
+          profileEditor.refresh(resolveDetectedProfile());
+        }
+
         const commitAdvanced = () => {
           modelEntry.temperature = normalizeTemperature(tempField.input.value);
           modelEntry.maxTokens = normalizeMaxTokensForModel(
@@ -2190,7 +2292,9 @@ export async function registerPrefsScripts(_window: Window | undefined | null) {
         });
 
         modelInput.addEventListener("input", () => {
+          const previousModel = modelEntry.model;
           modelEntry.model = modelInput.value;
+          onSelectedModelChanged(previousModel);
           persistGroups(groups);
           syncAddModelBtn();
           syncAddProviderBtn();
@@ -2250,7 +2354,7 @@ export async function registerPrefsScripts(_window: Window | undefined | null) {
             );
 
             if (!apiBase) throw new Error(t("API URL is required"));
-            if (!apiKey) {
+            if (!apiKey && presetRequiresApiKey) {
               throw new Error(
                 authMode === "codex_auth"
                   ? t("codex token missing. Run `codex login` first.")
@@ -2269,10 +2373,46 @@ export async function registerPrefsScripts(_window: Window | undefined | null) {
               apiKey,
               modelName,
             });
-            statusLine.textContent =
-              `${t("✓ Success — model says: ")}"${result.reply}"\n` +
-              `${t("Agent capability: ")}${result.capabilityLabel}`;
-            statusLine.style.color = "green";
+            // The editor validates nothing about a level's meaning — the
+            // model is the judge — so the test also tries every customized
+            // setting and shows the server's verdict per item.
+            statusLine.textContent = t("Testing custom settings…");
+            statusLine.style.color = "";
+            const settingsChecks = await runProviderSettingsChecks({
+              fetchFn,
+              protocol: providerProtocol,
+              authMode,
+              apiBase,
+              apiKey,
+              modelName,
+              profileOverride: modelEntry.profileOverride,
+            });
+            const settingsLines = settingsChecks.map((check) => {
+              const label =
+                check.kind === "extra"
+                  ? t("extra parameters")
+                  : `${t("level")} ${check.id}`;
+              return check.ok
+                ? `✓ ${label}`
+                : `✗ ${label} — ${check.error || t("rejected")}`;
+            });
+            const settingsFailed = settingsChecks.some((check) => !check.ok);
+            const settingsSuffix = settingsLines.length
+              ? `\n${settingsLines.join("\n")}`
+              : "";
+            if (result.warning) {
+              statusLine.textContent =
+                `${t("⚠ Connected, but no answer — ")}${t(result.warning)}\n` +
+                `${t("Agent capability: ")}${result.capabilityLabel}` +
+                settingsSuffix;
+              statusLine.style.color = "darkorange";
+            } else {
+              statusLine.textContent =
+                `${t("✓ Success — model says: ")}"${result.reply}"\n` +
+                `${t("Agent capability: ")}${result.capabilityLabel}` +
+                settingsSuffix;
+              statusLine.style.color = settingsFailed ? "darkorange" : "green";
+            }
           } catch (error) {
             statusLine.textContent = `✗ ${(error as Error).message}`;
             statusLine.style.color = "red";
