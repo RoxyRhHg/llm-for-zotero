@@ -2,7 +2,10 @@ import { assert } from "chai";
 import { readFileSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import { locatedResultIdentifiesQuoteSourceForTests as identifiesQuoteSource } from "../src/modules/contextPanel/assistantCitationLinks";
+import {
+  acceptsOpenedQuoteMatchForTests,
+  locatedResultIdentifiesQuoteSourceForTests as identifiesQuoteSource,
+} from "../src/modules/contextPanel/assistantCitationLinks";
 import { locateQuoteInPageTexts } from "../src/modules/contextPanel/livePdfSelectionLocator";
 import { summarizeQuoteTextSupport } from "../src/modules/contextPanel/quoteTextSearch";
 
@@ -335,6 +338,50 @@ describe("citation navigation contracts", function () {
       searchSection.indexOf("const scopeDelta"),
       searchSection.indexOf("const rankDelta"),
     );
+  });
+
+  describe("opening a candidate in the reader", function () {
+    // The background verifier refuses a library-search paper that only accounts
+    // for part of the quote. The viewer fallback is reached for exactly the
+    // papers whose text would not extract in the background, so applying a
+    // weaker rule there would let an unextractable decoy walk through the gate
+    // the extractable one is held to.
+    const decoy = locateQuoteInPageTexts(DECOY_PAPER, STITCHED_QUOTE, null);
+    const real = locateQuoteInPageTexts(SOURCE_PAPER, STITCHED_QUOTE, null);
+
+    it("will not move the reader to a searched paper that shares one passage", function () {
+      assert.equal(decoy.status, "resolved", "the locator does resolve it");
+      assert.isFalse(
+        acceptsOpenedQuoteMatchForTests({
+          authoritative: false,
+          result: decoy,
+        }),
+      );
+    });
+
+    it("still accepts the paper that holds the whole quote", function () {
+      assert.isTrue(
+        acceptsOpenedQuoteMatchForTests({ authoritative: false, result: real }),
+      );
+    });
+
+    it("keeps a paper the conversation itself carries eligible", function () {
+      // Writers stitch quotes, and a paper the answer actually used is allowed
+      // to account for the quote in pieces — the same latitude the background
+      // path gives it.
+      assert.isTrue(
+        acceptsOpenedQuoteMatchForTests({ authoritative: true, result: decoy }),
+      );
+    });
+
+    it("refuses a hit the locator could not place on a page", function () {
+      assert.isFalse(
+        acceptsOpenedQuoteMatchForTests({
+          authoritative: true,
+          result: { ...real, computedPageIndex: null },
+        }),
+      );
+    });
   });
 
   it("judges a candidate on how much of the quote it accounts for", function () {

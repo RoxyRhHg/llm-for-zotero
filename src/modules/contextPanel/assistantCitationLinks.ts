@@ -72,6 +72,7 @@ import {
   type QuoteEvidenceProvenance,
 } from "./quoteEvidenceProvenance";
 import {
+  mergeQuoteTargetResolutions,
   resolveVerifiedQuoteTarget,
   type QuoteTargetCandidate,
   type QuoteTargetResolution,
@@ -207,16 +208,21 @@ function getCitationNavigationMode(
   return hasQuoteText ? "trusted-quote" : "inline-citation";
 }
 
-function allowLibrarySearchForCitationNavigation(params: {
+/**
+ * An inline citation carries no quote to verify against, so it may only widen
+ * its search when it has nothing of its own to go on — and even then the
+ * papers already at hand come first.
+ */
+function resolveCitationNavigationLibrarySearchMode(params: {
   navigationMode: CitationNavigationMode;
   hasQuoteText: boolean;
   staticCandidateCount: number;
-}): boolean {
-  return (
-    params.navigationMode === "inline-citation" &&
+}): CitationLibrarySearchMode {
+  return params.navigationMode === "inline-citation" &&
     !params.hasQuoteText &&
     params.staticCandidateCount === 0
-  );
+    ? "local-first"
+    : "never";
 }
 
 function startCitationNavigationTiming(): CitationNavigationTiming {
@@ -2333,6 +2339,48 @@ function rankCandidateForCitation(
   return rankCitationSearchMatch(extractedCitation, candidate);
 }
 
+/**
+ * How far a citation click may look for the paper it names.
+ *
+ * - `always`: the quote decides, so the search may be as wide as the library.
+ *   Nothing navigates on a label alone here — every hit has its PDF text read
+ *   and must contain the quote — so a wider net costs a read at worst, while a
+ *   narrower one can hide the real source entirely.
+ * - `local-first`: no quote to check, so a library search is only worth its
+ *   cost when the papers already at hand do not confidently answer the label.
+ * - `never`: the caller already knows which paper it means.
+ */
+export type CitationLibrarySearchMode = "always" | "local-first" | "never";
+
+/**
+ * Whether this click should look past the papers already at hand.
+ *
+ * "Already at hand" has to mean *confidently* the cited paper.  Agreement is
+ * scored in tiers, and the weak ones are coincidences: sharing only a year
+ * with `(Smith, 2021)` scores above zero, yet says nothing — it is not even
+ * enough to navigate to.  Treating any non-zero score as an answer let one
+ * unrelated 2021 paper in the conversation suppress the search that would have
+ * found the real one.
+ */
+function shouldSearchLibraryForCitation(params: {
+  mode: CitationLibrarySearchMode;
+  extractedCitation: ExtractedCitationLabel | null;
+  localCandidates: AssistantCitationPaperCandidate[];
+}): boolean {
+  if (params.mode !== "local-first") return params.mode === "always";
+  // With no label to match on there is nothing to be confident about, so any
+  // paper at hand beats a search that has no criterion to search by.
+  if (!params.extractedCitation) return !params.localCandidates.length;
+  return !params.localCandidates.some(
+    (candidate) =>
+      rankCitationCandidateMatch(params.extractedCitation!, candidate)
+        .confidence === "high",
+  );
+}
+
+export const shouldSearchLibraryForCitationForTests =
+  shouldSearchLibraryForCitation;
+
 function buildAutoNavigableCitationCandidateKeys(params: {
   extractedCitation: ExtractedCitationLabel | null;
   orderedCandidates: AssistantCitationPaperCandidate[];
@@ -2523,8 +2571,9 @@ async function buildOrderedCitationCandidates(
   panelItem: Zotero.Item,
   extractedCitation: ExtractedCitationLabel | null,
   staticCandidates: AssistantCitationPaperCandidate[],
-  options?: {
-    allowLibrarySearch?: boolean;
+  options: {
+    /** Required: silently defaulting this is how the mode got lost before. */
+    librarySearch: CitationLibrarySearchMode;
     scopeCollectionIds?: ReadonlySet<number>;
   },
 ): Promise<AssistantCitationPaperCandidate[]> {
@@ -2535,20 +2584,17 @@ async function buildOrderedCitationCandidates(
     staticCandidates,
     dynamicFallbackCandidates,
   );
-  const hasUsefulLocalCandidate = extractedCitation
-    ? localCandidates.some(
-        (candidate) =>
-          rankCandidateForCitation(extractedCitation, candidate) > 0,
+  const searchedCandidates = shouldSearchLibraryForCitation({
+    mode: options.librarySearch,
+    extractedCitation,
+    localCandidates,
+  })
+    ? await resolveCitationCandidatesFromLibrarySearch(
+        panelItem,
+        extractedCitation,
+        options.scopeCollectionIds,
       )
-    : localCandidates.length > 0;
-  const searchedCandidates =
-    options?.allowLibrarySearch === false || hasUsefulLocalCandidate
-      ? []
-      : await resolveCitationCandidatesFromLibrarySearch(
-          panelItem,
-          extractedCitation,
-          options?.scopeCollectionIds,
-        );
+    : [];
   const effectiveCandidates = mergeCitationCandidates(
     staticCandidates,
     searchedCandidates,
@@ -2646,7 +2692,7 @@ async function resolveCandidatesForCitationNavigation(params: {
   extractedCitation: ExtractedCitationLabel | null;
   staticCandidates: AssistantCitationPaperCandidate[];
   quoteText: string;
-  allowLibrarySearch: boolean;
+  librarySearch: CitationLibrarySearchMode;
   scopeCollectionIds?: ReadonlySet<number>;
 }): Promise<AssistantCitationPaperCandidate[]> {
   // A source-backed quote with no trusted anchor may still search the library.
@@ -2659,7 +2705,7 @@ async function resolveCandidatesForCitationNavigation(params: {
     params.extractedCitation,
     params.staticCandidates,
     {
-      allowLibrarySearch: params.allowLibrarySearch,
+      librarySearch: params.librarySearch,
       scopeCollectionIds: params.scopeCollectionIds,
     },
   );
@@ -2741,6 +2787,42 @@ export const locatedResultIdentifiesQuoteSourceForTests =
   locatedResultIdentifiesQuoteSource;
 
 /**
+ * Papers the conversation itself carries are settled before — and judged more
+ * leniently than — a paper that a library label search merely proposed.
+ */
+function isAuthoritativeCitationCandidate(
+  candidate: AssistantCitationPaperCandidate,
+): boolean {
+  return candidate.provenance !== "library-search";
+}
+
+/**
+ * Whether a hit found by *opening* a candidate may move the reader.
+ *
+ * The background verifier refuses a paper that a library search merely proposed
+ * when it accounts for only part of the quote.  This path is reached for the
+ * papers whose text would not extract in the background, and it must apply the
+ * same rule: otherwise a scanned decoy sharing one long phrase walks straight
+ * through the gate its extractable twin is held to, and the click parks the
+ * user on a paper the answer never used.
+ *
+ * A paper the conversation itself carries keeps the latitude it has elsewhere —
+ * writers stitch quotes, and no single span need cover the whole of one.
+ */
+function acceptsOpenedQuoteMatch(params: {
+  authoritative: boolean;
+  result: LivePdfSelectionLocateResult;
+}): boolean {
+  if (params.result.status !== "resolved") return false;
+  if (params.result.computedPageIndex === null) return false;
+  return (
+    params.authoritative || locatedResultIdentifiesQuoteSource(params.result)
+  );
+}
+
+export const acceptsOpenedQuoteMatchForTests = acceptsOpenedQuoteMatch;
+
+/**
  * Read a candidate's PDF text in the background to decide whether it really
  * contains the quote.  This deliberately does not open a reader tab: a click
  * may have several candidates in range and only the winner should ever appear
@@ -2818,10 +2900,14 @@ async function locateQuoteByOpeningCitationCandidates(params: {
     for (const searchText of params.searchTexts) {
       const result = await locateQuoteInLivePdfReader(reader, searchText, {
         skipFindController: true,
-        exactOnly: true,
       });
-      if (result.status === "resolved" && result.computedPageIndex !== null) {
-        const pageIndex = Math.floor(result.computedPageIndex);
+      if (
+        acceptsOpenedQuoteMatch({
+          authoritative: isAuthoritativeCitationCandidate(candidate),
+          result,
+        })
+      ) {
+        const pageIndex = Math.floor(result.computedPageIndex as number);
         matches.push({
           candidate,
           pageIndex,
@@ -2914,9 +3000,7 @@ function buildQuoteTargetCandidates(
 ): QuoteTargetCandidate[] {
   return pdfCandidates.map((candidate) => ({
     contextItemId: candidate.contextItemId,
-    // Papers the conversation itself carries are settled before a paper that a
-    // library label search merely proposed.
-    authoritative: candidate.provenance !== "library-search",
+    authoritative: isAuthoritativeCitationCandidate(candidate),
     labelRank: rankCandidateForCitation(extractedCitation, candidate),
   }));
 }
@@ -2966,7 +3050,7 @@ async function navigateUntrustedQuoteCitation(params: {
       extractedCitation: params.extractedCitation,
       staticCandidates: params.staticCandidates,
       quoteText: params.quoteText,
-      allowLibrarySearch: true,
+      librarySearch: "always",
       scopeCollectionIds: citationButtonScopeCollectionCache.get(params.button),
     });
   const resolvedCandidates = recordedCandidates.length
@@ -3025,17 +3109,22 @@ async function navigateUntrustedQuoteCitation(params: {
           candidate,
         ]),
       );
-      resolution = await verifyCandidates(fallbackCandidates);
+      // Only the papers the first pass skipped are re-read, so the second
+      // verdict covers fewer papers than the click does.  Merging keeps the
+      // recorded paper's standing — a scanned PDF stays eligible for the
+      // viewer fallback instead of being written off by a search that failed
+      // somewhere else.
+      resolution = mergeQuoteTargetResolutions({
+        recorded: resolution,
+        searched: await verifyCandidates(fallbackCandidates),
+      });
     }
   }
   markCitationNavigationTiming(params.timing, "quote verification", {
     status: resolution.status,
     // How many PDFs this click had to read. A jump to a paper the answer
     // recorded should be 1; higher means the label search did the work.
-    pdfsRead:
-      resolution.status === "resolved" || resolution.status === "not-found"
-        ? resolution.readCount
-        : undefined,
+    pdfsRead: resolution.readCount,
   });
 
   let match: ResolvedQuoteCitationMatch | null = null;
@@ -3202,7 +3291,7 @@ async function resolveAndNavigateAssistantCitation(params: {
       extractedCitation,
       staticCandidates,
       quoteText: normalizedQuoteText,
-      allowLibrarySearch: allowLibrarySearchForCitationNavigation({
+      librarySearch: resolveCitationNavigationLibrarySearchMode({
         navigationMode,
         hasQuoteText: Boolean(normalizedQuoteText),
         staticCandidateCount: staticCandidates.length,
