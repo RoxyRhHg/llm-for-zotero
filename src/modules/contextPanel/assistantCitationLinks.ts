@@ -60,9 +60,15 @@ import {
   lookupCachedQuoteLocationForAttachment,
   resolvePageIndexForLabel,
   scrollToExactQuoteInReader,
+  verifyQuoteLocationForAttachment,
   warmPageTextCache,
   warmQuoteLocationCacheForAttachment,
 } from "./livePdfSelectionLocator";
+import {
+  resolveVerifiedQuoteTarget,
+  type QuoteTargetCandidate,
+  type QuoteTargetVerification,
+} from "./quoteCitationTargetResolver";
 import { resolveConversationBaseItem } from "./portalScope";
 import { searchPaperCandidates } from "./paperSearch";
 import { resolveQuoteCitationLookupText } from "./quoteNavigationText";
@@ -123,8 +129,6 @@ type CitationNavigationMode =
   | "inline-citation"
   | "trusted-quote"
   | "untrusted-quote";
-
-type QuoteCitationTrust = "trusted-anchor" | "source-backed-unverified";
 
 const citationButtonNavigationModeCache = new WeakMap<
   HTMLButtonElement,
@@ -2565,19 +2569,18 @@ async function resolveCandidatesForCitationNavigation(params: {
   extractedCitation: ExtractedCitationLabel | null;
   staticCandidates: AssistantCitationPaperCandidate[];
   quoteText: string;
-  trust: QuoteCitationTrust;
   allowLibrarySearch: boolean;
 }): Promise<AssistantCitationPaperCandidate[]> {
-  const allowLibrarySearch =
-    params.trust === "trusted-anchor"
-      ? params.allowLibrarySearch
-      : params.allowLibrarySearch &&
-        Boolean(params.extractedCitation?.normalizedCitationKey);
+  // A source-backed quote with no trusted anchor may still search the library.
+  // Widening the search space is safe because nothing navigates on a label
+  // alone: `navigateUntrustedQuoteCitation` reads each candidate's PDF text and
+  // only moves the reader once the quote is found there.  A trusted anchor
+  // already carries its own paper, so its search stays where the caller put it.
   return buildOrderedCitationCandidates(
     params.panelItem,
     params.extractedCitation,
     params.staticCandidates,
-    { allowLibrarySearch },
+    { allowLibrarySearch: params.allowLibrarySearch },
   );
 }
 
@@ -2604,73 +2607,85 @@ function resolveAuthoritativeNonPdfCitationCandidate(input: {
 export const resolveAuthoritativeNonPdfCitationCandidateForTests =
   resolveAuthoritativeNonPdfCitationCandidate;
 
-async function navigateUntrustedQuoteCitation(params: {
-  status: HTMLElement | null;
-  button: HTMLButtonElement;
-  panelItem: Zotero.Item;
-  extractedCitation: ExtractedCitationLabel | null;
-  staticCandidates: AssistantCitationPaperCandidate[];
-  displayCitationLabel: string;
+type ResolvedQuoteCitationMatch = {
+  candidate: AssistantCitationPaperCandidate;
+  pageIndex: number;
+  /**
+   * Only set when a reader actually reported it.  Zotero navigates by label
+   * when one is supplied, and a PDF's printed labels need not track its page
+   * order, so guessing one from the index can land on the wrong page.
+   */
+  pageLabel?: string;
   quoteText: string;
-  paragraphQuoteTexts: string[];
-}): Promise<boolean> {
-  const resolvedCandidates = await resolveCandidatesForCitationNavigation({
-    panelItem: params.panelItem,
-    extractedCitation: params.extractedCitation,
-    staticCandidates: params.staticCandidates,
-    quoteText: params.quoteText,
-    trust: "source-backed-unverified",
-    allowLibrarySearch: false,
-  });
-  const pdfCandidates = resolvedCandidates.filter((candidate) =>
-    isPdfBackedCitationCandidate(candidate),
+  sourceMatchText?: string;
+  sourceMatchPageOccurrence?: number;
+};
+
+/**
+ * Read a candidate's PDF text in the background to decide whether it really
+ * contains the quote.  This deliberately does not open a reader tab: a click
+ * may have several candidates in range and only the winner should ever appear
+ * on screen.
+ */
+async function verifyQuoteInCitationCandidate(
+  contextItemId: number,
+  quoteText: string,
+): Promise<QuoteTargetVerification> {
+  const result = await verifyQuoteLocationForAttachment(
+    contextItemId,
+    quoteText,
   );
-  if (!pdfCandidates.length) {
-    if (params.status) {
-      setStatus(
-        params.status,
-        "The cited quote is unverified and no explicit PDF context is available.",
-        "error",
-      );
-    }
-    return false;
-  }
+  return {
+    // A quote too short to identify a page is a property of the quote, not of
+    // this PDF, so it counts as "not here" rather than "could not be read" —
+    // re-reading it through the viewer would give the same verdict.
+    status:
+      result.status === "selection-too-short" ? "not-found" : result.status,
+    pageIndex: result.computedPageIndex,
+    sourceMatchText: result.sourceMatchText,
+    sourceMatchPageOccurrence: result.sourceMatchPageOccurrence,
+    reason: result.reason,
+  };
+}
 
-  if (params.status) {
-    setStatus(params.status, "Locating cited quote...", "sending");
-  }
+/**
+ * Opening a paper that turns out not to hold the quote is exactly the tab
+ * spam this path exists to avoid, so only the few best guesses are tried.
+ */
+const MAX_OPENED_QUOTE_VERIFICATION_CANDIDATES = 3;
 
-  const matchedCandidates: Array<{
-    candidate: AssistantCitationPaperCandidate;
-    pageIndex: number;
-    pageLabel: string;
-    quoteText: string;
-    sourceMatchText?: string;
-    sourceMatchPageOccurrence?: number;
-  }> = [];
-  const searchTexts = Array.from(
-    new Set(
-      [params.quoteText, ...params.paragraphQuoteTexts]
-        .map((text) => sanitizeText(text || "").trim())
-        .filter(Boolean),
-    ),
-  );
-  let lastReason = "The cited quote was not found in the explicit PDF context.";
-
-  for (const candidate of pdfCandidates) {
+/**
+ * Last resort for PDFs whose text the background worker cannot read (scanned
+ * or otherwise unextractable).  Opening the reader lets the viewer supply text
+ * the worker could not, which is how this path behaved before verification
+ * moved into the background.
+ */
+async function locateQuoteByOpeningCitationCandidates(params: {
+  candidates: AssistantCitationPaperCandidate[];
+  searchTexts: string[];
+}): Promise<{
+  matches: ResolvedQuoteCitationMatch[];
+  reason: string;
+}> {
+  const matches: ResolvedQuoteCitationMatch[] = [];
+  let reason = "";
+  for (const candidate of params.candidates.slice(
+    0,
+    MAX_OPENED_QUOTE_VERIFICATION_CANDIDATES,
+  )) {
     const reader = await openReaderForItem(candidate.contextItemId);
     if (!reader) {
-      lastReason = "Could not open an explicit PDF context for this quote.";
+      reason = "Could not open the cited paper.";
       continue;
     }
-    for (const searchText of searchTexts) {
+    for (const searchText of params.searchTexts) {
       const result = await locateQuoteInLivePdfReader(reader, searchText, {
         skipFindController: true,
         exactOnly: true,
       });
       if (result.status === "resolved" && result.computedPageIndex !== null) {
         const pageIndex = Math.floor(result.computedPageIndex);
-        matchedCandidates.push({
+        matches.push({
           candidate,
           pageIndex,
           pageLabel:
@@ -2681,35 +2696,142 @@ async function navigateUntrustedQuoteCitation(params: {
         });
         break;
       }
-      if (result.reason) {
-        lastReason = result.reason;
-      } else if (result.status === "ambiguous") {
-        lastReason = "The cited quote matched multiple pages.";
-      } else if (result.status === "not-found") {
-        lastReason =
-          "The cited quote was not found in the explicit PDF context.";
-      }
+      if (result.reason) reason = result.reason;
     }
-    if (matchedCandidates.length > 1) break;
+    if (matches.length > 1) break;
   }
+  return { matches, reason };
+}
 
-  if (matchedCandidates.length > 1) {
+function buildQuoteTargetCandidates(
+  pdfCandidates: AssistantCitationPaperCandidate[],
+  extractedCitation: ExtractedCitationLabel | null,
+): QuoteTargetCandidate[] {
+  return pdfCandidates.map((candidate) => ({
+    contextItemId: candidate.contextItemId,
+    // Papers the conversation itself carries are settled before a paper that a
+    // library label search merely proposed.
+    authoritative: candidate.provenance !== "library-search",
+    labelRank: rankCandidateForCitation(extractedCitation, candidate),
+  }));
+}
+
+async function navigateUntrustedQuoteCitation(params: {
+  status: HTMLElement | null;
+  button: HTMLButtonElement;
+  panelItem: Zotero.Item;
+  extractedCitation: ExtractedCitationLabel | null;
+  staticCandidates: AssistantCitationPaperCandidate[];
+  displayCitationLabel: string;
+  quoteText: string;
+  paragraphQuoteTexts: string[];
+}): Promise<boolean> {
+  const searchTexts = Array.from(
+    new Set(
+      [params.quoteText, ...params.paragraphQuoteTexts]
+        .map((text) => sanitizeText(text || "").trim())
+        .filter(Boolean),
+    ),
+  );
+  // The papers the conversation carries are searched first, but a library-wide
+  // lookup by citation label is allowed too: in library chat the answer's
+  // sources are discovered at runtime and are not attached to the message.
+  // Every hit still has to contain the quote before the reader moves.
+  const resolvedCandidates = await resolveCandidatesForCitationNavigation({
+    panelItem: params.panelItem,
+    extractedCitation: params.extractedCitation,
+    staticCandidates: params.staticCandidates,
+    quoteText: params.quoteText,
+    allowLibrarySearch: true,
+  });
+  const pdfCandidates = resolvedCandidates.filter((candidate) =>
+    isPdfBackedCitationCandidate(candidate),
+  );
+  if (!pdfCandidates.length || !searchTexts.length) {
     if (params.status) {
       setStatus(
         params.status,
-        "The cited quote matched more than one explicit PDF. Its citation was preserved, but no automatic jump is available.",
+        pdfCandidates.length
+          ? "This citation has no quote text to locate."
+          : "Could not find the cited paper in your library.",
         "error",
       );
     }
     return false;
   }
 
-  const match = matchedCandidates[0];
+  if (params.status) {
+    setStatus(params.status, "Locating cited quote...", "sending");
+  }
+
+  const candidatesByContextItemId = new Map(
+    pdfCandidates.map((candidate) => [candidate.contextItemId, candidate]),
+  );
+  const resolution = await resolveVerifiedQuoteTarget({
+    candidates: buildQuoteTargetCandidates(
+      pdfCandidates,
+      params.extractedCitation,
+    ),
+    searchTexts,
+    verify: verifyQuoteInCitationCandidate,
+  });
+
+  let match: ResolvedQuoteCitationMatch | null = null;
+  let lastReason = "The cited quote was not found in the cited paper.";
+  if (resolution.status === "resolved") {
+    const candidate = candidatesByContextItemId.get(resolution.contextItemId);
+    if (candidate) {
+      match = {
+        candidate,
+        pageIndex: resolution.pageIndex,
+        quoteText: resolution.quoteText,
+        sourceMatchText: resolution.sourceMatchText,
+        sourceMatchPageOccurrence: resolution.sourceMatchPageOccurrence,
+      };
+    }
+  } else if (resolution.status === "ambiguous") {
+    if (params.status) {
+      setStatus(
+        params.status,
+        "The cited quote appears in more than one paper. Its citation was preserved, but no automatic jump is available.",
+        "error",
+      );
+    }
+    return false;
+  } else if (resolution.status === "unverifiable") {
+    // Background text extraction failed for these; fall back to the viewer.
+    const opened = await locateQuoteByOpeningCitationCandidates({
+      candidates: resolution.contextItemIds
+        .map((contextItemId) => candidatesByContextItemId.get(contextItemId))
+        .filter((candidate): candidate is AssistantCitationPaperCandidate =>
+          Boolean(candidate),
+        ),
+      searchTexts,
+    });
+    if (opened.matches.length > 1) {
+      if (params.status) {
+        setStatus(
+          params.status,
+          "The cited quote appears in more than one paper. Its citation was preserved, but no automatic jump is available.",
+          "error",
+        );
+      }
+      return false;
+    }
+    match = opened.matches[0] || null;
+    if (opened.reason) lastReason = opened.reason;
+    if (!match && !opened.reason) lastReason = resolution.reason;
+  } else {
+    lastReason = resolution.reason;
+  }
+
   if (!match) {
     if (params.status) setStatus(params.status, lastReason, "error");
     return false;
   }
 
+  // Only the verified winner is ever opened, so a click can never leave the
+  // user parked on a paper that does not contain the quote.
   const reader = await openReaderForItem(match.candidate.contextItemId, {
     pageIndex: match.pageIndex,
     pageLabel: match.pageLabel,
@@ -2724,6 +2846,10 @@ async function navigateUntrustedQuoteCitation(params: {
     }
     return false;
   }
+  const pageLabel =
+    getPageLabelForIndex(reader, match.pageIndex) ||
+    match.pageLabel ||
+    `${match.pageIndex + 1}`;
 
   const paragraphJump = await attemptCitationParagraphJump({
     reader,
@@ -2731,15 +2857,11 @@ async function navigateUntrustedQuoteCitation(params: {
     displayCitationLabel: params.displayCitationLabel,
     quoteText: match.quoteText,
     pageIndex: match.pageIndex,
-    pageLabel: match.pageLabel,
+    pageLabel,
     sourceMatchPageOccurrence: match.sourceMatchPageOccurrence,
     verifiedSourceMatchText: match.sourceMatchText,
   });
-  const jumpedLabel = resolveJumpedPageLabel(
-    reader,
-    paragraphJump,
-    match.pageLabel,
-  );
+  const jumpedLabel = resolveJumpedPageLabel(reader, paragraphJump, pageLabel);
   if (paragraphJump.matched) {
     rememberCachedCitationPage(
       match.candidate.contextItemId,
@@ -2836,7 +2958,6 @@ async function resolveAndNavigateAssistantCitation(params: {
       extractedCitation,
       staticCandidates,
       quoteText: normalizedQuoteText,
-      trust: "trusted-anchor",
       allowLibrarySearch: allowLibrarySearchForCitationNavigation({
         navigationMode,
         hasQuoteText: Boolean(normalizedQuoteText),

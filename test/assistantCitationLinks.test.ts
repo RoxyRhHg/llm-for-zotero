@@ -1891,7 +1891,7 @@ describe("assistantCitationLinks", function () {
       assert.include(searchSection, '"library-search"');
     });
 
-    it("does not allow whole-library fallback for quote-card navigation", function () {
+    it("keeps distinct navigation modes for inline, trusted and untrusted citations", function () {
       const source = readFileSync(
         resolve(
           testDir,
@@ -1911,7 +1911,7 @@ describe("assistantCitationLinks", function () {
       );
     });
 
-    it("routes untrusted quote-card clicks through constrained source search", function () {
+    it("lets an untrusted quote-card click find its paper anywhere in the library", function () {
       const source = readFileSync(
         resolve(
           testDir,
@@ -1919,14 +1919,77 @@ describe("assistantCitationLinks", function () {
         ),
         "utf8",
       );
+      const start = source.indexOf(
+        "async function navigateUntrustedQuoteCitation(params: {",
+      );
+      const end = source.indexOf(
+        "async function resolveAndNavigateAssistantCitation(params: {",
+        start,
+      );
+      const navigateSection = source.slice(start, end);
 
-      assert.include(source, "navigateUntrustedQuoteCitation");
-      assert.include(source, "resolveCandidatesForCitationNavigation");
-      assert.include(source, "skipFindController: true");
-      assert.include(source, "matchedCandidates.length > 1");
-      assert.include(source, "quote matched more than one explicit PDF");
-      assert.include(source, "preferRawCitationLabel");
+      assert.isAtLeast(start, 0);
+      assert.isAbove(end, start);
+      // Library chat discovers its sources at runtime, so the answer's papers
+      // are not attached to the message. A quote click must still be able to
+      // find them instead of refusing because nothing was attached.
+      assert.include(navigateSection, "allowLibrarySearch: true");
       assert.include(source, "preferRawCitationLabel: true");
+    });
+
+    it("verifies the quote before moving the reader and opens only the winner", function () {
+      const source = readFileSync(
+        resolve(
+          testDir,
+          "../src/modules/contextPanel/assistantCitationLinks.ts",
+        ),
+        "utf8",
+      );
+      const start = source.indexOf(
+        "async function navigateUntrustedQuoteCitation(params: {",
+      );
+      const end = source.indexOf(
+        "async function resolveAndNavigateAssistantCitation(params: {",
+        start,
+      );
+      const navigateSection = source.slice(start, end);
+
+      // Candidates are checked against background PDF text; the single
+      // openReaderForItem call in this function is the verified winner.
+      assert.include(navigateSection, "resolveVerifiedQuoteTarget");
+      assert.include(navigateSection, "verify: verifyQuoteInCitationCandidate");
+      assert.lengthOf(navigateSection.match(/openReaderForItem\(/g) || [], 1);
+      assert.include(
+        navigateSection,
+        "The cited quote appears in more than one paper.",
+      );
+      assert.notInclude(
+        navigateSection,
+        "no explicit PDF context is available",
+      );
+    });
+
+    it("verifies candidates without opening them", function () {
+      const source = readFileSync(
+        resolve(
+          testDir,
+          "../src/modules/contextPanel/assistantCitationLinks.ts",
+        ),
+        "utf8",
+      );
+      const start = source.indexOf(
+        "async function verifyQuoteInCitationCandidate(",
+      );
+      const end = source.indexOf(
+        "async function locateQuoteByOpeningCitationCandidates(",
+        start,
+      );
+      const verifySection = source.slice(start, end);
+
+      assert.isAtLeast(start, 0);
+      assert.isAbove(end, start);
+      assert.include(verifySection, "verifyQuoteLocationForAttachment");
+      assert.notInclude(verifySection, "openReaderForItem");
     });
 
     it("renders untrusted quote-card citation controls without static candidates", function () {

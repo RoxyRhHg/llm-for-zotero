@@ -1,0 +1,294 @@
+import { assert } from "chai";
+import { readFileSync } from "node:fs";
+import { dirname, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
+import {
+  DEFAULT_QUOTE_TARGET_VERIFICATION_BUDGET,
+  resolveVerifiedQuoteTarget,
+  type QuoteTargetCandidate,
+  type QuoteTargetVerification,
+} from "../src/modules/contextPanel/quoteCitationTargetResolver";
+
+function candidate(
+  contextItemId: number,
+  options?: { authoritative?: boolean; labelRank?: number },
+): QuoteTargetCandidate {
+  return {
+    contextItemId,
+    authoritative: options?.authoritative ?? false,
+    labelRank: options?.labelRank ?? 0,
+  };
+}
+
+function resolved(pageIndex: number): QuoteTargetVerification {
+  return { status: "resolved", pageIndex };
+}
+
+const NOT_FOUND: QuoteTargetVerification = {
+  status: "not-found",
+  reason: "The quote was not found in this PDF.",
+};
+
+const UNAVAILABLE: QuoteTargetVerification = {
+  status: "unavailable",
+  reason: "Could not read PDF text.",
+};
+
+function trackingVerifier(
+  responses: Record<number, QuoteTargetVerification>,
+  attempts: Array<{ contextItemId: number; quoteText: string }>,
+): (
+  contextItemId: number,
+  quoteText: string,
+) => Promise<QuoteTargetVerification> {
+  return async (contextItemId, quoteText) => {
+    attempts.push({ contextItemId, quoteText });
+    return responses[contextItemId] || NOT_FOUND;
+  };
+}
+
+describe("quote citation target resolver", function () {
+  it("resolves the single candidate whose PDF actually contains the quote", async function () {
+    const attempts: Array<{ contextItemId: number; quoteText: string }> = [];
+    const resolution = await resolveVerifiedQuoteTarget({
+      candidates: [candidate(11), candidate(22)],
+      searchTexts: ["drift is orthogonal to context"],
+      verify: trackingVerifier({ 22: resolved(4) }, attempts),
+    });
+
+    assert.equal(resolution.status, "resolved");
+    if (resolution.status !== "resolved") return;
+    assert.equal(resolution.contextItemId, 22);
+    assert.equal(resolution.pageIndex, 4);
+    assert.equal(resolution.quoteText, "drift is orthogonal to context");
+    assert.deepEqual(
+      attempts.map((attempt) => attempt.contextItemId),
+      [11, 22],
+    );
+  });
+
+  it("never resolves a candidate whose PDF does not contain the quote", async function () {
+    const resolution = await resolveVerifiedQuoteTarget({
+      candidates: [candidate(11, { labelRank: 5 }), candidate(22)],
+      searchTexts: ["a quote nobody has"],
+      verify: async () => NOT_FOUND,
+    });
+
+    assert.equal(resolution.status, "not-found");
+    if (resolution.status !== "not-found") return;
+    assert.include(resolution.reason, "not found");
+  });
+
+  it("checks conversation-context papers before library-search papers", async function () {
+    const attempts: Array<{ contextItemId: number; quoteText: string }> = [];
+    const resolution = await resolveVerifiedQuoteTarget({
+      candidates: [
+        candidate(90, { authoritative: false, labelRank: 9 }),
+        candidate(7, { authoritative: true, labelRank: 0 }),
+      ],
+      searchTexts: ["verbatim sentence"],
+      verify: trackingVerifier({ 7: resolved(1), 90: resolved(2) }, attempts),
+    });
+
+    assert.equal(resolution.status, "resolved");
+    if (resolution.status !== "resolved") return;
+    assert.equal(resolution.contextItemId, 7);
+    assert.isTrue(resolution.authoritative);
+    // The library-search candidate must not even be read once an
+    // authoritative context paper verifies.
+    assert.deepEqual(
+      attempts.map((attempt) => attempt.contextItemId),
+      [7],
+    );
+  });
+
+  it("falls back to library-search papers when no context paper contains the quote", async function () {
+    const resolution = await resolveVerifiedQuoteTarget({
+      candidates: [
+        candidate(7, { authoritative: true }),
+        candidate(90, { authoritative: false, labelRank: 3 }),
+      ],
+      searchTexts: ["verbatim sentence"],
+      verify: async (contextItemId) =>
+        contextItemId === 90 ? resolved(6) : NOT_FOUND,
+    });
+
+    assert.equal(resolution.status, "resolved");
+    if (resolution.status !== "resolved") return;
+    assert.equal(resolution.contextItemId, 90);
+    assert.isFalse(resolution.authoritative);
+  });
+
+  it("breaks a two-paper tie using citation-label agreement", async function () {
+    const resolution = await resolveVerifiedQuoteTarget({
+      candidates: [
+        candidate(11, { authoritative: true, labelRank: 1 }),
+        candidate(22, { authoritative: true, labelRank: 4 }),
+      ],
+      searchTexts: ["shared sentence"],
+      verify: async () => resolved(2),
+    });
+
+    assert.equal(resolution.status, "resolved");
+    if (resolution.status !== "resolved") return;
+    assert.equal(resolution.contextItemId, 22);
+  });
+
+  it("reports ambiguity when equally labelled papers both contain the quote", async function () {
+    const resolution = await resolveVerifiedQuoteTarget({
+      candidates: [
+        candidate(11, { authoritative: true, labelRank: 2 }),
+        candidate(22, { authoritative: true, labelRank: 2 }),
+      ],
+      searchTexts: ["shared sentence"],
+      verify: async () => resolved(2),
+    });
+
+    assert.equal(resolution.status, "ambiguous");
+    if (resolution.status !== "ambiguous") return;
+    assert.deepEqual(resolution.contextItemIds.slice().sort(), [11, 22]);
+  });
+
+  it("reports unverifiable rather than not-found when PDF text cannot be read", async function () {
+    const resolution = await resolveVerifiedQuoteTarget({
+      candidates: [candidate(11, { authoritative: true }), candidate(22)],
+      searchTexts: ["some sentence"],
+      verify: async (contextItemId) =>
+        contextItemId === 11 ? UNAVAILABLE : NOT_FOUND,
+    });
+
+    assert.equal(resolution.status, "unverifiable");
+    if (resolution.status !== "unverifiable") return;
+    assert.deepEqual(resolution.contextItemIds, [11]);
+  });
+
+  it("tries every search text for a candidate and keeps the first that lands", async function () {
+    const attempts: Array<{ contextItemId: number; quoteText: string }> = [];
+    const resolution = await resolveVerifiedQuoteTarget({
+      candidates: [candidate(11)],
+      searchTexts: ["short span", "the full paragraph span"],
+      verify: async (contextItemId, quoteText) => {
+        attempts.push({ contextItemId, quoteText });
+        return quoteText === "the full paragraph span"
+          ? resolved(3)
+          : NOT_FOUND;
+      },
+    });
+
+    assert.equal(resolution.status, "resolved");
+    if (resolution.status !== "resolved") return;
+    assert.equal(resolution.quoteText, "the full paragraph span");
+    assert.lengthOf(attempts, 2);
+  });
+
+  it("stops reading PDFs once the verification budget is spent", async function () {
+    const attempts: Array<{ contextItemId: number; quoteText: string }> = [];
+    const candidates = Array.from({ length: 40 }, (_entry, index) =>
+      candidate(100 + index),
+    );
+    const resolution = await resolveVerifiedQuoteTarget({
+      candidates,
+      searchTexts: ["missing sentence"],
+      verify: trackingVerifier({}, attempts),
+      verificationBudget: 5,
+    });
+
+    assert.equal(resolution.status, "not-found");
+    assert.lengthOf(attempts, 5);
+  });
+
+  it("defaults to a bounded verification budget", async function () {
+    const attempts: Array<{ contextItemId: number; quoteText: string }> = [];
+    const candidates = Array.from({ length: 80 }, (_entry, index) =>
+      candidate(200 + index),
+    );
+    await resolveVerifiedQuoteTarget({
+      candidates,
+      searchTexts: ["missing sentence"],
+      verify: trackingVerifier({}, attempts),
+    });
+
+    assert.lengthOf(attempts, DEFAULT_QUOTE_TARGET_VERIFICATION_BUDGET);
+  });
+
+  it("reads each attachment at most once", async function () {
+    const attempts: Array<{ contextItemId: number; quoteText: string }> = [];
+    const resolution = await resolveVerifiedQuoteTarget({
+      candidates: [
+        candidate(11, { authoritative: true }),
+        candidate(11, { authoritative: false, labelRank: 9 }),
+      ],
+      searchTexts: ["only sentence"],
+      verify: trackingVerifier({ 11: resolved(0) }, attempts),
+    });
+
+    assert.equal(resolution.status, "resolved");
+    assert.lengthOf(attempts, 1);
+  });
+
+  it("ignores candidates without a usable attachment id", async function () {
+    const resolution = await resolveVerifiedQuoteTarget({
+      candidates: [candidate(0), candidate(-4), candidate(Number.NaN)],
+      searchTexts: ["only sentence"],
+      verify: async () => resolved(1),
+    });
+
+    assert.equal(resolution.status, "not-found");
+  });
+
+  it("does not jump when the locator resolves without a page", async function () {
+    const resolution = await resolveVerifiedQuoteTarget({
+      candidates: [candidate(11)],
+      searchTexts: ["only sentence"],
+      verify: async () => ({ status: "resolved", pageIndex: null }),
+    });
+
+    assert.notEqual(resolution.status, "resolved");
+  });
+
+  it("survives a verifier that throws", async function () {
+    const resolution = await resolveVerifiedQuoteTarget({
+      candidates: [candidate(11), candidate(22)],
+      searchTexts: ["only sentence"],
+      verify: async (contextItemId) => {
+        if (contextItemId === 11) throw new Error("pdf worker exploded");
+        return resolved(2);
+      },
+    });
+
+    assert.equal(resolution.status, "resolved");
+    if (resolution.status !== "resolved") return;
+    assert.equal(resolution.contextItemId, 22);
+  });
+});
+
+describe("untrusted quote navigation contract", function () {
+  const source = readFileSync(
+    resolve(
+      dirname(fileURLToPath(import.meta.url)),
+      "../src/modules/contextPanel/assistantCitationLinks.ts",
+    ),
+    "utf8",
+  );
+  const navigateSection = source.slice(
+    source.indexOf("type ResolvedQuoteCitationMatch = {"),
+    source.indexOf(
+      "async function resolveAndNavigateAssistantCitation(params: {",
+    ),
+  );
+
+  it("never invents a page label for the reader to navigate by", function () {
+    // Zotero navigates by printed label when one is given, and printed labels
+    // need not track page order.
+    assert.notInclude(navigateSection, "pageLabel: `${resolution.pageIndex");
+    assert.include(navigateSection, "pageLabel?: string;");
+  });
+
+  it("bounds how many papers a single click may open", function () {
+    assert.include(navigateSection, "MAX_OPENED_QUOTE_VERIFICATION_CANDIDATES");
+    assert.include(
+      source,
+      "const MAX_OPENED_QUOTE_VERIFICATION_CANDIDATES = 3",
+    );
+  });
+});
