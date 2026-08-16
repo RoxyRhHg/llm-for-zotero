@@ -4017,6 +4017,12 @@ type QuoteSourceEvidence = {
   complete: boolean;
 };
 
+/**
+ * Kept under the page-text cache's own entry limit so background warming
+ * cannot evict the pages it just read.
+ */
+const MAX_WARMED_QUOTE_SOURCE_PAPERS = 40;
+
 function hasUnresolvedQuoteSourceScope(
   ...groups: Array<PaperContextRef[] | undefined | null>
 ): boolean {
@@ -4087,7 +4093,14 @@ async function warmQuoteSourceCachesForPaperContexts(
     shouldContinue?: () => boolean;
   },
 ): Promise<void> {
-  const uniquePapers = collectQuoteSourcePapers(...groups);
+  // A library-chat answer can cite dozens of papers. Reading more of them than
+  // the page-text cache can hold would evict the earlier ones before they are
+  // used, so warming stops short of thrashing its own cache; quotes in the
+  // remainder simply stay deferred and resolve when clicked.
+  const uniquePapers = collectQuoteSourcePapers(...groups).slice(
+    0,
+    MAX_WARMED_QUOTE_SOURCE_PAPERS,
+  );
   for (const paper of uniquePapers) {
     if (options?.shouldContinue?.() === false) return;
     if (options?.yieldToMain) await options.yieldToMain();

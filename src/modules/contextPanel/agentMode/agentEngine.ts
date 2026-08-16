@@ -405,7 +405,7 @@ function createAgentTurnEventHandler(
         pairedUserMessage.citationPaperContexts = mergeCitationPaperContexts(
           pairedUserMessage.citationPaperContexts,
           toolPaperContexts,
-        );
+        ).slice(0, MAX_AGENT_EVIDENCE_PAPER_CONTEXTS);
         if ((pairedUserMessage.citationPaperContexts?.length || 0) === before)
           break;
         if (!isCompactCommand) {
@@ -874,12 +874,34 @@ function closeInlineConfirmationCard(
   syncInlineActionCardState(body, ui);
 }
 
+/**
+ * Provenance for one answer, bounded to roughly the number of evidence
+ * snippets a single retrieval returns.  This is a guard against a runaway
+ * agent run, not a relevance filter: the cost of consuming these papers is
+ * bounded where it is actually paid — background quote-source warming caps
+ * how many PDFs it reads, and a quote click caps how many it verifies.
+ */
+const MAX_AGENT_EVIDENCE_PAPER_CONTEXTS = 80;
+
+/**
+ * Recover the papers a tool actually grounded its answer in.
+ *
+ * Every tool nests this evidence differently — `library_retrieve` only exposes
+ * an attachment id on its `snippets`, `paper_read` on its `results` — so this
+ * walks the whole result rather than a list of key names that silently goes
+ * stale whenever a tool gains a new result shape.  A record counts as a paper
+ * only when it can name both the item and the attachment to open, which is
+ * specific enough that unrelated payload objects do not qualify.
+ */
 function extractPaperContextCandidatesFromToolContent(
   content: unknown,
 ): unknown[] {
   const out: unknown[] = [];
+  const seen = new WeakSet<object>();
   const visit = (value: unknown, depth: number) => {
     if (depth > 8 || !value || typeof value !== "object") return;
+    if (seen.has(value)) return;
+    seen.add(value);
     if (Array.isArray(value)) {
       for (const entry of value) visit(entry, depth + 1);
       return;
@@ -892,16 +914,16 @@ function extractPaperContextCandidatesFromToolContent(
     ) {
       out.push(record);
     }
-    if (record.paperContext) {
-      visit(record.paperContext, depth + 1);
-    }
-    for (const key of ["results", "papers", "items", "artifacts"]) {
-      if (record[key]) visit(record[key], depth + 1);
+    for (const nested of Object.values(record)) {
+      visit(nested, depth + 1);
     }
   };
   visit(content, 0);
   return out;
 }
+
+export const extractPaperContextCandidatesFromToolContentForTests =
+  extractPaperContextCandidatesFromToolContent;
 
 type EffectiveRequestConfigShape = {
   model: string;
