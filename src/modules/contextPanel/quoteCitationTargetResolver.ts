@@ -165,7 +165,7 @@ export async function resolveVerifiedQuoteTarget(params: {
   candidates: readonly QuoteTargetCandidate[];
   searchTexts: readonly string[];
   verify: (
-    contextItemId: number,
+    candidate: QuoteTargetCandidate,
     quoteText: string,
   ) => Promise<QuoteTargetVerification>;
   verificationBudget?: number;
@@ -200,10 +200,7 @@ export async function resolveVerifiedQuoteTarget(params: {
       for (const quoteText of searchTexts) {
         let verification: QuoteTargetVerification;
         try {
-          verification = await params.verify(
-            candidate.contextItemId,
-            quoteText,
-          );
+          verification = await params.verify(candidate, quoteText);
         } catch (_err) {
           void _err;
           verification = {

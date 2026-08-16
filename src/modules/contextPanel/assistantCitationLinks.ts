@@ -2628,13 +2628,29 @@ type ResolvedQuoteCitationMatch = {
  * on screen.
  */
 async function verifyQuoteInCitationCandidate(
-  contextItemId: number,
+  candidate: QuoteTargetCandidate,
   quoteText: string,
 ): Promise<QuoteTargetVerification> {
   const result = await verifyQuoteLocationForAttachment(
-    contextItemId,
+    candidate.contextItemId,
     quoteText,
   );
+  // When the whole quote does not align, the locator falls back to the largest
+  // contiguous span that occurs exactly once.  That is a reasonable rescue for
+  // a paper the conversation already used, but far too weak to move the reader
+  // to a paper that is only in range because a label search proposed it: a
+  // short shared phrase would be enough to "confirm" the wrong paper.
+  if (
+    result.status === "resolved" &&
+    !candidate.authoritative &&
+    result.sourceMatchQuoteTokenCoverage !== undefined &&
+    result.sourceMatchQuoteTokenCoverage < 1
+  ) {
+    return {
+      status: "not-found",
+      reason: "Only part of the cited quote appears in this paper.",
+    };
+  }
   return {
     // A quote too short to identify a page is a property of the quote, not of
     // this PDF, so it counts as "not here" rather than "could not be read" —
@@ -2688,8 +2704,9 @@ async function locateQuoteByOpeningCitationCandidates(params: {
         matches.push({
           candidate,
           pageIndex,
-          pageLabel:
-            getPageLabelForIndex(reader, pageIndex) || `${pageIndex + 1}`,
+          // Left unset when the reader has no printed label for this page;
+          // see ResolvedQuoteCitationMatch.pageLabel.
+          pageLabel: getPageLabelForIndex(reader, pageIndex) || undefined,
           quoteText: searchText,
           sourceMatchText: result.sourceMatchText,
           sourceMatchPageOccurrence: result.sourceMatchPageOccurrence,

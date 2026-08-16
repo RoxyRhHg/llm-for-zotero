@@ -38,12 +38,12 @@ function trackingVerifier(
   responses: Record<number, QuoteTargetVerification>,
   attempts: Array<{ contextItemId: number; quoteText: string }>,
 ): (
-  contextItemId: number,
+  candidate: QuoteTargetCandidate,
   quoteText: string,
 ) => Promise<QuoteTargetVerification> {
-  return async (contextItemId, quoteText) => {
-    attempts.push({ contextItemId, quoteText });
-    return responses[contextItemId] || NOT_FOUND;
+  return async (candidate, quoteText) => {
+    attempts.push({ contextItemId: candidate.contextItemId, quoteText });
+    return responses[candidate.contextItemId] || NOT_FOUND;
   };
 }
 
@@ -109,8 +109,8 @@ describe("quote citation target resolver", function () {
         candidate(90, { authoritative: false, labelRank: 3 }),
       ],
       searchTexts: ["verbatim sentence"],
-      verify: async (contextItemId) =>
-        contextItemId === 90 ? resolved(6) : NOT_FOUND,
+      verify: async (candidate) =>
+        candidate.contextItemId === 90 ? resolved(6) : NOT_FOUND,
     });
 
     assert.equal(resolution.status, "resolved");
@@ -153,8 +153,8 @@ describe("quote citation target resolver", function () {
     const resolution = await resolveVerifiedQuoteTarget({
       candidates: [candidate(11, { authoritative: true }), candidate(22)],
       searchTexts: ["some sentence"],
-      verify: async (contextItemId) =>
-        contextItemId === 11 ? UNAVAILABLE : NOT_FOUND,
+      verify: async (candidate) =>
+        candidate.contextItemId === 11 ? UNAVAILABLE : NOT_FOUND,
     });
 
     assert.equal(resolution.status, "unverifiable");
@@ -167,8 +167,8 @@ describe("quote citation target resolver", function () {
     const resolution = await resolveVerifiedQuoteTarget({
       candidates: [candidate(11)],
       searchTexts: ["short span", "the full paragraph span"],
-      verify: async (contextItemId, quoteText) => {
-        attempts.push({ contextItemId, quoteText });
+      verify: async (candidate, quoteText) => {
+        attempts.push({ contextItemId: candidate.contextItemId, quoteText });
         return quoteText === "the full paragraph span"
           ? resolved(3)
           : NOT_FOUND;
@@ -250,8 +250,9 @@ describe("quote citation target resolver", function () {
     const resolution = await resolveVerifiedQuoteTarget({
       candidates: [candidate(11), candidate(22)],
       searchTexts: ["only sentence"],
-      verify: async (contextItemId) => {
-        if (contextItemId === 11) throw new Error("pdf worker exploded");
+      verify: async (candidate) => {
+        if (candidate.contextItemId === 11)
+          throw new Error("pdf worker exploded");
         return resolved(2);
       },
     });
@@ -290,5 +291,22 @@ describe("untrusted quote navigation contract", function () {
       source,
       "const MAX_OPENED_QUOTE_VERIFICATION_CANDIDATES = 3",
     );
+  });
+  it("refuses a library-search paper that only holds part of the quote", function () {
+    const start = source.indexOf(
+      "async function verifyQuoteInCitationCandidate(",
+    );
+    const end = source.indexOf(
+      "async function locateQuoteByOpeningCitationCandidates(",
+      start,
+    );
+    const verifySection = source.slice(start, end);
+
+    // The locator resolves on the largest uniquely-occurring span when the
+    // whole quote does not align. A short shared phrase must not be enough to
+    // send the reader to a paper the conversation never used.
+    assert.include(verifySection, "!candidate.authoritative");
+    assert.include(verifySection, "sourceMatchQuoteTokenCoverage < 1");
+    assert.include(verifySection, 'status: "not-found"');
   });
 });
