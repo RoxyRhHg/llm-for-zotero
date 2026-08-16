@@ -97,6 +97,38 @@ describe("local model catalog (Ollama)", function () {
         "false is authoritative: it suppresses the control even if the name looks like a reasoning model",
       );
     });
+
+    it("leaves capabilities unknown when the server reports none", function () {
+      const { capabilities: _omitted, ...show } = showPayload();
+      const model = buildDiscoveredModelFromShow({ id: "qwen3:8b", show });
+
+      // An older Ollama (or a proxy in front of one) answers /api/show with no
+      // `capabilities` at all.  Silence is not a denial: reporting `false` here
+      // would strip tool calling, images and the reasoning menu from a model
+      // that supports all three, because every consumer treats live `false` as
+      // authoritative over the optimistic default.
+      assert.isUndefined(model.features?.tools);
+      assert.isUndefined(model.inputs?.image);
+      assert.isUndefined(model.reasoningSupported);
+      assert.equal(
+        model.limits?.contextWindowTokens,
+        40960,
+        "the rest of the payload is still trusted",
+      );
+    });
+
+    it("treats an empty capabilities array as a real answer", function () {
+      const model = buildDiscoveredModelFromShow({
+        id: "qwen3:8b",
+        show: showPayload({ capabilities: [] }),
+      });
+
+      // Present-but-empty is the server stating the model does nothing special,
+      // which stays authoritative — only an absent field is unknown.
+      assert.equal(model.features?.tools, false);
+      assert.equal(model.inputs?.image, false);
+      assert.equal(model.reasoningSupported, false);
+    });
   });
 
   describe("fetchOllamaModelList", function () {

@@ -69,8 +69,13 @@ function asString(value: unknown): string {
   return typeof value === "string" ? value.trim() : "";
 }
 
-function asCapabilityList(value: unknown): string[] {
-  if (!Array.isArray(value)) return [];
+/**
+ * `undefined` when the server said nothing — distinct from `[]`, which is the
+ * server stating this model has no special capabilities.  Only a stated answer
+ * may become a `false` in the catalog.
+ */
+function asCapabilityList(value: unknown): string[] | undefined {
+  if (!Array.isArray(value)) return undefined;
   return value
     .map((entry) => asString(entry).toLowerCase())
     .filter((entry) => Boolean(entry));
@@ -126,12 +131,18 @@ export function buildDiscoveredModelFromShow(params: {
   return {
     id: params.id,
     ...(Object.keys(limits).length ? { limits } : {}),
-    inputs: { image: capabilities.includes(CAPABILITY_VISION) },
-    features: { tools: capabilities.includes(CAPABILITY_TOOLS) },
-    // Authoritative for the artifact actually loaded: a model name may look
-    // like a reasoning model while this particular GGUF is a non-thinking
-    // variant, and vice versa.
-    reasoningSupported: capabilities.includes(CAPABILITY_THINKING),
+    // A stated capability list is authoritative for the artifact actually
+    // loaded: a model name may look like a reasoning model while this
+    // particular GGUF is a non-thinking variant, and vice versa.  An absent
+    // list is not an answer — older servers and proxies simply do not report
+    // one — so the fields stay unset and the optimistic defaults survive.
+    ...(capabilities
+      ? {
+          inputs: { image: capabilities.includes(CAPABILITY_VISION) },
+          features: { tools: capabilities.includes(CAPABILITY_TOOLS) },
+          reasoningSupported: capabilities.includes(CAPABILITY_THINKING),
+        }
+      : {}),
     source: "live",
   };
 }
