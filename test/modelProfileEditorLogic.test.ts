@@ -216,6 +216,69 @@ describe("model profile editor logic", function () {
       );
     });
 
+    it("derives the thinkingConfig shape Gemini reads for a level family", function () {
+      const detected = getModelCapabilities({
+        provider: "gemini",
+        model: "gemini-3-pro",
+        protocol: "gemini_native",
+      });
+      const draft = computeProfileOverrideDraft({
+        rows: [{ id: "ultra" }],
+        extraJson: "",
+        detected,
+        modelName: "gemini-3-pro",
+      });
+      assert.deepEqual(
+        draft.override?.reasoning?.options[0]?.controls?.body,
+        { thinkingConfig: { thinkingLevel: "ultra" } },
+        "Gemini reads generationConfig.thinkingConfig; a flat key is dropped",
+      );
+    });
+
+    it("derives a budget for the Gemini families that take one", function () {
+      const detected = getModelCapabilities({
+        provider: "gemini",
+        model: "gemini-2.5-pro",
+        protocol: "gemini_native",
+      });
+      const draft = computeProfileOverrideDraft({
+        rows: [{ id: "24000" }],
+        extraJson: "",
+        detected,
+        modelName: "gemini-2.5-pro",
+      });
+      assert.deepEqual(
+        draft.override?.reasoning?.options[0]?.controls?.body,
+        { thinkingConfig: { thinkingBudget: 24000 } },
+        "2.5 takes a token budget, not a level word",
+      );
+    });
+
+    it("still speaks Ollama's think when the server declares no capabilities", function () {
+      // An Ollama server that omits `capabilities` from /api/show leaves the
+      // profile with no declared options to read the key from. Falling back to
+      // a hosted `reasoning_effort` there would be silently ignored by Ollama.
+      const detected = getModelCapabilities({
+        model: "mistral-small:latest",
+        apiBase: "http://localhost:11434",
+        protocol: "ollama_native",
+      });
+      assert.lengthOf(
+        detected.reasoning.options,
+        0,
+        "fixture must be a model with no detected levels",
+      );
+      const draft = computeProfileOverrideDraft({
+        rows: [{ id: "ultra" }],
+        extraJson: "",
+        detected,
+        modelName: "mistral-small:latest",
+      });
+      assert.deepEqual(draft.override?.reasoning?.options[0]?.controls?.body, {
+        think: "ultra",
+      });
+    });
+
     it("preserves the user's JSON structure, dotted keys included", function () {
       const draft = computeProfileOverrideDraft({
         rows: [],

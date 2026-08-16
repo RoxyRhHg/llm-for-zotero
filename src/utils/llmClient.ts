@@ -17,6 +17,7 @@ import {
   getReasoningDefaultLevelForModel,
   getRuntimeReasoningOptionsForModel,
   supportsReasoningForModel,
+  withGeminiThoughtSummaries,
 } from "./reasoningProfiles";
 import type {
   ReasoningProvider,
@@ -2789,8 +2790,9 @@ function buildGeminiNativePayload(params: {
       declarative?.extra.thinkingConfig ||
       declarative?.extra.thinking_config ||
       generationConfig.thinkingConfig;
-    if (declarativeConfig && typeof declarativeConfig === "object") {
-      generationConfig.thinkingConfig = declarativeConfig;
+    if (isRecord(declarativeConfig)) {
+      generationConfig.thinkingConfig =
+        withGeminiThoughtSummaries(declarativeConfig);
     } else {
       const profile = getGeminiReasoningProfile(params.model);
       const value =

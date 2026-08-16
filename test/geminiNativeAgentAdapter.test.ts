@@ -1,5 +1,7 @@
 import { assert } from "chai";
 import { GeminiNativeAgentAdapter } from "../src/agent/model/geminiNative";
+import { getModelCapabilities } from "../src/modelCapabilities";
+import { computeProfileOverrideDraft } from "../src/modules/modelProfileEditor";
 import type { AgentRuntimeRequest, ToolSpec } from "../src/agent/types";
 
 function makeSseStream(chunks: string[]): ReadableStream<Uint8Array> {
@@ -968,5 +970,77 @@ describe("GeminiNativeAgentAdapter", function () {
     const functionCallPart = modelParts.find((part) => part.functionCall);
     assert.isDefined(functionCallPart);
     assert.equal(functionCallPart?.thoughtSignature, "sig-123");
+  });
+
+  it("sends a user-authored reasoning level on the wire", async function () {
+    const adapter = new GeminiNativeAgentAdapter();
+    let capturedBody: Record<string, unknown> | null = null;
+    (
+      globalThis as typeof globalThis & {
+        ztoolkit: { getGlobal: (name: string) => unknown };
+      }
+    ).ztoolkit = {
+      getGlobal: (name: string) => {
+        if (name !== "fetch") return undefined;
+        return async (_url: string, init?: RequestInit) => {
+          capturedBody = JSON.parse(String(init?.body || "{}")) as Record<
+            string,
+            unknown
+          >;
+          return {
+            ok: true,
+            status: 200,
+            statusText: "OK",
+            body: undefined,
+            json: async () => ({
+              candidates: [{ content: { parts: [{ text: "done" }] } }],
+            }),
+            text: async () => "",
+          };
+        };
+      },
+    };
+
+    const model = "gemini-3-pro";
+    await adapter.runStep({
+      request: makeRequest({
+        model,
+        reasoning: { provider: "gemini", level: "ultra" as never },
+        advanced: {
+          profileOverride: computeProfileOverrideDraft({
+            rows: [{ id: "ultra" }],
+            extraJson: "",
+            detected: getModelCapabilities({
+              provider: "gemini",
+              model,
+              protocol: "gemini_native",
+            }),
+            modelName: model,
+          }).override,
+        },
+      }),
+      messages: [{ role: "user", content: "Inspect this paper" }],
+      tools: [],
+    });
+
+    // The editor promises the plugin owns the encoding, so a level the user
+    // typed has to arrive in the shape Gemini reads.  A flat reasoning_effort
+    // is not one: this builder would drop it and quietly think at the default
+    // level while the menu claimed "ultra".
+    const generationConfig = capturedBody?.generationConfig as Record<
+      string,
+      unknown
+    >;
+    const thinkingConfig = generationConfig?.thinkingConfig as Record<
+      string,
+      unknown
+    >;
+    assert.equal(thinkingConfig?.thinkingLevel, "ultra");
+    assert.notInclude(JSON.stringify(capturedBody), "reasoning_effort");
+    assert.equal(
+      thinkingConfig?.includeThoughts,
+      true,
+      "customizing the level must not silently cost the user the thought stream",
+    );
   });
 });

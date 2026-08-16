@@ -38,6 +38,7 @@ import {
   type ResolvedModelCapabilities,
 } from "../modelCapabilities";
 import { el, iconBtn } from "../utils/domHelpers";
+import { getGeminiReasoningProfileForModel } from "../utils/reasoningProfiles";
 
 /**
  * Suggestions only — the level id is free text.
@@ -121,10 +122,20 @@ export type ProfileOverrideDraft = {
 
 /**
  * The parameter key this model's levels are sent with, read from whatever the
- * detected profile sends: Ollama's options carry `think`, so that is the key;
- * hosted profiles carry no controls, where `reasoning_effort` is right for
- * chat-style APIs and the Responses API nests it (`reasoning.effort` — a dot
- * path the key=value parser expands).
+ * detected profile sends: Ollama's options carry `think`, so that is the key.
+ *
+ * A profile that declares nothing falls back to its protocol's own shape, and
+ * the shapes are not interchangeable — a flat `reasoning_effort` is silently
+ * ignored by Gemini and by Ollama, so a level sent that way looks selected
+ * while doing nothing. `ollama_native` needs its own entry rather than relying
+ * on the declared-body loop above: a server that reports no capabilities
+ * resolves to a profile with no options at all, and there is then no declared
+ * `think` to read.
+ *
+ * Anthropic is deliberately absent. Its thinking block also needs a `type` and
+ * a budget clamped against `max_tokens`, and `omitTemperature` alongside — none
+ * of which survives the override store today — so a derived key there would
+ * only trade one rejected request for another.
  */
 export function resolveReasoningParameterKey(
   detected: ResolvedModelCapabilities,
@@ -133,17 +144,31 @@ export function resolveReasoningParameterKey(
     const key = Object.keys(option.controls?.body || {})[0];
     if (key) return key;
   }
-  return detected.identity.protocol === "responses_api"
-    ? "reasoning.effort"
-    : "reasoning_effort";
+  switch (detected.identity.protocol) {
+    case "responses_api":
+    case "codex_responses":
+      return "reasoning.effort";
+    case "ollama_native":
+      return "think";
+    case "gemini_native":
+      // 2.5 thinks in token budgets, 3.x in level words; the family decides,
+      // and the wrong one of the two is a 400.
+      return getGeminiReasoningProfileForModel(detected.model).param ===
+        "thinking_budget"
+        ? "thinkingConfig.thinkingBudget"
+        : "thinkingConfig.thinkingLevel";
+    default:
+      return "reasoning_effort";
+  }
 }
 
 /**
  * The level IS the only thing the user provides: typing `ultra` means
  * `reasoning_effort=ultra` (or `think=ultra` on Ollama, `reasoning.effort`
- * on the Responses API) — the plugin owns the encoding, the user owns the
- * vocabulary, and the model is the judge of what is valid (the Test button
- * tries every custom level and shows what the server said).
+ * on the Responses API, `thinkingConfig.thinkingLevel` on Gemini) — the plugin
+ * owns the encoding, the user owns the vocabulary, and the model is the judge
+ * of what is valid (the Test button tries every custom level and shows what
+ * the server said).
  */
 export function deriveLevelParameters(
   detected: ResolvedModelCapabilities,

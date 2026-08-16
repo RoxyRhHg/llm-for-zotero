@@ -12,6 +12,7 @@ import {
   normalizeMaxTokensForModel,
   resolveGeminiTemperature,
 } from "../../utils/normalization";
+import { withGeminiThoughtSummaries } from "../../utils/reasoningProfiles";
 import {
   buildProviderTransportHeaders,
   resolveProviderTransportEndpoint,
@@ -248,8 +249,8 @@ function resolveGeminiReasoningConfig(request: AgentRuntimeRequest) {
   );
   const declarativeConfig =
     declarative?.extra.thinkingConfig || declarative?.extra.thinking_config;
-  if (declarativeConfig && typeof declarativeConfig === "object") {
-    return declarativeConfig;
+  if (isRecord(declarativeConfig)) {
+    return withGeminiThoughtSummaries(declarativeConfig);
   }
   const profile = getGeminiReasoningProfile(request.model);
   const value =

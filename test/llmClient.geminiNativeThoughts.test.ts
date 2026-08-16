@@ -19,10 +19,13 @@ describe("llmClient gemini native thought parts", function () {
     });
   }
 
-  function mockGeminiFetch(handlers: {
-    stream?: () => ReadableStream<Uint8Array>;
-    json?: () => unknown;
-  }) {
+  function mockGeminiFetch(
+    handlers: {
+      stream?: () => ReadableStream<Uint8Array>;
+      json?: () => unknown;
+    },
+    onRequestBody?: (body: Record<string, unknown>) => void,
+  ) {
     const requestedUrls: string[] = [];
     (
       globalThis as typeof globalThis & {
@@ -31,8 +34,13 @@ describe("llmClient gemini native thought parts", function () {
     ).ztoolkit = {
       getGlobal: (name: string) => {
         if (name !== "fetch") return undefined;
-        return async (url: string) => {
+        return async (url: string, init?: RequestInit) => {
           requestedUrls.push(url);
+          if (onRequestBody) {
+            onRequestBody(
+              JSON.parse(String(init?.body || "{}")) as Record<string, unknown>,
+            );
+          }
           if (url.includes(":streamGenerateContent") && handlers.stream) {
             return {
               ok: true,
@@ -175,5 +183,55 @@ describe("llmClient gemini native thought parts", function () {
     });
 
     assert.equal(output, "Visible answer.");
+  });
+
+  it("sends a user-authored reasoning level, thought summaries intact", async function () {
+    let body: Record<string, unknown> = {};
+    mockGeminiFetch(
+      {
+        json: () => ({
+          candidates: [{ content: { parts: [{ text: "Answer." }] } }],
+        }),
+      },
+      (captured) => {
+        body = captured;
+      },
+    );
+
+    await callLLM({
+      prompt: "Summarize the paper.",
+      model: "gemini-3.6-flash",
+      apiBase: "https://generativelanguage.googleapis.com/v1beta",
+      apiKey: "gemini-test",
+      providerProtocol: "gemini_native",
+      reasoning: { provider: "gemini", level: "ultra" as never },
+      profileOverride: {
+        forModel: "gemini-3.6-flash",
+        reasoning: {
+          kind: "select",
+          options: [
+            {
+              id: "ultra",
+              label: "ultra",
+              enabled: true,
+              controls: {
+                body: { thinkingConfig: { thinkingLevel: "ultra" } },
+              },
+            },
+          ],
+        },
+      },
+    });
+
+    // The chat path builds its own Gemini payload, so it needs the same two
+    // guarantees as the agent adapter: the customized level travels, and
+    // declaring one does not turn the thought stream off.
+    const generationConfig = body.generationConfig as Record<string, unknown>;
+    const thinkingConfig = generationConfig?.thinkingConfig as Record<
+      string,
+      unknown
+    >;
+    assert.equal(thinkingConfig?.thinkingLevel, "ultra");
+    assert.equal(thinkingConfig?.includeThoughts, true);
   });
 });

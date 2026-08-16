@@ -167,4 +167,49 @@ describe("provider settings checks", function () {
     assert.isFalse(firstLevel?.ok);
     assert.match(firstLevel?.error || "", /model reloading/);
   });
+
+  it("probes a Gemini level where Gemini actually reads it", async function () {
+    const { fetchFn, requests } = makeFetchStub(() => ok());
+    await runProviderSettingsChecks({
+      fetchFn,
+      protocol: "gemini_native",
+      authMode: "api_key",
+      apiBase: "https://generativelanguage.googleapis.com/v1beta",
+      apiKey: "gemini-test",
+      modelName: "gemini-3-pro",
+      profileOverride: {
+        forModel: "gemini-3-pro",
+        reasoning: {
+          kind: "select",
+          options: [
+            {
+              id: "ultra",
+              label: "ultra",
+              enabled: true,
+              controls: {
+                body: { thinkingConfig: { thinkingLevel: "ultra" } },
+              },
+            },
+          ],
+        },
+        extraBody: { safetySettings: [] },
+      },
+    });
+
+    // The probe has to send the shape the plugin sends. A top-level
+    // thinkingConfig is not a field of generateContent, so testing it there
+    // reports a level that works as broken.
+    const levelRequest = requests[requests.length - 1];
+    const generationConfig = levelRequest.body.generationConfig as Record<
+      string,
+      unknown
+    >;
+    assert.deepEqual(generationConfig?.thinkingConfig, {
+      thinkingLevel: "ultra",
+    });
+    assert.isUndefined(levelRequest.body.thinkingConfig);
+    // The open JSON field addresses the request as a whole, so it stays where
+    // the user put it.
+    assert.deepEqual(levelRequest.body.safetySettings, []);
+  });
 });

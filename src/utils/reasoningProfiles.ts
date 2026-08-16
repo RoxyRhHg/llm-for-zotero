@@ -1073,6 +1073,25 @@ export function getQwenReasoningProfileForModel(
   };
 }
 
+/**
+ * Thought summaries are the plugin's ask, not the profile's: every branch that
+ * builds a `thinkingConfig` from a known profile requests them, so a config
+ * that arrives declared — from the registry, or from a reasoning level the
+ * user typed — must not cost the reasoning stream merely by saying nothing
+ * about it. An explicit `includeThoughts: false` still wins.
+ */
+export function withGeminiThoughtSummaries(
+  config: Record<string, unknown>,
+): Record<string, unknown> {
+  // Both call sites accept `thinking_config` as well as `thinkingConfig`, and
+  // this repo's own legacy encoder writes snake_case, so both spellings of the
+  // field have to count as "already stated" — adding the camelCase one beside
+  // an existing `include_thoughts` would send Gemini the same field twice.
+  return "includeThoughts" in config || "include_thoughts" in config
+    ? config
+    : { includeThoughts: true, ...config };
+}
+
 export function getGeminiReasoningProfileForModel(
   modelName?: string,
 ): GeminiReasoningProfile {

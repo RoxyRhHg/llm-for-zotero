@@ -405,6 +405,41 @@ export type ConnectionSettingsCheck = {
  * `reasoning`, `generationConfig`) instead of replacing them — mirroring how
  * the real payload builders fold user parameters in.
  */
+/**
+ * Put a reasoning level's body where its protocol actually reads it.
+ *
+ * A probe is only worth anything if it sends the request the plugin sends.
+ * Gemini's thinking controls live under `generationConfig`; sent at the top
+ * level they are not a field of `generateContent` at all, so a level that works
+ * would be reported as broken. Only the level body is placed — the open JSON
+ * field addresses the whole request and stays exactly where the user put it.
+ */
+function placeLevelBody(
+  protocol: ProviderProtocol,
+  body: Record<string, unknown>,
+): Record<string, unknown> {
+  if (protocol !== "gemini_native") return body;
+  const nested: Record<string, unknown> = {};
+  const top: Record<string, unknown> = {};
+  for (const [key, value] of Object.entries(body)) {
+    // A body that already names its container is left alone.
+    if (key === "generationConfig" || key === "generation_config") {
+      top[key] = value;
+    } else {
+      nested[key] = value;
+    }
+  }
+  if (!Object.keys(nested).length) return top;
+  const existing = top.generationConfig;
+  return {
+    ...top,
+    generationConfig: {
+      ...(isRecord(existing) ? existing : {}),
+      ...nested,
+    },
+  };
+}
+
 function mergeBodyPatch(
   base: Record<string, unknown>,
   patch: Record<string, unknown>,
@@ -519,8 +554,9 @@ export async function runProviderSettingsChecks(params: {
   const options =
     override.reasoning?.kind === "select" ? override.reasoning.options : [];
   for (const option of options) {
-    const body = option.controls?.body;
-    if (!body || !Object.keys(body).length) continue;
+    const declared = option.controls?.body;
+    if (!declared || !Object.keys(declared).length) continue;
+    const body = placeLevelBody(params.protocol, declared);
     const result = await probe(
       extraBody && extraUsable ? mergeBodyPatch(extraBody, body) : body,
     );
