@@ -9,8 +9,13 @@
  *
  * Because verification is the safety net, the search space can be wide: papers
  * carried by the conversation first, then papers found by searching the
- * library for the citation label.  Reading PDF text is the expensive part, so
- * candidates are checked in priority order under a fixed budget.
+ * library for the citation label.
+ *
+ * Reading a PDF's text costs on the order of a second, so the search space
+ * being wide must not make a click slow.  Candidates are ordered best-first
+ * and the first one holding the quote wins immediately.  That loses nothing:
+ * since the order is already best-first, reading on could only turn up equal
+ * or worse matches.
  */
 
 export type QuoteTargetVerificationStatus =
@@ -49,27 +54,20 @@ export type QuoteTargetResolution =
       sourceMatchText?: string;
       sourceMatchPageOccurrence?: number;
       authoritative: boolean;
+      /** PDFs read to reach this answer; 1 on the common path. */
+      readCount: number;
     }
-  | { status: "ambiguous"; contextItemIds: number[] }
   | { status: "unverifiable"; contextItemIds: number[]; reason: string }
-  | { status: "not-found"; reason: string };
+  | { status: "not-found"; reason: string; readCount: number };
 
 /**
- * Upper bound on how many PDFs a single click may read.  Library chat can put
- * dozens of papers in range; reading them all would stall the panel.
+ * Upper bound on how many PDFs a single click may read before giving up.  Only
+ * the failing path can reach it — a successful click stops at its first hit.
  */
-export const DEFAULT_QUOTE_TARGET_VERIFICATION_BUDGET = 12;
+export const DEFAULT_QUOTE_TARGET_VERIFICATION_BUDGET = 8;
 
 const DEFAULT_NOT_FOUND_REASON =
   "The cited quote was not found in any matching paper.";
-
-type VerifiedMatch = {
-  candidate: QuoteTargetCandidate;
-  pageIndex: number;
-  quoteText: string;
-  sourceMatchText?: string;
-  sourceMatchPageOccurrence?: number;
-};
 
 function normalizeContextItemId(value: unknown): number {
   const parsed = Math.floor(Number(value));
@@ -145,22 +143,6 @@ function normalizeSearchTexts(searchTexts: readonly string[]): string[] {
   return out;
 }
 
-/**
- * Pick a winner among papers that all contain the quote.  Near-duplicates
- * (preprint plus published version) are common in a library, so a clear label
- * winner is preferred over refusing to move.  Only a genuine tie is ambiguous.
- */
-function selectBestMatch(matches: VerifiedMatch[]): VerifiedMatch | null {
-  if (matches.length <= 1) return matches[0] || null;
-  const bestRank = Math.max(
-    ...matches.map((match) => match.candidate.labelRank),
-  );
-  const leaders = matches.filter(
-    (match) => match.candidate.labelRank === bestRank,
-  );
-  return leaders.length === 1 ? leaders[0] : null;
-}
-
 export async function resolveVerifiedQuoteTarget(params: {
   candidates: readonly QuoteTargetCandidate[];
   searchTexts: readonly string[];
@@ -172,7 +154,11 @@ export async function resolveVerifiedQuoteTarget(params: {
 }): Promise<QuoteTargetResolution> {
   const searchTexts = normalizeSearchTexts(params.searchTexts);
   if (!searchTexts.length) {
-    return { status: "not-found", reason: "No quote text was available." };
+    return {
+      status: "not-found",
+      reason: "No quote text was available.",
+      readCount: 0,
+    };
   }
 
   const budgetInput = Number(params.verificationBudget);
@@ -190,11 +176,8 @@ export async function resolveVerifiedQuoteTarget(params: {
   // Conversation papers are settled before library guesses are read at all, so
   // a paper the answer actually used always wins over a same-label lookalike.
   for (const tier of [true, false]) {
-    const tierCandidates = candidates.filter(
-      (candidate) => candidate.authoritative === tier,
-    );
-    const matches: VerifiedMatch[] = [];
-    for (const candidate of tierCandidates) {
+    for (const candidate of candidates) {
+      if (candidate.authoritative !== tier) continue;
       if (spent >= budget) break;
       spent += 1;
       for (const quoteText of searchTexts) {
@@ -221,37 +204,18 @@ export async function resolveVerifiedQuoteTarget(params: {
         if (verification?.status !== "resolved") continue;
         const pageIndex = normalizePageIndex(verification.pageIndex);
         if (pageIndex === null) continue;
-        matches.push({
-          candidate,
+        // Best-first order means no later candidate can beat this one.
+        return {
+          status: "resolved",
+          contextItemId: candidate.contextItemId,
           pageIndex,
           quoteText,
           sourceMatchText: verification.sourceMatchText,
           sourceMatchPageOccurrence: verification.sourceMatchPageOccurrence,
-        });
-        break;
+          authoritative: candidate.authoritative,
+          readCount: spent,
+        };
       }
-      // Two hits are enough to know the label has to arbitrate; reading more
-      // PDFs cannot change that verdict.
-      if (matches.length > 1) break;
-    }
-
-    const best = selectBestMatch(matches);
-    if (best) {
-      return {
-        status: "resolved",
-        contextItemId: best.candidate.contextItemId,
-        pageIndex: best.pageIndex,
-        quoteText: best.quoteText,
-        sourceMatchText: best.sourceMatchText,
-        sourceMatchPageOccurrence: best.sourceMatchPageOccurrence,
-        authoritative: best.candidate.authoritative,
-      };
-    }
-    if (matches.length > 1) {
-      return {
-        status: "ambiguous",
-        contextItemIds: matches.map((match) => match.candidate.contextItemId),
-      };
     }
   }
 
@@ -266,5 +230,6 @@ export async function resolveVerifiedQuoteTarget(params: {
   return {
     status: "not-found",
     reason: lastReason || DEFAULT_NOT_FOUND_REASON,
+    readCount: spent,
   };
 }

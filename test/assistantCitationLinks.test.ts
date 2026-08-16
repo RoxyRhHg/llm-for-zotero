@@ -1959,10 +1959,9 @@ describe("assistantCitationLinks", function () {
       assert.include(navigateSection, "resolveVerifiedQuoteTarget");
       assert.include(navigateSection, "verify: verifyQuoteInCitationCandidate");
       assert.lengthOf(navigateSection.match(/openReaderForItem\(/g) || [], 1);
-      assert.include(
-        navigateSection,
-        "The cited quote appears in more than one paper.",
-      );
+      // How many PDFs a click had to read is the number to watch when a jump
+      // feels slow, so it is recorded rather than left to guesswork.
+      assert.include(navigateSection, "pdfsRead:");
       assert.notInclude(
         navigateSection,
         "no explicit PDF context is available",

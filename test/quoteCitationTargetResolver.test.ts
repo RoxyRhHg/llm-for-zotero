@@ -79,6 +79,25 @@ describe("quote citation target resolver", function () {
     assert.include(resolution.reason, "not found");
   });
 
+  it("stops reading PDFs as soon as one of them holds the quote", async function () {
+    const attempts: Array<{ contextItemId: number; quoteText: string }> = [];
+    const candidates = [
+      candidate(11, { labelRank: 9 }),
+      ...Array.from({ length: 30 }, (_entry, index) => candidate(100 + index)),
+    ];
+    const resolution = await resolveVerifiedQuoteTarget({
+      candidates,
+      searchTexts: ["verbatim sentence"],
+      verify: trackingVerifier({ 11: resolved(2) }, attempts),
+    });
+
+    assert.equal(resolution.status, "resolved");
+    if (resolution.status !== "resolved") return;
+    assert.equal(resolution.contextItemId, 11);
+    assert.equal(resolution.readCount, 1);
+    assert.lengthOf(attempts, 1, "a hit must end the search immediately");
+  });
+
   it("checks conversation-context papers before library-search papers", async function () {
     const attempts: Array<{ contextItemId: number; quoteText: string }> = [];
     const resolution = await resolveVerifiedQuoteTarget({
@@ -119,22 +138,28 @@ describe("quote citation target resolver", function () {
     assert.isFalse(resolution.authoritative);
   });
 
-  it("breaks a two-paper tie using citation-label agreement", async function () {
+  it("prefers the better-labelled paper when several hold the quote", async function () {
+    const attempts: Array<{ contextItemId: number; quoteText: string }> = [];
     const resolution = await resolveVerifiedQuoteTarget({
       candidates: [
         candidate(11, { authoritative: true, labelRank: 1 }),
         candidate(22, { authoritative: true, labelRank: 4 }),
       ],
       searchTexts: ["shared sentence"],
-      verify: async () => resolved(2),
+      verify: trackingVerifier({ 11: resolved(2), 22: resolved(5) }, attempts),
     });
 
     assert.equal(resolution.status, "resolved");
     if (resolution.status !== "resolved") return;
+    // Best-first ordering makes the label winner the first one read, so the
+    // right answer costs one read rather than a full scan.
     assert.equal(resolution.contextItemId, 22);
+    assert.lengthOf(attempts, 1);
   });
 
-  it("reports ambiguity when equally labelled papers both contain the quote", async function () {
+  it("jumps to a near-duplicate rather than refusing when labels tie", async function () {
+    // A preprint and its published version both hold the quote; sending the
+    // reader to the first is far better than declining to move at all.
     const resolution = await resolveVerifiedQuoteTarget({
       candidates: [
         candidate(11, { authoritative: true, labelRank: 2 }),
@@ -144,9 +169,9 @@ describe("quote citation target resolver", function () {
       verify: async () => resolved(2),
     });
 
-    assert.equal(resolution.status, "ambiguous");
-    if (resolution.status !== "ambiguous") return;
-    assert.deepEqual(resolution.contextItemIds.slice().sort(), [11, 22]);
+    assert.equal(resolution.status, "resolved");
+    if (resolution.status !== "resolved") return;
+    assert.equal(resolution.contextItemId, 11);
   });
 
   it("reports unverifiable rather than not-found when PDF text cannot be read", async function () {

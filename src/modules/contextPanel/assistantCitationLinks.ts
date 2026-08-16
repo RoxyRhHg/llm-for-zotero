@@ -2715,7 +2715,7 @@ async function locateQuoteByOpeningCitationCandidates(params: {
       }
       if (result.reason) reason = result.reason;
     }
-    if (matches.length > 1) break;
+    if (matches.length) break;
   }
   return { matches, reason };
 }
@@ -2736,6 +2736,7 @@ function buildQuoteTargetCandidates(
 async function navigateUntrustedQuoteCitation(params: {
   status: HTMLElement | null;
   button: HTMLButtonElement;
+  timing: CitationNavigationTiming;
   panelItem: Zotero.Item;
   extractedCitation: ExtractedCitationLabel | null;
   staticCandidates: AssistantCitationPaperCandidate[];
@@ -2764,6 +2765,11 @@ async function navigateUntrustedQuoteCitation(params: {
   const pdfCandidates = resolvedCandidates.filter((candidate) =>
     isPdfBackedCitationCandidate(candidate),
   );
+  markCitationNavigationTiming(params.timing, "candidate resolution", {
+    staticCandidateCount: params.staticCandidates.length,
+    pdfCandidateCount: pdfCandidates.length,
+    navigationMode: "untrusted-quote",
+  });
   if (!pdfCandidates.length || !searchTexts.length) {
     if (params.status) {
       setStatus(
@@ -2792,6 +2798,15 @@ async function navigateUntrustedQuoteCitation(params: {
     searchTexts,
     verify: verifyQuoteInCitationCandidate,
   });
+  markCitationNavigationTiming(params.timing, "quote verification", {
+    status: resolution.status,
+    // How many PDFs this click had to read. A jump to a paper the answer
+    // recorded should be 1; higher means the label search did the work.
+    pdfsRead:
+      resolution.status === "resolved" || resolution.status === "not-found"
+        ? resolution.readCount
+        : undefined,
+  });
 
   let match: ResolvedQuoteCitationMatch | null = null;
   let lastReason = "The cited quote was not found in the cited paper.";
@@ -2806,15 +2821,6 @@ async function navigateUntrustedQuoteCitation(params: {
         sourceMatchPageOccurrence: resolution.sourceMatchPageOccurrence,
       };
     }
-  } else if (resolution.status === "ambiguous") {
-    if (params.status) {
-      setStatus(
-        params.status,
-        "The cited quote appears in more than one paper. Its citation was preserved, but no automatic jump is available.",
-        "error",
-      );
-    }
-    return false;
   } else if (resolution.status === "unverifiable") {
     // Background text extraction failed for these; fall back to the viewer.
     const opened = await locateQuoteByOpeningCitationCandidates({
@@ -2825,16 +2831,6 @@ async function navigateUntrustedQuoteCitation(params: {
         ),
       searchTexts,
     });
-    if (opened.matches.length > 1) {
-      if (params.status) {
-        setStatus(
-          params.status,
-          "The cited quote appears in more than one paper. Its citation was preserved, but no automatic jump is available.",
-          "error",
-        );
-      }
-      return false;
-    }
     match = opened.matches[0] || null;
     if (opened.reason) lastReason = opened.reason;
     if (!match && !opened.reason) lastReason = resolution.reason;
@@ -2958,6 +2954,7 @@ async function resolveAndNavigateAssistantCitation(params: {
       quoteJumpSucceeded = await navigateUntrustedQuoteCitation({
         status,
         button: params.button,
+        timing,
         panelItem: params.panelItem,
         extractedCitation,
         staticCandidates,
