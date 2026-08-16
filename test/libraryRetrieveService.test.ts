@@ -2434,6 +2434,193 @@ describe("LibraryRetrieveService evidence triage", function () {
     );
     assert.isTrue(result.paperMatches.some((match) => match.itemId === "5"));
   });
+
+  it("never displaces a paper the query itself matched", async function () {
+    // One paper in the pool genuinely matches the query on its title and
+    // abstract; the rest are noise. Probe hits are weaker evidence than that,
+    // so they may take the seats of unmatched leads but never this one's.
+    const entries = POOL_ENTRIES();
+    entries[7] = makeItem(
+      8,
+      "Stimulation protocol for cortical neurons",
+      "A stimulation protocol for cortical neurons is described.",
+      { collectionIds: [3] },
+    );
+    const service = new LibraryRetrieveService(
+      makeGateway(entries, {
+        quicksearchItemIds: (query) => (query === "新探针" ? [5, 6, 7] : []),
+      }) as any,
+      {
+        ensurePaperContext: async () => makePdfContext(["Body chunk text."]),
+      } as any,
+      async () => [],
+      NOOP_REFORMULATOR,
+      (async () => ({
+        selectedItemIds: ["1"],
+        suggestedProbes: ["新探针"],
+      })) as any,
+    );
+
+    const result = await service.retrieve({
+      query: "stimulation protocols in these papers",
+      queryVariants: ["stimulation protocol"],
+      depth: "evidence",
+      maxCandidatePapers: 3,
+      maxFullTextPapers: 2,
+      apiBase: "https://example.invalid",
+      apiKey: "test-key",
+      request: REQUEST,
+    });
+
+    assert.isTrue(
+      result.candidates.some((candidate) => candidate.itemId === "8"),
+      `the matched paper was evicted; candidates were: ${JSON.stringify(
+        result.candidates.map((candidate) => candidate.itemId),
+      )}`,
+    );
+    assert.isTrue(
+      result.paperMatches.some((match) => match.itemId === "8"),
+      "a paper the query matched must stay in the ledger",
+    );
+  });
+
+  it("ranks rescan hits by relevance, not by library order", async function () {
+    // Twenty noise papers, so nothing the probe finds is in the shortlist
+    // already. All three hits carry the probe phrase; only the last one is
+    // about it, and it is returned last — library order would bury it.
+    const entries = Array.from({ length: 20 }, (_, index) =>
+      makeItem(index + 1, `论文${index + 1}`, "与查询无关的摘要内容。", {
+        collectionIds: [3],
+      }),
+    );
+    // Titles stay uniform: the shortlist tie-breaks on title, and a distinctive
+    // one would seat these three before the rescan ever runs.
+    const mention = "Kilohertz waveform is mentioned in passing here.";
+    entries[14] = makeItem(15, "论文15", mention, { collectionIds: [3] });
+    entries[15] = makeItem(16, "论文16", mention, { collectionIds: [3] });
+    // Shares no vocabulary with the original query, so it enters only as a
+    // discovery — but it is the one the probe is really about.
+    entries[16] = makeItem(
+      17,
+      "论文17",
+      "Kilohertz waveform calibration for kilohertz waveform delivery, on a kilohertz waveform schedule.",
+      { collectionIds: [3] },
+    );
+    const service = new LibraryRetrieveService(
+      makeGateway(entries, {
+        quicksearchItemIds: (query) =>
+          query === "kilohertz waveform" ? [15, 16, 17] : [],
+      }) as any,
+      {
+        ensurePaperContext: async () => makePdfContext(["Body chunk text."]),
+      } as any,
+      async () => [],
+      NOOP_REFORMULATOR,
+      (async () => ({
+        selectedItemIds: ["1"],
+        suggestedProbes: ["kilohertz waveform"],
+      })) as any,
+    );
+
+    const result = await service.retrieve({
+      query: "stimulation protocols in these papers",
+      queryVariants: ["stimulation protocol"],
+      depth: "evidence",
+      maxCandidatePapers: 5,
+      maxFullTextPapers: 2,
+      apiBase: "https://example.invalid",
+      apiKey: "test-key",
+      request: REQUEST,
+    });
+
+    const ids = result.candidates.map((candidate) => candidate.itemId);
+    assert.include(ids, "17", `candidates were: ${JSON.stringify(ids)}`);
+    assert.isBelow(
+      ids.indexOf("17"),
+      ids.indexOf("15"),
+      `discoveries kept library order; candidates were: ${JSON.stringify(ids)}`,
+    );
+  });
+
+  it("makes room for a rescan hit when the shortlist is already full", async function () {
+    const service = new LibraryRetrieveService(
+      makeGateway(POOL_ENTRIES(), {
+        quicksearchItemIds: (query) => (query === "新探针" ? [5] : []),
+      }) as any,
+      {
+        ensurePaperContext: async () => makePdfContext(["Body chunk text."]),
+      } as any,
+      async () => [],
+      NOOP_REFORMULATOR,
+      (async () => ({
+        selectedItemIds: ["1"],
+        suggestedProbes: ["新探针"],
+      })) as any,
+    );
+
+    const result = await service.retrieve({
+      query: "stimulation protocols in these papers",
+      queryVariants: ["stimulation protocol"],
+      depth: "evidence",
+      maxCandidatePapers: 3,
+      maxFullTextPapers: 1,
+      apiBase: "https://example.invalid",
+      apiKey: "test-key",
+      request: REQUEST,
+    });
+
+    // The shortlist is capped, and a pool-fallback shortlist is full of papers
+    // nothing matched. A paper the rescan actually matched has to be able to
+    // take one of those seats — otherwise the probe round only moves counters
+    // and the answer never sees what it found.
+    assert.isTrue(
+      result.candidates.some((candidate) => candidate.itemId === "5"),
+      `candidates were: ${JSON.stringify(
+        result.candidates.map((candidate) => candidate.itemId),
+      )}`,
+    );
+    assert.isAtMost(result.candidates.length, 3, "the cap still holds");
+  });
+
+  it("reads a rescan hit before the unmatched papers it outranks", async function () {
+    const expanded: number[] = [];
+    const service = new LibraryRetrieveService(
+      makeGateway(POOL_ENTRIES(), {
+        quicksearchItemIds: (query) => (query === "新探针" ? [5] : []),
+      }) as any,
+      {
+        ensurePaperContext: async (paperContext: PaperContextRef) => {
+          expanded.push(paperContext.itemId);
+          return makePdfContext(["Body chunk text."]);
+        },
+      } as any,
+      async () => [],
+      NOOP_REFORMULATOR,
+      (async () => ({
+        selectedItemIds: ["1"],
+        suggestedProbes: ["新探针"],
+      })) as any,
+    );
+
+    await service.retrieve({
+      query: "stimulation protocols in these papers",
+      queryVariants: ["stimulation protocol"],
+      depth: "evidence",
+      maxCandidatePapers: 3,
+      maxFullTextPapers: 2,
+      apiBase: "https://example.invalid",
+      apiKey: "test-key",
+      request: REQUEST,
+    });
+
+    // Snippet slots are handed out in shortlist order, so landing at the tail
+    // is the same as never being found. Triage's own pick keeps the first slot.
+    assert.include(
+      expanded,
+      5,
+      `papers expanded were: ${JSON.stringify(expanded)}`,
+    );
+  });
 });
 
 describe("LibraryRetrieveService classified intent defaults", function () {

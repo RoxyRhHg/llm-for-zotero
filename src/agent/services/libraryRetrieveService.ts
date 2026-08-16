@@ -433,6 +433,19 @@ const BM25_BLEND_WEIGHT = 8;
 
 const BM25_MIN_TERM_HITS = 2;
 
+/**
+ * Whether the query itself reached this paper — the one definition of "matched"
+ * this service has. Everything that ranks, shortlists or displaces a paper must
+ * ask this and nothing narrower: `quicksearchMatched` alone, for instance,
+ * silently demotes every paper found by metadata or BM25 rather than by the
+ * indexed-text probe.
+ */
+function recordMatchedQuery(record: ResourceRecord): boolean {
+  return (
+    record.metadataScore > 0 || record.ftsScore > 0 || recordBm25Matched(record)
+  );
+}
+
 function recordBm25Matched(record: ResourceRecord): boolean {
   // A single shared token (often one CJK bigram) is noise, and tokens shared
   // by most of the pool (generic vocabulary) carry no signal either — at
@@ -912,6 +925,65 @@ function resourceStates(
 
 function queryStates(record: ResourceRecord): LibraryRetrieveQueryState[] {
   return Array.from(record.queryState);
+}
+
+/**
+ * Fold the papers only a triage-suggested rescan matched into the shortlist.
+ *
+ * The shortlist is capped, and on the pool-fallback path that triage exists
+ * for it arrives already full — mostly of papers nothing matched, carried as
+ * leads to verify rather than as evidence. A paper the rescan matched outranks
+ * those, so it takes their seats instead of queueing behind them: appending
+ * would leave it past the snippet budget, which reads the shortlist in order,
+ * and at capacity it would not enter at all.
+ *
+ * Only unmatched leads may be displaced. Triage's own picks and every paper
+ * the query already reached — by metadata, FTS or BM25, not just by the
+ * indexed-text probe — keep their places, because a probe hit is the weaker
+ * evidence of the two. Whatever still does not fit is reported rather than
+ * dropped in silence.
+ */
+function mergeRescanDiscoveries<
+  TRecord extends { target: { itemId: number | string }; bm25Score: number },
+>(params: {
+  shortlist: readonly TRecord[];
+  discovered: readonly TRecord[];
+  /** True for a paper that is already evidence and so cannot be displaced. */
+  isEstablished: (record: TRecord) => boolean;
+  maxCandidatePapers: number;
+}): { shortlist: TRecord[]; displaced: TRecord[]; droppedDiscoveries: number } {
+  if (!params.discovered.length) {
+    return {
+      shortlist: [...params.shortlist],
+      displaced: [],
+      droppedDiscoveries: 0,
+    };
+  }
+  const established: TRecord[] = [];
+  const leads: TRecord[] = [];
+  for (const record of params.shortlist) {
+    (params.isEstablished(record) ? established : leads).push(record);
+  }
+  // Discoveries arrive in library order, which says nothing about relevance —
+  // and since they now sit ahead of the leads, that order would decide which
+  // ones are read. `score` is the pre-rescan ranking and is not recomputed, so
+  // it is uniform here; `bm25Score` is, against a plan that now carries the
+  // probe terms, which is exactly what separates these papers.
+  const ranked = [...params.discovered].sort(
+    (left, right) => right.bm25Score - left.bm25Score,
+  );
+  const merged = [...established, ...ranked, ...leads];
+  const shortlist = merged.slice(0, Math.max(0, params.maxCandidatePapers));
+  const kept = new Set(shortlist.map((record) => String(record.target.itemId)));
+  return {
+    shortlist,
+    displaced: params.shortlist.filter(
+      (record) => !kept.has(String(record.target.itemId)),
+    ),
+    droppedDiscoveries: params.discovered.filter(
+      (record) => !kept.has(String(record.target.itemId)),
+    ).length,
+  };
 }
 
 function candidateFromRecord(record: ResourceRecord): LibraryRetrieveCandidate {
@@ -1518,12 +1590,7 @@ export class LibraryRetrieveService {
       return left.target.title.localeCompare(right.target.title);
     });
 
-    const matchedRecords = sorted.filter(
-      (record) =>
-        record.metadataScore > 0 ||
-        record.ftsScore > 0 ||
-        recordBm25Matched(record),
-    );
+    const matchedRecords = sorted.filter(recordMatchedQuery);
     const shouldPreferMatchedLedger =
       input.intent === "enumerate" ||
       input.intent === "verify" ||
@@ -1554,7 +1621,7 @@ export class LibraryRetrieveService {
         `Lexical/metadata matching found only ${matchedRecords.length} direct match(es) in this scope; returning the top-scored pool slice instead (LOW CONFIDENCE). Treat unmatched candidates as leads to verify, not evidence.`,
       );
     }
-    const candidateRecords =
+    let candidateRecords =
       input.depth === "pool"
         ? []
         : candidateSource.slice(0, input.maxCandidatePapers);
@@ -1666,14 +1733,31 @@ export class LibraryRetrieveService {
           const candidateIds = new Set(
             candidateRecords.map((record) => record.target.itemId),
           );
-          for (const record of records) {
-            if (candidateRecords.length >= input.maxCandidatePapers) break;
-            if (!record.quicksearchMatched) continue;
-            if (previouslyMatched.has(record.target.itemId)) continue;
-            if (candidateIds.has(record.target.itemId)) continue;
+          const discovered = records.filter(
+            (record) =>
+              record.quicksearchMatched &&
+              !previouslyMatched.has(record.target.itemId) &&
+              !candidateIds.has(record.target.itemId),
+          );
+          const merged = mergeRescanDiscoveries({
+            shortlist: candidateRecords,
+            discovered,
+            isEstablished: (record) =>
+              rank.has(String(record.target.itemId)) ||
+              recordMatchedQuery(record),
+            maxCandidatePapers: input.maxCandidatePapers,
+          });
+          for (const record of merged.displaced) {
+            record.queryState.delete("shortlisted");
+          }
+          for (const record of merged.shortlist) {
             record.queryState.add("shortlisted");
-            candidateRecords.push(record);
-            candidateIds.add(record.target.itemId);
+          }
+          candidateRecords = merged.shortlist;
+          if (merged.droppedDiscoveries) {
+            warnings.push(
+              `${merged.droppedDiscoveries} paper(s) matched by the follow-up probes did not fit the candidate budget and were not read.`,
+            );
           }
         }
       } else {
