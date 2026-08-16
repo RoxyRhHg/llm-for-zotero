@@ -44,7 +44,12 @@ const MIN_AUTO_TRUSTED_QUOTE_NORMALIZED_CHARS = 36;
 const MIN_AUTO_TRUSTED_QUOTE_TOKENS = 6;
 const MIN_AUTO_TRUSTED_NON_ASCII_QUOTE_CHARS = 16;
 const MIN_COMPLETE_LAYOUT_ARTIFACT_SUPPORT_COVERAGE = 0.7;
-const MIN_NEAR_COMPLETE_QUOTE_SUPPORT_COVERAGE = 0.8;
+/**
+ * How much of a displayed quote a source must account for before that source
+ * is treated as the quote's origin.  Shared by the answer-time quote gate and
+ * by click-time navigation, so both judge a quote the same way.
+ */
+export const MIN_NEAR_COMPLETE_QUOTE_SUPPORT_COVERAGE = 0.8;
 const MIN_NEAR_COMPLETE_QUOTE_SUPPORTED_TOKENS = 7;
 const MIN_NEAR_COMPLETE_QUOTE_ANCHOR_TOKENS = 6;
 const MIN_EXTRACTION_SENSITIVE_QUOTE_SUPPORT_COVERAGE = 0.55;

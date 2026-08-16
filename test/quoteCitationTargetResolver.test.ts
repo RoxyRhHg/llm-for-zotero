@@ -286,6 +286,26 @@ describe("quote citation target resolver", function () {
     if (resolution.status !== "resolved") return;
     assert.equal(resolution.contextItemId, 22);
   });
+  it("explains a failure in terms of the most likely paper, not the last one checked", async function () {
+    const resolution = await resolveVerifiedQuoteTarget({
+      candidates: [
+        candidate(11, { authoritative: true, labelRank: 9 }),
+        candidate(22, { labelRank: 1 }),
+      ],
+      searchTexts: ["missing sentence"],
+      verify: async (c) => ({
+        status: "not-found",
+        reason:
+          c.contextItemId === 11
+            ? "Only part of the cited quote appears in this paper."
+            : "The complete quote was not found in the live PDF text.",
+      }),
+    });
+
+    assert.equal(resolution.status, "not-found");
+    if (resolution.status !== "not-found") return;
+    assert.include(resolution.reason, "Only part of the cited quote");
+  });
 });
 
 describe("untrusted quote navigation contract", function () {
@@ -327,11 +347,15 @@ describe("untrusted quote navigation contract", function () {
     );
     const verifySection = source.slice(start, end);
 
-    // The locator resolves on the largest uniquely-occurring span when the
-    // whole quote does not align. A short shared phrase must not be enough to
-    // send the reader to a paper the conversation never used.
+    // A short shared phrase must not be enough to send the reader to a paper
+    // the conversation never used — but the test is how much of the quote the
+    // document accounts for in total, not how long its single best span is.
     assert.include(verifySection, "!candidate.authoritative");
-    assert.include(verifySection, "sourceMatchQuoteTokenCoverage < 1");
+    assert.include(
+      verifySection,
+      "quoteSupportCoverage(result) < MIN_NEAR_COMPLETE_QUOTE_SUPPORT_COVERAGE",
+    );
+    assert.notInclude(verifySection, "sourceMatchQuoteTokenCoverage < 1");
     assert.include(verifySection, 'status: "not-found"');
   });
 });

@@ -762,6 +762,123 @@ function sourceTextForTokenRun(
     .trim();
 }
 
+/**
+ * A run has to carry real content before it counts as evidence that a source
+ * accounts for part of a quote; a couple of shared short words do not.
+ */
+const MIN_SUPPORTING_RUN_TOKENS = 3;
+const MIN_SUPPORTING_RUN_CHARS = 12;
+
+type QuoteTokenRunCandidate = {
+  run: CommonQuoteTokenRun;
+  query: string;
+  normalizedQuery: string;
+  matchedTokenCount: number;
+  score: number;
+};
+
+function collectQuoteTokenRunCandidates(
+  normalizedEntries: NormalizedQuoteTextSearchEntry[],
+  quoteIndex: QuoteTextIndex,
+  options: { minQueryLength: number; rejectWeakQueries: boolean },
+): QuoteTokenRunCandidate[] {
+  return normalizedEntries
+    .flatMap((entry) => collectCommonQuoteTokenRuns(entry, quoteIndex))
+    .map((run) => {
+      const query = sourceTextForTokenRun(run, quoteIndex.tokens.length);
+      const normalizedQuery = normalizeLocatorText(query);
+      const matchedTokenCount = run.quoteTokenEnd - run.quoteTokenStart;
+      return {
+        run,
+        query,
+        normalizedQuery,
+        matchedTokenCount,
+        score: quoteIndex.tokens
+          .slice(run.quoteTokenStart, run.quoteTokenEnd)
+          .reduce((sum, token) => sum + scoreSearchToken(token.text), 0),
+      };
+    })
+    .filter(
+      (candidate) =>
+        isLocatorQueryLongEnough(
+          candidate.normalizedQuery,
+          options.minQueryLength,
+        ) &&
+        (!options.rejectWeakQueries ||
+          !isWeakQuoteSearchQuery(candidate.normalizedQuery)),
+    );
+}
+
+function runCountsAsQuoteSupport(candidate: QuoteTokenRunCandidate): boolean {
+  return (
+    candidate.matchedTokenCount >= MIN_SUPPORTING_RUN_TOKENS &&
+    candidate.normalizedQuery.length >= MIN_SUPPORTING_RUN_CHARS
+  );
+}
+
+export type QuoteTextSupportSummary = {
+  quoteTokenCount: number;
+  supportedQuoteTokenCount: number;
+  /** Supported fraction of the quote, 0..1. */
+  coverage: number;
+};
+
+/**
+ * How much of a quote a set of sources accounts for **in total**, counting
+ * every contiguous run they share rather than only the longest one.
+ *
+ * Writers quote by stitching: a displayed quote is routinely assembled from
+ * two or three passages, sometimes marked with an ellipsis and sometimes not.
+ * Judging such a quote by its longest single run understates it badly — a
+ * quote entirely present in a paper, in three pieces, can score below half.
+ * Judging it by the union answers the question that actually matters: how much
+ * of this quote does this source account for?
+ *
+ * Entries are pooled deliberately, so a quote whose pieces straddle two pages
+ * of one PDF is summarised over the whole document rather than per page.
+ */
+export function summarizeQuoteTextSupport(
+  entries: QuoteTextSearchEntry[],
+  quoteText: string,
+  options?: Pick<
+    QuoteTextSearchOptions,
+    "minQueryLength" | "rejectWeakQueries"
+  >,
+): QuoteTextSupportSummary {
+  const normalizedEntries = normalizeEntries(entries);
+  const cleanQuote = stripBoundaryEllipsis(
+    sanitizeText(quoteText || "").trim(),
+  );
+  const quoteIndex = buildQuoteTextIndex(cleanQuote);
+  const quoteTokenCount = quoteIndex.tokens.length;
+  if (!quoteTokenCount || !normalizedEntries.length) {
+    return { quoteTokenCount, supportedQuoteTokenCount: 0, coverage: 0 };
+  }
+  const supported = new Set<number>();
+  for (const candidate of collectQuoteTokenRunCandidates(
+    normalizedEntries,
+    quoteIndex,
+    {
+      minQueryLength: Math.max(1, options?.minQueryLength ?? 24),
+      rejectWeakQueries: options?.rejectWeakQueries ?? true,
+    },
+  )) {
+    if (!runCountsAsQuoteSupport(candidate)) continue;
+    for (
+      let tokenIndex = candidate.run.quoteTokenStart;
+      tokenIndex < candidate.run.quoteTokenEnd;
+      tokenIndex += 1
+    ) {
+      supported.add(tokenIndex);
+    }
+  }
+  return {
+    quoteTokenCount,
+    supportedQuoteTokenCount: supported.size,
+    coverage: supported.size / quoteTokenCount,
+  };
+}
+
 function buildQuoteTextAnchorMatches(
   entries: QuoteTextSearchEntry[],
   quoteText: string,
@@ -813,34 +930,14 @@ function buildQuoteTextAnchorMatches(
     ];
   }
 
-  const candidates = normalizedEntries
-    .flatMap((entry) => collectCommonQuoteTokenRuns(entry, quoteIndex))
-    .map((run) => {
-      const query = sourceTextForTokenRun(run, quoteIndex.tokens.length);
-      const normalizedQuery = normalizeLocatorText(query);
-      const matchedTokenCount = run.quoteTokenEnd - run.quoteTokenStart;
-      return {
-        run,
-        query,
-        normalizedQuery,
-        matchedTokenCount,
-        score: quoteIndex.tokens
-          .slice(run.quoteTokenStart, run.quoteTokenEnd)
-          .reduce((sum, token) => sum + scoreSearchToken(token.text), 0),
-      };
-    })
-    .filter(
-      (candidate) =>
-        isLocatorQueryLongEnough(candidate.normalizedQuery, minQueryLength) &&
-        (!rejectWeakQueries ||
-          !isWeakQuoteSearchQuery(candidate.normalizedQuery)),
-    );
+  const candidates = collectQuoteTokenRunCandidates(
+    normalizedEntries,
+    quoteIndex,
+    { minQueryLength, rejectWeakQueries },
+  );
   const supportedQuoteTokensByEntry = new Map<string, Set<number>>();
   for (const candidate of candidates) {
-    if (
-      candidate.matchedTokenCount < 3 ||
-      candidate.normalizedQuery.length < 12
-    ) {
+    if (!runCountsAsQuoteSupport(candidate)) {
       continue;
     }
     let supported = supportedQuoteTokensByEntry.get(candidate.run.entry.id);

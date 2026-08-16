@@ -13,6 +13,7 @@ import {
 } from "./normalizers";
 import {
   findMatchingTrustedQuoteCitation,
+  MIN_NEAR_COMPLETE_QUOTE_SUPPORT_COVERAGE,
   normalizeQuoteCitations,
   QUOTE_CITATION_PATTERN,
   stripQuoteCitationAnchorsFromDisplayText,
@@ -55,6 +56,7 @@ import {
 } from "./citationNavigationCache";
 import {
   type ExactQuoteJumpResult,
+  type LivePdfSelectionLocateResult,
   locateQuoteInLivePdfReader,
   getPageLabelForIndex,
   lookupCachedQuoteLocationForAttachment,
@@ -64,6 +66,7 @@ import {
   warmPageTextCache,
   warmQuoteLocationCacheForAttachment,
 } from "./livePdfSelectionLocator";
+import { resolveQuoteEvidenceProvenance } from "./quoteEvidenceProvenance";
 import {
   resolveVerifiedQuoteTarget,
   type QuoteTargetCandidate,
@@ -134,6 +137,32 @@ const citationButtonNavigationModeCache = new WeakMap<
   HTMLButtonElement,
   CitationNavigationMode
 >();
+
+const citationButtonAgentRunIdCache = new WeakMap<HTMLButtonElement, string>();
+
+/** Collections the chat was scoped to, used to order a library lookup. */
+const citationButtonScopeCollectionCache = new WeakMap<
+  HTMLButtonElement,
+  ReadonlySet<number>
+>();
+
+/**
+ * The collections a chat was asked about.  A quote in a collection chat almost
+ * always comes from that collection, so its members are worth checking before
+ * a same-label paper from elsewhere in the library.
+ */
+export function collectCitationScopeCollectionIds(
+  pairedUserMessage: Message | null | undefined,
+): ReadonlySet<number> {
+  const out = new Set<number>();
+  for (const context of pairedUserMessage?.selectedCollectionContexts || []) {
+    const collectionId = Math.floor(Number(context?.collectionId));
+    if (Number.isFinite(collectionId) && collectionId > 0) {
+      out.add(collectionId);
+    }
+  }
+  return out;
+}
 
 function getCitationNavigationMode(
   button: HTMLButtonElement,
@@ -2382,6 +2411,7 @@ function mergeCitationCandidates(
 async function resolveCitationCandidatesFromLibrarySearch(
   panelItem: Zotero.Item,
   extractedCitation: ExtractedCitationLabel | null,
+  scopeCollectionIds?: ReadonlySet<number>,
 ): Promise<AssistantCitationPaperCandidate[]> {
   if (!extractedCitation) return [];
   const libraryID = Number(panelItem.libraryID || 0);
@@ -2404,6 +2434,7 @@ async function resolveCitationCandidatesFromLibrarySearch(
   if (!groups.length) return [];
 
   const candidates: AssistantCitationPaperCandidate[] = [];
+  const inScope = new Set<string>();
   const seen = new Set<string>();
   const displayCache: PaperContextDisplayCache = new Map();
   for (const group of groups) {
@@ -2425,6 +2456,14 @@ async function resolveCitationCandidatesFromLibrarySearch(
       displayCache,
       "library-search",
     );
+    if (
+      scopeCollectionIds?.size &&
+      group.collectionIds.some((collectionId) =>
+        scopeCollectionIds.has(Math.floor(collectionId)),
+      )
+    ) {
+      inScope.add(buildCitationCandidateKey(candidates[candidates.length - 1]));
+    }
   }
   if (!candidates.length) return [];
 
@@ -2432,9 +2471,14 @@ async function resolveCitationCandidatesFromLibrarySearch(
     .map((candidate) => ({
       candidate,
       rank: rankCitationSearchMatch(extractedCitation, candidate),
+      inScope: inScope.has(buildCitationCandidateKey(candidate)),
     }))
     .filter((entry) => entry.rank > 0)
     .sort((left, right) => {
+      // The chat was asked about a collection, so its members are checked
+      // before same-label lookalikes from the rest of the library.
+      const scopeDelta = Number(right.inScope) - Number(left.inScope);
+      if (scopeDelta !== 0) return scopeDelta;
       const rankDelta = right.rank - left.rank;
       if (rankDelta !== 0) return rankDelta;
       return left.candidate.displayPaperContext.title.localeCompare(
@@ -2450,7 +2494,10 @@ async function buildOrderedCitationCandidates(
   panelItem: Zotero.Item,
   extractedCitation: ExtractedCitationLabel | null,
   staticCandidates: AssistantCitationPaperCandidate[],
-  options?: { allowLibrarySearch?: boolean },
+  options?: {
+    allowLibrarySearch?: boolean;
+    scopeCollectionIds?: ReadonlySet<number>;
+  },
 ): Promise<AssistantCitationPaperCandidate[]> {
   const dynamicFallbackCandidates = staticCandidates.length
     ? []
@@ -2471,6 +2518,7 @@ async function buildOrderedCitationCandidates(
       : await resolveCitationCandidatesFromLibrarySearch(
           panelItem,
           extractedCitation,
+          options?.scopeCollectionIds,
         );
   const effectiveCandidates = mergeCitationCandidates(
     staticCandidates,
@@ -2570,6 +2618,7 @@ async function resolveCandidatesForCitationNavigation(params: {
   staticCandidates: AssistantCitationPaperCandidate[];
   quoteText: string;
   allowLibrarySearch: boolean;
+  scopeCollectionIds?: ReadonlySet<number>;
 }): Promise<AssistantCitationPaperCandidate[]> {
   // A source-backed quote with no trusted anchor may still search the library.
   // Widening the search space is safe because nothing navigates on a label
@@ -2580,7 +2629,10 @@ async function resolveCandidatesForCitationNavigation(params: {
     params.panelItem,
     params.extractedCitation,
     params.staticCandidates,
-    { allowLibrarySearch: params.allowLibrarySearch },
+    {
+      allowLibrarySearch: params.allowLibrarySearch,
+      scopeCollectionIds: params.scopeCollectionIds,
+    },
   );
 }
 
@@ -2622,6 +2674,18 @@ type ResolvedQuoteCitationMatch = {
 };
 
 /**
+ * How much of the quote the document accounts for.  Falls back to the single
+ * span's coverage for results produced before the pooled figure existed, and
+ * treats a complete alignment (which reports neither figure) as full support.
+ */
+function quoteSupportCoverage(result: LivePdfSelectionLocateResult): number {
+  const pooled = Number(result.sourceMatchQuoteTokenSupportCoverage);
+  if (Number.isFinite(pooled)) return pooled;
+  const span = Number(result.sourceMatchQuoteTokenCoverage);
+  return Number.isFinite(span) ? span : 1;
+}
+
+/**
  * Read a candidate's PDF text in the background to decide whether it really
  * contains the quote.  This deliberately does not open a reader tab: a click
  * may have several candidates in range and only the winner should ever appear
@@ -2636,15 +2700,17 @@ async function verifyQuoteInCitationCandidate(
     quoteText,
   );
   // When the whole quote does not align, the locator falls back to the largest
-  // contiguous span that occurs exactly once.  That is a reasonable rescue for
-  // a paper the conversation already used, but far too weak to move the reader
-  // to a paper that is only in range because a label search proposed it: a
-  // short shared phrase would be enough to "confirm" the wrong paper.
+  // contiguous span that occurs exactly once.  A short shared phrase must not
+  // be enough to send the reader to a paper the conversation never used — but
+  // "partial" is not the same as "a fragment".  Writers quote by stitching,
+  // and a quote assembled from three passages of the right paper is fully
+  // accounted for by it while no single span covers even half.  So judge on
+  // how much of the quote this document accounts for in total, using the same
+  // threshold the answer-time quote gate already trusts.
   if (
     result.status === "resolved" &&
     !candidate.authoritative &&
-    result.sourceMatchQuoteTokenCoverage !== undefined &&
-    result.sourceMatchQuoteTokenCoverage < 1
+    quoteSupportCoverage(result) < MIN_NEAR_COMPLETE_QUOTE_SUPPORT_COVERAGE
   ) {
     return {
       status: "not-found",
@@ -2720,6 +2786,67 @@ async function locateQuoteByOpeningCitationCandidates(params: {
   return { matches, reason };
 }
 
+/**
+ * Build a navigation candidate straight from an attachment the answer named.
+ * The paper is already known here, so there is nothing to rank or search.
+ */
+function buildCandidateForContextItemId(
+  contextItemId: number,
+): AssistantCitationPaperCandidate | null {
+  const out: AssistantCitationPaperCandidate[] = [];
+  try {
+    const contextItem = Zotero.Items.get(Math.floor(contextItemId)) || null;
+    addCitationCandidate(
+      out,
+      new Set<string>(),
+      resolvePaperContextRefFromAttachment(contextItem),
+      contextItemId,
+      new Map(),
+      "quote-citation",
+    );
+  } catch (_err) {
+    void _err;
+    return null;
+  }
+  const candidate = out[0] || null;
+  return candidate && isPdfBackedCitationCandidate(candidate)
+    ? candidate
+    : null;
+}
+
+/**
+ * The paper the answer's own run recorded this quote against, if any.
+ *
+ * This is the shortcut the rest of the function exists to avoid needing: the
+ * agent was shown each passage together with the paper it came from, and that
+ * pairing is persisted, so a click can read the answer instead of searching
+ * the library and guessing from a citation label.
+ */
+async function resolveRecordedQuoteSourceCandidate(params: {
+  button: HTMLButtonElement;
+  searchTexts: string[];
+}): Promise<AssistantCitationPaperCandidate | null> {
+  const agentRunId = citationButtonAgentRunIdCache.get(params.button);
+  if (!agentRunId) return null;
+  for (const quoteText of params.searchTexts) {
+    let provenance: Awaited<ReturnType<typeof resolveQuoteEvidenceProvenance>> =
+      null;
+    try {
+      provenance = await resolveQuoteEvidenceProvenance({
+        agentRunId,
+        quoteText,
+      });
+    } catch (_err) {
+      void _err;
+      return null;
+    }
+    if (!provenance) continue;
+    const candidate = buildCandidateForContextItemId(provenance.contextItemId);
+    if (candidate) return candidate;
+  }
+  return null;
+}
+
 function buildQuoteTargetCandidates(
   pdfCandidates: AssistantCitationPaperCandidate[],
   extractedCitation: ExtractedCitationLabel | null,
@@ -2751,17 +2878,34 @@ async function navigateUntrustedQuoteCitation(params: {
         .filter(Boolean),
     ),
   );
-  // The papers the conversation carries are searched first, but a library-wide
-  // lookup by citation label is allowed too: in library chat the answer's
-  // sources are discovered at runtime and are not attached to the message.
-  // Every hit still has to contain the quote before the reader moves.
-  const resolvedCandidates = await resolveCandidatesForCitationNavigation({
-    panelItem: params.panelItem,
-    extractedCitation: params.extractedCitation,
-    staticCandidates: params.staticCandidates,
-    quoteText: params.quoteText,
-    allowLibrarySearch: true,
+  // Ask the answer before searching for it.  When the turn recorded which
+  // paper each passage came from, that is the source — no label matching, no
+  // library search, and only the one paper is ever read.
+  const recordedCandidate = await resolveRecordedQuoteSourceCandidate({
+    button: params.button,
+    searchTexts,
   });
+  markCitationNavigationTiming(params.timing, "recorded provenance", {
+    resolved: Boolean(recordedCandidate),
+    contextItemId: recordedCandidate?.contextItemId,
+  });
+
+  // Otherwise fall back to finding the paper: the conversation's own papers
+  // first, then a library-wide lookup by citation label, since in library chat
+  // the answer's sources are discovered at runtime and are not attached to the
+  // message.  Every hit still has to contain the quote before the reader moves.
+  const resolvedCandidates = recordedCandidate
+    ? [recordedCandidate]
+    : await resolveCandidatesForCitationNavigation({
+        panelItem: params.panelItem,
+        extractedCitation: params.extractedCitation,
+        staticCandidates: params.staticCandidates,
+        quoteText: params.quoteText,
+        allowLibrarySearch: true,
+        scopeCollectionIds: citationButtonScopeCollectionCache.get(
+          params.button,
+        ),
+      });
   const pdfCandidates = resolvedCandidates.filter((candidate) =>
     isPdfBackedCitationCandidate(candidate),
   );
@@ -3703,6 +3847,9 @@ function createCitationButton(params: {
   preferRawCitationLabel?: boolean;
   inline?: boolean;
   rawCitationText?: string;
+  /** Lets a click ask the answer's own run where the quote came from. */
+  agentRunId?: string;
+  scopeCollectionIds?: ReadonlySet<number>;
 }): HTMLSpanElement {
   const baseSourceLabel = params.extractedCitation.sourceLabel;
   const displayCitationLabel = params.extractedCitation.displayCitationLabel;
@@ -3752,6 +3899,15 @@ function createCitationButton(params: {
     ? "llm-citation-icon llm-citation-icon-inline"
     : "llm-citation-icon";
   citationButtonCandidateCache.set(citationButton, params.candidates.slice());
+  if (params.agentRunId) {
+    citationButtonAgentRunIdCache.set(citationButton, params.agentRunId);
+  }
+  if (params.scopeCollectionIds?.size) {
+    citationButtonScopeCollectionCache.set(
+      citationButton,
+      params.scopeCollectionIds,
+    );
+  }
   if (params.quoteCitation) {
     citationButtonQuoteCitationCache.set(citationButton, params.quoteCitation);
   }
@@ -4290,6 +4446,8 @@ function createQuoteRenderOccurrenceElement(params: {
   candidates: AssistantCitationPaperCandidate[];
   occurrence: QuoteRenderOccurrence;
   quoteContent?: DocumentFragment | null;
+  agentRunId?: string;
+  scopeCollectionIds?: ReadonlySet<number>;
 }): HTMLElement {
   const trustedCitation = params.occurrence.quoteCitation;
   if (trustedCitation) {
@@ -4371,6 +4529,8 @@ function createQuoteRenderOccurrenceElement(params: {
     navigationMode: "untrusted-quote",
     preferRawCitationLabel: true,
     rawCitationText: params.occurrence.citationLabel,
+    agentRunId: params.agentRunId,
+    scopeCollectionIds: params.scopeCollectionIds,
   });
   return createQuoteCardElement({
     ownerDoc: params.ownerDoc,
@@ -4531,6 +4691,9 @@ export function renderQuoteCitationPlaceholders(params: {
     params.panelItem,
     params.pairedUserMessage,
   );
+  const scopeCollectionIds = collectCitationScopeCollectionIds(
+    params.pairedUserMessage,
+  );
   const immediateQuoteBodies = renderImmediateQuoteBodiesBatch(
     plan.occurrences,
     ownerDoc,
@@ -4603,6 +4766,8 @@ export function renderQuoteCitationPlaceholders(params: {
               occurrence,
               quoteContent:
                 immediateQuoteBodies.get(occurrence.occurrenceId) || null,
+              agentRunId: params.assistantMessage.agentRunId,
+              scopeCollectionIds,
             }),
           );
         }
@@ -4865,6 +5030,9 @@ export function decorateAssistantCitationLinks(params: {
     params.panelItem,
     params.pairedUserMessage,
   );
+  const scopeCollectionIds = collectCitationScopeCollectionIds(
+    params.pairedUserMessage,
+  );
   const blockquotes = Array.from(
     params.bubble.querySelectorAll("blockquote"),
   ) as Element[];
@@ -4990,6 +5158,8 @@ export function decorateAssistantCitationLinks(params: {
         paragraphQuoteText: quoteText,
         navigationMode: "untrusted-quote",
         preferRawCitationLabel: true,
+        agentRunId: params.assistantMessage.agentRunId,
+        scopeCollectionIds,
       });
       const displayedQuoteContent = buildQuoteCardBodyContentFromBlockquote(
         blockquote,

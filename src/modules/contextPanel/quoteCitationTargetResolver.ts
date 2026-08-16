@@ -170,7 +170,10 @@ export async function resolveVerifiedQuoteTarget(params: {
   const candidates = prioritizeCandidates(params.candidates);
   const unverifiableContextItemIds: number[] = [];
   let unverifiableReason = "";
-  let lastReason = "";
+  // Candidates are read best-first, so the first verdict is the one about the
+  // paper most likely to be meant.  Reporting the last one instead explains a
+  // failure in terms of whichever unrelated paper happened to be checked last.
+  let bestReason = "";
   let spent = 0;
 
   // Conversation papers are settled before library guesses are read at all, so
@@ -191,7 +194,9 @@ export async function resolveVerifiedQuoteTarget(params: {
             reason: "Could not read this PDF's text.",
           };
         }
-        if (verification?.reason) lastReason = verification.reason;
+        if (verification?.reason && !bestReason) {
+          bestReason = verification.reason;
+        }
         if (verification?.status === "unavailable") {
           if (!unverifiableContextItemIds.includes(candidate.contextItemId)) {
             unverifiableContextItemIds.push(candidate.contextItemId);
@@ -229,7 +234,7 @@ export async function resolveVerifiedQuoteTarget(params: {
   }
   return {
     status: "not-found",
-    reason: lastReason || DEFAULT_NOT_FOUND_REASON,
+    reason: bestReason || DEFAULT_NOT_FOUND_REASON,
     readCount: spent,
   };
 }
