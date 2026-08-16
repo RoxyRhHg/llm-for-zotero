@@ -57,14 +57,88 @@ export type QuoteTargetResolution =
       /** PDFs read to reach this answer; 1 on the common path. */
       readCount: number;
     }
-  | { status: "unverifiable"; contextItemIds: number[]; reason: string }
+  | {
+      status: "unverifiable";
+      contextItemIds: number[];
+      reason: string;
+      readCount: number;
+    }
   | { status: "not-found"; reason: string; readCount: number };
 
 /**
- * Upper bound on how many PDFs a single click may read before giving up.  Only
- * the failing path can reach it — a successful click stops at its first hit.
+ * Upper bound on how many PDFs one verification pass may read before giving up.
+ * Only the failing path can reach it — a successful pass stops at its first
+ * hit.  A click that verifies recorded papers and then searches the library
+ * runs two passes, and each gets its own budget.
  */
 export const DEFAULT_QUOTE_TARGET_VERIFICATION_BUDGET = 8;
+
+/** PDFs read to reach a verdict; `unverifiable` carries one too, so a merged
+ * click can report what it actually cost. */
+function resolutionReadCount(resolution: QuoteTargetResolution): number {
+  return resolution.readCount || 0;
+}
+
+/**
+ * Fold the library-search pass's verdict into the recorded pass's.
+ *
+ * A click may verify twice: the papers the answer recorded, then — if those do
+ * not hold the quote — papers found by searching the library.  The second pass
+ * reads only the papers the first one did not, so its verdict describes fewer
+ * papers than the click as a whole and cannot simply replace the first.
+ *
+ * "Unverifiable" is the case that matters.  It means a PDF's text could not be
+ * extracted in the background, which is not a "no" — opening it in the reader
+ * is the one remaining way to find the quote.  A later pass that merely fails
+ * to find the quote elsewhere must not retire that option.
+ *
+ * The two are named rather than positional because swapping them is silent:
+ * both are the same type, and the only visible symptom is that the recorded
+ * paper stops being offered first.
+ */
+export function mergeQuoteTargetResolutions(params: {
+  /** The papers the answer itself recorded — always verified first. */
+  recorded: QuoteTargetResolution;
+  /** The papers a library label search proposed afterwards. */
+  searched: QuoteTargetResolution;
+}): QuoteTargetResolution {
+  const { recorded, searched } = params;
+  const readCount =
+    resolutionReadCount(recorded) + resolutionReadCount(searched);
+  // A paper the answer used outranks a same-label lookalike, so its hit is
+  // taken first even though the caller only reaches here when it had none.
+  if (recorded.status === "resolved") return { ...recorded, readCount };
+  if (searched.status === "resolved") return { ...searched, readCount };
+
+  if (
+    recorded.status === "unverifiable" ||
+    searched.status === "unverifiable"
+  ) {
+    // Recorded papers first: the answer named them, so they are the reader's
+    // best guess, and this order is what the viewer fallback opens by.
+    const contextItemIds = [
+      ...(recorded.status === "unverifiable" ? recorded.contextItemIds : []),
+      ...(searched.status === "unverifiable" ? searched.contextItemIds : []),
+    ];
+    return {
+      status: "unverifiable",
+      contextItemIds: Array.from(new Set(contextItemIds)),
+      reason:
+        (recorded.status === "unverifiable" ? recorded.reason : "") ||
+        (searched.status === "unverifiable" ? searched.reason : "") ||
+        "Could not read the cited paper's PDF text.",
+      readCount,
+    };
+  }
+
+  return {
+    status: "not-found",
+    // The recorded paper is the one the user asked about, so its verdict is
+    // the one worth showing.
+    reason: recorded.reason || searched.reason,
+    readCount,
+  };
+}
 
 const DEFAULT_NOT_FOUND_REASON =
   "The cited quote was not found in any matching paper.";
@@ -230,6 +304,7 @@ export async function resolveVerifiedQuoteTarget(params: {
       contextItemIds: unverifiableContextItemIds,
       reason:
         unverifiableReason || "Could not read the cited paper's PDF text.",
+      readCount: spent,
     };
   }
   return {

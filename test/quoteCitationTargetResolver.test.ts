@@ -4,8 +4,10 @@ import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import {
   DEFAULT_QUOTE_TARGET_VERIFICATION_BUDGET,
+  mergeQuoteTargetResolutions,
   resolveVerifiedQuoteTarget,
   type QuoteTargetCandidate,
+  type QuoteTargetResolution,
   type QuoteTargetVerification,
 } from "../src/modules/contextPanel/quoteCitationTargetResolver";
 
@@ -306,6 +308,124 @@ describe("quote citation target resolver", function () {
     if (resolution.status !== "not-found") return;
     assert.include(resolution.reason, "Only part of the cited quote");
   });
+
+  describe("mergeQuoteTargetResolutions", function () {
+    const UNVERIFIABLE_RECORDED: QuoteTargetResolution = {
+      status: "unverifiable",
+      contextItemIds: [11],
+      reason: "Could not read the cited paper's PDF text.",
+      readCount: 1,
+    };
+    const NOT_FOUND_SEARCHED: QuoteTargetResolution = {
+      status: "not-found",
+      reason: "The complete quote was not found in the live PDF text.",
+      readCount: 2,
+    };
+
+    it("keeps a scanned recorded PDF eligible for the viewer fallback", function () {
+      // The recorded paper's text could not be extracted, so opening it in the
+      // reader is the one remaining way to find the quote.  A later search that
+      // merely fails on other papers must not retire that option.
+      const merged = mergeQuoteTargetResolutions({
+        recorded: UNVERIFIABLE_RECORDED,
+        searched: NOT_FOUND_SEARCHED,
+      });
+
+      assert.equal(merged.status, "unverifiable");
+      if (merged.status !== "unverifiable") return;
+      assert.deepEqual(merged.contextItemIds, [11]);
+    });
+
+    it("offers the recorded paper before the searched ones", function () {
+      const merged = mergeQuoteTargetResolutions({
+        recorded: UNVERIFIABLE_RECORDED,
+        searched: {
+          status: "unverifiable",
+          contextItemIds: [22, 11],
+          reason: "Could not read PDF text.",
+          readCount: 2,
+        },
+      });
+
+      assert.equal(merged.status, "unverifiable");
+      if (merged.status !== "unverifiable") return;
+      assert.deepEqual(
+        merged.contextItemIds,
+        [11, 22],
+        "the paper the answer named is opened first, and never twice",
+      );
+    });
+
+    it("keeps the recorded paper's hit ahead of a searched one", function () {
+      // Both passes found the quote. The paper the answer actually used wins,
+      // or a same-label lookalike could take a click away from it.
+      const merged = mergeQuoteTargetResolutions({
+        recorded: {
+          status: "resolved",
+          contextItemId: 11,
+          pageIndex: 2,
+          quoteText: "drift is orthogonal to context",
+          authoritative: true,
+          readCount: 1,
+        },
+        searched: {
+          status: "resolved",
+          contextItemId: 22,
+          pageIndex: 3,
+          quoteText: "drift is orthogonal to context",
+          authoritative: false,
+          readCount: 1,
+        },
+      });
+
+      assert.equal(merged.status, "resolved");
+      if (merged.status !== "resolved") return;
+      assert.equal(merged.contextItemId, 11);
+    });
+
+    it("lets a search that actually found the quote win", function () {
+      const merged = mergeQuoteTargetResolutions({
+        recorded: UNVERIFIABLE_RECORDED,
+        searched: {
+          status: "resolved",
+          contextItemId: 22,
+          pageIndex: 3,
+          quoteText: "drift is orthogonal to context",
+          authoritative: false,
+          readCount: 3,
+        },
+      });
+
+      assert.equal(merged.status, "resolved");
+      if (merged.status !== "resolved") return;
+      assert.equal(merged.contextItemId, 22);
+      assert.equal(
+        merged.readCount,
+        4,
+        "the click read the recorded PDF too, and the metric exists to say so",
+      );
+    });
+
+    it("reports both reads when neither side found the quote", function () {
+      const merged = mergeQuoteTargetResolutions({
+        recorded: {
+          status: "not-found",
+          reason: "Only part of the cited quote appears in this paper.",
+          readCount: 1,
+        },
+        searched: NOT_FOUND_SEARCHED,
+      });
+
+      assert.equal(merged.status, "not-found");
+      if (merged.status !== "not-found") return;
+      assert.equal(merged.readCount, 3, "both passes read PDFs");
+      assert.include(
+        merged.reason,
+        "Only part of the cited quote",
+        "the recorded paper is the one the user asked about",
+      );
+    });
+  });
 });
 
 describe("untrusted quote navigation contract", function () {
@@ -337,6 +457,21 @@ describe("untrusted quote navigation contract", function () {
       "const MAX_OPENED_QUOTE_VERIFICATION_CANDIDATES = 3",
     );
   });
+  it("re-verifies through the merge so a fallback cannot bury the first verdict", function () {
+    const start = navigateSection.indexOf("const searched = (await");
+    assert.isAbove(start, -1, "the fallback search still runs");
+    const mergeSection = navigateSection.slice(start);
+    assert.include(
+      mergeSection,
+      "mergeQuoteTargetResolutions({",
+      "the fallback verdict must be merged with the first, not assigned over it",
+    );
+    // Swapping the two sides is silent — same type, and the only symptom is
+    // that the recorded paper stops being offered to the viewer first.
+    assert.include(mergeSection, "recorded: resolution");
+    assert.include(mergeSection, "searched: await verifyCandidates(");
+  });
+
   it("refuses a library-search paper that only holds part of the quote", function () {
     const start = source.indexOf(
       "async function verifyQuoteInCitationCandidate(",
