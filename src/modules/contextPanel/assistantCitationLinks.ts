@@ -3918,12 +3918,24 @@ function renderQuoteCardBodyMarkdown(
   renderQuoteCardMarkdownInto(body, quoteText, ownerDoc);
 }
 
+// Markdown that sanitizes down to nothing still leaves nodes behind: the
+// renderer swaps a disallowed element for an empty text node rather than
+// dropping it. Node presence therefore proves nothing about what the reader
+// will see, so ask for text or for an element that paints on its own. A lone
+// <br> is deliberately absent — it occupies no visible space, and the caller's
+// raw-text fallback shows more than an empty card would.
+const QUOTE_CARD_SELF_RENDERING_SELECTOR = "img, svg, hr, input";
+
+function hasRenderableQuoteCardContent(source: ParentNode): boolean {
+  if ((source.textContent || "").trim()) return true;
+  return Boolean(source.querySelector?.(QUOTE_CARD_SELF_RENDERING_SELECTOR));
+}
+
 function appendQuoteCardBodyContent(
   body: HTMLElement,
   quoteContent: ParentNode | null | undefined,
 ): boolean {
   if (!quoteContent?.firstChild) return false;
-  body.classList.add("llm-rendered-markdown");
   const firstElement =
     "firstElementChild" in quoteContent ? quoteContent.firstElementChild : null;
   const hasSingleParagraph =
@@ -3931,11 +3943,17 @@ function appendQuoteCardBodyContent(
     firstElement?.tagName.toLowerCase() === "p";
   const moveSource =
     hasSingleParagraph && firstElement ? firstElement : quoteContent;
+  // Decide before mutating. Rolling back after the move would strand the
+  // caller's nodes and leave `quoteContent` unusable for the fallback render.
+  if (!hasRenderableQuoteCardContent(moveSource)) return false;
+  body.classList.add("llm-rendered-markdown");
   while (moveSource.firstChild) {
     body.appendChild(moveSource.firstChild);
   }
   return true;
 }
+
+export const appendQuoteCardBodyContentForTests = appendQuoteCardBodyContent;
 
 function createQuoteCardElement(params: {
   ownerDoc: Document;
