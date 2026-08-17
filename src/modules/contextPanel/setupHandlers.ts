@@ -267,7 +267,6 @@ import {
   isManagedBlobPath,
   removeAttachmentFile,
 } from "./attachmentStorage";
-import { clearConversationSummary as clearConversationSummaryFromCache } from "./conversationSummaryCache";
 import { conversationRepository } from "../../core/conversations/repository";
 import { pendingDeletionStore } from "../../core/conversations/pendingDeletionStore";
 import {

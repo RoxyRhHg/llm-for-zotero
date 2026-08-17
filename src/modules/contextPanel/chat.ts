@@ -364,7 +364,6 @@ import { getAgentRunTrace } from "../../agent/store/traceStore";
 import {
   applyHistoryCompression,
   scheduleLLMSummary,
-  clearConversationSummary,
 } from "./conversationSummaryCache";
 import type {
   AgentAttachmentResource,
