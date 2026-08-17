@@ -730,6 +730,17 @@ const PROFILE_RULES: Record<
         match: /^(gpt-5(?:\b|[.-])|o\d+(?:\b|[.-]))/,
         profile: OPENAI_GPT5_PROFILE,
       },
+      // The GPT-3 and GPT-4 families predate reasoning and reject
+      // `reasoning_effort` outright. They have to be named here rather than
+      // left to the fallback, which is deliberately optimistic so an
+      // unreleased OpenAI reasoning model still gets a usable level set
+      // before this table learns its name. `(?:chat)?` catches
+      // `chatgpt-4o-latest`; no trailing boundary, so `gpt-35-turbo` (Azure's
+      // spelling) and every dated `gpt-4o-*` snapshot fall out for free.
+      {
+        match: /^(?:chat)?gpt-[34]/,
+        profile: UNSUPPORTED_PROFILE,
+      },
     ],
     fallback: OPENAI_GPT5_PROFILE,
   },
