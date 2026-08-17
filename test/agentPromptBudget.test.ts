@@ -99,6 +99,19 @@ describe("agent prompt budget", function () {
     assert.notProperty(limits, "toolResultMaxTokens");
   });
 
+  it("resolves the prompt budget from the matching profile override", function () {
+    const limits = resolveAgentPromptBudgetLimits({
+      model: "claude-haiku-4-5",
+      profileOverride: {
+        forModel: "claude-haiku-4-5",
+        limits: { inputTokens: 18_000 },
+      },
+    });
+
+    assert.equal(limits.contextWindow, 18_000);
+    assert.equal(limits.softLimitTokens, 16_200);
+  });
+
   it("leaves small prompts unchanged", function () {
     const messages: AgentModelMessage[] = [
       { role: "system", content: "You are helpful." },

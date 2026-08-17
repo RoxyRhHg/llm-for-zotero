@@ -1476,6 +1476,7 @@ function estimateHistoryContextUsageSnapshot(
       apiBase: effectiveRequestConfig.apiBase,
       protocol: effectiveRequestConfig.providerProtocol,
       authMode: effectiveRequestConfig.authMode,
+      profileOverride: effectiveRequestConfig.advanced?.profileOverride,
     },
   );
   if (inputCap.estimatedAfterTokens <= 0) return undefined;
@@ -10484,6 +10485,8 @@ export async function sendQuestion(
         apiBase: effectiveRequestConfig.apiBase,
         apiKey: effectiveRequestConfig.apiKey,
         authMode: effectiveRequestConfig.authMode,
+        providerProtocol: effectiveRequestConfig.providerProtocol,
+        profileOverride: effectiveRequestConfig.advanced?.profileOverride,
       });
     }
 

@@ -849,6 +849,7 @@ export class AgentRuntime {
           apiBase: request.apiBase,
           providerProtocol: request.providerProtocol,
           authMode: request.authMode,
+          profileOverride: request.advanced?.profileOverride,
           policy,
           forceCompact: true,
         });
@@ -917,7 +918,10 @@ export class AgentRuntime {
         await emit({
           type: "provider_event",
           providerType: "turn_intent_classifier",
-          payload: { status: "degraded_to_regex" },
+          payload: {
+            status: "degraded_to_regex",
+            reason: turnIntent.failureReason,
+          },
         });
       }
       const matchedSkills = getMatchedSkillIds(request, turnIntent.skillIds);
@@ -966,6 +970,7 @@ export class AgentRuntime {
         apiBase: request.apiBase,
         providerProtocol: request.providerProtocol,
         authMode: request.authMode,
+        profileOverride: request.advanced?.profileOverride,
         recentlyCompacted: Boolean(transcriptSegment.compactedAt),
       });
       if (budgetState.shouldCompact && transcriptMessagesForPrompt.length) {
@@ -1208,6 +1213,7 @@ export class AgentRuntime {
           apiBase: request.apiBase,
           providerProtocol: request.providerProtocol,
           authMode: request.authMode,
+          profileOverride: request.advanced?.profileOverride,
           conversationKey: request.conversationKey,
           resourceSignature: resourceContextPlan.resourceSignature,
         });

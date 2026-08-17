@@ -378,7 +378,10 @@ describe("ollama native protocol", function () {
           model: "qwen3:8b",
           apiBase: "http://localhost:11434",
           providerProtocol: "ollama_native",
-          profileOverride: { extraBody: { options: { repeat_penalty: 1.1 } } },
+          profileOverride: {
+            forModel: "qwen3:8b",
+            extraBody: { options: { repeat_penalty: 1.1 } },
+          },
         },
         () => undefined,
       );

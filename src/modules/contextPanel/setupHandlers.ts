@@ -158,6 +158,7 @@ import {
   refreshModelCapabilityRegistry,
   subscribeModelCapabilities,
 } from "../../modelCapabilities";
+import type { ModelProfileOverride } from "../../modelCapabilities";
 import {
   sendQuestion,
   refreshChat,
@@ -6245,13 +6246,18 @@ export function setupHandlers(
 
   function getSelectedProfile() {
     if (!item) return null;
-    if (isClaudeConversationSystem()) {
-      return getSelectedClaudeRuntimeEntry();
-    }
-    if (isCodexConversationSystem()) {
-      return getSelectedCodexRuntimeEntry();
-    }
-    return getSelectedModelEntryForItem(item.id);
+    const selected = isClaudeConversationSystem()
+      ? getSelectedClaudeRuntimeEntry()
+      : isCodexConversationSystem()
+        ? getSelectedCodexRuntimeEntry()
+        : getSelectedModelEntryForItem(item.id);
+    if (!selected) return null;
+    return {
+      ...selected,
+      profileOverride: selected.advanced?.profileOverride as
+        | ModelProfileOverride
+        | undefined,
+    };
   }
 
   const getAdvancedModelParams = (
@@ -6433,6 +6439,9 @@ export function setupHandlers(
     getEffectivePdfModePaperContexts,
     getEffectiveFullTextPaperContexts,
     getSelectedProfile,
+    // Lets a long batched action publish its abort controller under the
+    // active conversation, so the panel's stop button cancels it.
+    getConversationKey: () => (item ? getConversationKey(item) : null),
     getDoSend: () => doSend,
     closeRetryModelMenu,
     closeModelMenu,

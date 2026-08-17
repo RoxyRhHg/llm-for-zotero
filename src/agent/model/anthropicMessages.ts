@@ -1,13 +1,11 @@
 import {
   buildReasoningPayload,
   getAnthropicMessagesReasoningRecoverySelection,
+  normalizeMaxTokensForRequest,
   postWithReasoningFallback,
   type ReasoningSelection,
 } from "../../utils/llmClient";
-import {
-  normalizeMaxTokensForModel,
-  normalizeTemperature,
-} from "../../utils/normalization";
+import { normalizeTemperature } from "../../utils/normalization";
 import {
   buildProviderTransportHeaders,
   resolveProviderTransportEndpoint,
@@ -788,15 +786,14 @@ export class AnthropicMessagesAgentAdapter implements AgentModelAdapter {
     const messages = continuation.length
       ? [...conversationBase, ...continuation]
       : conversationBase;
-    const maxTokens = normalizeMaxTokensForModel(
-      request.advanced?.maxTokens,
-      request.model,
-      {
-        apiBase: request.apiBase,
-        protocol: "anthropic_messages",
-        authMode: request.authMode,
-      },
-    );
+    const maxTokens = normalizeMaxTokensForRequest({
+      value: request.advanced?.maxTokens,
+      model: request.model || "",
+      apiBase: request.apiBase,
+      protocol: "anthropic_messages",
+      authMode: request.authMode,
+      profileOverride: request.advanced?.profileOverride,
+    });
     const buildPayload = (
       reasoningOverride: ReasoningSelection | undefined,
     ) => {

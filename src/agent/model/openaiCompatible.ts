@@ -2,13 +2,11 @@ import { usesMaxCompletionTokens } from "../../utils/apiHelpers";
 import {
   buildReasoningPayload,
   buildPromptCachePayloadHints,
+  normalizeMaxTokensForRequest,
   postWithReasoningFallback,
   resolveRequestAuthState,
 } from "../../utils/llmClient";
-import {
-  normalizeMaxTokensForModel,
-  normalizeTemperature,
-} from "../../utils/normalization";
+import { normalizeTemperature } from "../../utils/normalization";
 import { resolveProviderTransportEndpoint } from "../../utils/providerTransport";
 import { extractContextCacheUsage } from "../../contextCache/manager";
 import type {
@@ -386,26 +384,24 @@ export class OpenAIChatCompatAgentAdapter implements AgentModelAdapter {
           stream_options: { include_usage: true },
           ...(usesMaxCompletionTokens(request.model || "")
             ? {
-                max_completion_tokens: normalizeMaxTokensForModel(
-                  request.advanced?.maxTokens,
-                  request.model,
-                  {
-                    apiBase: request.apiBase,
-                    protocol: "openai_chat_compat",
-                    authMode: request.authMode,
-                  },
-                ),
+                max_completion_tokens: normalizeMaxTokensForRequest({
+                  value: request.advanced?.maxTokens,
+                  model: request.model || "",
+                  apiBase: request.apiBase,
+                  protocol: "openai_chat_compat",
+                  authMode: request.authMode,
+                  profileOverride: request.advanced?.profileOverride,
+                }),
               }
             : {
-                max_tokens: normalizeMaxTokensForModel(
-                  request.advanced?.maxTokens,
-                  request.model,
-                  {
-                    apiBase: request.apiBase,
-                    protocol: "openai_chat_compat",
-                    authMode: request.authMode,
-                  },
-                ),
+                max_tokens: normalizeMaxTokensForRequest({
+                  value: request.advanced?.maxTokens,
+                  model: request.model || "",
+                  apiBase: request.apiBase,
+                  protocol: "openai_chat_compat",
+                  authMode: request.authMode,
+                  profileOverride: request.advanced?.profileOverride,
+                }),
               }),
           ...reasoningPayload.extra,
           ...(reasoningPayload.omitTemperature

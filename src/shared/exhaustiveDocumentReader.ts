@@ -95,7 +95,13 @@ type PaperInput = {
 
 type LlmBatchConfig = Pick<
   ChatParams,
-  "model" | "apiBase" | "apiKey" | "authMode" | "providerProtocol" | "reasoning"
+  | "model"
+  | "apiBase"
+  | "apiKey"
+  | "authMode"
+  | "providerProtocol"
+  | "reasoning"
+  | "profileOverride"
 >;
 
 export type ExhaustiveDocumentReaderParams = {

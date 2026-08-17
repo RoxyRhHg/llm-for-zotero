@@ -170,7 +170,61 @@ describe("detectTurnIntent", function () {
       skillIds: [],
       classifiedIntent: null,
       degraded: false,
+      failureReason: "not_configured",
     });
+  });
+
+  it("passes the profile to a provider-safe utility classifier call", async function () {
+    let captured: Record<string, unknown> = {};
+    const profileOverride = {
+      forModel: "gpt-5.4",
+      limits: { outputTokens: 2_000 },
+    };
+    const result = await detectTurnIntent(
+      {
+        userText: "compare these papers",
+        model: "gpt-5.4",
+        apiBase: "https://api.openai.com/v1",
+        apiKey: "key",
+        providerProtocol: "openai_chat_compat",
+        advanced: {
+          temperature: 0,
+          maxTokens: 4_000,
+          profileOverride,
+        },
+      } as any,
+      SKILLS,
+      {
+        llmCall: async (params) => {
+          captured = params as unknown as Record<string, unknown>;
+          return '{"skillIds":["unmatched"],"retrievalIntent":"none","wantedSections":[],"queryLanguage":"en"}';
+        },
+      },
+    );
+
+    assert.isFalse(result.degraded);
+    assert.deepEqual(captured.reasoning, {
+      provider: "openai",
+      level: "low",
+    });
+    assert.deepEqual(captured.profileOverride, profileOverride);
+  });
+
+  it("records unparseable classifier output as a distinct degradation reason", async function () {
+    const result = await detectTurnIntent(
+      {
+        userText: "compare these papers",
+        model: "gpt-5.4",
+        apiBase: "https://api.openai.com/v1",
+        apiKey: "key",
+        providerProtocol: "openai_chat_compat",
+      } as any,
+      SKILLS,
+      { llmCall: async () => "not JSON" },
+    );
+
+    assert.isTrue(result.degraded);
+    assert.equal(result.failureReason, "unparseable");
   });
 });
 

@@ -303,6 +303,8 @@ export function getAgentApi() {
         ) => Promise<import("./types").AgentConfirmationResolution>;
         /** LLM credentials for actions that propose per-item suggestions. */
         llm?: import("./actions").ActionLLMConfig;
+        /** Cancels a long batched run part-way through. */
+        signal?: AbortSignal;
       } = {},
     ) => {
       if (!_actionRegistry || !_toolRegistry)
@@ -324,6 +326,7 @@ export function getAgentApi() {
           opts.requestConfirmation ?? (async () => ({ approved: true })),
         llm: opts.llm,
         requestContext: opts.requestContext,
+        signal: opts.signal,
       };
       return _actionRegistry.run(name, input, ctx);
     },

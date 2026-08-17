@@ -1,9 +1,15 @@
-import {
-  callLLM,
-  type ChatParams,
-  type ReasoningConfig,
-} from "../../utils/llmClient";
+import type { ChatParams } from "../../utils/llmClient";
 import type { ProviderProtocol } from "../../utils/providerProtocol";
+import {
+  callLLMWithTimeout,
+  type LLMCallWithTimeoutParams,
+} from "../../utils/llmCallTimeout";
+import {
+  callUtilityLLM,
+  describeUtilityLLMFailure,
+  logUtilityLLMFailure,
+} from "../../utils/utilityLLM";
+import type { ModelProfileOverride } from "../../modelCapabilities";
 import { tokenizeRetrievalQuery } from "./retrievalTokenizer";
 import {
   buildCanonicalReferenceQuery,
@@ -460,48 +466,10 @@ export function shouldAutoGenerateQueryVariants(params: {
   return !isLikelyExactLookupQuery(query);
 }
 
-export async function callLLMWithTimeout(
-  params: Omit<ChatParams, "signal"> & {
-    parentSignal?: AbortSignal;
-    timeoutMs?: number;
-    /** Test seam: replaces callLLM. */
-    llmCall?: (chatParams: ChatParams) => Promise<string>;
-  },
-): Promise<string> {
-  const { parentSignal, timeoutMs, llmCall, ...chatParams } = params;
-  const budgetMs = timeoutMs || RETRIEVAL_QUERY_PLAN_TIMEOUT_MS;
-  // Zotero's Gecko chrome scope has no dependable bare AbortController (see
-  // the guarded constructors in mineruClient/chat.ts), so construct it only
-  // when present and enforce the bound with a raced timer either way — the
-  // request just cannot be cancelled mid-flight without abort support.
-  const AbortControllerCtor = (
-    globalThis as { AbortController?: typeof AbortController }
-  ).AbortController;
-  const controller = AbortControllerCtor ? new AbortControllerCtor() : null;
-  const onAbort = () => controller?.abort();
-  parentSignal?.addEventListener("abort", onAbort, { once: true });
-  let timeoutHandle: ReturnType<typeof setTimeout> | undefined;
-  const timeoutPromise = new Promise<never>((_, reject) => {
-    timeoutHandle = setTimeout(() => {
-      controller?.abort();
-      reject(new Error(`LLM call timed out after ${budgetMs}ms`));
-    }, budgetMs);
-  });
-  try {
-    const invoke = llmCall || callLLM;
-    const call = invoke({
-      ...chatParams,
-      signal: controller?.signal,
-    } as ChatParams);
-    // Keep a handler attached so a late rejection after a timeout loss does
-    // not surface as an unhandled rejection.
-    call.catch(() => {});
-    return await Promise.race([call, timeoutPromise]);
-  } finally {
-    if (timeoutHandle !== undefined) clearTimeout(timeoutHandle);
-    parentSignal?.removeEventListener("abort", onAbort);
-  }
-}
+// Kept as a compatibility export for retrieval and focused runtime tests;
+// the implementation lives in the dependency-neutral utility layer.
+export { callLLMWithTimeout };
+export type { LLMCallWithTimeoutParams };
 
 const RETRIEVAL_PROBE_REFORMULATION_TIMEOUT_MS = 6000;
 
@@ -520,9 +488,10 @@ export async function generateRetrievalProbeReformulation(params: {
   apiKey?: string;
   authMode?: ChatParams["authMode"];
   providerProtocol?: ProviderProtocol;
-  reasoning?: ReasoningConfig;
+  profileOverride?: ModelProfileOverride;
   signal?: AbortSignal;
   timeoutMs?: number;
+  llmCall?: LLMCallWithTimeoutParams["llmCall"];
 }): Promise<{ variants: string[]; notes: string[] }> {
   const failure = {
     variants: [] as string[],
@@ -553,22 +522,28 @@ export async function generateRetrievalProbeReformulation(params: {
       : []),
   ].join("\n");
   try {
-    const raw = await callLLMWithTimeout({
+    const result = await callUtilityLLM({
       prompt,
       model: params.model,
       apiBase: params.apiBase,
       apiKey: params.apiKey,
       authMode: params.authMode,
       providerProtocol: params.providerProtocol,
-      reasoning: params.reasoning,
-      maxTokens: 200,
+      profileOverride: params.profileOverride,
+      jsonBudget: 200,
       temperature: 0,
-      parentSignal: params.signal,
+      signal: params.signal,
       timeoutMs: params.timeoutMs || RETRIEVAL_PROBE_REFORMULATION_TIMEOUT_MS,
+      llmCall: params.llmCall,
       systemMessages: [
         "You are a search probe reformulator. Return JSON only. Do not answer the user's question.",
       ],
     });
+    if (!result.ok) {
+      logUtilityLLMFailure("Probe reformulation skipped", result);
+      return failure;
+    }
+    const raw = result.text;
     const parsed = extractJsonObject(raw);
     const variants = Array.isArray(
       (parsed as { variants?: unknown[] } | null)?.variants,
@@ -622,10 +597,11 @@ export async function generateRetrievalQueryPlanWithModel(params: {
   apiKey?: string;
   authMode?: ChatParams["authMode"];
   providerProtocol?: ProviderProtocol;
-  reasoning?: ReasoningConfig;
+  profileOverride?: ModelProfileOverride;
   signal?: AbortSignal;
   timeoutMs?: number;
   sourceSamples?: string[];
+  llmCall?: LLMCallWithTimeoutParams["llmCall"];
 }): Promise<RetrievalQueryPlan> {
   const fallback = buildRetrievalQueryPlan({ query: params.query });
   if (!shouldAutoGenerateQueryVariants(params)) return fallback;
@@ -639,22 +615,33 @@ export async function generateRetrievalQueryPlanWithModel(params: {
   try {
     let parsed: ReturnType<typeof extractJsonObject> = null;
     for (let attempt = 0; attempt < 2; attempt += 1) {
-      const raw = await callLLMWithTimeout({
+      const result = await callUtilityLLM({
         prompt,
         model: params.model,
         apiBase: params.apiBase,
         apiKey: params.apiKey,
         authMode: params.authMode,
         providerProtocol: params.providerProtocol,
-        reasoning: params.reasoning,
-        maxTokens: 260,
+        profileOverride: params.profileOverride,
+        jsonBudget: 260,
         temperature: 0,
-        parentSignal: params.signal,
-        timeoutMs: params.timeoutMs,
+        signal: params.signal,
+        timeoutMs: params.timeoutMs || RETRIEVAL_QUERY_PLAN_TIMEOUT_MS,
+        llmCall: params.llmCall,
         systemMessages: [
           "You are a retrieval query planner. Return JSON only. Do not answer the user's research question.",
         ],
       });
+      if (!result.ok) {
+        // A blank response is exactly what the second attempt exists for —
+        // re-prompting often lands the JSON. Every other reason is either
+        // terminal or would just burn another timeout.
+        if (result.reason === "empty") continue;
+        throw new Error(
+          `Retrieval planner ${describeUtilityLLMFailure(result)}`,
+        );
+      }
+      const raw = result.text;
       const candidate = extractJsonObject(raw);
       if (isValidPlannerOutput(candidate)) {
         parsed = candidate;
@@ -701,10 +688,11 @@ export async function resolveRetrievalQueryPlan(params: {
   apiKey?: string;
   authMode?: ChatParams["authMode"];
   providerProtocol?: ProviderProtocol;
-  reasoning?: ReasoningConfig;
+  profileOverride?: ModelProfileOverride;
   signal?: AbortSignal;
   timeoutMs?: number;
   sourceSamples?: string[];
+  llmCall?: LLMCallWithTimeoutParams["llmCall"];
 }): Promise<RetrievalQueryPlan> {
   if (params.queryPlan) return params.queryPlan;
   if (hasUsableVariants(params.queryVariants)) {
@@ -722,9 +710,10 @@ export async function resolveRetrievalQueryPlan(params: {
     apiKey: params.apiKey,
     authMode: params.authMode,
     providerProtocol: params.providerProtocol,
-    reasoning: params.reasoning,
+    profileOverride: params.profileOverride,
     signal: params.signal,
     timeoutMs: params.timeoutMs,
     sourceSamples: params.sourceSamples,
+    llmCall: params.llmCall,
   });
 }

@@ -57,6 +57,13 @@ type TargetPaper = {
 };
 
 const LLM_BATCH_SIZE = 10;
+/**
+ * One batch asks for 800 JSON tokens on top of the reasoning reserve, which
+ * is well past the 10s the short utility calls use. Nothing blocks on this —
+ * the action reports progress per batch — so the budget favors completing
+ * over failing fast.
+ */
+const LLM_BATCH_TIMEOUT_MS = 30_000;
 const DEFAULT_TAGS_PER_ITEM = 5;
 const MAX_TAGS_PER_ITEM = 6;
 
@@ -709,8 +716,11 @@ async function suggestTagsForItems(
   ctx: ActionExecutionContext,
 ): Promise<Array<{ itemId: number; tags: string[] }>> {
   if (!ctx.llm) return [];
-  return collectActionLlmBatchResults(items, LLM_BATCH_SIZE, (batch) =>
-    suggestTagsBatch(batch, existingTags, maxTags, userQuery, ctx),
+  return collectActionLlmBatchResults(
+    items,
+    LLM_BATCH_SIZE,
+    (batch) => suggestTagsBatch(batch, existingTags, maxTags, userQuery, ctx),
+    ctx.signal,
   );
 }
 
@@ -727,6 +737,7 @@ async function suggestTagsBatch(
     ctx,
     prompt,
     maxTokens: 800,
+    timeoutMs: LLM_BATCH_TIMEOUT_MS,
   });
   return parseTagResponse(raw, batch, maxTags);
 }

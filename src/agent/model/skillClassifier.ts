@@ -13,7 +13,12 @@
  * — network failure, malformed JSON, unconfigured model — it falls back to
  * the per-skill regex `match:` patterns so the agent still works.
  */
-import { callLLMWithTimeout } from "../../modules/contextPanel/retrievalQueryPlan";
+import {
+  callUtilityLLM,
+  logUtilityLLMFailure,
+  type UtilityLLMFailureReason,
+  type UtilityLLMParams,
+} from "../../utils/utilityLLM";
 import { resolveSkillRequestContext } from "../skills/contextEligibility";
 import { matchesSkill } from "../skills/skillLoader";
 import type { AgentSkill } from "../skills/skillLoader";
@@ -41,6 +46,8 @@ export type DetectTurnIntentResult = {
    * returned malformed output — the silent-regression case worth surfacing.
    */
   degraded: boolean;
+  /** Detailed reason for a degraded or skipped classifier attempt. */
+  failureReason?: UtilityLLMFailureReason | "unparseable";
 };
 
 /**
@@ -51,7 +58,11 @@ export type DetectTurnIntentResult = {
 export async function detectTurnIntent(
   request: AgentRuntimeRequest,
   skills: AgentSkill[],
-  options: { signal?: AbortSignal; timeoutMs?: number } = {},
+  options: {
+    signal?: AbortSignal;
+    timeoutMs?: number;
+    llmCall?: UtilityLLMParams["llmCall"];
+  } = {},
 ): Promise<DetectTurnIntentResult> {
   if (skills.length === 0) {
     return { skillIds: [], classifiedIntent: null, degraded: false };
@@ -69,48 +80,55 @@ export async function detectTurnIntent(
       skillIds: regexFallback(skills, request),
       classifiedIntent: null,
       degraded: false,
+      failureReason: "not_configured",
     };
   }
 
   const prompt = buildClassifierPrompt(skills, request);
 
-  let raw: string;
-  try {
-    raw = await callLLMWithTimeout({
-      prompt,
-      model: request.model,
-      apiBase: request.apiBase,
-      apiKey: request.apiKey,
-      authMode: request.authMode,
-      providerProtocol: request.providerProtocol,
-      temperature: 0,
-      maxTokens: 300,
-      parentSignal: options.signal,
-      timeoutMs: options.timeoutMs || TURN_INTENT_TIMEOUT_MS,
-    });
-  } catch (err) {
-    Zotero.debug?.(
-      `[llm-for-zotero] Skill classifier LLM call failed, falling back to regex: ${
-        err instanceof Error ? err.message : String(err)
-      }`,
+  const result = await callUtilityLLM({
+    prompt,
+    model: request.model,
+    apiBase: request.apiBase,
+    apiKey: request.apiKey,
+    authMode: request.authMode,
+    providerProtocol: request.providerProtocol,
+    profileOverride: request.advanced?.profileOverride,
+    jsonBudget: 300,
+    temperature: 0,
+    signal: options.signal,
+    timeoutMs: options.timeoutMs || TURN_INTENT_TIMEOUT_MS,
+    llmCall: options.llmCall,
+  });
+  if (!result.ok) {
+    logUtilityLLMFailure(
+      "Skill classifier LLM call failed, falling back to regex",
+      result,
     );
     return {
       skillIds: regexFallback(skills, request),
       classifiedIntent: null,
       degraded: true,
+      failureReason: result.reason,
     };
   }
+  const raw = result.text;
 
   const classifiedIntent = parseClassifiedTurnIntent(raw);
   const parsed = parseClassifierResponse(raw, skills);
   if (parsed === null) {
-    Zotero.debug?.(
+    (
+      globalThis as typeof globalThis & {
+        Zotero?: { debug?: (message: string) => void };
+      }
+    ).Zotero?.debug?.(
       `[llm-for-zotero] Skill classifier returned malformed JSON, falling back to regex. Raw: ${raw.slice(0, 200)}`,
     );
     return {
       skillIds: regexFallback(skills, request),
       classifiedIntent,
       degraded: true,
+      failureReason: "unparseable",
     };
   }
   return { skillIds: parsed, classifiedIntent, degraded: false };

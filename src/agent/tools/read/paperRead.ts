@@ -1191,6 +1191,7 @@ export function createPaperReadTool(
             ? createCodexAppServerExhaustiveReaderSession({
                 model: nativeFullReadModel,
                 reasoning: context.request.reasoning,
+                profileOverride: context.request.advanced?.profileOverride,
               })
             : null;
         const result = await (async () => {
@@ -1216,6 +1217,7 @@ export function createPaperReadTool(
                 authMode: context.request.authMode,
                 providerProtocol: context.request.providerProtocol,
                 reasoning: context.request.reasoning,
+                profileOverride: context.request.advanced?.profileOverride,
               },
             });
           } finally {
@@ -1304,7 +1306,7 @@ export function createPaperReadTool(
         apiKey: context.request.apiKey,
         authMode: context.request.authMode,
         providerProtocol: context.request.providerProtocol,
-        reasoning: context.request.reasoning,
+        profileOverride: context.request.advanced?.profileOverride,
         topK: input.topK,
         perPaperTopK: input.topK,
       });

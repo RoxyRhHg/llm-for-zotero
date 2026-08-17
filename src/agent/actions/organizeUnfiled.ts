@@ -56,6 +56,12 @@ type Collection = {
 };
 
 const LLM_BATCH_SIZE = 12;
+/**
+ * The largest utility budget in the plugin: 1200 JSON tokens for 12 items,
+ * plus the reasoning reserve. Sits above auto-tag's 30s for the extra items
+ * and the longer collection list in the prompt.
+ */
+const LLM_BATCH_TIMEOUT_MS = 45_000;
 
 /**
  * Finds unfiled library items and pages through native
@@ -561,8 +567,11 @@ async function suggestCollectionsForItems(
   ctx: ActionExecutionContext,
 ): Promise<Array<{ itemId: number; collectionId: number }>> {
   if (!ctx.llm || !collections.length) return [];
-  return collectActionLlmBatchResults(items, LLM_BATCH_SIZE, (batch) =>
-    suggestCollectionsBatch(batch, collections, userQuery, ctx),
+  return collectActionLlmBatchResults(
+    items,
+    LLM_BATCH_SIZE,
+    (batch) => suggestCollectionsBatch(batch, collections, userQuery, ctx),
+    ctx.signal,
   );
 }
 
@@ -578,6 +587,7 @@ async function suggestCollectionsBatch(
     ctx,
     prompt,
     maxTokens: 1200,
+    timeoutMs: LLM_BATCH_TIMEOUT_MS,
   });
   return parseCollectionResponse(raw, batch, collections);
 }

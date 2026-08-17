@@ -1,6 +1,11 @@
-import { callLLMWithTimeout } from "../../modules/contextPanel/retrievalQueryPlan";
-import type { ChatParams, ReasoningConfig } from "../../utils/llmClient";
+import type { ChatParams } from "../../utils/llmClient";
 import type { ProviderProtocol } from "../../utils/providerProtocol";
+import {
+  callUtilityLLM,
+  logUtilityLLMFailure,
+  type UtilityLLMParams,
+} from "../../utils/utilityLLM";
+import type { ModelProfileOverride } from "../../modelCapabilities";
 
 export type LibraryRetrieveTriageCandidate = {
   itemId: string;
@@ -42,9 +47,10 @@ export async function triageCandidatesWithModel(params: {
   apiKey?: string;
   authMode?: ChatParams["authMode"];
   providerProtocol?: ProviderProtocol;
-  reasoning?: ReasoningConfig;
+  profileOverride?: ModelProfileOverride;
   signal?: AbortSignal;
   timeoutMs?: number;
+  llmCall?: UtilityLLMParams["llmCall"];
 }): Promise<LibraryRetrieveTriageResult | null> {
   if (!params.candidates.length) return null;
   if (!params.apiBase && !params.apiKey) return null;
@@ -71,22 +77,28 @@ export async function triageCandidatesWithModel(params: {
     }),
   ].join("\n");
   try {
-    const raw = await callLLMWithTimeout({
+    const result = await callUtilityLLM({
       prompt,
       model: params.model,
       apiBase: params.apiBase,
       apiKey: params.apiKey,
       authMode: params.authMode,
       providerProtocol: params.providerProtocol,
-      reasoning: params.reasoning,
-      maxTokens: 400,
+      profileOverride: params.profileOverride,
+      jsonBudget: 400,
       temperature: 0,
-      parentSignal: params.signal,
+      signal: params.signal,
       timeoutMs: params.timeoutMs || TRIAGE_TIMEOUT_MS,
+      llmCall: params.llmCall,
       systemMessages: [
         "You are a retrieval triage assistant. Return JSON only. Do not answer the user's question.",
       ],
     });
+    if (!result.ok) {
+      logUtilityLLMFailure("Retrieval triage skipped", result);
+      return null;
+    }
+    const raw = result.text;
     const match = raw.match(/\{[\s\S]*\}/);
     if (!match) return null;
     const parsed = JSON.parse(match[0]) as {

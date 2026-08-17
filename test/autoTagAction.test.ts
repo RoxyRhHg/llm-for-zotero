@@ -588,6 +588,92 @@ describe("autoTag action", function () {
     });
   });
 
+  it("tells the user when the model was unreachable instead of reporting no tags", async function () {
+    const registry = new AgentToolRegistry();
+    registry.register({
+      spec: {
+        name: "apply_tags",
+        description: "apply tags",
+        inputSchema: { type: "object" },
+        mutability: "write",
+        requiresConfirmation: true,
+      },
+      validate(args) {
+        return ok(
+          args as {
+            action: "add";
+            assignments: Array<{ itemId: number; tags: string[] }>;
+          },
+        );
+      },
+      createPendingAction(input) {
+        return {
+          toolName: "apply_tags",
+          title: "Review tag additions",
+          confirmLabel: "Apply",
+          cancelLabel: "Cancel",
+          fields: [
+            {
+              type: "tag_assignment_table",
+              id: "tagAssignments:apply_tags",
+              label: "Suggested tags to add",
+              rows: input.assignments.map((assignment) => ({
+                id: `${assignment.itemId}`,
+                label: `Paper ${assignment.itemId}`,
+                value: assignment.tags,
+              })),
+            },
+          ],
+        };
+      },
+      applyConfirmation(input) {
+        return ok(input);
+      },
+      async execute() {
+        return { result: { updatedCount: 0 } };
+      },
+    });
+
+    const { ctx, progress } = createActionContext(registry, {
+      zoteroGateway: {
+        listBibliographicItemTargets: async () => ({
+          items: [makeBibliographicTarget(1, "Paper One")],
+          totalCount: 1,
+        }),
+        getEditableArticleMetadata: () => ({
+          fields: { abstractNote: "Paper one abstract" },
+        }),
+        getItem: (itemId: number) => ({ id: itemId }),
+      } as never,
+      llm: {
+        model: "gpt-5.4",
+        apiBase: "https://api.openai.com/v1",
+        apiKey: "key",
+        providerProtocol: "openai_chat_compat",
+        llmCall: async () => {
+          throw new Error("401 Unauthorized - Incorrect API key provided");
+        },
+      },
+      requestConfirmation: async () => ({ approved: false }),
+    });
+
+    await autoTagAction.execute({ scope: "all", limit: 1 }, ctx);
+
+    // Swallowing the failure into "" would leave the user with a green
+    // "No tags applied" card and no hint the key is wrong.
+    const summaries = progress
+      .map((event) => (event as { summary?: string }).summary || "")
+      .filter(Boolean);
+    const unavailable = summaries.find((summary) =>
+      summary.includes("AI suggestions unavailable"),
+    );
+    assert.isString(
+      unavailable,
+      `expected an unavailable notice, saw: ${summaries.join(" | ")}`,
+    );
+    assert.include(unavailable || "", "Incorrect API key");
+  });
+
   it("navigates to the next page without applying current-page tags", async function () {
     const registry = new AgentToolRegistry();
     const executedItemIds: number[] = [];

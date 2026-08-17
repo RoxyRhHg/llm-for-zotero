@@ -8,7 +8,6 @@ import {
   callEmbeddings,
   checkEmbeddingAvailability,
   type ChatParams,
-  type ReasoningConfig,
 } from "../../utils/llmClient";
 import type { ProviderProtocol } from "../../utils/providerProtocol";
 import {
@@ -17,6 +16,7 @@ import {
 } from "../../modules/contextPanel/paperAttribution";
 import type { PaperContextRef } from "../../shared/types";
 import { PdfService } from "./pdfService";
+import type { ModelProfileOverride } from "../../modelCapabilities";
 
 type RetrievalResult = {
   paperContext: PaperContextRef;
@@ -93,7 +93,7 @@ export class RetrievalService {
     apiKey?: string;
     authMode?: ChatParams["authMode"];
     providerProtocol?: ProviderProtocol;
-    reasoning?: ReasoningConfig;
+    profileOverride?: ModelProfileOverride;
     signal?: AbortSignal;
     topK?: number;
     perPaperTopK?: number;
@@ -126,7 +126,7 @@ export class RetrievalService {
       apiKey: params.apiKey,
       authMode: params.authMode,
       providerProtocol: params.providerProtocol,
-      reasoning: params.reasoning,
+      profileOverride: params.profileOverride,
       signal: params.signal,
       sourceSamples: papers.map((paperContext) => {
         const pdfContext = pdfContexts.get(paperContext.contextItemId);

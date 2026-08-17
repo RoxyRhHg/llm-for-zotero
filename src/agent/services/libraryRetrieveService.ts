@@ -57,6 +57,7 @@ import type {
   ZoteroGateway,
 } from "./zoteroGateway";
 import type { PdfService } from "./pdfService";
+import type { ModelProfileOverride } from "../../modelCapabilities";
 
 export type LibraryRetrieveDepth = "pool" | "metadata" | "evidence" | "verify";
 export type LibraryRetrieveIntent = "enumerate" | "verify" | "summarize";
@@ -1389,7 +1390,7 @@ export class LibraryRetrieveService {
       apiKey?: string;
       authMode?: AgentRuntimeRequest["authMode"];
       providerProtocol?: AgentRuntimeRequest["providerProtocol"];
-      reasoning?: AgentRuntimeRequest["reasoning"];
+      profileOverride?: ModelProfileOverride;
       signal?: AbortSignal;
     },
   ): Promise<LibraryRetrieveResult> {
@@ -1415,7 +1416,8 @@ export class LibraryRetrieveService {
       authMode: params.authMode || params.request?.authMode,
       providerProtocol:
         params.providerProtocol || params.request?.providerProtocol,
-      reasoning: params.reasoning || params.request?.reasoning,
+      profileOverride:
+        params.profileOverride || params.request?.advanced?.profileOverride,
       signal: params.signal,
       sourceSamples: this.buildScopeSourceSamples(scope),
     });
@@ -1513,7 +1515,8 @@ export class LibraryRetrieveService {
           authMode: params.authMode || params.request?.authMode,
           providerProtocol:
             params.providerProtocol || params.request?.providerProtocol,
-          reasoning: params.reasoning || params.request?.reasoning,
+          profileOverride:
+            params.profileOverride || params.request?.advanced?.profileOverride,
           signal: params.signal,
         });
         warnings.push(...reformulation.notes);
@@ -1657,7 +1660,8 @@ export class LibraryRetrieveService {
         authMode: params.authMode || params.request?.authMode,
         providerProtocol:
           params.providerProtocol || params.request?.providerProtocol,
-        reasoning: params.reasoning || params.request?.reasoning,
+        profileOverride:
+          params.profileOverride || params.request?.advanced?.profileOverride,
         signal: params.signal,
       });
       if (triageResult) {

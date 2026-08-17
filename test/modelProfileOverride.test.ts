@@ -32,6 +32,7 @@ describe("model profile override", function () {
   describe("precedence", function () {
     it("beats every detected source, per section", function () {
       const override: ModelProfileOverride = {
+        forModel: IDENTITY.model,
         limits: { contextWindowTokens: 4096 },
       };
       const capabilities = getModelCapabilities({
@@ -45,7 +46,10 @@ describe("model profile override", function () {
     it("leaves untouched sections on their detected source", function () {
       const capabilities = getModelCapabilities({
         ...IDENTITY,
-        profileOverride: { limits: { outputTokens: 999 } },
+        profileOverride: {
+          forModel: IDENTITY.model,
+          limits: { outputTokens: 999 },
+        },
       });
       assert.equal(capabilities.provenance.limits, "user");
       assert.notEqual(
@@ -59,6 +63,7 @@ describe("model profile override", function () {
       const capabilities = getModelCapabilities({
         ...IDENTITY,
         profileOverride: {
+          forModel: IDENTITY.model,
           reasoning: {
             kind: "select",
             defaultOptionId: "medium",
@@ -263,6 +268,7 @@ describe("model profile override", function () {
     } as const;
 
     const ULTRA_OVERRIDE: ModelProfileOverride = {
+      forModel: HOSTED.model,
       reasoning: {
         kind: "select",
         options: [
@@ -311,6 +317,7 @@ describe("model profile override", function () {
         "responses_api",
         {
           profileOverride: {
+            forModel: HOSTED.model,
             reasoning: {
               kind: "select",
               options: [{ id: "ultra", label: "ultra", enabled: true }],
@@ -371,6 +378,7 @@ describe("model profile override", function () {
         "ollama_native",
         {
           profileOverride: {
+            forModel: "gemma4",
             reasoning: {
               kind: "select",
               options: [
@@ -401,6 +409,7 @@ describe("model profile override", function () {
         "responses_api",
         {
           profileOverride: {
+            forModel: "gpt-5.4",
             reasoning: {
               kind: "select",
               options: [
@@ -535,7 +544,12 @@ describe("model profile override", function () {
         "qwen3:8b",
         "http://localhost:11434",
         "ollama_native",
-        { profileOverride: { extraBody: { top_k: 40 } } },
+        {
+          profileOverride: {
+            forModel: "qwen3:8b",
+            extraBody: { top_k: 40 },
+          },
+        },
       );
       assert.deepEqual(payload.extra, { top_k: 40 });
     });
@@ -552,6 +566,7 @@ describe("model profile override", function () {
         "ollama_native",
         {
           profileOverride: {
+            forModel: "qwen3:8b",
             extraBody: {
               messages: [{ role: "user", content: "hijack" }],
               tools: [],
@@ -574,6 +589,7 @@ describe("model profile override", function () {
         "ollama_native",
         {
           profileOverride: {
+            forModel: "custom-model",
             extraBody: { think: false, top_k: 40 },
             reasoning: {
               kind: "select",

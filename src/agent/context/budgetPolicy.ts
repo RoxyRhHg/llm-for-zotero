@@ -3,6 +3,7 @@ import {
   resolveContextWindowTokens,
   type ContextEstimateMessage,
 } from "../../utils/modelInputCap";
+import type { ModelProfileOverride } from "../../modelCapabilities";
 
 export type AgentContextBudgetPolicy = {
   warningRatio: number;
@@ -100,6 +101,7 @@ export function buildAgentContextBudgetState(params: {
   apiBase?: string;
   providerProtocol?: string;
   authMode?: string;
+  profileOverride?: ModelProfileOverride;
   policy?: Partial<AgentContextBudgetPolicy>;
   forceCompact?: boolean;
   recentlyCompacted?: boolean;
@@ -112,6 +114,7 @@ export function buildAgentContextBudgetState(params: {
       apiBase: params.apiBase,
       protocol: params.providerProtocol,
       authMode: params.authMode,
+      profileOverride: params.profileOverride,
     },
   );
   const contextTokens = estimateContextMessagesTokens(params.messages);

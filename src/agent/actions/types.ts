@@ -13,6 +13,8 @@ import type {
   TagContextRef,
 } from "../../shared/types";
 import type { PaperScopedActionProfile } from "./paperScopeTypes";
+import type { ModelProfileOverride } from "../../modelCapabilities";
+import type { UtilityLLMParams } from "../../utils/utilityLLM";
 
 /**
  * LLM credentials that an action can use to call the model directly
@@ -25,6 +27,9 @@ export type ActionLLMConfig = {
   apiKey?: string;
   authMode?: ModelProviderAuthMode;
   providerProtocol?: ProviderProtocol;
+  profileOverride?: ModelProfileOverride;
+  /** Test seam: replaces the actual model call. */
+  llmCall?: UtilityLLMParams["llmCall"];
 };
 
 /**
@@ -95,6 +100,11 @@ export type ActionExecutionContext = {
   llm?: ActionLLMConfig;
   /** Optional chat-context refs forwarded from the compose UI. */
   requestContext?: ActionRequestContext;
+  /**
+   * Cancels the run. Batched actions call the model once per batch and those
+   * batches are sequential, so without this a long queue is unstoppable.
+   */
+  signal?: AbortSignal;
 };
 
 export type ActionResult<TOutput = unknown> =

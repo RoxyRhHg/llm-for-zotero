@@ -5,6 +5,20 @@ import { compactAgentTranscript } from "../src/agent/context/transcriptCompactor
 import type { AgentModelMessage } from "../src/agent/types";
 
 describe("agent transcript compactor", function () {
+  it("uses the profile context limit when deciding compaction thresholds", function () {
+    const budget = buildAgentContextBudgetState({
+      messages: [{ role: "user", content: "current request" }],
+      model: "claude-haiku-4-5",
+      profileOverride: {
+        forModel: "claude-haiku-4-5",
+        limits: { contextWindowTokens: 10_000, inputTokens: 10_000 },
+      },
+    });
+
+    assert.equal(budget.contextWindow, 10_000);
+    assert.equal(budget.targetTokens, 5_800);
+  });
+
   it("creates rehydratable handles for dropped tool messages", function () {
     const messages: AgentModelMessage[] = [
       { role: "user", content: "old catalog request" },

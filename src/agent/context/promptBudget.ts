@@ -13,6 +13,7 @@ import {
   resolveContextWindowTokens,
   sliceTextToTokenBudget,
 } from "../../utils/modelInputCap";
+import type { ModelProfileOverride } from "../../modelCapabilities";
 
 const AGENT_PROMPT_SOFT_LIMIT_RATIO = 0.9;
 const HISTORY_CHECKPOINT_MAX_TOKENS = 1_200;
@@ -69,6 +70,7 @@ export function resolveAgentPromptBudgetLimits(params: {
   apiBase?: string;
   providerProtocol?: string;
   authMode?: string;
+  profileOverride?: ModelProfileOverride;
 }): AgentPromptBudgetLimits {
   const contextWindow = resolveContextWindowTokens(
     params.model || "",
@@ -77,6 +79,7 @@ export function resolveAgentPromptBudgetLimits(params: {
       apiBase: params.apiBase,
       protocol: params.providerProtocol,
       authMode: params.authMode,
+      profileOverride: params.profileOverride,
     },
   );
   return {
@@ -1033,6 +1036,7 @@ export function enforceAgentPromptBudget(params: {
   apiBase?: string;
   providerProtocol?: string;
   authMode?: string;
+  profileOverride?: ModelProfileOverride;
   conversationKey?: number;
   resourceSignature?: string;
 }): AgentPromptBudgetResult {
@@ -1042,6 +1046,7 @@ export function enforceAgentPromptBudget(params: {
     apiBase: params.apiBase,
     providerProtocol: params.providerProtocol,
     authMode: params.authMode,
+    profileOverride: params.profileOverride,
   });
   let messages = params.messages.map((message) => cloneMessage(message));
   const reductions: AgentPromptReduction[] = [];

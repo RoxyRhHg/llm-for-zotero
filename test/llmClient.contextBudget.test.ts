@@ -40,4 +40,20 @@ describe("llmClient context budget", function () {
     assert.equal(plan.reasoningReserveTokens, 4_096);
     assert.isAtLeast(plan.contextBudgetTokens, 0);
   });
+
+  it("uses the same matching profile override for input and output budgets", function () {
+    const plan = estimateAvailableContextBudget({
+      model: "claude-haiku-4-5",
+      prompt: "Summarize the paper.",
+      maxTokens: 4_000,
+      profileOverride: {
+        forModel: "claude-haiku-4-5",
+        limits: { inputTokens: 20_000, outputTokens: 5_000 },
+      },
+    });
+
+    assert.equal(plan.modelLimitTokens, 20_000);
+    assert.equal(plan.limitTokens, 20_000);
+    assert.equal(plan.outputReserveTokens, 4_000);
+  });
 });

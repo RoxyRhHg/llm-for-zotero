@@ -1,15 +1,13 @@
 import {
   buildReasoningPayload,
   buildPromptCachePayloadHints,
+  normalizeMaxTokensForRequest,
   postWithReasoningFallback,
   resolveRequestAuthState,
   uploadFilesForResponses,
   type ChatFileAttachment,
 } from "../../utils/llmClient";
-import {
-  normalizeMaxTokensForModel,
-  normalizeTemperature,
-} from "../../utils/normalization";
+import { normalizeTemperature } from "../../utils/normalization";
 import { resolveProviderTransportEndpoint } from "../../utils/providerTransport";
 import type {
   AgentModelCapabilities,
@@ -136,15 +134,14 @@ export class OpenAIResponsesAgentAdapter implements AgentModelAdapter {
           tool_choice: "auto",
           store: false,
           stream: true,
-          max_output_tokens: normalizeMaxTokensForModel(
-            request.advanced?.maxTokens,
-            request.model,
-            {
-              apiBase: request.apiBase,
-              protocol: "responses_api",
-              authMode: request.authMode,
-            },
-          ),
+          max_output_tokens: normalizeMaxTokensForRequest({
+            value: request.advanced?.maxTokens,
+            model: request.model || "",
+            apiBase: request.apiBase,
+            protocol: "responses_api",
+            authMode: request.authMode,
+            profileOverride: request.advanced?.profileOverride,
+          }),
           ...reasoningPayload.extra,
           ...(reasoningPayload.omitTemperature
             ? {}

@@ -59,6 +59,7 @@ import {
   usesMaxCompletionTokens,
 } from "./apiHelpers";
 import { getLocalParentPath, joinLocalPath, pathToFileUrl } from "./localPath";
+import { fingerprintSecret } from "./secretFingerprint";
 import {
   normalizeTemperature,
   normalizeMaxTokensForModel,
@@ -334,14 +335,7 @@ function normalizeEmbeddingApiBase(apiBase: string): string {
   return apiBase.trim().replace(/\/+$/, "");
 }
 
-function fingerprintEmbeddingSecret(secret: string): string {
-  let hash = 2166136261;
-  for (let i = 0; i < secret.length; i += 1) {
-    hash ^= secret.charCodeAt(i);
-    hash = Math.imul(hash, 16777619);
-  }
-  return (hash >>> 0).toString(16);
-}
+const fingerprintEmbeddingSecret = fingerprintSecret;
 
 function resolveSeparateEmbeddingApiKey(embeddingProvider: string): string {
   const explicitKey = (getPref("embeddingApiKey") || "").toString().trim();
@@ -1513,6 +1507,7 @@ export function estimateAvailableContextBudget(params: {
   apiBase?: string;
   providerProtocol?: ProviderProtocol;
   authMode?: ModelProviderAuthMode;
+  profileOverride?: ModelProfileOverride;
 }): ContextBudgetPlan {
   const normalizedModel =
     (params.model || DEFAULT_MODEL).trim() || DEFAULT_MODEL;
@@ -1523,6 +1518,7 @@ export function estimateAvailableContextBudget(params: {
     apiBase: params.apiBase,
     protocol: params.providerProtocol,
     authMode: params.authMode,
+    profileOverride: params.profileOverride,
   });
   const limitTokens = normalizeInputTokenCap(
     params.inputTokenCap,
@@ -1535,6 +1531,7 @@ export function estimateAvailableContextBudget(params: {
     apiBase: params.apiBase,
     protocol: params.providerProtocol,
     authMode: params.authMode,
+    profileOverride: params.profileOverride,
   });
   const reasoningReserveTokens = getReasoningReserveTokens(params.reasoning);
 
@@ -1944,6 +1941,16 @@ function resolveAnthropicThinkingMode(params: {
   return null;
 }
 
+/** A local validation failure for a main request's selected reasoning mode. */
+export class ReasoningBudgetError extends Error {
+  readonly code = "reasoning_budget_too_small" as const;
+
+  constructor(message: string) {
+    super(message);
+    this.name = "ReasoningBudgetError";
+  }
+}
+
 function resolveAnthropicManualBudget(params: {
   level: ReasoningLevel;
   profile: AnthropicReasoningProfile;
@@ -1963,7 +1970,7 @@ function resolveAnthropicManualBudget(params: {
   const maxBudgetTokens = maxTokens - reservedAnswerTokens;
   if (maxBudgetTokens < 1024) {
     const label = (params.modelName || "the selected Anthropic model").trim();
-    throw new Error(
+    throw new ReasoningBudgetError(
       `${label} extended thinking requires max_tokens of at least 2048 so budget_tokens can be less than max_tokens while leaving room for the answer. Increase max tokens or turn thinking off.`,
     );
   }
@@ -3521,7 +3528,7 @@ async function postWithTemperatureFallback(params: {
   );
 }
 
-function parseStatusFromErrorMessage(message: string): number | null {
+export function parseStatusFromErrorMessage(message: string): number | null {
   const match = message.trim().match(/^(\d{3})\b/);
   if (!match) return null;
   const value = Number.parseInt(match[1], 10);

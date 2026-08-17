@@ -5,6 +5,7 @@ import {
   callLLMStream,
   getResolvedEmbeddingConfig,
   prepareChatRequest,
+  ReasoningBudgetError,
 } from "../src/utils/llmClient";
 
 describe("llmClient prepareChatRequest", function () {
@@ -757,6 +758,11 @@ describe("llmClient prepareChatRequest", function () {
       );
       assert.fail("expected max_tokens validation to fail locally");
     } catch (error) {
+      assert.instanceOf(error, ReasoningBudgetError);
+      assert.equal(
+        (error as ReasoningBudgetError).code,
+        "reasoning_budget_too_small",
+      );
       assert.include(
         (error as Error).message,
         "extended thinking requires max_tokens of at least 2048",

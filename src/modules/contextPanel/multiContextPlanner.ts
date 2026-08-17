@@ -1645,6 +1645,7 @@ export async function resolveMultiContextPlan(params: {
       | "copilot_auth"
       | "webchat"
       | undefined,
+    profileOverride: params.advanced?.profileOverride,
   });
   const pageFallbackContext = renderSelectedTextPageFallbackContext({
     anchors: params.resolvedSelectedTextAnchors || [],
@@ -1682,7 +1683,7 @@ export async function resolveMultiContextPlan(params: {
       apiKey: params.apiKey,
       authMode: params.authMode as ChatParams["authMode"],
       providerProtocol: params.providerProtocol,
-      reasoning: params.reasoning,
+      profileOverride: params.advanced?.profileOverride,
       signal: params.signal,
       sourceSamples: papers
         .map((paper) =>
@@ -1965,6 +1966,7 @@ export async function resolveMultiContextPlan(params: {
               authMode: params.authMode as ChatParams["authMode"],
               providerProtocol: params.providerProtocol,
               reasoning: params.reasoning,
+              profileOverride: params.advanced?.profileOverride,
             }
           : undefined,
       signal: params.signal,

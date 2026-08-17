@@ -2,9 +2,13 @@ import type { AgentSkill } from "../../../../agent/skills/skillLoader";
 import { getAgentApi, initAgentSubsystem } from "../../../../agent";
 import type { ActionRequestContext } from "../../../../agent/actions";
 import { createElement } from "../../../../utils/domHelpers";
-import { callLLM } from "../../../../utils/llmClient";
 import type { ModelProviderAuthMode } from "../../../../utils/modelProviders";
 import type { ProviderProtocol } from "../../../../utils/providerProtocol";
+import {
+  callUtilityLLM,
+  describeUtilityLLMFailure,
+} from "../../../../utils/utilityLLM";
+import type { ModelProfileOverride } from "../../../../modelCapabilities";
 import { getAgentModeEnabled } from "../../prefHelpers";
 import { formatActionLabel } from "../../actionStatusText";
 import { renderPendingActionCard } from "../../agentTrace/render";
@@ -75,7 +79,14 @@ type ActionProfile = {
   apiKey?: string;
   authMode?: ModelProviderAuthMode;
   providerProtocol?: ProviderProtocol;
+  profileOverride?: ModelProfileOverride;
 };
+/**
+ * Scope inference blocks the slash command the user just typed, and asks for
+ * only ~220 tokens, so it stays on the short end of the utility budgets.
+ */
+const ACTION_SCOPE_TIMEOUT_MS = 10_000;
+
 type ActionMenuTrigger = "/" | "$";
 type ActiveActionToken = {
   query: string;
@@ -995,26 +1006,30 @@ export function createActionCommandController(
       tags: params.tagCandidates,
       requestContext: params.requestContext,
     });
-    let raw: string;
-    try {
-      raw = await callLLM({
-        prompt,
-        model: selectedProfile.model,
-        apiBase: selectedProfile.apiBase || "",
-        apiKey: selectedProfile.apiKey,
-        authMode: selectedProfile.authMode,
-        providerProtocol: selectedProfile.providerProtocol,
-        temperature: 0,
-        maxTokens: 220,
-      });
-    } catch (error) {
-      deps.logError("LLM: failed to infer action scope", error);
+    const result = await callUtilityLLM({
+      prompt,
+      model: selectedProfile.model,
+      apiBase: selectedProfile.apiBase || "",
+      apiKey: selectedProfile.apiKey,
+      authMode: selectedProfile.authMode,
+      providerProtocol: selectedProfile.providerProtocol,
+      profileOverride: selectedProfile.profileOverride,
+      temperature: 0,
+      jsonBudget: 220,
+      timeoutMs: ACTION_SCOPE_TIMEOUT_MS,
+    });
+    if (!result.ok) {
+      deps.logError(
+        "LLM: failed to infer action scope",
+        describeUtilityLLMFailure(result),
+      );
       return {
         kind: "error" as const,
         error:
           "Could not infer the collection from this description. Select a folder chip or use collection <name>.",
       };
     }
+    const raw = result.text;
 
     const choice = parseLlmActionScopeChoice(raw);
     if (!choice) {
@@ -1293,8 +1308,10 @@ export function createActionCommandController(
             apiKey: selectedProfile.apiKey,
             authMode: selectedProfile.authMode,
             providerProtocol: selectedProfile.providerProtocol,
+            profileOverride: selectedProfile.profileOverride,
           }
         : undefined,
+      conversationKey: deps.getConversationKey?.() ?? null,
       isPagedLibraryAction: isPagedLibraryActionForMode(
         action.name,
         actionMode,

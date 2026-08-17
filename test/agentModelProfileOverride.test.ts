@@ -97,11 +97,25 @@ describe("agent adapters honour model profile overrides", function () {
   }
 
   /** Advanced config carrying an extra request parameter the user authored. */
-  function advancedWith(extraBody: Record<string, unknown>) {
+  function advancedWith(
+    extraBody: Record<string, unknown>,
+    forModel = "gpt-4o-mini",
+  ) {
     return {
       temperature: 0.3,
       maxTokens: 4096,
-      profileOverride: { extraBody },
+      profileOverride: { forModel, extraBody },
+    };
+  }
+
+  function advancedWithRaisedOutputLimit() {
+    return {
+      temperature: 0.3,
+      maxTokens: 80_000,
+      profileOverride: {
+        forModel: "claude-haiku-4-5",
+        limits: { outputTokens: 100_000 },
+      },
     };
   }
 
@@ -178,13 +192,74 @@ describe("agent adapters honour model profile overrides", function () {
         model: "claude-sonnet-4-5",
         apiBase: "https://api.anthropic.com/v1",
         providerProtocol: "anthropic_messages",
-        advanced: advancedWith({ top_k: 40 }),
+        advanced: advancedWith({ top_k: 40 }, "claude-sonnet-4-5"),
       }),
       messages: [{ role: "user", content: "Summarize" }],
       tools,
     });
 
     assert.equal(body.read().top_k, 40);
+  });
+
+  it("openai_chat_compat clamps output using the matching raised profile limit", async function () {
+    const body = captureBody({
+      sse: [
+        `data: ${JSON.stringify({ choices: [{ delta: { content: "hi" } }] })}\n\n`,
+        "data: [DONE]\n\n",
+      ],
+    });
+
+    await new OpenAIChatCompatAgentAdapter().runStep({
+      request: makeRequest({
+        model: "claude-haiku-4-5",
+        advanced: advancedWithRaisedOutputLimit(),
+      }),
+      messages: [{ role: "user", content: "Summarize" }],
+      tools,
+    });
+
+    assert.equal(body.read().max_tokens, 80_000);
+  });
+
+  it("responses_api clamps output using the matching raised profile limit", async function () {
+    const body = captureBody({
+      json: { output: [{ content: [{ type: "output_text", text: "hi" }] }] },
+    });
+
+    await new OpenAIResponsesAgentAdapter().runStep({
+      request: makeRequest({
+        model: "claude-haiku-4-5",
+        apiBase: "https://api.openai.com/v1/responses",
+        providerProtocol: "responses_api",
+        advanced: advancedWithRaisedOutputLimit(),
+      }),
+      messages: [{ role: "user", content: "Summarize" }],
+      tools,
+    });
+
+    assert.equal(body.read().max_output_tokens, 80_000);
+  });
+
+  it("anthropic_messages clamps output using the matching raised profile limit", async function () {
+    const body = captureBody({
+      json: {
+        content: [{ type: "text", text: "hi" }],
+        stop_reason: "end_turn",
+      },
+    });
+
+    await new AnthropicMessagesAgentAdapter().runStep({
+      request: makeRequest({
+        model: "claude-haiku-4-5",
+        apiBase: "https://api.anthropic.com/v1",
+        providerProtocol: "anthropic_messages",
+        advanced: advancedWithRaisedOutputLimit(),
+      }),
+      messages: [{ role: "user", content: "Summarize" }],
+      tools,
+    });
+
+    assert.equal(body.read().max_tokens, 80_000);
   });
 
   it("ollama_native sends the user's extra parameters", async function () {
@@ -197,7 +272,7 @@ describe("agent adapters honour model profile overrides", function () {
         model: "qwen3:8b",
         apiBase: "http://localhost:11434",
         providerProtocol: "ollama_native",
-        advanced: advancedWith({ top_k: 40 }),
+        advanced: advancedWith({ top_k: 40 }, "qwen3:8b"),
       }),
       messages: [{ role: "user", content: "Summarize" }],
       tools,
@@ -216,7 +291,10 @@ describe("agent adapters honour model profile overrides", function () {
         model: "qwen3:8b",
         apiBase: "http://localhost:11434",
         providerProtocol: "ollama_native",
-        advanced: advancedWith({ options: { repeat_penalty: 1.1 } }),
+        advanced: advancedWith(
+          { options: { repeat_penalty: 1.1 } },
+          "qwen3:8b",
+        ),
       }),
       messages: [{ role: "user", content: "Summarize" }],
       tools,
@@ -242,6 +320,7 @@ describe("agent adapters honour model profile overrides", function () {
 
     await new OpenAIChatCompatAgentAdapter().runStep({
       request: makeRequest({
+        model: "kimi-k3",
         apiBase: "https://api.moonshot.ai/v1",
         providerProtocol: "openai_chat_compat",
         reasoning: { provider: "kimi", level: "ultra" },
@@ -249,6 +328,7 @@ describe("agent adapters honour model profile overrides", function () {
           temperature: 0.3,
           maxTokens: 4096,
           profileOverride: {
+            forModel: "kimi-k3",
             reasoning: {
               kind: "select",
               options: [
@@ -348,6 +428,7 @@ describe("agent adapters honour model profile overrides", function () {
           temperature: 0.3,
           maxTokens: 4096,
           profileOverride: {
+            forModel: "gemma4",
             reasoning: {
               kind: "select",
               options: [
@@ -383,11 +464,14 @@ describe("agent adapters honour model profile overrides", function () {
         model: "qwen3:8b",
         apiBase: "http://localhost:11434",
         providerProtocol: "ollama_native",
-        advanced: advancedWith({
-          tools: [],
-          messages: [{ role: "user", content: "hijack" }],
-          top_k: 40,
-        }),
+        advanced: advancedWith(
+          {
+            tools: [],
+            messages: [{ role: "user", content: "hijack" }],
+            top_k: 40,
+          },
+          "qwen3:8b",
+        ),
       }),
       messages: [{ role: "user", content: "Summarize" }],
       tools,

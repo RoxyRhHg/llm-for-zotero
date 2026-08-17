@@ -354,6 +354,79 @@ describe("probe reformulation", function () {
       result.notes.some((note) => note.includes("Probe reformulation failed")),
     );
   });
+
+  it("uses the profile on a provider-safe planner call without inheriting main reasoning", async function () {
+    let captured: Record<string, unknown> = {};
+    const plan = await resolveRetrievalQueryPlan({
+      query: "How does representational drift change across development?",
+      hasRetrievalContext: true,
+      model: "gpt-5.4",
+      apiBase: "https://api.openai.com/v1",
+      apiKey: "key",
+      providerProtocol: "openai_chat_compat",
+      profileOverride: {
+        forModel: "gpt-5.4",
+        limits: { outputTokens: 2_000 },
+      },
+      llmCall: async (params) => {
+        captured = params as unknown as Record<string, unknown>;
+        return '{"readIntent":"targeted","variants":["developmental representational drift"]}';
+      },
+    });
+
+    assert.deepEqual(plan.variants, ["developmental representational drift"]);
+    assert.deepEqual(captured.reasoning, {
+      provider: "openai",
+      level: "low",
+    });
+    assert.equal(captured.maxTokens, 1_284);
+    assert.deepEqual(captured.profileOverride, {
+      forModel: "gpt-5.4",
+      limits: { outputTokens: 2_000 },
+    });
+  });
+
+  it("re-prompts once when the planner's first response comes back blank", async function () {
+    let calls = 0;
+    const plan = await resolveRetrievalQueryPlan({
+      query: "How does representational drift change across development?",
+      hasRetrievalContext: true,
+      model: "gpt-5.4",
+      apiBase: "https://api.openai.com/v1",
+      apiKey: "key",
+      providerProtocol: "openai_chat_compat",
+      llmCall: async () => {
+        calls += 1;
+        // A budget-truncated first response is exactly what the second
+        // attempt exists for; treating it as terminal wastes the retry.
+        return calls === 1
+          ? "   "
+          : '{"readIntent":"targeted","variants":["developmental representational drift"]}';
+      },
+    });
+
+    assert.equal(calls, 2);
+    assert.deepEqual(plan.variants, ["developmental representational drift"]);
+  });
+
+  it("does not burn the second attempt on a transport failure", async function () {
+    let calls = 0;
+    const plan = await resolveRetrievalQueryPlan({
+      query: "How does representational drift change across development?",
+      hasRetrievalContext: true,
+      model: "gpt-5.4",
+      apiBase: "https://api.openai.com/v1",
+      apiKey: "key",
+      providerProtocol: "openai_chat_compat",
+      llmCall: async () => {
+        calls += 1;
+        throw new Error("401 Unauthorized - bad key");
+      },
+    });
+
+    assert.equal(calls, 1);
+    assert.deepEqual(plan.variants, []);
+  });
 });
 
 describe("callLLMWithTimeout runtime safety", function () {
