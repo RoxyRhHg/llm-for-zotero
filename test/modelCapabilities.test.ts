@@ -93,6 +93,84 @@ describe("model capability service", function () {
     );
   });
 
+  it("applies controls for an explicit disabled option named none", function () {
+    const capabilities = getModelCapabilities({
+      provider: "local",
+      model: "profiled-local",
+      profileOverride: {
+        forModel: "profiled-local",
+        reasoning: {
+          kind: "select",
+          defaultOptionId: "none",
+          options: [
+            {
+              id: "none",
+              label: "Disabled",
+              controls: { body: { think: false } },
+            },
+          ],
+        },
+      },
+    });
+
+    assert.deepEqual(
+      compileReasoningControls(capabilities, { level: "none" }),
+      { extra: { think: false }, omitTemperature: false },
+    );
+    const bare = getModelCapabilities({
+      provider: "local",
+      model: "bare-none-local",
+      profileOverride: {
+        forModel: "bare-none-local",
+        reasoning: {
+          kind: "select",
+          options: [{ id: "none", label: "None" }],
+        },
+      },
+    });
+    assert.isNull(compileReasoningControls(bare, { level: "none" }));
+  });
+
+  it("never lets a disabled level inherit the capability-level enable patch", function () {
+    // Only a registry entry can pair capability-level controls with a bare
+    // disabled option — normalizeProfileOverride keeps per-option bodies only.
+    const registry: ModelCapabilityRegistry = {
+      schemaVersion: 1,
+      revision: 3,
+      models: [
+        {
+          match: { provider: "qwen", exact: "qwen-shared-controls" },
+          reasoning: {
+            kind: "select",
+            defaultOptionId: "high",
+            controls: { body: { enable_thinking: true } },
+            options: [
+              { id: "none", label: "None" },
+              { id: "high", label: "High" },
+            ],
+          },
+        },
+      ],
+    };
+    assert.isTrue(setModelCapabilityRegistryForTests(registry));
+    const capabilities = getModelCapabilities({
+      provider: "qwen",
+      model: "qwen-shared-controls",
+      apiBase: "https://dashscope.aliyuncs.com/compatible-mode/v1",
+    });
+
+    // "high" has no controls of its own, so the shared patch still applies.
+    assert.deepEqual(
+      compileReasoningControls(capabilities, { level: "high" }),
+      {
+        extra: { enable_thinking: true },
+        omitTemperature: false,
+      },
+    );
+    // "none" must not turn thinking on.
+    assert.isNull(compileReasoningControls(capabilities, { level: "none" }));
+  });
+
   it("uses live model metadata and preserves exact opaque model IDs", async function () {
     configureModelCapabilityRuntime({
       fetch: (async () =>

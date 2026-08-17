@@ -665,14 +665,19 @@ export function compileReasoningControls(
   selection: { level?: string; effort?: string },
 ): { extra: Record<string, unknown>; omitTemperature: boolean } | null {
   const reasoning = capabilities.reasoning;
-  if (reasoning.kind === "none" || reasoning.kind === "server_default")
-    return null;
   const requested = normalize(selection.effort || selection.level);
-  if (!requested || requested === "auto" || requested === "none") return null;
+  const explicitOption = reasoning.options.find(
+    (candidate) => Boolean(requested) && normalize(candidate.id) === requested,
+  );
+  if (
+    (reasoning.kind === "none" || reasoning.kind === "server_default") &&
+    !explicitOption?.controls
+  ) {
+    return null;
+  }
+  if (!requested || requested === "auto") return null;
   const option =
-    reasoning.options.find(
-      (candidate) => normalize(candidate.id) === requested,
-    ) ||
+    explicitOption ||
     (requested === "minimal"
       ? reasoning.options.find((candidate) => normalize(candidate.id) === "off")
       : undefined) ||
@@ -681,8 +686,20 @@ export function compileReasoningControls(
           (candidate) => candidate.id === reasoning.defaultOptionId,
         ) || reasoning.options[0]
       : undefined);
-  const controls = option?.controls || reasoning.controls;
-  if (!option || option.enabled === false || !controls) return null;
+  const disabledOption =
+    requested === "none" || requested === "off" || requested === "disabled";
+  // A disabled selection may only emit controls its own option authored.
+  // The capability-level patch is the *enable* payload, so inheriting it here
+  // would turn reasoning on for the level the user picked to turn it off.
+  const controls =
+    option?.controls || (disabledOption ? undefined : reasoning.controls);
+  if (
+    !option ||
+    (option.enabled === false && !(disabledOption && option.controls)) ||
+    !controls
+  ) {
+    return null;
+  }
   const extra = applyControlPatch({}, controls);
   removeControlRoots(extra, controls);
   return {
