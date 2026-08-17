@@ -52,10 +52,90 @@ describe("action LLM batch helpers", function () {
           controller.abort();
           return batch;
         },
-        controller.signal,
+        { signal: controller.signal },
       );
 
       assert.deepEqual(seen, [[1, 2]]);
+      assert.deepEqual(results, [1, 2]);
+    });
+
+    /**
+     * Each batch is one bounded model call, so a blank reply or a timeout on
+     * batch N says nothing about batches 1..N-1. Losing their results turns a
+     * single hiccup into "every item on this review page falls back to
+     * deterministic suggestions", which is exactly what the user sees.
+     */
+    it("keeps completed batches when a later batch fails", async function () {
+      const failures: Array<{ index: number; message: string }> = [];
+      const results = await collectActionLlmBatchResults(
+        [1, 2, 3, 4, 5, 6],
+        2,
+        async (batch) => {
+          if (batch[0] === 3) throw new Error("empty: no text in 800 tokens");
+          return batch;
+        },
+        {
+          onBatchError: (error, index) =>
+            failures.push({
+              index,
+              message: error instanceof Error ? error.message : String(error),
+            }),
+        },
+      );
+
+      assert.deepEqual(results, [1, 2, 5, 6]);
+      assert.deepEqual(failures, [
+        { index: 1, message: "empty: no text in 800 tokens" },
+      ]);
+    });
+
+    it("rethrows the first failure when no batch succeeds", async function () {
+      // A total outage must still reach the action's "AI suggestions
+      // unavailable" branch rather than looking like "the model had nothing".
+      let thrown: unknown;
+      try {
+        await collectActionLlmBatchResults([1, 2, 3, 4], 2, async (batch) => {
+          throw new Error(`batch ${batch[0]} failed`);
+        });
+      } catch (error) {
+        thrown = error;
+      }
+
+      assert.instanceOf(thrown, Error);
+      assert.equal((thrown as Error).message, "batch 1 failed");
+    });
+
+    it("does not rethrow when a failing batch produced no items to lose", async function () {
+      const results = await collectActionLlmBatchResults(
+        [1, 2, 3],
+        2,
+        async (batch) => (batch[0] === 1 ? [] : batch),
+      );
+
+      assert.deepEqual(results, [3]);
+    });
+
+    it("stops after a failed batch once the run is cancelled", async function () {
+      const controller = new AbortController();
+      const seen: number[][] = [];
+      const results = await collectActionLlmBatchResults(
+        [1, 2, 3, 4, 5, 6],
+        2,
+        async (batch) => {
+          seen.push(batch);
+          if (batch[0] === 3) {
+            controller.abort();
+            throw new Error("timeout");
+          }
+          return batch;
+        },
+        { signal: controller.signal },
+      );
+
+      assert.deepEqual(seen, [
+        [1, 2],
+        [3, 4],
+      ]);
       assert.deepEqual(results, [1, 2]);
     });
   });

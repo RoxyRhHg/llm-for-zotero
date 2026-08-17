@@ -720,7 +720,17 @@ async function suggestTagsForItems(
     items,
     LLM_BATCH_SIZE,
     (batch) => suggestTagsBatch(batch, existingTags, maxTags, userQuery, ctx),
-    ctx.signal,
+    {
+      signal: ctx.signal,
+      onBatchError: (error) =>
+        ctx.onProgress({
+          type: "step_done",
+          step: "Suggesting tags",
+          summary: `A batch of ${LLM_BATCH_SIZE} fell back to deterministic tags (${
+            error instanceof Error ? error.message : "error"
+          })`,
+        }),
+    },
   );
 }
 

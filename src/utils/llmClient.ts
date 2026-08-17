@@ -1610,6 +1610,12 @@ type ThoughtTagState = {
   buffer: string;
   /** Which tag opened the current block, so only its match can close it. */
   openTagName?: string;
+  /**
+   * Whether any non-whitespace answer text has streamed yet. Once it has, a
+   * reasoning tag can no longer be a chat-template leak, so it is left in the
+   * answer as the ordinary text it is.
+   */
+  sawAnswerText: boolean;
 };
 
 function getPartialTagTailLength(text: string, tag: string): number {
@@ -1625,16 +1631,32 @@ function getPartialTagTailLength(text: string, tag: string): number {
 }
 
 /**
- * Reasoning tags that arrive inline in the content stream.
+ * Reasoning tags that arrive inline in the content stream instead of in a
+ * dedicated field. Every one of them is *leakage*, not a contract this plugin
+ * asked the model for: llama.cpp and vLLM without a reasoning parser pass the
+ * chat template's raw output straight through, and `<thought>` reaches us the
+ * same way from a Codex-side prompt we do not own.
  *
- * `<thought>` is what the Codex prompt asks for. `<think>` and `<reasoning>`
- * leak from local servers — llama.cpp and vLLM without a reasoning parser pass
- * the model's raw template output straight through, so those tags would
- * otherwise render inside the answer.
+ * That distinction is why `thoughtBlockCanOpen` below exists. Nothing tells a
+ * leaked `<think>` apart from a model *writing about* `<think>` except where it
+ * sits: a template always emits its reasoning block first, so a leak opens the
+ * assistant message, while an answer that mentions the tag has already started
+ * talking. Without that rule, "how do I stop my model emitting <think> blocks?"
+ * loses its own answer into the Thinking panel.
  */
 const THOUGHT_TAG_NAMES = ["thought", "think", "reasoning"] as const;
 
 type ThoughtTagMatch = { index: number; length: number; name: string };
+
+/**
+ * Whether a reasoning block may still open. False once the model has streamed
+ * any non-whitespace answer text — the leading newlines a chat template emits
+ * around its block (`<think>\n…\n</think>\n\n`) are part of the leak, so
+ * whitespace alone must not close the window.
+ */
+function thoughtBlockCanOpen(state: ThoughtTagState): boolean {
+  return !state.sawAnswerText;
+}
 
 /** Earliest opening tag at or after `from`, across every recognized name. */
 function findEarliestTag(
@@ -1706,11 +1728,24 @@ function splitThoughtTaggedText(
       continue;
     }
 
-    const open = findEarliestTag(inputLower, cursor, openTag);
-    if (!open) {
+    const open = thoughtBlockCanOpen(state)
+      ? findEarliestTag(inputLower, cursor, openTag)
+      : null;
+    // Answer text ahead of the tag means the model is writing about it, not
+    // leaking it, so the tag and everything after stay in the answer.
+    const opensTheMessage = open
+      ? !input.slice(cursor, open.index).trim()
+      : false;
+    if (!open || !opensTheMessage) {
       const segment = input.slice(cursor);
-      const tailLen = longestPartialTagTail(segment, openTag);
-      answer += segment.slice(0, segment.length - tailLen);
+      // Only hold back a partial tag while one could still open; afterwards a
+      // trailing `<thi` is ordinary text and must not be swallowed.
+      const tailLen = thoughtBlockCanOpen(state)
+        ? longestPartialTagTail(segment, openTag)
+        : 0;
+      const emitted = segment.slice(0, segment.length - tailLen);
+      answer += emitted;
+      if (emitted.trim()) state.sawAnswerText = true;
       state.buffer = segment.slice(segment.length - tailLen);
       break;
     }
@@ -4310,7 +4345,11 @@ export async function parseStreamResponse(
   const decoder = new TextDecoder("utf-8");
   let buffer = "";
   let fullText = "";
-  const thoughtState: ThoughtTagState = { inThought: false, buffer: "" };
+  const thoughtState: ThoughtTagState = {
+    inThought: false,
+    buffer: "",
+    sawAnswerText: false,
+  };
 
   try {
     while (true) {
@@ -4421,7 +4460,11 @@ async function parseResponsesStream(
   const decoder = new TextDecoder("utf-8");
   let buffer = "";
   let fullText = "";
-  const thoughtState: ThoughtTagState = { inThought: false, buffer: "" };
+  const thoughtState: ThoughtTagState = {
+    inThought: false,
+    buffer: "",
+    sawAnswerText: false,
+  };
   let sawAnswerDelta = false;
   let sawAnswerFinal = false;
   let sawSummaryDelta = false;

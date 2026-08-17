@@ -571,7 +571,17 @@ async function suggestCollectionsForItems(
     items,
     LLM_BATCH_SIZE,
     (batch) => suggestCollectionsBatch(batch, collections, userQuery, ctx),
-    ctx.signal,
+    {
+      signal: ctx.signal,
+      onBatchError: (error) =>
+        ctx.onProgress({
+          type: "step_done",
+          step: "Matching items to collections",
+          summary: `A batch of ${LLM_BATCH_SIZE} fell back to deterministic matching (${
+            error instanceof Error ? error.message : "error"
+          })`,
+        }),
+    },
   );
 }
 

@@ -112,9 +112,14 @@ describe("inline reasoning tag parsing", function () {
     assert.equal(reasoning, "plan");
   });
 
-  it("keeps text before and after a reasoning block", async function () {
-    const { answer } = await run(["before <think>mid</think> after"]);
-    assert.equal(answer, "before  after");
+  it("strips a leaked block that opens after only whitespace", async function () {
+    // Chat templates emit `<think>\n…\n</think>\n\n`, so leading newlines are
+    // part of the leak, not answer text.
+    const { answer, reasoning } = await run([
+      "\n\n<think>plan</think>\n\ndone",
+    ]);
+    assert.equal(answer.trim(), "done");
+    assert.equal(reasoning, "plan");
   });
 
   it("does not let a mismatched closing tag end the block early", async function () {
@@ -136,16 +141,65 @@ describe("inline reasoning tag parsing", function () {
     assert.equal(reasoning, "the whole response, never closed");
   });
 
-  it("keeps an unclosed trailer as reasoning when an answer already streamed", async function () {
-    const { answer, reasoning } = await run([
-      "Here is the answer.<think>afterthought",
-    ]);
-    assert.equal(answer, "Here is the answer.");
-    assert.equal(reasoning, "afterthought");
-  });
-
   it("leaves ordinary content with angle brackets alone", async function () {
     const { answer } = await run(["use <div> and <thinking-cap> markup"]);
     assert.equal(answer, "use <div> and <thinking-cap> markup");
+  });
+
+  /**
+   * A leaked reasoning block always OPENS the assistant message — that is how
+   * the chat template is built. A model that merely writes about the tag does
+   * so after it has started answering. Position is therefore the one signal
+   * that separates leakage from prose, and without it a question like "how do
+   * I stop my model emitting <think> blocks?" loses its own answer.
+   */
+  describe("a tag written inside an answer is content, not reasoning", function () {
+    for (const tag of ["thought", "think", "reasoning"]) {
+      it(`keeps a <${tag}> mention that follows answer text`, async function () {
+        const { answer, reasoning } = await run([
+          `Set think: false to hide the <${tag}> block.`,
+        ]);
+        assert.equal(answer, `Set think: false to hide the <${tag}> block.`);
+        assert.equal(reasoning, "");
+      });
+    }
+
+    it("keeps a paired mention and the words between it", async function () {
+      const { answer, reasoning } = await run([
+        "before <think>mid</think> after",
+      ]);
+      assert.equal(answer, "before <think>mid</think> after");
+      assert.equal(reasoning, "");
+    });
+
+    it("keeps an unclosed mention that follows answer text", async function () {
+      // The failure this guards: everything after the mention used to vanish
+      // from the chat bubble into the Thinking panel.
+      const { answer, reasoning } = await run([
+        "Here is the answer.<think>afterthought",
+      ]);
+      assert.equal(answer, "Here is the answer.<think>afterthought");
+      assert.equal(reasoning, "");
+    });
+
+    it("keeps a mention split across stream chunks", async function () {
+      const { answer, reasoning } = await run(["Answer. <thi", "nk> literal"]);
+      assert.equal(answer, "Answer. <think> literal");
+      assert.equal(reasoning, "");
+    });
+
+    it("keeps a mention inside a fenced code block", async function () {
+      const source = "Strip it with:\n\n```\n<think>.*?</think>\n```\n";
+      const { answer } = await run([source]);
+      assert.equal(answer, source);
+    });
+
+    it("keeps a second mention after a genuine leaked block", async function () {
+      const { answer, reasoning } = await run([
+        "<think>plan</think>Remove the <think> prefix yourself.",
+      ]);
+      assert.equal(answer, "Remove the <think> prefix yourself.");
+      assert.equal(reasoning, "plan");
+    });
   });
 });

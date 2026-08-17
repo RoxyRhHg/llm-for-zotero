@@ -4,20 +4,52 @@ import {
 } from "../../utils/utilityLLM";
 import type { ActionExecutionContext } from "./types";
 
+export type ActionLlmBatchOptions = {
+  signal?: AbortSignal;
+  /**
+   * Called once per failed batch so the action can tell the user that part of
+   * the page fell back, instead of silently mixing model and deterministic
+   * suggestions.
+   */
+  onBatchError?: (error: unknown, batchIndex: number) => void;
+};
+
+/**
+ * Run `runBatch` over `items` in batches, keeping whatever completes.
+ *
+ * Each batch is one bounded model call, so a blank reply or a timeout on one
+ * batch says nothing about the batches that already succeeded. Losing their
+ * results would turn a single hiccup into "every item on this review page got
+ * deterministic suggestions" — the failure is scoped to the batch that caused
+ * it. A run in which no batch survives still throws, so the caller's
+ * "AI suggestions unavailable" branch keeps handling a real outage.
+ */
 export async function collectActionLlmBatchResults<TItem, TResult>(
   items: readonly TItem[],
   batchSize: number,
   runBatch: (batch: TItem[]) => Promise<TResult[]>,
-  signal?: AbortSignal,
+  options: ActionLlmBatchOptions = {},
 ): Promise<TResult[]> {
   const results: TResult[] = [];
-  for (let i = 0; i < items.length; i += batchSize) {
+  let firstError: unknown;
+  let ranABatch = false;
+  let batchIndex = 0;
+  for (let i = 0; i < items.length; i += batchSize, batchIndex += 1) {
     // Batches run one after another, so a long queue is only cancellable
     // between them. Check here rather than after the loop so a stop lands
     // within one batch instead of at the end of the run.
-    if (signal?.aborted) break;
-    results.push(...(await runBatch(items.slice(i, i + batchSize))));
+    if (options.signal?.aborted) break;
+    try {
+      results.push(...(await runBatch(items.slice(i, i + batchSize))));
+      ranABatch = true;
+    } catch (error) {
+      if (firstError === undefined) firstError = error;
+      options.onBatchError?.(error, batchIndex);
+    }
   }
+  // `ranABatch`, not `results.length`: a batch that legitimately returns no
+  // suggestions is a success, and must not be mistaken for an outage.
+  if (firstError !== undefined && !ranABatch) throw firstError;
   return results;
 }
 
