@@ -3,6 +3,7 @@ import { createTrashItemsTool } from "../src/agent/tools/write/trashItems";
 import { createMergeItemsTool } from "../src/agent/tools/write/mergeItems";
 import { createImportIdentifiersTool } from "../src/agent/tools/write/importIdentifiers";
 import { createImportLocalFilesTool } from "../src/agent/tools/write/importLocalFiles";
+import { createManageAttachmentsTool } from "../src/agent/tools/write/manageAttachments";
 import type { AgentToolContext } from "../src/agent/types";
 
 /**
@@ -198,6 +199,78 @@ describe("destructive checklist consent", function () {
     it("fails when every file is unchecked", function () {
       const { tool, input } = validated();
       const applied = tool.applyConfirmation?.(input, { filesChecklist: [] });
+      assert.isFalse(applied?.ok);
+    });
+  });
+
+  /**
+   * Rename and re-link render "New name" / "New path" as real editable
+   * inputs — there is no read-only text field in that renderer. The edit was
+   * thrown away, so correcting a wrong filename did nothing, and for re-link
+   * correcting the path is the entire point of the operation.
+   */
+  describe("attachment rename and re-link honour the edited value", function () {
+    const attachmentGateway = {
+      getItem: (id: number) => ({
+        id,
+        getDisplayTitle: () => `Attachment ${id}`,
+        getField: () => "",
+        isAttachment: () => true,
+      }),
+    } as never;
+
+    it("renames to the value the user typed, not the model's", function () {
+      const tool = createManageAttachmentsTool(attachmentGateway);
+      const validated = tool.validate({
+        action: "rename",
+        attachmentId: 5,
+        newName: "paper-final-v2.pdf",
+      });
+      assert.isTrue(validated.ok, JSON.stringify(validated));
+      if (!validated.ok) return;
+
+      const applied = tool.applyConfirmation?.(validated.value, {
+        to: "Smith 2024 - Hippocampal replay.pdf",
+      });
+      assert.isTrue(applied?.ok);
+      if (!applied?.ok) return;
+      assert.equal(
+        (applied.value as { operation: { newName: string } }).operation.newName,
+        "Smith 2024 - Hippocampal replay.pdf",
+      );
+    });
+
+    it("re-links to the corrected path", function () {
+      const tool = createManageAttachmentsTool(attachmentGateway);
+      const validated = tool.validate({
+        action: "relink",
+        attachmentId: 5,
+        newPath: "/wrong/guess.pdf",
+      });
+      assert.isTrue(validated.ok, JSON.stringify(validated));
+      if (!validated.ok) return;
+
+      const applied = tool.applyConfirmation?.(validated.value, {
+        path: "/Users/me/papers/real.pdf",
+      });
+      assert.isTrue(applied?.ok);
+      if (!applied?.ok) return;
+      assert.equal(
+        (applied.value as { operation: { newPath: string } }).operation.newPath,
+        "/Users/me/papers/real.pdf",
+      );
+    });
+
+    it("refuses an emptied field rather than running the model's value", function () {
+      const tool = createManageAttachmentsTool(attachmentGateway);
+      const validated = tool.validate({
+        action: "rename",
+        attachmentId: 5,
+        newName: "paper.pdf",
+      });
+      assert.isTrue(validated.ok);
+      if (!validated.ok) return;
+      const applied = tool.applyConfirmation?.(validated.value, { to: "   " });
       assert.isFalse(applied?.ok);
     });
   });

@@ -255,6 +255,10 @@ describe("editCurrentNote create tracking", function () {
       status: "created",
       noteId: 100,
       title: "",
+      // Present-but-undefined: this note asked for no collections. The key
+      // exists so the manual (image) branch reports where a note landed,
+      // matching the mutation-service branch.
+      collections: undefined,
     });
 
     const tracked = getTrackedAssistantNoteForParent(9);

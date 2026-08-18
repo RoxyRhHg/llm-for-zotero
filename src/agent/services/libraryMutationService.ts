@@ -290,10 +290,10 @@ function buildCreateCollectionUndo(
  * follow. Name, parent and membership are what the user actually cares
  * about, and those are restored exactly.
  *
- * KNOWN GAP (Stage B, item 7): `addItemsToCollections` still filters members
- * through `resolveBibliographicItem`, so a restored collection loses any
- * standalone notes or attachments it contained. Retiring that filter fixes
- * this restore for free; until then the loss is real and undeclared here.
+ * Membership is restored through `addItemsToCollections`, which since the
+ * capability matrix landed accepts standalone notes and attachments as well
+ * as regular items — so a collection of mixed contents comes back intact.
+ * Child items were never members to begin with.
  */
 function buildDeleteCollectionUndo(
   zoteroGateway: ZoteroGateway,
@@ -469,22 +469,29 @@ export class LibraryMutationService {
         };
       }
       case "remove_tags": {
-        const targetMap = new Map(
-          this.zoteroGateway
-            .getPaperTargetsByItemIds(operation.itemIds)
-            .map((target) => [target.itemId, target] as const),
-        );
+        // Counted from what the gateway actually removed. Deriving this from
+        // the paper-target map meant a book (or any PDF-less item) reported
+        // zero removals and recorded no undo, while the tag really was gone.
         const removed: Array<{ itemId: number; tags: string[] }> = [];
+        const rows: Array<{
+          itemId: number;
+          status: string;
+          reason?: string;
+        }> = [];
         for (const itemId of operation.itemIds) {
-          const existing = (targetMap.get(itemId)?.tags || []).filter((tag) =>
-            operation.tags.includes(tag),
-          );
-          await this.zoteroGateway.removeTagsFromItem({
+          const outcome = await this.zoteroGateway.removeTagsFromItem({
             itemId,
             tags: operation.tags,
           });
-          if (existing.length) {
-            removed.push({ itemId, tags: existing });
+          if (outcome.removed.length) {
+            removed.push({ itemId, tags: outcome.removed });
+            rows.push({ itemId, status: "removed" });
+          } else {
+            rows.push({
+              itemId,
+              status: "skipped",
+              reason: "None of those tags were on this item",
+            });
           }
         }
         return {
@@ -495,6 +502,7 @@ export class LibraryMutationService {
               itemIds: operation.itemIds,
               removedCount: removed.length,
               tags: operation.tags,
+              items: rows,
             },
           },
           undo: buildRemoveTagsUndo(this.zoteroGateway, removed),

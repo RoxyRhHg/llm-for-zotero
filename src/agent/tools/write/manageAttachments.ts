@@ -207,7 +207,44 @@ export function createManageAttachmentsTool(
       };
     },
 
-    applyConfirmation(input, _resolutionData) {
+    applyConfirmation(input, resolutionData) {
+      // The "New name" and "New path" fields render as real <input> elements
+      // the user can type into — there is no read-only text field in this
+      // renderer. Discarding the edit meant correcting a wrong filename or a
+      // wrong path did nothing, and for re-link, correcting the path is the
+      // entire point of the operation.
+      const data =
+        resolutionData && typeof resolutionData === "object"
+          ? (resolutionData as Record<string, unknown>)
+          : undefined;
+      if (!data) return ok(input);
+
+      if (input.operation.type === "rename_attachment") {
+        const edited = typeof data.to === "string" ? data.to.trim() : "";
+        if (!edited) {
+          return fail(
+            "The new attachment name was left empty. Enter a filename or cancel.",
+          );
+        }
+        return ok({
+          ...input,
+          operation: { ...input.operation, newName: edited },
+        });
+      }
+
+      if (input.operation.type === "relink_attachment") {
+        const edited = typeof data.path === "string" ? data.path.trim() : "";
+        if (!edited) {
+          return fail(
+            "The new file path was left empty. Enter a path or cancel.",
+          );
+        }
+        return ok({
+          ...input,
+          operation: { ...input.operation, newPath: edited },
+        });
+      }
+
       return ok(input);
     },
 

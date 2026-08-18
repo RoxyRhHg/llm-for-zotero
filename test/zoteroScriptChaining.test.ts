@@ -80,3 +80,104 @@ describe("zotero_script chaining", function () {
     );
   });
 });
+
+/**
+ * Write mode had no coverage at all — both chaining tests above run in read
+ * mode, where env.snapshot returns early. The widened snapshot then called
+ * getNote() unguarded; that method exists on every Zotero.Item's prototype
+ * but throws for anything that is not a note, so env.snapshot — the tool's
+ * own mandatory first step — aborted every write script before its first
+ * mutation.
+ */
+describe("zotero_script write-mode snapshotting", function () {
+  const originalZotero = (
+    globalThis as typeof globalThis & { Zotero?: unknown }
+  ).Zotero;
+
+  afterEach(function () {
+    (globalThis as typeof globalThis & { Zotero?: unknown }).Zotero =
+      originalZotero;
+  });
+
+  const context: AgentToolContext = {
+    request: { conversationKey: 4, mode: "agent", userText: "tag", libraryID: 1 },
+    item: null,
+    currentAnswerText: "",
+    modelName: "test-model",
+  };
+
+  function installItem(over: Record<string, unknown>) {
+    const item = {
+      id: 51,
+      isNote: () => false,
+      isAttachment: () => false,
+      // Real Zotero throws here for a journalArticle. The old code called it
+      // through a `typeof === "function"` guard, which always passes.
+      getNote: () => {
+        throw new Error(
+          "getNote() can only be called on notes and attachments",
+        );
+      },
+      getField: () => "",
+      getTags: () => [],
+      getCollections: () => [],
+      getCreatorsJSON: () => [],
+      toJSON: () => ({ itemType: "journalArticle" }),
+      addTag: () => undefined,
+      saveTx: async () => undefined,
+      ...over,
+    };
+    (globalThis as typeof globalThis & { Zotero?: unknown }).Zotero = {
+      Items: { get: () => item },
+      debug: () => undefined,
+    };
+    return item;
+  }
+
+  it("snapshots a regular item without throwing on getNote", async function () {
+    installItem({});
+    const tool = createZoteroScriptTool();
+    const validated = tool.validate({
+      mode: "write",
+      script:
+        "const item = Zotero.Items.get(51); env.snapshot(item); item.addTag('x'); await item.saveTx(); return 'ok';",
+      description: "tag one item",
+    });
+    assert.isTrue(validated.ok, JSON.stringify(validated));
+    if (!validated.ok) return;
+
+    const result = (await tool.execute(validated.value, context)) as Record<
+      string,
+      unknown
+    >;
+
+    assert.isUndefined(
+      result.error,
+      `write scripts must not abort while snapshotting: ${String(result.error)}`,
+    );
+    assert.equal(result.returnValue, "ok");
+    assert.equal(result.itemsAffected, 1, "the item was still snapshotted");
+  });
+
+  it("still snapshots a real note's HTML", async function () {
+    installItem({
+      isNote: () => true,
+      getNote: () => "<p>body</p>",
+    });
+    const tool = createZoteroScriptTool();
+    const validated = tool.validate({
+      mode: "write",
+      script:
+        "const n = Zotero.Items.get(51); env.snapshot(n); await n.saveTx(); return 'ok';",
+      description: "touch a note",
+    });
+    assert.isTrue(validated.ok);
+    if (!validated.ok) return;
+    const result = (await tool.execute(validated.value, context)) as Record<
+      string,
+      unknown
+    >;
+    assert.isUndefined(result.error);
+    assert.equal(result.itemsAffected, 1);
+  });
+});

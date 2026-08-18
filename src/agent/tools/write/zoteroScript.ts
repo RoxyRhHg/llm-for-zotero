@@ -86,6 +86,25 @@ const SNAPSHOT_FIELDS = [
   "place",
 ];
 
+/**
+ * Reads a note's HTML, or undefined for anything that is not a note.
+ *
+ * `getNote` is a prototype method on EVERY Zotero.Item, so a `typeof` guard
+ * always passes — and the real implementation throws for anything that is not
+ * a note or attachment, and throws UnloadedDataException for a note whose
+ * text is not loaded. An unguarded call here aborted `env.snapshot`, which is
+ * the tool's own mandatory first step, so every write-mode script failed
+ * before its first mutation.
+ */
+function captureNoteHtml(item: any): string | undefined {
+  try {
+    if (!item?.isNote?.()) return undefined;
+    return String(item.getNote?.() ?? "");
+  } catch {
+    return undefined;
+  }
+}
+
 function captureItemSnapshot(item: any): ItemSnapshot {
   const fields: Record<string, string> = {};
   for (const field of SNAPSHOT_FIELDS) {
@@ -135,8 +154,7 @@ function captureItemSnapshot(item: any): ItemSnapshot {
     parentID: readNumber(item.parentID),
     deleted: item.deleted === true,
     itemTypeID: readNumber(item.itemTypeID),
-    noteHtml:
-      typeof item.getNote === "function" ? String(item.getNote() ?? "") : undefined,
+    noteHtml: captureNoteHtml(item),
     json,
   };
 }
@@ -312,7 +330,18 @@ async function executeScript(params: {
     snapshot: (item: any) => {
       if (!isWrite) return; // no-op in read mode
       if (item?.id && !snapshots.has(item.id)) {
-        snapshots.set(item.id, captureItemSnapshot(item));
+        try {
+          snapshots.set(item.id, captureItemSnapshot(item));
+        } catch (error) {
+          // Snapshotting must never abort the user's script. A field that
+          // cannot be read costs undo fidelity for that item; throwing here
+          // costs the whole operation, which is strictly worse.
+          logBuffer.push(
+            `[snapshot warning] could not fully snapshot item ${item.id}: ${
+              error instanceof Error ? error.message : String(error)
+            }`,
+          );
+        }
       }
     },
     addUndoStep: (fn: () => Promise<void>) => {

@@ -318,13 +318,13 @@ export function createQueryLibraryTool(
           offset: {
             type: "number",
             description:
-              "Skip this many results before returning. Use with limit to page through a large result set across several calls.",
+              "Skip this many results before returning. Use with limit to page through a large result set across several calls. Applies to entity:'items' with mode:'list'.",
           },
           sort: {
             type: "string",
             enum: ["dateAdded", "dateModified", "title"],
             description:
-              "Order results before limit/offset are applied. Use sort:'dateAdded' for requests like 'the most recently added papers'.",
+              "Order results before limit/offset are applied. Use sort:'dateAdded' for requests like 'the most recently added papers'. Applies to entity:'items' with mode:'list'; text search returns relevance order and ignores this.",
           },
           order: {
             type: "string",

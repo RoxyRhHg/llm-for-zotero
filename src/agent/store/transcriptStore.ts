@@ -161,12 +161,66 @@ function sanitizeMessageForTranscript(
   };
 }
 
+/**
+ * Drops assistant `tool_calls` that no `role:"tool"` reply ever answered.
+ *
+ * An assistant message carrying a round's whole `tool_calls` list is recorded
+ * before the per-call loop runs, and that loop can bail mid-list — a denial
+ * that ends the run, an error breaker, a review card the user declines. The
+ * unanswered calls then sit in the persisted transcript forever, and
+ * OpenAI-compatible providers reject the next request outright with a 400,
+ * breaking the conversation until the compatibility key changes.
+ *
+ * The Anthropic and Gemini adapters already filter orphans at render time,
+ * which is the tell that this invariant is known and that the OpenAI path was
+ * relying on the producer never emitting one. Enforcing it in the store fixes
+ * every producer at once, including the pre-existing declined-review-card
+ * path that could already do this on a *completed* run.
+ */
+function dropOrphanToolCalls(
+  messages: readonly AgentModelMessage[],
+): AgentModelMessage[] {
+  const answered = new Set<string>();
+  for (const message of messages) {
+    if (message?.role !== "tool") continue;
+    const id = (message as { tool_call_id?: unknown }).tool_call_id;
+    if (typeof id === "string" && id) answered.add(id);
+  }
+
+  const result: AgentModelMessage[] = [];
+  for (const message of messages) {
+    const calls = (message as { tool_calls?: unknown }).tool_calls;
+    if (message?.role !== "assistant" || !Array.isArray(calls) || !calls.length) {
+      result.push(message);
+      continue;
+    }
+    const kept = calls.filter((call) => {
+      const id = (call as { id?: unknown })?.id;
+      return typeof id === "string" && answered.has(id);
+    });
+    if (kept.length === calls.length) {
+      result.push(message);
+      continue;
+    }
+    const content = (message as { content?: unknown }).content;
+    if (!kept.length && !String(content ?? "").trim()) {
+      // Nothing left worth keeping: an assistant turn that only announced
+      // calls, none of which were answered.
+      continue;
+    }
+    result.push({ ...message, tool_calls: kept } as AgentModelMessage);
+  }
+  return result;
+}
+
 function normalizeMessages(
   messages: readonly AgentModelMessage[],
 ): AgentModelMessage[] {
-  return messages
-    .map((message) => normalizeMessage(message))
-    .filter((message): message is AgentModelMessage => Boolean(message));
+  return dropOrphanToolCalls(
+    messages
+      .map((message) => normalizeMessage(message))
+      .filter((message): message is AgentModelMessage => Boolean(message)),
+  );
 }
 
 async function ensureAgentTranscriptStore(): Promise<boolean> {

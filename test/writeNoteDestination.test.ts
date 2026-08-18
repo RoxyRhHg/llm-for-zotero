@@ -147,4 +147,45 @@ describe("write note destination classifier", function () {
       "file",
     );
   });
+
+  /**
+   * Ordering regression guard. An earlier revision checked the Zotero signal
+   * first, which sounds right until you notice that signal leads with a bare
+   * \bzotero\b — a mention, not a destination. In a Zotero plugin users say
+   * "this Zotero paper" constantly, so explicit file requests were being
+   * routed to Zotero notes, taking the runtime's file_io enforcement with
+   * them. Every case below pairs a real filesystem cue with the word Zotero.
+   */
+  it("keeps an explicit file destination even when Zotero is mentioned", function () {
+    const fileRequests = [
+      "save the note to ~/vaults/papers/x.md instead of Zotero",
+      "write reading notes to my Obsidian vault for this Zotero paper",
+      "export this Zotero paper's note as a markdown file",
+      "save a note about this Zotero item to disk",
+    ];
+    for (const text of fileRequests) {
+      assert.equal(classifyWriteNoteDestination(text), "file", text);
+    }
+  });
+
+  it("still honours Zotero when it is named as the destination", function () {
+    const zoteroRequests = [
+      "put this in Zotero, not Obsidian",
+      "save the answer as a Zotero note",
+      "write this into Zotero",
+    ];
+    for (const text of zoteroRequests) {
+      assert.equal(classifyWriteNoteDestination(text), "zotero", text);
+    }
+  });
+
+  it("respects the configured nickname over a Zotero mention", function () {
+    assert.equal(
+      classifyWriteNoteDestination(
+        "write notes to MyNotes for this Zotero paper",
+        "MyNotes",
+      ),
+      "file",
+    );
+  });
 });

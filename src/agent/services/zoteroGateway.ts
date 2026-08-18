@@ -2574,23 +2574,38 @@ export class ZoteroGateway {
     if (libraryID > 0) invalidatePaperSearchCache(libraryID);
   }
 
+  /**
+   * Removes tags and reports which ones were actually on the item.
+   *
+   * It used to return `void`, and the caller derived its count from the
+   * paper-target map — which `buildPaperTargetFromItem` gates on having a PDF
+   * child. So removing a tag from a book worked, reported `removedCount: 0`,
+   * and recorded no undo. Once `effect` started reading that count, the same
+   * stale zero also told the user nothing had changed.
+   */
   async removeTagsFromItem(params: {
     itemId: number;
     tags: string[];
-  }): Promise<void> {
-    const item = this.resolveBibliographicItem(this.getItem(params.itemId));
-    if (!item || !params.tags.length) return;
-    let changed = false;
+  }): Promise<{ removed: string[] }> {
+    // Tags live on the item itself — including notes and standalone
+    // attachments, which the regular-item filter used to exclude — so this
+    // resolves through the capability matrix rather than the paper map.
+    const raw = this.getItem(params.itemId);
+    const resolution = resolveCollectionMemberItem(raw, params.itemId);
+    const item = "item" in resolution ? resolution.item : null;
+    if (!item || !params.tags.length) return { removed: [] };
+    const removed: string[] = [];
     for (const tag of params.tags) {
       if (!tag) continue;
       if (item.hasTag?.(tag)) {
         item.removeTag?.(tag);
-        changed = true;
+        removed.push(tag);
       }
     }
-    if (changed) {
+    if (removed.length) {
       await item.saveTx();
     }
+    return { removed };
   }
 
   /**

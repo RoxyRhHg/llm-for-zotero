@@ -1,7 +1,7 @@
 ---
 id: write-note
 description: Write a long-form reading or literature note for a specific paper, saved as a Zotero note or Markdown file. Use ONLY when the user explicitly asks to write, draft, or edit a note.
-version: 8
+version: 9
 contexts: any
 activation: auto
 match: /\b(create|make|write|draft|generate)\b.*\b(note|summary note|reading note|notes?)\b.*\b(for|from|about|on)\b.*\b(paper|article|this)\b/i
@@ -16,8 +16,8 @@ match: /\b(write|save|export|send)\b.*\bobsidian\b/i
 match: /\bobsidian\b.*\b(note|write|save|export)\b/i
 match: /\bto\s+obsidian\b/i
 match: /\bobsidian\b.*\bvault\b/i
-match: /\b(save|write|export)\b.*\bnote\b.*\b(to\s+)?(file|disk|local|directory|folder)\b/i
-match: /\b(note|notes?)\b.*\b(to\s+)?(file|disk|local|directory|folder)\b/i
+match: /\b(save|write|export)\b.*\bnote\b.*\b(to\s+)?(file|disk|local|directory)\b/i
+match: /\b(note|notes?)\b.*\b(to\s+)?(file|disk|local|directory)\b/i
 match: /\b(use|apply|with)\b.*\btemplate\b/i
 ---
 
@@ -47,8 +47,10 @@ match: /\b(use|apply|with)\b.*\btemplate\b/i
 
 Decide the destination based on what the user says:
 
-- **File-based** (`file_io`): user mentions Obsidian, the notes directory nickname, or "save to file/directory/folder".
-- **Zotero note** (`note_write`): user says "create a note", "save to note", "edit my note", or anything without a file destination.
+- **File-based** (`file_io`): user mentions Obsidian, the notes directory nickname, a path, a `.md` filename, or "save to file/disk/directory".
+- **Zotero note** (`note_write`): user says "create a note", "save to note", "edit my note", names a **folder** or collection, or says anything without an explicit file destination.
+
+> A bare "folder" means a Zotero **collection**, not a filesystem directory. Zotero's own UI calls collections folders and this plugin's tool descriptions say "collections (folders)", so routing "save this note into folder X" to disk sent notes nowhere at all (issue #374). File it with `note_write({ mode:'create', target:'standalone', collections:[<id>] })`, resolving the name with `library_search({ entity:'collections', mode:'list' })`.
 
 If unclear, default to Zotero note.
 

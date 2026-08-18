@@ -130,4 +130,130 @@ describe("note into a collection (issue #374)", function () {
     );
     assert.deepEqual(saved[0].collections, [88]);
   });
+
+  /**
+   * A note containing an image takes a different branch: it is constructed
+   * manually so the note id exists before images are imported. That branch
+   * bypasses the mutation service entirely, so it needed the collection
+   * filing separately — otherwise a figure note silently lost the collection
+   * an identical text note landed in.
+   */
+  it("files a note that contains an image, which takes the manual branch", async function () {
+    const originalZotero = (
+      globalThis as typeof globalThis & { Zotero?: unknown }
+    ).Zotero;
+    const filed: number[] = [];
+    try {
+      (globalThis as typeof globalThis & { Zotero?: unknown }).Zotero = {
+        Item: class {
+          libraryID = 0;
+          parentID: number | undefined;
+          id = 777;
+          constructor(public itemType: string) {}
+          addToCollection(id: number) {
+            filed.push(id);
+          }
+          setNote() {}
+          async saveTx() {}
+          getNote() {
+            return "";
+          }
+        },
+        Items: { get: () => null },
+        debug: () => undefined,
+      };
+
+      const { gateway } = makeGateway();
+      const tool = createEditCurrentNoteTool(gateway as never);
+      const validated = tool.validate({
+        mode: "create",
+        content: "See ![Figure 1](file:///tmp/fig.png)",
+        target: "standalone",
+        collections: [88],
+      });
+      assert.isTrue(validated.ok, JSON.stringify(validated));
+      if (!validated.ok) return;
+
+      try {
+        await tool.execute(validated.value, context);
+      } catch {
+        // The manual branch does real note persistence we are not stubbing;
+        // what matters is that the collection was applied to the note object
+        // before the save was attempted.
+      }
+
+      assert.deepEqual(
+        filed,
+        [88],
+        "an image note must land in the same collection a text note would",
+      );
+    } finally {
+      (globalThis as typeof globalThis & { Zotero?: unknown }).Zotero =
+        originalZotero;
+    }
+  });
+
+  /**
+   * `addToCollection` does no existence check and never throws for a valid
+   * integer — the failure lands later as a foreign-key violation on the
+   * INSERT, inside the same transaction as the note itself. So a wrong
+   * collection id did not merely skip the filing: it destroyed the generated
+   * note and returned a raw SQLite error.
+   */
+  it("refuses an unresolvable collection instead of losing the note", async function () {
+    const gateway = {
+      getCollectionSummary: () => null,
+      getItem: () => null,
+      getActiveNoteSnapshot: () => null,
+      saveAnswerToNote: async () => {
+        throw new Error("saveAnswerToNote must not be reached");
+      },
+    };
+    const tool = createEditCurrentNoteTool(gateway as never);
+    const validated = tool.validate({
+      mode: "create",
+      content: "The answer.",
+      target: "standalone",
+      collections: [4242],
+    });
+    assert.isTrue(validated.ok);
+    if (!validated.ok) return;
+
+    let message = "";
+    try {
+      await tool.execute(validated.value, context);
+      assert.fail("expected the create to be refused");
+    } catch (error) {
+      message = error instanceof Error ? error.message : String(error);
+    }
+    assert.include(message, "4242");
+    assert.include(
+      message,
+      "not created",
+      "the user must be told the note was not written",
+    );
+  });
+
+  it("does not name a destination it cannot resolve on the card", function () {
+    const gateway = {
+      getCollectionSummary: () => null,
+      getItem: () => null,
+      getActiveNoteSnapshot: () => null,
+    };
+    const tool = createEditCurrentNoteTool(gateway as never);
+    const validated = tool.validate({
+      mode: "create",
+      content: "The answer.",
+      target: "standalone",
+      collections: [4242],
+    });
+    assert.isTrue(validated.ok);
+    if (!validated.ok) return;
+    const pending = tool.createPendingAction?.(validated.value, context);
+    assert.notInclude(
+      pending?.description || "",
+      "4242",
+      "inventing a label told the user the note was going somewhere real",
+    );
+  });
 });

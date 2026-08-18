@@ -629,10 +629,13 @@ export function createEditCurrentNoteTool(
         // Name the destination. The card previously promised "attaching it to
         // the paper" even when execute() would later rewrite the target to
         // standalone, so the user approved a statement that was not true.
+        // Only name collections that actually resolve. Falling back to
+        // "Collection 41" told the user their note was going somewhere real
+        // when the id did not exist.
         const collectionLabels = (input.collections || [])
           .map((collectionId) => {
             const summary = zoteroGateway.getCollectionSummary(collectionId);
-            return summary?.path || summary?.name || `Collection ${collectionId}`;
+            return summary?.path || summary?.name || "";
           })
           .filter(Boolean);
         const filesIntoCollections =
@@ -777,6 +780,31 @@ export function createEditCurrentNoteTool(
         );
 
       if (input.mode === "create") {
+        // Resolve every requested collection BEFORE the note is built.
+        //
+        // `addToCollection` does no existence check and never throws for a
+        // valid integer; the failure surfaces later as a foreign-key
+        // violation on the INSERT, inside the same transaction as the note
+        // itself — so a wrong id did not just skip the filing, it destroyed
+        // the generated note. The rest of the codebase already resolves
+        // before mutating (see the gateway's "Collection not found").
+        if (input.collections?.length) {
+          const resolved: number[] = [];
+          const unresolved: number[] = [];
+          for (const collectionId of input.collections) {
+            if (zoteroGateway.getCollectionSummary(collectionId)) {
+              resolved.push(collectionId);
+            } else {
+              unresolved.push(collectionId);
+            }
+          }
+          if (!resolved.length) {
+            throw new Error(
+              `No collection found for ID ${unresolved.join(", ")}. Resolve the name to an ID with library_search({ entity:'collections', mode:'list' }) and try again. The note was not created.`,
+            );
+          }
+          input.collections = resolved;
+        }
         // A collection destination is only satisfiable by a standalone note:
         // a child note belongs to its parent item and cannot be a collection
         // member. Asking for both is a request for a filed note, so honour
@@ -843,6 +871,27 @@ export function createEditCurrentNoteTool(
         if (parentId && input.target !== "standalone") {
           note.parentID = parentId;
         }
+        // File the note in the same save as its body. This branch runs for
+        // notes containing images -- the figure-note case this plugin
+        // specialises in -- and without this a note with a figure silently
+        // lost the collection the user asked for, while an identical note
+        // without one landed correctly.
+        const filedCollections: number[] = [];
+        if (input.target === "standalone") {
+          for (const collectionId of input.collections || []) {
+            if (!Number.isFinite(collectionId) || collectionId <= 0) continue;
+            try {
+              note.addToCollection(Math.floor(collectionId));
+              filedCollections.push(Math.floor(collectionId));
+            } catch (error) {
+              Zotero.debug?.(
+                `[llm-for-zotero] Could not file note into collection ${collectionId}: ${
+                  error instanceof Error ? error.message : String(error || "")
+                }`,
+              );
+            }
+          }
+        }
         const initialHtml = input._isHtml
           ? sanitizeNoteHtml(input.content)
           : renderRawNoteHtml(input.content);
@@ -902,6 +951,7 @@ export function createEditCurrentNoteTool(
 
         return {
           status: "created",
+          collections: filedCollections.length ? filedCollections : undefined,
           noteId,
           title: String(note.getField?.("title") || ""),
           ...(persisted.warnings.length

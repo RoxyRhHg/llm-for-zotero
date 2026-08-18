@@ -271,6 +271,9 @@ export class LibraryQueryService {
     libraryID: number;
     filters?: QueryLibraryFilters;
     limit?: number;
+    offset?: number;
+    sort?: LibrarySortKey;
+    order?: LibrarySortOrder;
     include?: QueryLibraryInclude[];
   }): Promise<{
     results: QueryLibraryItemResult[];
@@ -333,13 +336,12 @@ export class LibraryQueryService {
       });
     }
     const totalCount = papers.length;
-    const normalizedLimit = Number.isFinite(params.limit)
-      ? Math.max(1, Math.floor(params.limit as number))
-      : undefined;
-    const limitedPapers =
-      normalizedLimit && papers.length > normalizedLimit
-        ? papers.slice(0, normalizedLimit)
-        : papers;
+    // The hasPdf:true short-circuit used to drop sort and offset silently, so
+    // a schema that advertised them lied on this path.
+    const limitedPapers = applyLimit(
+      applyOffset(applySort(papers, params.sort, params.order), params.offset),
+      params.limit,
+    );
     const enriched = limitedPapers.map((paper) =>
       enrichPaperTarget(paper, this.zoteroGateway, params.include),
     );

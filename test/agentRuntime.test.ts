@@ -3916,4 +3916,99 @@ describe("shallow guard round-limit safety", function () {
       restoreDb();
     }
   });
+
+  /**
+   * The guard reads turn-wide records, so without scoping a first attempt
+   * that failed and was then correctly retried still produced "ran but
+   * changed nothing … Do not report the request as completed" — with the
+   * items sitting in the collection and the user told otherwise. The false
+   * correction was also persisted into the transcript.
+   */
+  it("does not correct a zero-effect write that a later call superseded", async function () {
+    const restoreDb = installMockDb();
+    try {
+      let call = 0;
+      const registry = new AgentToolRegistry();
+      registry.register({
+        spec: {
+          name: "library_update",
+          description: "update",
+          inputSchema: { type: "object" },
+          mutability: "write",
+          requiresConfirmation: false,
+        },
+        validate: (args) => ({ ok: true, value: args as never }),
+        async execute() {
+          call += 1;
+          return call === 1
+            ? {
+                movedCount: 0,
+                selectedCount: 3,
+                items: [
+                  { itemId: 1, status: "missing", reason: "wrong collection" },
+                ],
+              }
+            : {
+                movedCount: 3,
+                selectedCount: 3,
+                items: [
+                  { itemId: 1, status: "moved" },
+                  { itemId: 2, status: "moved" },
+                  { itemId: 3, status: "moved" },
+                ],
+              };
+        },
+      } as never);
+
+      const toolStep = (id: string) => ({
+        kind: "tool_calls" as const,
+        calls: [{ id, name: "library_update", arguments: {} }],
+        assistantMessage: { role: "assistant" as const, content: "" },
+      });
+
+      const runtime = new AgentRuntime({
+        registry,
+        adapterFactory: () =>
+          new MockAdapter(
+            [
+              toolStep("c1"),
+              toolStep("c2"),
+              {
+                kind: "final",
+                text: "Moved all 3 papers into Reading List.",
+                assistantMessage: {
+                  role: "assistant",
+                  content: "Moved all 3 papers into Reading List.",
+                },
+              },
+            ],
+            { streaming: false, toolCalls: true, multimodal: false },
+          ),
+      });
+
+      const outcome = await runtime.runTurn({
+        request: {
+          conversationKey: 993,
+          mode: "agent",
+          userText: "move these into Reading List",
+          model: "gpt-4o-mini",
+          apiBase: "https://api.openai.com/v1/chat/completions",
+          apiKey: "test",
+          libraryID: 1,
+        },
+        onEvent: () => undefined,
+      });
+
+      assert.equal(outcome.kind, "completed");
+      if (outcome.kind !== "completed") return;
+      assert.include(
+        outcome.text,
+        "Moved all 3",
+        "the retry succeeded, so the true answer must survive",
+      );
+      assert.equal(call, 2, "exactly the two writes, no forced third round");
+    } finally {
+      restoreDb();
+    }
+  });
 });

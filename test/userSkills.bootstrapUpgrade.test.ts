@@ -378,6 +378,8 @@ describe("user skill bootstrap upgrades", function () {
       canonicalWriteNote,
       "Path pattern: `{papertitle}/{papertitle}.md`",
     );
-    assert.equal(parseSkill(canonicalWriteNote).version, 8);
+    // Tracks the shipped write-note version; bumped to 9 when the skill's
+    // "folder means filesystem" guidance was corrected for issue #374.
+    assert.equal(parseSkill(canonicalWriteNote).version, 9);
   });
 });

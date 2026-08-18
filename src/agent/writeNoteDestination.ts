@@ -73,6 +73,18 @@ function hasFileDestinationSignal(
   );
 }
 
+/**
+ * The narrow case Zotero-first was meant to catch: the user names Zotero as
+ * the destination *in contrast to* a file destination. This requires a
+ * directional phrase ("in Zotero", "into Zotero", "as a Zotero note"), not a
+ * bare mention, so "this Zotero paper" does not qualify.
+ */
+function hasExplicitZoteroOverFileSignal(text: string): boolean {
+  return /\b(?:in|into|to|inside|within)\s+zotero\b|\bzotero\s+(?:note|collection|library)\b|\bnot\s+(?:in\s+)?(?:obsidian|a\s+file|to\s+a\s+file)\b/i.test(
+    text,
+  );
+}
+
 function hasZoteroDestinationSignal(text: string): boolean {
   return /\b(?:zotero(?:\s+library|\s+note)?|standalone\s+notes?|item\s+notes?|child\s+notes?|current\s+(?:zotero\s+)?notes?|active\s+(?:zotero\s+)?notes?|open\s+(?:zotero\s+)?notes?)\b/i.test(
     text,
@@ -102,10 +114,23 @@ export function classifyWriteNoteDestination(
 ): WriteNoteDestination {
   const text = (userText || "").trim();
   if (!text) return "none";
-  // Zotero first: naming Zotero explicitly should beat an incidental file
-  // cue elsewhere in the sentence ("put this in Zotero, not Obsidian").
-  if (hasZoteroDestinationSignal(text)) return "zotero";
+  // File first, deliberately.
+  //
+  // Reordering these looked attractive — "put this in Zotero, not Obsidian"
+  // should pick Zotero — but `hasZoteroDestinationSignal` leads with a bare
+  // \bzotero\b, which is a MENTION test, not a destination test. In a Zotero
+  // plugin users say "this Zotero paper" constantly, so Zotero-first sent
+  // explicit file requests ("save to ~/vaults/papers/x.md", "write to my
+  // Obsidian vault for this Zotero paper") to a Zotero note, and with them
+  // the whole file_io enforcement path in the runtime.
+  //
+  // An explicit filesystem cue — a path, an extension, a configured nickname,
+  // Obsidian/vault — is a far stronger signal of intent than the product
+  // name appearing somewhere in the sentence. The narrow contrast case is
+  // handled below instead.
+  if (hasExplicitZoteroOverFileSignal(text)) return "zotero";
   if (hasFileDestinationSignal(text, notesDirectoryNickname)) return "file";
+  if (hasZoteroDestinationSignal(text)) return "zotero";
   if (hasGenericNoteWriteSignal(text)) return "zotero";
   // `hasGenericNoteWriteSignal` is English-only. The multilingual note-intent
   // patterns already exist and are shared by every skill router, so a

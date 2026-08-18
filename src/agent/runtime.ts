@@ -1856,8 +1856,26 @@ export class AgentRuntime {
           // a zero-effect write is frequently legitimate ("they were already
           // in that collection"), and the goal is an accurate report, not a
           // dead turn.
+          // Only writes that were NOT superseded by a later successful call
+          // of the same tool. `toolExecutionRecords` spans the whole turn, so
+          // filtering it naively meant a first attempt that failed and was
+          // then correctly retried still produced "ran but changed nothing"
+          // — and `library_update` covers tags, collections and metadata, so
+          // one legitimately no-op call beside an applied one hit it too.
+          const supersededTools = new Set(
+            toolExecutionRecords
+              .filter(
+                (record) =>
+                  record.ok &&
+                  (record.effect === "applied" || record.effect === "partial"),
+              )
+              .map((record) => record.name),
+          );
           const zeroEffectWrites = toolExecutionRecords.filter(
-            (record) => record.ok && record.effect === "none",
+            (record) =>
+              record.ok &&
+              record.effect === "none" &&
+              !supersededTools.has(record.name),
           );
           if (zeroEffectWrites.length && !zeroEffectWriteCorrectionUsed) {
             zeroEffectWriteCorrectionUsed = true;
