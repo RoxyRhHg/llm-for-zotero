@@ -1,11 +1,13 @@
 import { assert } from "chai";
 import {
+  IMPLEMENTED_BY,
   LIBRARY_OBJECT_KINDS,
   LIBRARY_OPERATIONS,
   checkCapability,
   classifyLibraryItem,
   refusalFor,
 } from "../src/agent/capabilities/libraryObjects";
+import { createBuiltInToolRegistry } from "../src/agent/tools";
 
 /**
  * The point of the matrix is that it is *total*: every (operation x kind)
@@ -41,6 +43,100 @@ describe("library capability matrix", function () {
       }
     }
     assert.deepEqual(vague, [], "a refusal the agent cannot act on is a bug");
+  });
+
+  /**
+   * Totality was the only thing this file used to check, so the table could
+   * claim capabilities that no tool implemented — note reparent, item
+   * relations, saved-search CRUD, collection rename, tag rename — and nothing
+   * caught it. `refusalFor` has one call site reached with three operations,
+   * so 82 of the 100 cells are never consulted at runtime.
+   */
+  describe("an allowed cell means a tool actually does it", function () {
+    function registeredToolNames(): Set<string> {
+      const registry = createBuiltInToolRegistry({
+        zoteroGateway: {} as never,
+        pdfService: {} as never,
+        pdfPageService: {} as never,
+        retrievalService: {} as never,
+      });
+      const names = new Set<string>();
+      for (const spec of registry.listTools()) {
+        names.add(spec.name);
+      }
+      return names;
+    }
+
+    it("names the implementing tool for every allowed cell", function () {
+      const unbacked: string[] = [];
+      for (const kind of LIBRARY_OBJECT_KINDS) {
+        for (const operation of LIBRARY_OPERATIONS) {
+          if (checkCapability(operation, kind).status !== "allowed") continue;
+          if (!IMPLEMENTED_BY[`${kind}:${operation}`]) {
+            unbacked.push(`${kind}:${operation}`);
+          }
+        }
+      }
+      assert.deepEqual(
+        unbacked,
+        [],
+        "either wire these up and add them to IMPLEMENTED_BY, or mark them unimplemented",
+      );
+    });
+
+    it("only names tools that are actually registered", function () {
+      const registered = registeredToolNames();
+      const missing: string[] = [];
+      for (const [cell, toolName] of Object.entries(IMPLEMENTED_BY)) {
+        if (toolName && !registered.has(toolName)) {
+          missing.push(`${cell} -> ${toolName}`);
+        }
+      }
+      assert.deepEqual(
+        missing,
+        [],
+        "IMPLEMENTED_BY names a tool that does not exist",
+      );
+    });
+
+    it("does not claim an implementation for a cell that is not allowed", function () {
+      const contradictory: string[] = [];
+      for (const kind of LIBRARY_OBJECT_KINDS) {
+        for (const operation of LIBRARY_OPERATIONS) {
+          const verdict = checkCapability(operation, kind);
+          if (verdict.status === "allowed") continue;
+          if (IMPLEMENTED_BY[`${kind}:${operation}`]) {
+            contradictory.push(`${kind}:${operation}`);
+          }
+        }
+      }
+      assert.deepEqual(contradictory, []);
+    });
+
+    it("tells the agent where to go when a capability is not built yet", function () {
+      const unhelpful: string[] = [];
+      for (const kind of LIBRARY_OBJECT_KINDS) {
+        for (const operation of LIBRARY_OPERATIONS) {
+          const verdict = checkCapability(operation, kind);
+          if (verdict.status !== "unimplemented") continue;
+          if (!verdict.reason.includes("zotero_script")) {
+            unhelpful.push(`${kind}:${operation}`);
+          }
+        }
+      }
+      // "not supported" with no route forward strands the agent; the escape
+      // hatch is the whole reason a gap is not a refusal.
+      assert.deepEqual(unhelpful, []);
+    });
+
+    it("keeps unimplemented distinct from refused at runtime", function () {
+      // Both stop the write, but only one of them is a permanent answer.
+      const notBuilt = checkCapability("reparent", "childNote");
+      assert.equal(notBuilt.status, "unimplemented");
+
+      const impossible = checkCapability("addToCollection", "childAttachment");
+      assert.equal(impossible.status, "refused");
+    });
   });
 
   it("reports an undeclared pair as a gap, not as a policy refusal", function () {
@@ -99,7 +195,10 @@ describe("library capability matrix", function () {
       }) as never;
 
     it("splits notes and attachments by whether they are top-level", function () {
-      assert.equal(classifyLibraryItem(item({ isNote: () => true })), "standaloneNote");
+      assert.equal(
+        classifyLibraryItem(item({ isNote: () => true })),
+        "standaloneNote",
+      );
       assert.equal(
         classifyLibraryItem(item({ isNote: () => true, parentID: 5 })),
         "childNote",
@@ -117,7 +216,11 @@ describe("library capability matrix", function () {
     it("checks annotations before attachments, since annotations report a parent", function () {
       assert.equal(
         classifyLibraryItem(
-          item({ isAnnotation: () => true, isAttachment: () => true, parentID: 9 }),
+          item({
+            isAnnotation: () => true,
+            isAttachment: () => true,
+            parentID: 9,
+          }),
         ),
         "annotation",
       );
@@ -131,7 +234,10 @@ describe("library capability matrix", function () {
 
   describe("refusalFor", function () {
     it("distinguishes a missing item from a wrong-kind item", function () {
-      assert.include(refusalFor("addToCollection", null, 42) || "", "No item with ID 42");
+      assert.include(
+        refusalFor("addToCollection", null, 42) || "",
+        "No item with ID 42",
+      );
       const childNote = {
         isAnnotation: () => false,
         isNote: () => true,
@@ -141,7 +247,11 @@ describe("library capability matrix", function () {
       } as never;
       const reason = refusalFor("addToCollection", childNote, 8) || "";
       assert.include(reason, "top-level");
-      assert.notInclude(reason, "not found", "the item exists; saying otherwise is a lie");
+      assert.notInclude(
+        reason,
+        "not found",
+        "the item exists; saying otherwise is a lie",
+      );
     });
 
     it("returns null when the operation is allowed", function () {
