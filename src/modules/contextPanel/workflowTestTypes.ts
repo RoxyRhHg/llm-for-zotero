@@ -139,6 +139,7 @@ export type WorkflowTestDiagnostics = {
   conversationKey?: number;
   panelConversationKey?: number;
   conversationKind?: string;
+  runtimeMode?: string;
   conversationSystem?: string;
   noteId?: number;
   noteKind?: string;
@@ -185,6 +186,7 @@ export type WorkflowTestStandaloneDiagnostics = {
   basePaperItemId?: number;
   contextItemId?: number;
   conversationKind?: string;
+  runtimeMode?: string;
   conversationSystem?: string;
   titleText?: string;
   chipText: string[];
@@ -348,6 +350,9 @@ export type WorkflowTestApi = {
   clickPanelSystemToggle: (
     panelId: string,
     system: RuntimeConversationSystem,
+  ) => Promise<WorkflowTestDiagnostics>;
+  clickPanelRuntimeModeToggle: (
+    panelId: string,
   ) => Promise<WorkflowTestDiagnostics>;
   clickPanelSystemTogglesRapidly: (
     panelId: string,

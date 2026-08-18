@@ -20,7 +20,11 @@ import {
   MESSAGE_WORD_SPACING_MAX_PX,
   isUpstreamGlobalConversationKey,
 } from "./constants";
-import type { CustomShortcut, ReasoningLevelSelection } from "./types";
+import type {
+  ChatRuntimeMode,
+  CustomShortcut,
+  ReasoningLevelSelection,
+} from "./types";
 import {
   selectedModelCache,
   panelFontScalePercent,
@@ -82,6 +86,7 @@ export function getClaudeCodeModeEnabled(): boolean {
   return getBoolPref("enableClaudeCodeMode", false);
 }
 
+const LAST_RUNTIME_MODE_PREF_KEY = "lastUsedRuntimeMode";
 const LAST_REASONING_LEVEL_PREF_KEY = "lastUsedReasoningLevel";
 const LAST_REASONING_LEVEL_BY_PROVIDER_PREF_KEY =
   "lastUsedReasoningLevelByProvider";
@@ -160,6 +165,28 @@ export function buildPaperStateKey(
 
 function buildLibraryStateKey(libraryID: number): string {
   return `${Math.floor(libraryID)}`;
+}
+
+const RUNTIME_MODES = new Set<ChatRuntimeMode>(["chat", "agent"]);
+
+/**
+ * The runtime mode the user last picked explicitly, remembered across
+ * conversations and restarts so the Agent toggle stops resetting itself.
+ * `null` means the user has never touched the toggle.
+ */
+export function getLastUsedRuntimeMode(): ChatRuntimeMode | null {
+  const raw = getStringPref(LAST_RUNTIME_MODE_PREF_KEY).trim().toLowerCase();
+  if (!RUNTIME_MODES.has(raw as ChatRuntimeMode)) return null;
+  return raw as ChatRuntimeMode;
+}
+
+export function setLastUsedRuntimeMode(mode: ChatRuntimeMode): void {
+  if (!RUNTIME_MODES.has(mode)) return;
+  getZoteroPrefs()?.set?.(
+    `${config.prefsPrefix}.${LAST_RUNTIME_MODE_PREF_KEY}`,
+    mode,
+    true,
+  );
 }
 
 export function getLastUsedReasoningLevel(): ReasoningLevelSelection | null {

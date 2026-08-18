@@ -142,8 +142,10 @@ import {
   setSelectedModelEntryForItem,
   getLastUsedReasoningLevel,
   getLastUsedReasoningLevelForProvider,
+  getLastUsedRuntimeMode,
   setLastUsedReasoningLevel,
   setLastUsedReasoningLevelForProvider,
+  setLastUsedRuntimeMode,
   setLastUsedUpstreamConversationMode,
   setLastUsedUpstreamGlobalConversationKey,
   getLastUsedPaperConversationKey,
@@ -1137,6 +1139,7 @@ export function setupHandlers(
       agentModeEnabled: getAgentModeEnabled(),
       displayConversationKind: resolveDisplayConversationKind(item),
       noteKind: noteSession?.noteKind || null,
+      lastUsedRuntimeMode: getLastUsedRuntimeMode(),
     });
   };
   const updateRuntimeModeButton = () => {
@@ -7152,6 +7155,9 @@ export function setupHandlers(
       const nextMode: ChatRuntimeMode =
         getCurrentRuntimeMode() === "agent" ? "chat" : "agent";
       setCurrentRuntimeMode(nextMode);
+      // Only an explicit toggle updates the sticky default, so implicit
+      // switches (/compact, skill selection) stay scoped to this conversation.
+      setLastUsedRuntimeMode(nextMode);
       if (status) {
         setStatus(
           status,

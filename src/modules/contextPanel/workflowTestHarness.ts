@@ -8,6 +8,7 @@ import {
   activeGlobalConversationByLibrary,
   activePaperConversationByPaper,
   chatHistory,
+  selectedRuntimeModeCache,
   loadedConversationKeys,
   paperContextModeOverrides,
   isRequestPending,
@@ -657,6 +658,7 @@ async function renderStartupPanelForItem(
 
 function clearWorkflowConversationRuntimeState(): void {
   chatHistory.clear();
+  selectedRuntimeModeCache.clear();
   loadedConversationKeys.clear();
   activeConversationModeByLibrary.clear();
   activeGlobalConversationByLibrary.clear();
@@ -937,6 +939,32 @@ async function clickPanelSystemTogglesRapidly(
     }
   }
   await Zotero.Promise.delay(500);
+  return getDiagnostics(panelId);
+}
+
+async function clickPanelRuntimeModeToggle(
+  panelId: string,
+): Promise<WorkflowTestDiagnostics> {
+  assertWorkflowTestEnabled();
+  const panel = getPanel(panelId);
+  const button = panel.body.querySelector(
+    "#llm-runtime-mode-toggle",
+  ) as HTMLButtonElement | null;
+  if (!button) {
+    throw new Error("Panel runtime mode toggle was not rendered");
+  }
+  if (button.style.display === "none") {
+    throw new Error("Panel runtime mode toggle is hidden");
+  }
+  const eventCtor = panel.body.ownerDocument.defaultView?.MouseEvent;
+  if (eventCtor) {
+    button.dispatchEvent(
+      new eventCtor("click", { bubbles: true, cancelable: true }),
+    );
+  } else {
+    button.click();
+  }
+  await Zotero.Promise.delay(150);
   return getDiagnostics(panelId);
 }
 
@@ -1722,6 +1750,7 @@ function readStandaloneDiagnostics(): WorkflowTestStandaloneDiagnostics {
     basePaperItemId: parsePositiveInt(panelRoot?.dataset.basePaperItemId),
     contextItemId: parsePositiveInt(panelRoot?.dataset.contextItemId),
     conversationKind: panelRoot?.dataset.conversationKind || undefined,
+    runtimeMode: panelRoot?.dataset.runtimeMode || undefined,
     conversationSystem: panelRoot?.dataset.conversationSystem || undefined,
     titleText: titleEl?.textContent?.trim() || undefined,
     chipText: Array.from(
@@ -2232,6 +2261,7 @@ async function getDiagnostics(
     conversationKey: mountedItem ? getConversationKey(mountedItem) : undefined,
     panelConversationKey: parsePositiveInt(panelRoot?.dataset.itemId),
     conversationKind: panelRoot?.dataset.conversationKind || undefined,
+    runtimeMode: panelRoot?.dataset.runtimeMode || undefined,
     conversationSystem: panelRoot?.dataset.conversationSystem || undefined,
     noteId: parsePositiveInt(panelRoot?.dataset.noteId),
     noteKind: panelRoot?.dataset.noteKind || undefined,
@@ -3372,6 +3402,7 @@ export function installWorkflowTestHarness(targetAddon: {
     seedPanelStoredUserMessage,
     clickPanelSystemToggle,
     clickPanelSystemTogglesRapidly,
+    clickPanelRuntimeModeToggle,
     measurePanelRuntimeGeometry,
     selectNoteEditorText,
     ask,
