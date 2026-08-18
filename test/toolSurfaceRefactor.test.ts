@@ -105,6 +105,7 @@ describe("semantic tool surface", function () {
     const names = tools.map((tool) => tool.name).sort();
 
     assert.deepEqual(names, [
+      "annotate_pdf",
       "attachment_update",
       "collection_update",
       "file_io",

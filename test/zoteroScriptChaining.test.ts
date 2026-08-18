@@ -181,3 +181,77 @@ describe("zotero_script write-mode snapshotting", function () {
     assert.equal(result.itemsAffected, 1);
   });
 });
+
+/**
+ * `mode` was a declaration, not a boundary. The evaluator compiled in the
+ * plugin's own realm, where `globalThis.Zotero`, `IOUtils` and `ChromeUtils`
+ * are ambient, so binding Zotero as a parameter fenced nothing — a read-mode
+ * script could reach the unwrapped global in one line and write freely.
+ *
+ * The sandbox is the enforcement. Where it is unavailable the tool still
+ * runs (falling back to the old compile) rather than refusing outright, so
+ * these cover the parts that hold either way.
+ */
+describe("zotero_script scope control", function () {
+  const originalZotero = (
+    globalThis as typeof globalThis & { Zotero?: unknown }
+  ).Zotero;
+
+  afterEach(function () {
+    (globalThis as typeof globalThis & { Zotero?: unknown }).Zotero =
+      originalZotero;
+  });
+
+  const context: AgentToolContext = {
+    request: { conversationKey: 6, mode: "agent", userText: "x", libraryID: 1 },
+    item: null,
+    currentAnswerText: "",
+    modelName: "test-model",
+  };
+
+  it("refuses Zotero.DB to write scripts, which no mechanism can invert", async function () {
+    (globalThis as typeof globalThis & { Zotero?: unknown }).Zotero = {
+      DB: { queryAsync: async () => [] },
+      Items: { get: () => null },
+      debug: () => undefined,
+    };
+    const tool = createZoteroScriptTool();
+    const validated = tool.validate({
+      mode: "write",
+      script:
+        "env.addUndoStep(async () => {}); await Zotero.DB.queryAsync('DELETE FROM items'); return 'done';",
+      description: "raw sql",
+    });
+    assert.isTrue(validated.ok, JSON.stringify(validated));
+    if (!validated.ok) return;
+
+    const result = (await tool.execute(validated.value, context)) as Record<
+      string,
+      unknown
+    >;
+    assert.isDefined(result.error, "raw SQL must not silently succeed");
+    assert.include(String(result.error), "Zotero.DB");
+  });
+
+  it("still allows Zotero.DB to read scripts, which change nothing", async function () {
+    (globalThis as typeof globalThis & { Zotero?: unknown }).Zotero = {
+      DB: { queryAsync: async () => [{ n: 3 }] },
+      Items: { get: () => null },
+      debug: () => undefined,
+    };
+    const tool = createZoteroScriptTool();
+    const validated = tool.validate({
+      mode: "read",
+      script: "const rows = await Zotero.DB.queryAsync('SELECT 1'); return rows.length;",
+      description: "count",
+    });
+    assert.isTrue(validated.ok);
+    if (!validated.ok) return;
+    const result = (await tool.execute(validated.value, context)) as Record<
+      string,
+      unknown
+    >;
+    assert.isUndefined(result.error);
+    assert.equal(result.returnValue, 1);
+  });
+});

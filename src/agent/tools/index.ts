@@ -18,6 +18,7 @@ import { createDelegatingTool, createRenamedTool } from "./facade";
 
 import { createEditCurrentNoteTool } from "./write/editCurrentNote";
 import { createRevertChangesTool } from "./write/revertChanges";
+import { createAnnotatePdfTool } from "./write/annotatePdf";
 import { createUndoLastActionTool } from "./write/undoLastAction";
 import { createApplyTagsTool } from "./write/applyTags";
 import { createMoveToCollectionTool } from "./write/moveToCollection";
@@ -517,6 +518,7 @@ export function createBuiltInToolRegistry(
   );
   registry.register(undoLastAction);
   registry.register(createRevertChangesTool(deps.zoteroGateway));
+  registry.register(createAnnotatePdfTool(deps.zoteroGateway));
   registry.register(markToolTier(fileIO, "advanced"));
   registry.register(markToolTier(runCommand, "advanced"));
   registry.register(markToolTier(zoteroScript, "advanced"));
