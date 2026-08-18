@@ -140,9 +140,7 @@ function compileScript(
       "[llm-for-zotero] zotero_script sandbox unavailable; running in the plugin realm. Zotero.DB is still withheld from write mode.",
     );
   }
-  const AsyncFunction = Object.getPrototypeOf(
-    async function () {},
-  ).constructor;
+  const AsyncFunction = Object.getPrototypeOf(async function () {}).constructor;
   return new AsyncFunction("Zotero", "env", source) as (
     zotero: unknown,
     env: unknown,
@@ -179,8 +177,9 @@ function getComponentsUtils(): any {
 function createScriptSandbox(isWrite: boolean): unknown | null {
   const cu = getComponentsUtils();
   const sandboxCtor = cu?.Sandbox;
-  const principal = (globalThis as any).Services?.scriptSecurityManager
-    ?.getSystemPrincipal?.();
+  const principal = (
+    globalThis as any
+  ).Services?.scriptSecurityManager?.getSystemPrincipal?.();
   if (typeof sandboxCtor !== "function" || !principal) return null;
   try {
     const sandbox = new sandboxCtor(principal, {
@@ -340,7 +339,10 @@ function buildRevertFunction(
           /* ignore */
         }
         try {
-          if (snapshot.deleted !== undefined && item.deleted !== snapshot.deleted) {
+          if (
+            snapshot.deleted !== undefined &&
+            item.deleted !== snapshot.deleted
+          ) {
             item.deleted = snapshot.deleted;
           }
         } catch {
@@ -455,6 +457,7 @@ async function executeScript(params: {
   const snapshots = new Map<number, ItemSnapshot>();
   const undoSteps: Array<() => Promise<void>> = [];
   const isWrite = params.mode === "write";
+  const deadline = Date.now() + params.timeoutMs;
 
   const env = {
     mode: params.mode,
@@ -462,6 +465,18 @@ async function executeScript(params: {
     log: (msg: string) => {
       logBuffer.push(String(msg));
     },
+    /**
+     * True once the script has run past its time budget.
+     *
+     * The timeout is a race, not a kill: JavaScript cannot interrupt a
+     * running function, so when the budget expires the tool reports failure
+     * while the script keeps going and keeps mutating the library. A loop
+     * that checks this can stop at a clean boundary and return what it
+     * finished, instead of being abandoned mid-way.
+     */
+    shouldStop: () => Date.now() >= deadline,
+    /** Milliseconds left before `shouldStop()` starts returning true. */
+    remainingMs: () => Math.max(0, deadline - Date.now()),
     snapshot: (item: any) => {
       if (!isWrite) return; // no-op in read mode
       if (item?.id && !snapshots.has(item.id)) {
@@ -505,10 +520,19 @@ async function executeScript(params: {
       if (timeoutHandle !== undefined) clearTimeout(timeoutHandle);
     }
     if (raceResult === "timeout") {
+      // The script is still running -- nothing here can stop it. Freeze what
+      // has been recorded so far, because the live Map and array keep being
+      // written by the abandoned script, and the undo entry closes over
+      // them: without a copy, what "undo" does would depend on when the user
+      // happened to click it.
+      const frozenSnapshots = new Map(snapshots);
+      const frozenUndoSteps = [...undoSteps];
       return {
-        output: logBuffer.join("\n") + "\n[Script timed out]",
-        snapshots,
-        undoSteps,
+        output:
+          logBuffer.join("\n") +
+          "\n[Script timed out. It may still be running and still changing the library; only the changes recorded before the timeout can be undone. Check env.shouldStop() inside long loops and return early so this cannot happen.]",
+        snapshots: frozenSnapshots,
+        undoSteps: frozenUndoSteps,
         error: `Script timed out after ${params.timeoutMs}ms`,
       };
     }
@@ -638,7 +662,17 @@ several areas have no typed tool at all — reach for them directly:
 5. Do NOT use \`eraseTx()\` — use Zotero trash instead (item.deleted = true; await item.saveTx())
 6. Do NOT create or edit Zotero notes here. Use note_write for all Zotero note creation, edits, and appends so note validation still runs.
 7. Write mode runs with \`Zotero.DB\` withheld: raw SQL emits no change notifications and cannot be undone, so use the item and collection APIs. Read mode keeps it.
-8. Write straightforward code — no dry-run branching needed. The script runs directly, and undo_last_action uses snapshots/custom undo steps to revert it.`;
+8. Write straightforward code — no dry-run branching needed. The script runs directly, and undo_last_action uses snapshots/custom undo steps to revert it.
+9. In any loop over more than a few dozen items, check \`env.shouldStop()\` and return early when it is true. The timeout cannot interrupt a running script — it only stops *waiting* for it — so a script that ignores this keeps mutating the library after the tool has already reported failure, and those later changes cannot be undone. Return partial results; a partial answer you can undo beats a complete one you cannot.
+   \`\`\`
+   const done = [];
+   for (const id of ids) {
+     if (env.shouldStop()) { env.log(\`stopped early after \${done.length}\`); break; }
+     ...
+     done.push(id);
+   }
+   return done;
+   \`\`\``;
 
 // ── Tool definition ─────────────────────────────────────────────────────────
 
@@ -653,7 +687,8 @@ export function createZoteroScriptTool(): AgentToolDefinition<
         "Execute a JavaScript script inside Zotero's runtime with full API access. " +
         "Two modes: mode:'read' for gathering data across many items (no confirmation); " +
         "mode:'write' for mutations (runs directly with undo support; env.snapshot(item) or env.addUndoStep(fn) is required). " +
-        "The script receives the global Zotero object and an env helper (env.log, env.snapshot, env.addUndoStep, env.libraryID). " +
+        "The script receives the global Zotero object and an env helper (env.log, env.snapshot, env.addUndoStep, env.libraryID, env.shouldStop, env.remainingMs). " +
+        "Long loops must check env.shouldStop() and return early: the timeout stops waiting for the script but cannot stop the script itself. " +
         "Not for ordinary Zotero paper/library reading when semantic Zotero tools can answer.",
       inputSchema: {
         type: "object",
