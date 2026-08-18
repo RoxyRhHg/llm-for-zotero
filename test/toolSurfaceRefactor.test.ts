@@ -117,6 +117,7 @@ describe("semantic tool surface", function () {
       "literature_search",
       "note_write",
       "paper_read",
+      "revert_changes",
       "run_command",
       "undo_last_action",
       "zotero_script",

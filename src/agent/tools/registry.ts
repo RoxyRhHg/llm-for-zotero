@@ -11,6 +11,7 @@ import type {
 } from "../types";
 import { isMalformedToolArgumentsDiagnostic } from "../toolArgumentDiagnostics";
 import { deriveToolEffect } from "./effect";
+import { getAgentLibraryWriteMode } from "../libraryWriteMode";
 
 function createSyntheticErrorResult(
   call: AgentToolCall,
@@ -67,6 +68,28 @@ function normalizeExecutionOutput(value: AgentToolExecutionOutput<any>): {
   return {
     content: value,
   };
+}
+
+/**
+ * Tools that change the library unattended and therefore need `yolo`.
+ *
+ * Deliberately a short, explicit list rather than "every write tool": the
+ * ordinary write tools already stop at a confirmation card, so gating them
+ * here would only duplicate a control the user already has. What needs a mode
+ * is the work that runs *without* a card once approved.
+ */
+const YOLO_ONLY_TOOLS = new Set(["library_batch"]);
+
+function refuseForLibraryWriteMode(
+  tool: AgentToolDefinition<any, any>,
+  options: PreparedToolExecutionOptions,
+): string | null {
+  if (!YOLO_ONLY_TOOLS.has(tool.spec.name)) return null;
+  // Only the model path is gated. The actions subsystem and the public API
+  // are driven by an explicit user gesture, which is its own consent.
+  if (options.callerKind && options.callerKind !== "model") return null;
+  if (getAgentLibraryWriteMode() === "yolo") return null;
+  return `${tool.spec.name} runs unattended and requires the agent library write mode to be "yolo". Change it in the plugin preferences, or use the slash-command surface, which reviews each page before applying it.`;
 }
 
 export class AgentToolRegistry {
@@ -131,6 +154,18 @@ export class AgentToolRegistry {
         call,
         `${call.name} is not available for this request`,
       );
+    }
+    // Enforce the library write mode here, not in the tool listing.
+    //
+    // `exposure` is checked when listing tools and deliberately NOT here --
+    // seventeen internal tools are called by name through this method by the
+    // actions subsystem, the slash commands and the public runAction API, and
+    // a test asserts they stay reachable. So this is a separate gate keyed on
+    // the caller being the model, and it lives at the one point every backend
+    // (in-plugin runtime, MCP, the external bridge) passes through.
+    const modeRefusal = refuseForLibraryWriteMode(tool, options);
+    if (modeRefusal) {
+      return createSyntheticErrorResult(call, modeRefusal);
     }
     if (isMalformedToolArgumentsDiagnostic(call.arguments)) {
       return createSyntheticErrorResult(

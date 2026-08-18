@@ -11,7 +11,14 @@ import { initAgentToolResultHandleStore } from "./store/toolResultHandles";
 import { initAgentEvidenceStore } from "./context/cacheManagement";
 import { initAgentCoverageStore } from "./context/coverageLedger";
 import { createAgentModelAdapter } from "./model/factory";
-import { createBuiltInActionRegistry, type ActionRegistry } from "./actions";
+import {
+  createBuiltInActionRegistry,
+  type ActionRegistry,
+  type ActionServices,
+} from "./actions";
+import { createLibraryBatchTool } from "./tools/write/libraryBatch";
+import { initAgentBatchJobStore } from "./store/batchJobStore";
+import { initAgentChangeJournal } from "./store/changeJournal";
 import { registerMcpServer, unregisterMcpServer } from "./mcp/server";
 import type {
   AgentConfirmationResolution,
@@ -89,6 +96,23 @@ async function createAgentSubsystemRuntime(
     adapterFactory: (request) => createAgentModelAdapter(request),
   });
   const actionRegistry = createBuiltInActionRegistry();
+
+  // Registered here rather than inside createBuiltInToolRegistry: the batch
+  // tool needs both registries, and the action registry is built after the
+  // tool one. Wiring it this way keeps the two from depending on each other.
+  toolRegistry.register(
+    createLibraryBatchTool({
+      actionRegistry,
+      toolRegistry,
+      zoteroGateway,
+      // Actions reach everything through callTool and ctx.zoteroGateway;
+      // `services` is vestigial and the public runAction API passes the same
+      // empty object.
+      services: {} as ActionServices,
+    }),
+  );
+  await initAgentBatchJobStore();
+  await initAgentChangeJournal();
 
   assertAgentInitCurrent(generation);
   registerMcpServer({

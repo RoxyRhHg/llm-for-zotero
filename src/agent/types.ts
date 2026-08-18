@@ -784,6 +784,18 @@ export type PreparedToolExecutionOptions = {
   inheritedApproval?: AgentInheritedApproval;
   forceConfirmation?: boolean;
   /**
+   * Who is driving this call.
+   *
+   * `prepareExecution` has three very different callers — the model's tool
+   * loop, the actions subsystem, and the public `runAction` API — and they
+   * carry different consent. A slash command or a plugin API call IS an
+   * explicit user gesture; a model tool call is not. Gates that exist to
+   * bound autonomy apply to `"model"` only. Defaults to `"model"` when
+   * absent, so a caller that forgets to declare itself gets the stricter
+   * treatment rather than the looser one.
+   */
+  callerKind?: "model" | "action" | "api";
+  /**
    * Lifecycle fence checked immediately before any tool implementation runs.
    * A tool may be prepared while a conversation is still live and execute only
    * after Clear or deletion has frozen that conversation.

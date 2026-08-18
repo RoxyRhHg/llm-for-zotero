@@ -159,6 +159,20 @@ export type LibraryMutationUndo = {
   toolName: string;
   description: string;
   revert: () => Promise<void>;
+  /**
+   * The inverse expressed as operations, so it can be persisted.
+   *
+   * `revert` is a closure and dies with the process — which is why the old
+   * undo stack was ten of them in RAM, wiped by a restart. An inverse
+   * expressed as data survives, and replaying it takes the same path (and the
+   * same refusals) as a forward write.
+   *
+   * Absent means the inverse is not expressible as operations; the journal
+   * records those as irreversible with `irreversibleReason` rather than
+   * pretending they can be undone.
+   */
+  inverseOperations?: LibraryMutationOperation[];
+  irreversibleReason?: string;
 };
 
 export type LibraryMutationExecutionResult = {
@@ -193,6 +207,11 @@ function buildTagUndo(
   if (!itemIdsByTag.length) return null;
   return {
     toolName: "library_mutation",
+    inverseOperations: itemIdsByTag.map(({ itemId, addedTags }) => ({
+      type: "remove_tags" as const,
+      itemIds: [itemId],
+      tags: addedTags,
+    })),
     description: `Undo tags applied to ${itemIdsByTag.length} paper${
       itemIdsByTag.length === 1 ? "" : "s"
     }`,
@@ -211,6 +230,11 @@ function buildRemoveTagsUndo(
   if (!restored.length) return null;
   return {
     toolName: "library_mutation",
+    inverseOperations: restored.map((entry) => ({
+      type: "apply_tags" as const,
+      itemIds: [entry.itemId],
+      tags: entry.tags,
+    })),
     description: `Restore removed tags on ${restored.length} paper${
       restored.length === 1 ? "" : "s"
     }`,
@@ -230,8 +254,21 @@ function buildCollectionAddUndo(
   movedItems: Array<{ itemId: number; collectionId: number }>,
 ): LibraryMutationUndo | null {
   if (!movedItems.length) return null;
+  const byCollection = new Map<number, number[]>();
+  for (const { itemId, collectionId } of movedItems) {
+    const list = byCollection.get(collectionId) || [];
+    list.push(itemId);
+    byCollection.set(collectionId, list);
+  }
   return {
     toolName: "library_mutation",
+    inverseOperations: Array.from(byCollection.entries()).map(
+      ([collectionId, itemIds]) => ({
+        type: "remove_from_collection" as const,
+        itemIds,
+        collectionId,
+      }),
+    ),
     description: `Undo collection moves for ${movedItems.length} paper${
       movedItems.length === 1 ? "" : "s"
     }`,
@@ -253,6 +290,11 @@ function buildCollectionRemoveUndo(
   if (!removedItems.length) return null;
   return {
     toolName: "library_mutation",
+    inverseOperations: removedItems.map(({ itemId, collectionId }) => ({
+      type: "move_to_collection" as const,
+      itemIds: [itemId],
+      targetCollectionId: collectionId,
+    })),
     description: `Restore ${removedItems.length} paper${
       removedItems.length === 1 ? "" : "s"
     } to their collection`,
@@ -273,6 +315,9 @@ function buildCreateCollectionUndo(
 ): LibraryMutationUndo {
   return {
     toolName: "library_mutation",
+    inverseOperations: [
+      { type: "delete_collection", collectionId: collection.collectionId },
+    ],
     description: `Undo creation of collection "${collection.name}"`,
     revert: async () => {
       await zoteroGateway.deleteCollection({
@@ -339,6 +384,7 @@ function buildSaveNoteUndo(
 ): LibraryMutationUndo {
   return {
     toolName: "library_mutation",
+    inverseOperations: [{ type: "trash_items", itemIds: [noteId] }],
     description: "Trash the note that was just created",
     revert: async () => {
       await zoteroGateway.trashItems({ itemIds: [noteId] });

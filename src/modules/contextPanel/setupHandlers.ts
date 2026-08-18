@@ -6477,7 +6477,6 @@ export function setupHandlers(
     getActiveCommandAction,
     consumeForcedSkillIds,
     handleInlineCommand,
-    handleNaturalLanguageActionIntent,
     consumeActiveActionToken,
   } = actionCommandController;
   closeSlashMenu = closeActionSlashMenu;
@@ -7090,9 +7089,16 @@ export function setupHandlers(
       void handleInlineCommand(chipAction.name, params);
       return;
     }
-    if (await handleNaturalLanguageActionIntent(inputBox?.value ?? "")) {
-      return;
-    }
+    // The natural-language action interceptor used to run here, matching
+    // phrases like "reorganize all items in my library" and diverting them to
+    // a slash-command action before the agent turn began. That is exactly the
+    // request `library_batch` exists to handle, and the agent can now chain a
+    // batch job with other steps in one turn — which the interceptor could
+    // never do, because it replaced the turn entirely.
+    //
+    // Explicit slash commands and the action picker are untouched: those are
+    // deterministic user gestures, and they remain the surface that reviews
+    // each page before applying it.
     const inlineCommand = parseInlineActionCommand(inputBox?.value ?? "");
     if (inlineCommand) {
       closeSlashMenu();

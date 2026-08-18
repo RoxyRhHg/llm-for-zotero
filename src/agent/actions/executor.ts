@@ -107,6 +107,10 @@ export async function callTool(
   const prepared: PreparedToolExecution = await ctx.registry.prepareExecution(
     call,
     toolContext,
+    // An action is started by an explicit user gesture (a slash command or
+    // the action picker), which is its own consent — autonomy gates that
+    // bound the model's tool loop do not apply here.
+    { callerKind: "action" },
   );
 
   if (prepared.kind === "result") {

@@ -4,6 +4,7 @@
  */
 import type { AgentPendingField, AgentToolContext } from "../../types";
 import type {
+  LibraryMutationUndo,
   ApplyTagsOperation,
   MoveToCollectionOperation,
   UpdateMetadataOperation,
@@ -20,6 +21,7 @@ import type {
 } from "../../services/zoteroGateway";
 import { EDITABLE_ARTICLE_METADATA_FIELDS } from "../../services/zoteroGateway";
 import { pushUndoEntry } from "../../store/undoStore";
+import { recordChange } from "../../store/changeJournal";
 import {
   normalizePositiveInt,
   normalizeStringArray,
@@ -578,7 +580,64 @@ export async function executeAndRecordUndo(
       revert: executed.undo.revert,
     });
   }
+  // The in-memory stack above is the fast path for "undo that" in the current
+  // conversation. The journal is the durable one: it survives a restart, has
+  // no ten-entry ceiling, and is what the history panel reads.
+  await journalMutation({
+    context,
+    operation,
+    facadeToolName,
+    undo: executed.undo ?? null,
+  });
   return { result: executed.result };
+}
+
+let journalSequence = 0;
+
+async function journalMutation(params: {
+  context: AgentToolContext;
+  operation: LibraryMutationOperation;
+  facadeToolName: string;
+  undo: LibraryMutationUndo | null;
+}): Promise<void> {
+  const { context, operation, undo } = params;
+  // Grouped per conversation: the request carries no run id, and a
+  // conversation-scoped group is what the history panel lists anyway.
+  const runId = `conv-${context.request.conversationKey}`;
+  journalSequence += 1;
+  try {
+    await recordChange({
+      entryId: `${runId}-${Date.now()}-${journalSequence}`,
+      runId,
+      conversationKey: context.request.conversationKey,
+      operation: operation.type,
+      description: undo?.description || `Applied ${operation.type}`,
+      inverse: undo?.inverseOperations?.length
+        ? undo.inverseOperations
+        : undefined,
+      irreversibleReason: undo?.inverseOperations?.length
+        ? undefined
+        : undo?.irreversibleReason ||
+          (undo
+            ? "This change can only be undone in the current session"
+            : `${operation.type} did not record a way to undo it`),
+      itemCount: countAffected(operation),
+      now: Date.now(),
+    });
+  } catch {
+    // A journal write must never fail the mutation that already landed.
+  }
+}
+
+function countAffected(operation: LibraryMutationOperation): number {
+  const record = operation as unknown as Record<string, unknown>;
+  for (const key of ["itemIds", "identifiers", "filePaths", "otherItemIds"]) {
+    const value = record[key];
+    if (Array.isArray(value)) return value.length;
+  }
+  const assignments = record.assignments;
+  if (Array.isArray(assignments)) return assignments.length;
+  return 1;
 }
 
 /**

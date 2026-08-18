@@ -179,7 +179,6 @@ export function createActionCommandController(
   getActiveCommandAction: () => { name: string } | null;
   consumeForcedSkillIds: () => string[] | undefined;
   handleInlineCommand: (actionName: string, params: string) => Promise<void>;
-  handleNaturalLanguageActionIntent: (text: string) => Promise<boolean>;
   consumeActiveActionToken: () => boolean;
 } {
   const {
@@ -1346,68 +1345,6 @@ export function createActionCommandController(
     deps.persistDraftInputForCurrentConversation();
   };
 
-  const handleNaturalLanguageActionIntent = async (
-    text: string,
-  ): Promise<boolean> => {
-    if (deps.isClaudeConversationSystem()) return false;
-    const requestContext = buildActionRequestContext();
-    if (requestContext.mode !== "library") return false;
-    try {
-      await initAgentSubsystem();
-      const actions = getAgentApi()
-        .listActions(requestContext.mode)
-        .map((action) => ({
-          ...action,
-          paperScopeProfile: getAgentApi().getPaperScopedActionProfile(
-            action.name,
-          ),
-        }));
-      const collectionCandidates = getPaperScopedCollectionCandidates();
-      const tagCandidates = await getPaperScopedTagCandidates();
-      const result = resolveNaturalLanguageActionIntent({
-        text,
-        mode: requestContext.mode,
-        actions,
-        requestContext,
-        collectionCandidates,
-        tagCandidates,
-      });
-      const resolvedResult =
-        result.kind === "none"
-          ? await resolveLlmNaturalLanguageActionIntent({
-              text,
-              actions,
-              requestContext,
-              collectionCandidates,
-              tagCandidates,
-            })
-          : result;
-      if (resolvedResult.kind === "none") return false;
-      if (resolvedResult.kind === "error") {
-        setStatus(resolvedResult.error, "error");
-        return true;
-      }
-      const action = actions.find(
-        (candidate) => candidate.name === resolvedResult.actionName,
-      );
-      if (!action) {
-        setStatus(`Unknown action: ${resolvedResult.actionName}`, "error");
-        return true;
-      }
-      closeSlashMenu();
-      clearSubmittedActionDraft();
-      void executeAgentAction(
-        action,
-        resolvedResult.input,
-        resolvedResult.userQuery,
-      );
-      return true;
-    } catch (error) {
-      deps.logError("LLM: failed to resolve natural action intent", error);
-      setStatus("Agent system unavailable", "error");
-      return true;
-    }
-  };
 
   const handleSkillSelection = (skill: AgentSkill): void => {
     clearForcedSkill();
@@ -1649,7 +1586,6 @@ export function createActionCommandController(
       return ids;
     },
     handleInlineCommand,
-    handleNaturalLanguageActionIntent,
     consumeActiveActionToken,
   };
 }
