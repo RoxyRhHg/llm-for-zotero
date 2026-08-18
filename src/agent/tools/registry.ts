@@ -10,6 +10,7 @@ import type {
   ToolSpec,
 } from "../types";
 import { isMalformedToolArgumentsDiagnostic } from "../toolArgumentDiagnostics";
+import { deriveToolEffect } from "./effect";
 
 function createSyntheticErrorResult(
   call: AgentToolCall,
@@ -181,7 +182,15 @@ export class AgentToolRegistry {
             result: {
               callId: call.id,
               name: call.name,
+              // `ok` reports that the tool ran, not that it changed anything.
+              // See AgentToolResult: flipping this on a zero-effect write
+              // would disable the result-review loop and trip the
+              // consecutive-error breaker.
               ok: true,
+              effect:
+                tool.spec.mutability === "write"
+                  ? deriveToolEffect(executionOutput.content)
+                  : undefined,
               content: executionOutput.content,
               artifacts: executionOutput.artifacts,
             },

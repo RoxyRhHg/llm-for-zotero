@@ -24,6 +24,7 @@ import type {
   AgentToolArtifact,
   AgentToolContext,
   AgentToolResult,
+  AgentToolEffect,
 } from "./types";
 import type { AgentModelAdapter } from "./model/adapter";
 import type {
@@ -804,6 +805,7 @@ export class AgentRuntime {
       const toolExecutionRecords: Array<{
         name: string;
         ok: boolean;
+        effect?: AgentToolEffect;
         input?: unknown;
         content?: unknown;
       }> = [];
@@ -1039,6 +1041,7 @@ export class AgentRuntime {
         intent.isBulkOperation,
       );
       let noteWriteCorrectionUsed = false;
+      let zeroEffectWriteCorrectionUsed = false;
       let fullReadCorrectionUsed = false;
       let shallowLibraryCorrectionUsed = false;
       const hasSuccessfulFileWrite = () =>
@@ -1512,6 +1515,7 @@ export class AgentRuntime {
         toolExecutionRecords.push({
           name: toolResult.name,
           ok: toolResult.ok,
+          effect: toolResult.effect,
           input: executedCall.input,
           content: toolResult.content,
         });
@@ -1826,6 +1830,43 @@ export class AgentRuntime {
               `I could not complete the ${targetLabel} write because the model did not call \`file_io({ action:'write', filePath, content })\` after being corrected.`,
               "failed",
             );
+          }
+          // Zotero-write guard. The turn already refuses to finalize on an
+          // unfulfilled file_io write or full-text read; a library mutation
+          // that reported `effect:"none"` had no such check, which is how a
+          // move of zero items could be summarized as done (issue #374).
+          //
+          // This corrects once and then accepts, rather than failing the run:
+          // a zero-effect write is frequently legitimate ("they were already
+          // in that collection"), and the goal is an accurate report, not a
+          // dead turn.
+          const zeroEffectWrites = toolExecutionRecords.filter(
+            (record) => record.ok && record.effect === "none",
+          );
+          if (zeroEffectWrites.length && !zeroEffectWriteCorrectionUsed) {
+            zeroEffectWriteCorrectionUsed = true;
+            await rollbackCommittedStreamedText(stepStreamedText);
+            const assistantCorrectionMessage: AgentModelMessage =
+              step.assistantMessage ?? {
+                role: "assistant",
+                content: stepStreamedText,
+              };
+            const names = Array.from(
+              new Set(zeroEffectWrites.map((record) => record.name)),
+            ).join(", ");
+            const userCorrectionMessage: AgentModelMessage = {
+              role: "user",
+              content:
+                `Correction for this turn: ${names} ran but changed nothing in the library. ` +
+                "Read the per-row `reason` values in that tool result. Either fix the cause and retry (for example resolve the correct collection ID, or target items of a type the operation accepts), or tell the user plainly that nothing changed and why. " +
+                "Do not report the request as completed.",
+            };
+            messages.push(assistantCorrectionMessage, userCorrectionMessage);
+            newTranscriptMessages.push(
+              assistantCorrectionMessage,
+              userCorrectionMessage,
+            );
+            continue;
           }
           // Shallow-answer guard: a collection/tag-scoped evidence question
           // must not finalize without library evidence. One correction turn,

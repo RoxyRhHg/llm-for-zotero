@@ -1158,12 +1158,20 @@ function appendAssistantAnswerToNoteHtml(
 
 export type AssistantResponseNoteDestination =
   | { kind: "item"; item: Zotero.Item }
-  | { kind: "standalone"; libraryID: number };
+  /**
+   * `collections` files the new note into Zotero collections. Only standalone
+   * notes can be collection members — a note with a parent is a child item,
+   * and Zotero collections hold top-level items only — which is why this
+   * lives on the standalone variant alone.
+   */
+  | { kind: "standalone"; libraryID: number; collections?: number[] };
 
 export type AssistantResponseNoteResult = {
   status: "created";
   destination: AssistantResponseNoteDestination["kind"];
   noteId?: number;
+  /** Collection ids the note was actually filed into. */
+  collections?: number[];
   warnings?: string[];
 };
 
@@ -1249,6 +1257,23 @@ export async function createAssistantResponseNote(params: {
   const note = new Zotero.Item("note");
   note.libraryID = libraryID;
   if (parentId) note.parentID = parentId;
+  // Collection membership is persisted by the same save as the note body, so
+  // there is no window where the note exists outside its target collection.
+  const filedCollections: number[] = [];
+  if (params.destination.kind === "standalone") {
+    for (const collectionId of params.destination.collections || []) {
+      if (!Number.isFinite(collectionId) || collectionId <= 0) continue;
+      try {
+        note.addToCollection(Math.floor(collectionId));
+        filedCollections.push(Math.floor(collectionId));
+      } catch (error) {
+        ztoolkit.log(
+          `LLM: Could not file response note into collection ${collectionId}`,
+          error,
+        );
+      }
+    }
+  }
   const containsVisualFigures =
     containsVisualFigureFences(params.queryText || "") ||
     containsVisualFigureFences(params.contentText || "");
@@ -1290,6 +1315,7 @@ export async function createAssistantResponseNote(params: {
     status: "created",
     destination: params.destination.kind,
     noteId: noteId && noteId > 0 ? noteId : undefined,
+    collections: filedCollections.length ? filedCollections : undefined,
     warnings: persisted.warnings.length ? persisted.warnings : undefined,
   };
 }
@@ -1401,9 +1427,10 @@ export async function createStandaloneNoteFromAssistantText(
   generatedImages?: GeneratedChatImage[],
   queryText?: string,
   figureRender?: NoteFigureRenderOptions,
-): Promise<"created"> {
-  await createAssistantResponseNote({
-    destination: { kind: "standalone", libraryID },
+  collections?: number[],
+): Promise<{ status: "created"; noteId?: number; collections?: number[] }> {
+  const result = await createAssistantResponseNote({
+    destination: { kind: "standalone", libraryID, collections },
     contentText,
     queryText,
     modelName,
@@ -1412,7 +1439,13 @@ export async function createStandaloneNoteFromAssistantText(
     generatedImages,
     figureRender,
   });
-  return "created";
+  // The note id was previously discarded here, which is why no caller could
+  // follow up on a note it had just created (issue #374).
+  return {
+    status: "created",
+    noteId: result.noteId,
+    collections: result.collections,
+  };
 }
 
 async function buildGeneratedImageHtmlByMessageIndex(

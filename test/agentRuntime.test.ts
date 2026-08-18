@@ -3727,4 +3727,102 @@ describe("shallow guard round-limit safety", function () {
       restoreDb();
     }
   });
+
+  /**
+   * A library write that changed nothing used to be summarized as done: the
+   * registry stamped ok:true, the trace showed a constant "Library updated",
+   * and nothing at end of turn compared the claim to the ledger. The runtime
+   * already refuses to finalize on an unfulfilled file write or full-text
+   * read; this is the same shape for Zotero mutations.
+   *
+   * It corrects once and then accepts. A zero-effect write is often
+   * legitimate ("they were already in that collection") — the goal is an
+   * accurate report, not a failed run.
+   */
+  it("corrects the model once when a library write changed nothing", async function () {
+    const restoreDb = installMockDb();
+    try {
+      const registry = new AgentToolRegistry();
+      registry.register({
+        spec: {
+          name: "library_update",
+          description: "update",
+          inputSchema: { type: "object" },
+          mutability: "write",
+          requiresConfirmation: false,
+        },
+        validate: (args) => ({ ok: true, value: args as never }),
+        async execute() {
+          // The exact ledger shape the gateway returns when every row was
+          // rejected: the operation ran, and nothing moved.
+          return {
+            movedCount: 0,
+            selectedCount: 2,
+            items: [
+              { itemId: 1, status: "missing", reason: "wrong type" },
+              { itemId: 2, status: "missing", reason: "wrong type" },
+            ],
+          };
+        },
+      } as never);
+
+      const runtime = new AgentRuntime({
+        registry,
+        adapterFactory: () =>
+          new MockAdapter(
+            [
+              {
+                kind: "tool_calls",
+                calls: [
+                  { id: "c1", name: "library_update", arguments: { kind: "collections" } },
+                ],
+                assistantMessage: { role: "assistant", content: "" },
+              },
+              {
+                kind: "final",
+                text: "Filed both papers into Neuroscience.",
+                assistantMessage: {
+                  role: "assistant",
+                  content: "Filed both papers into Neuroscience.",
+                },
+              },
+              {
+                kind: "final",
+                text: "Nothing changed — both items are the wrong type to file.",
+                assistantMessage: {
+                  role: "assistant",
+                  content:
+                    "Nothing changed — both items are the wrong type to file.",
+                },
+              },
+            ],
+            { streaming: false, toolCalls: true, multimodal: false },
+          ),
+      });
+
+      const outcome = await runtime.runTurn({
+        request: {
+          conversationKey: 991,
+          mode: "agent",
+          userText: "file these two papers into Neuroscience",
+          model: "gpt-4o-mini",
+          apiBase: "https://api.openai.com/v1/chat/completions",
+          apiKey: "test",
+          libraryID: 1,
+        },
+        onEvent: () => undefined,
+      });
+
+      assert.equal(outcome.kind, "completed");
+      if (outcome.kind !== "completed") return;
+      assert.notInclude(
+        outcome.text,
+        "Filed both papers",
+        "the first, false claim must not be what the user is left with",
+      );
+      assert.include(outcome.text, "Nothing changed");
+    } finally {
+      restoreDb();
+    }
+  });
 });

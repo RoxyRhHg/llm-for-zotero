@@ -81,6 +81,12 @@ export type SaveNoteOperation = {
   modelName?: string;
   appendToTrackedNote?: boolean;
   generatedImages?: GeneratedChatImage[];
+  /**
+   * Collections to file a standalone note into. Only standalone notes can be
+   * collection members — a child note belongs to its parent item, and Zotero
+   * collections hold top-level items only.
+   */
+  collections?: number[];
 };
 
 export type TrashItemsOperation = {
@@ -322,6 +328,24 @@ function buildDeleteCollectionUndo(
   };
 }
 
+/**
+ * Trashes a note the agent just created. `save_note` previously recorded no
+ * inverse at all, so "undo that" after writing a note popped an unrelated
+ * earlier entry instead.
+ */
+function buildSaveNoteUndo(
+  zoteroGateway: ZoteroGateway,
+  noteId: number,
+): LibraryMutationUndo {
+  return {
+    toolName: "library_mutation",
+    description: "Trash the note that was just created",
+    revert: async () => {
+      await zoteroGateway.trashItems({ itemIds: [noteId] });
+    },
+  };
+}
+
 function directTagAssignments(
   operation: ApplyTagsOperation,
 ): BatchTagAssignment[] {
@@ -506,15 +530,26 @@ export class LibraryMutationService {
       case "remove_from_collection": {
         const removedItems: Array<{ itemId: number; collectionId: number }> =
           [];
+        const rows: Array<{
+          itemId: number;
+          status: string;
+          reason?: string;
+        }> = [];
         for (const itemId of operation.itemIds) {
-          await this.zoteroGateway.removeItemFromCollection({
+          const outcome = await this.zoteroGateway.removeItemFromCollection({
             itemId,
             collectionId: operation.collectionId,
           });
-          removedItems.push({
-            itemId,
-            collectionId: operation.collectionId,
-          });
+          if (outcome.removed) {
+            removedItems.push({ itemId, collectionId: operation.collectionId });
+            rows.push({ itemId, status: "removed" });
+          } else {
+            rows.push({
+              itemId,
+              status: "skipped",
+              reason: outcome.reason,
+            });
+          }
         }
         return {
           result: {
@@ -523,10 +558,14 @@ export class LibraryMutationService {
             result: {
               itemIds: operation.itemIds,
               collectionId: operation.collectionId,
-              removedCount: operation.itemIds.length,
+              // Counted from what actually happened, not from the request.
+              removedCount: removedItems.length,
+              items: rows,
             },
           },
-          undo: buildCollectionRemoveUndo(this.zoteroGateway, removedItems),
+          undo: removedItems.length
+            ? buildCollectionRemoveUndo(this.zoteroGateway, removedItems)
+            : undefined,
         };
       }
       case "create_collection": {
@@ -594,7 +633,7 @@ export class LibraryMutationService {
             : null) ||
           this.zoteroGateway.getItem(context.request.activeItemId) ||
           context.item;
-        const status = await this.zoteroGateway.saveAnswerToNote({
+        const saved = await this.zoteroGateway.saveAnswerToNote({
           item,
           libraryID: context.request.libraryID,
           content: operation.content,
@@ -602,13 +641,25 @@ export class LibraryMutationService {
           target: operation.target,
           appendToTrackedNote: operation.appendToTrackedNote,
           generatedImages: operation.generatedImages,
+          collections: operation.collections,
         });
+        // The note id and the collections it landed in are returned so the
+        // caller can verify and follow up; previously only a status string
+        // came back and any next step was impossible to express.
         return {
           result: {
             operation: operation.type,
             operationId: operation.id,
-            result: { status },
+            result: {
+              status: saved.status,
+              noteId: saved.noteId,
+              collections: saved.collections,
+            },
           },
+          undo:
+            saved.noteId && saved.noteId > 0
+              ? buildSaveNoteUndo(this.zoteroGateway, saved.noteId)
+              : undefined,
         };
       }
       case "import_identifiers": {

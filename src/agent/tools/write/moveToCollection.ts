@@ -18,6 +18,7 @@ import {
   normalizePositiveInt,
   normalizePositiveIntArray,
 } from "../shared";
+import { summarizeMutationOutcome } from "../effect";
 import {
   buildMoveAssignmentField,
   normalizeMoveAssignmentsFromResolution,
@@ -102,7 +103,11 @@ export function createMoveToCollectionTool(
         onPending: "Waiting for confirmation on collection changes",
         onApproved: "Applying collection changes",
         onDenied: "Collection changes cancelled",
-        onSuccess: "Collection updated",
+        onSuccess: ({ content }) =>
+          summarizeMutationOutcome(content, {
+            applied: "Filed",
+            noun: "papers",
+          }) || "Collection updated",
       },
     },
 

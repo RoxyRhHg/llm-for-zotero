@@ -39,6 +39,7 @@ import {
   isPaperPortalItem,
   resolvePaperPortalBaseItem,
 } from "../../modules/contextPanel/portalScope";
+import { refusalFor } from "../capabilities/libraryObjects";
 
 export const EDITABLE_ARTICLE_METADATA_FIELDS = [
   "title",
@@ -140,6 +141,19 @@ export type CollectionBrowseNode = {
   childCollections: CollectionBrowseNode[];
 };
 
+/**
+ * Result of `saveAnswerToNote`.
+ *
+ * The bare `"created" | "appended" | "standalone_created"` string this
+ * replaced is why no caller could act on a note it had just written — the id
+ * existed two layers down and was thrown away on the way up (issue #374).
+ */
+export type SaveAnswerToNoteResult = {
+  status: "created" | "appended" | "standalone_created";
+  noteId?: number;
+  collections?: number[];
+};
+
 export type CollectionSummary = {
   collectionId: number;
   name: string;
@@ -207,6 +221,39 @@ function normalizeMetadataValue(value: unknown): string {
 
 function normalizeText(value: unknown): string {
   return `${value ?? ""}`.replace(/\s+/g, " ").trim();
+}
+
+/**
+ * Resolves an item for a collection-membership write and reports why it may
+ * not proceed, using the declared capability matrix rather than the old
+ * regular-item filter.
+ *
+ * The behaviour change that matters: standalone notes and standalone
+ * attachments are legal collection members in Zotero and are now filed
+ * instead of being reported as "Item not found", and a child attachment is
+ * refused explicitly instead of silently filing its parent.
+ *
+ * Portal pseudo-items are still unwrapped first — they stand in for a real
+ * paper and must be resolved before the matrix sees them.
+ */
+function resolveCollectionMemberItem(
+  item: Zotero.Item | null | undefined,
+  itemId: number,
+): { item: Zotero.Item } | { refusal: string } {
+  if (!item) {
+    return { refusal: `No item with ID ${itemId} exists in this library` };
+  }
+  if (isGlobalPortalItem(item)) {
+    return { refusal: "The library portal is not an item that can be filed" };
+  }
+  const resolved = isPaperPortalItem(item)
+    ? resolvePaperPortalBaseItem(item)
+    : item;
+  if (!resolved) {
+    return { refusal: `No item with ID ${itemId} exists in this library` };
+  }
+  const refusal = refusalFor("addToCollection", resolved, itemId);
+  return refusal ? { refusal } : { item: resolved };
 }
 
 function resolveRegularItem(
@@ -2182,17 +2229,31 @@ export class ZoteroGateway {
         });
         continue;
       }
-      const item = this.resolveBibliographicItem(
-        this.getItem(assignment.itemId),
+      const rawItem = this.getItem(assignment.itemId);
+      const resolution = resolveCollectionMemberItem(
+        rawItem,
+        assignment.itemId,
       );
+      const item = "item" in resolution ? resolution.item : null;
       if (!item) {
+        // "Item not found" was reported for items that plainly exist — a
+        // note, a standalone attachment, a child attachment — because the
+        // filter that rejected them could not say why. An agent reading that
+        // reason has no way to correct itself, and a user reading it in the
+        // trace is simply told something false.
         results.push({
           itemId: assignment.itemId,
-          title: `Item ${assignment.itemId}`,
+          title: rawItem
+            ? normalizeText(rawItem.getDisplayTitle?.()) ||
+              `Item ${assignment.itemId}`
+            : `Item ${assignment.itemId}`,
           status: "missing",
           targetCollectionId: collection.collectionId,
           targetCollectionName: collection.path || collection.name,
-          reason: "Item not found",
+          reason:
+            "refusal" in resolution
+              ? resolution.refusal
+              : `Item ${assignment.itemId} could not be resolved`,
         });
         continue;
       }
@@ -2280,26 +2341,35 @@ export class ZoteroGateway {
     target?: "item" | "standalone";
     appendToTrackedNote?: boolean;
     generatedImages?: GeneratedChatImage[];
-  }): Promise<"created" | "appended" | "standalone_created"> {
+    /** Collections to file a standalone note into. Ignored for child notes. */
+    collections?: number[];
+  }): Promise<SaveAnswerToNoteResult> {
     if (params.target === "standalone") {
       const libraryID =
         Number.isFinite(params.libraryID) && (params.libraryID as number) > 0
           ? Math.floor(params.libraryID as number)
           : params.item?.libraryID || 0;
-      await createStandaloneNoteFromAssistantText(
+      const created = await createStandaloneNoteFromAssistantText(
         libraryID,
         params.content,
         params.modelName,
         undefined,
         undefined,
         params.generatedImages,
+        undefined,
+        undefined,
+        params.collections,
       );
-      return "standalone_created";
+      return {
+        status: "standalone_created",
+        noteId: created.noteId,
+        collections: created.collections,
+      };
     }
     if (!params.item) {
       throw new Error("No Zotero item is active for item-note creation");
     }
-    return createNoteFromAssistantText(
+    const status = await createNoteFromAssistantText(
       params.item,
       params.content,
       params.modelName,
@@ -2310,6 +2380,7 @@ export class ZoteroGateway {
         generatedImages: params.generatedImages,
       },
     );
+    return { status };
   }
 
   getPaperNotes(params: {
@@ -2522,17 +2593,36 @@ export class ZoteroGateway {
     }
   }
 
+  /**
+   * Returns whether the item was actually removed. It used to return `void`
+   * and bail silently on an unresolvable item, while the caller counted every
+   * requested id as removed — so a request to unfile ten notes reported
+   * "removedCount: 10" having done nothing at all.
+   */
   async removeItemFromCollection(params: {
     itemId: number;
     collectionId: number;
-  }): Promise<void> {
-    const item = this.resolveBibliographicItem(this.getItem(params.itemId));
-    if (!item) return;
+  }): Promise<{ removed: boolean; reason?: string }> {
+    const resolution = resolveCollectionMemberItem(
+      this.getItem(params.itemId),
+      params.itemId,
+    );
+    if (!("item" in resolution)) {
+      return { removed: false, reason: resolution.refusal };
+    }
+    const item = resolution.item;
+    if (!item.inCollection?.(params.collectionId)) {
+      return {
+        removed: false,
+        reason: "The item was not in that collection",
+      };
+    }
     item.removeFromCollection(params.collectionId);
     await item.saveTx();
     const collection = this.getCollection(params.collectionId);
     const libraryID = Number(collection?.libraryID) || 0;
     if (libraryID > 0) invalidatePaperSearchCache(libraryID);
+    return { removed: true };
   }
 
   async findRelatedPapersInLibrary(params: {

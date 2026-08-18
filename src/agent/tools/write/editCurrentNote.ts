@@ -15,7 +15,13 @@ import {
   persistVerifiedNoteHtml,
 } from "../../../modules/contextPanel/notePersistence";
 import { escapeNoteHtml } from "../../../modules/contextPanel/textUtils";
-import { ok, fail, validateObject, normalizePositiveInt } from "../shared";
+import {
+  ok,
+  fail,
+  validateObject,
+  normalizePositiveInt,
+  normalizePositiveIntArray,
+} from "../shared";
 import { executeAndRecordUndo } from "./mutateLibraryShared";
 
 type NotePatch = { find: string; replace: string };
@@ -69,6 +75,7 @@ type EditCurrentNoteInput = {
   target?: "item" | "standalone";
   targetItemId?: number;
   targetNoteId?: number;
+  collections?: number[];
 };
 
 /**
@@ -424,6 +431,12 @@ export function createEditCurrentNoteTool(
             description:
               "For mode 'append': append to this specific existing Zotero note ID.",
           },
+          collections: {
+            type: "array",
+            items: { type: "number" },
+            description:
+              "For mode 'create' with target 'standalone': Zotero collection IDs (folders) to file the new note into. Resolve names to IDs with library_search({ entity:'collections', mode:'list' }). Ignored for child notes, which belong to their parent item rather than to a collection.",
+          },
         },
       },
       mutability: "write",
@@ -558,6 +571,12 @@ export function createEditCurrentNoteTool(
           mode === "append"
             ? normalizePositiveInt(args.targetNoteId)
             : undefined,
+        // Only meaningful when creating a standalone note; a child note
+        // belongs to its parent item, not to a collection.
+        collections:
+          mode === "create"
+            ? normalizePositiveIntArray(args.collections)
+            : undefined,
       } as EditCurrentNoteInput);
     },
     createPendingAction: (input, context) => {
@@ -607,14 +626,31 @@ export function createEditCurrentNoteTool(
       input.content = normalizedContent;
 
       if (input.mode === "create") {
+        // Name the destination. The card previously promised "attaching it to
+        // the paper" even when execute() would later rewrite the target to
+        // standalone, so the user approved a statement that was not true.
+        const collectionLabels = (input.collections || [])
+          .map((collectionId) => {
+            const summary = zoteroGateway.getCollectionSummary(collectionId);
+            return summary?.path || summary?.name || `Collection ${collectionId}`;
+          })
+          .filter(Boolean);
+        const filesIntoCollections =
+          collectionLabels.length > 0 || Boolean(input.collections?.length);
+        const description = filesIntoCollections
+          ? `Review the note content before creating it in ${
+              collectionLabels.length
+                ? collectionLabels.join(", ")
+                : "the requested collection"
+            }.`
+          : input.target === "standalone"
+            ? "Review the note content before creating a standalone note."
+            : "Review the note content before attaching it to the paper.";
         return {
           toolName: "edit_current_note",
           mode: "review",
           title: "Review new note",
-          description:
-            input.target === "standalone"
-              ? "Review the note content before creating a standalone note."
-              : "Review the note content before attaching it to the paper.",
+          description,
           confirmLabel: "Create note",
           cancelLabel: "Cancel",
           fields: [
@@ -741,6 +777,15 @@ export function createEditCurrentNoteTool(
         );
 
       if (input.mode === "create") {
+        // A collection destination is only satisfiable by a standalone note:
+        // a child note belongs to its parent item and cannot be a collection
+        // member. Asking for both is a request for a filed note, so honour
+        // the collection rather than silently dropping it and attaching the
+        // note to a paper the user never mentioned.
+        if (input.collections?.length && input.target !== "standalone") {
+          input.target = "standalone";
+          input.targetItemId = undefined;
+        }
         // Auto-fallback to standalone if no parent item is resolvable
         // (e.g. library chat mode with no active paper)
         let resolvedParentTarget: ReturnType<
@@ -770,6 +815,7 @@ export function createEditCurrentNoteTool(
               target: input.target,
               targetItemId: input.targetItemId,
               appendToTrackedNote: false,
+              collections: input.collections,
             },
             context,
             "edit_current_note",

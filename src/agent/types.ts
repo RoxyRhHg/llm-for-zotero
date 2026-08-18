@@ -598,10 +598,30 @@ export type AgentToolArtifact =
       paperContext?: PaperContextRef;
     };
 
+/**
+ * `ok` means the tool RAN — it is not a report of whether anything changed.
+ *
+ * That distinction is load-bearing and easy to get wrong. `ok` gates the
+ * result-review loop (`runtime.ts`), counts toward the consecutive-error
+ * breaker that fails a run after three, and is mapped to MCP's `isError` for
+ * external backends. A write that legitimately changed nothing — every item
+ * already carried the tag — must therefore stay `ok: true`.
+ *
+ * `effect` carries what actually happened:
+ *   - `"applied"` — every targeted object changed
+ *   - `"partial"` — some changed, some were skipped or refused
+ *   - `"none"`    — nothing changed
+ *
+ * Absent `effect` means the tool does not mutate (reads) or does not report
+ * granular outcomes.
+ */
+export type AgentToolEffect = "applied" | "partial" | "none";
+
 export type AgentToolResult = {
   callId: string;
   name: string;
   ok: boolean;
+  effect?: AgentToolEffect;
   content: unknown;
   artifacts?: AgentToolArtifact[];
 };
