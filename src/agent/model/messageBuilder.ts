@@ -136,6 +136,12 @@ function buildFullUserMessage(
   } = {},
 ): AgentModelMessage {
   const contextLines: string[] = [];
+  // Volatile by nature (collection ids and counts change as the agent works),
+  // so it lives here rather than in the cached system prefix.
+  const libraryOverview = renderLibraryOverviewSection(request.libraryID);
+  if (libraryOverview) {
+    contextLines.push(libraryOverview);
+  }
   const visibleTurnContext = buildVisibleTurnContextBlock(request);
   if (visibleTurnContext) {
     contextLines.push(visibleTurnContext);
@@ -592,17 +598,16 @@ export async function buildAgentInitialMessages(
       id: "notes-directory-config",
       lines: [buildNotesDirectoryConfigSection()],
     },
-    {
-      // The library the agent is actually operating on. Everything above
-      // described the user's machine; this describes the workspace.
-      //
-      // Degrades to nothing rather than throwing: the shared gateway is not
-      // available before the agent subsystem is initialized, and a missing
-      // enhancement must never be able to fail a turn.
-      id: "library-overview",
-      lines: [renderLibraryOverviewSection(request.libraryID)],
-    },
   ];
+  // The library overview is deliberately NOT a system section.
+  //
+  // The cache breakpoint sits at the last "stable-prefix" block, so every
+  // system section is inside the cached prefix. This section names collection
+  // ids and a collection count, both of which change the moment the agent
+  // creates a folder — which would invalidate the prompt cache on the next
+  // turn, for Anthropic's explicit caching and for the automatic prefix
+  // caching DeepSeek and Kimi do. It belongs with the other volatile
+  // per-turn context instead; see buildAgentTurnUserMessage.
   const stableResourceBlock =
     resourceContextPlan?.stableContextBlock ||
     buildAgentStableResourceContextBlock(request);

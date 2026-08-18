@@ -9,6 +9,7 @@ import {
   applyOffset,
 } from "../src/agent/services/libraryQueryService";
 import { createQueryLibraryTool } from "../src/agent/tools/read/queryLibrary";
+import { buildAgentInitialMessages } from "../src/agent/model/messageBuilder";
 import type { AgentToolContext } from "../src/agent/types";
 
 /**
@@ -205,5 +206,58 @@ describe("library_search ordering through the tool", function () {
     assert.notDeepEqual(first, second, "a paging chain would loop forever");
     assert.deepEqual(first, [2]);
     assert.deepEqual(second, [3]);
+  });
+});
+
+/**
+ * The overview names collection ids and a collection count, both of which
+ * change the moment the agent creates a folder. The cache breakpoint sits at
+ * the last "stable-prefix" system block, so putting this in a system section
+ * invalidated the whole cached prefix on the next turn — for Anthropic's
+ * explicit caching and for the automatic prefix caching DeepSeek and Kimi do.
+ */
+describe("library overview stays out of the cached prefix", function () {
+  afterEach(function () {
+    setLibraryOverviewGateway(null);
+  });
+
+  it("is absent from the system prompt", async function () {
+    setLibraryOverviewGateway({
+      listAllLibraries: () => [{ libraryID: 1, name: "My Library", editable: true }],
+      listCollectionSummaries: () => [
+        { collectionId: 12, name: "Neuroscience", libraryID: 1, path: "Neuroscience" },
+      ],
+    } as never);
+
+    const messages = await buildAgentInitialMessages(
+      {
+        conversationKey: 1,
+        mode: "agent",
+        userText: "what is in my library",
+        libraryID: 1,
+      } as never,
+      [],
+      [],
+    );
+
+    const systemText = messages
+      .filter((m) => m.role === "system")
+      .map((m) => String(m.content ?? ""))
+      .join("\n");
+    assert.notInclude(
+      systemText,
+      "Neuroscience (id=12)",
+      "a collection id in the cached prefix invalidates it whenever a folder is created",
+    );
+
+    const userText = messages
+      .filter((m) => m.role === "user")
+      .map((m) => String(m.content ?? ""))
+      .join("\n");
+    assert.include(
+      userText,
+      "Neuroscience (id=12)",
+      "the agent still has to be able to see it",
+    );
   });
 });
