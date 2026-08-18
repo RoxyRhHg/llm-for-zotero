@@ -2449,6 +2449,52 @@ export class ZoteroGateway {
     };
   }
 
+  /**
+   * Captures everything needed to rebuild a collection after `eraseTx`.
+   *
+   * `eraseTx` is permanent — Zotero has no trash for collections — so the
+   * only way `delete_collection` can be reversible is to record its state
+   * first. Returns `null` when the collection does not exist, and reports
+   * `childCollectionCount` so callers can refuse a delete whose subtree this
+   * flat snapshot could not faithfully restore.
+   */
+  snapshotCollectionForDelete(params: { collectionId: number }): {
+    name: string;
+    parentCollectionId?: number;
+    libraryID: number;
+    itemIds: number[];
+    childCollectionCount: number;
+  } | null {
+    const collection = this.getCollection(params.collectionId) as
+      | (Zotero.Collection & {
+          getChildItems?: (asIDs: true, includeDeleted?: boolean) => number[];
+          getChildCollections?: (asIDs: true) => number[];
+        })
+      | null;
+    if (!collection) return null;
+    let itemIds: number[] = [];
+    try {
+      itemIds = collection.getChildItems?.(true) || [];
+    } catch {
+      itemIds = [];
+    }
+    let childCollectionCount = 0;
+    try {
+      childCollectionCount = (collection.getChildCollections?.(true) || [])
+        .length;
+    } catch {
+      childCollectionCount = 0;
+    }
+    const parentID = Number((collection as { parentID?: unknown }).parentID);
+    return {
+      name: normalizeText(collection.name) || `Collection ${params.collectionId}`,
+      parentCollectionId: Number.isFinite(parentID) && parentID > 0 ? parentID : undefined,
+      libraryID: Number(collection.libraryID) || 0,
+      itemIds,
+      childCollectionCount,
+    };
+  }
+
   async deleteCollection(params: { collectionId: number }): Promise<void> {
     const collection = this.getCollection(params.collectionId);
     if (!collection) return;

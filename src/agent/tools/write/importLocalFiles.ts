@@ -15,7 +15,12 @@ import {
   normalizePositiveInt,
   normalizeStringArray,
 } from "../shared";
-import { executeAndRecordUndo } from "./mutateLibraryShared";
+import {
+  executeAndRecordUndo,
+  normalizeChecklistSelectionFromResolution,
+} from "./mutateLibraryShared";
+
+const FILES_CHECKLIST_FIELD_ID = "filesChecklist";
 
 type ImportLocalFilesInput = {
   operation: ImportLocalFilesOperation;
@@ -135,7 +140,7 @@ export function createImportLocalFilesTool(
         fields: [
           {
             type: "checklist" as const,
-            id: "filesChecklist",
+            id: FILES_CHECKLIST_FIELD_ID,
             label: "Files to import",
             items: operation.filePaths.map((path, i) => ({
               id: path,
@@ -147,8 +152,34 @@ export function createImportLocalFilesTool(
       };
     },
 
-    applyConfirmation(input, _resolutionData) {
-      return ok(input);
+    applyConfirmation(input, resolutionData) {
+      const selected = normalizeChecklistSelectionFromResolution(
+        resolutionData,
+        FILES_CHECKLIST_FIELD_ID,
+      );
+      // No resolution — auto_approve / non-HITL path.
+      if (selected === undefined) {
+        return ok(input);
+      }
+      if (!selected.length) {
+        return fail(
+          "No files were left checked, so nothing was imported. Check the files you want to import, or cancel the operation.",
+        );
+      }
+      // Row ids are the file paths themselves.
+      const chosen = new Set(selected);
+      const filePaths = input.operation.filePaths.filter((path) =>
+        chosen.has(path),
+      );
+      if (!filePaths.length) {
+        return fail(
+          "The confirmed selection did not match any of the files in this request. Nothing was imported.",
+        );
+      }
+      return ok({
+        ...input,
+        operation: { ...input.operation, filePaths },
+      });
     },
 
     async execute(input, context) {

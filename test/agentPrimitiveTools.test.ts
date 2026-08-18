@@ -3754,7 +3754,7 @@ describe("primitive agent tools", function () {
     assert.equal((result as { noteText: string }).noteText, "Approved *note*");
   });
 
-  it("zotero_script write mode runs directly and records undo snapshots", async function () {
+  it("zotero_script write mode confirms with a code preview, then records undo snapshots", async function () {
     const fakeItem = createFakeZoteroItem();
     globalScope.Zotero = {
       ...(globalScope.Zotero || {}),
@@ -3788,9 +3788,21 @@ env.log('updated');
       baseContext,
     );
 
-    assert.equal(prepared.kind, "result");
-    if (prepared.kind !== "result") return;
-    assert.equal(prepared.execution.result.ok, true);
+    // Write-mode scripts mutate the live library, so they must present the
+    // source for approval rather than running straight through.
+    assert.equal(prepared.kind, "confirmation");
+    if (prepared.kind !== "confirmation") return;
+    const preview = prepared.action.fields.find(
+      (field) => field.type === "code_preview",
+    );
+    assert.exists(preview, "the card must show the script itself");
+    assert.include(
+      (preview as never as { value: string }).value,
+      "item.setField('title', 'Updated title')",
+    );
+
+    const execution = await prepared.execute();
+    assert.equal(execution.result.ok, true);
     assert.equal(fakeItem.getField("title"), "Updated title");
     assert.sameMembers(Array.from(fakeItem.tags), ["existing", "new-tag"]);
     assert.sameMembers(Array.from(fakeItem.collections), [5, 9]);

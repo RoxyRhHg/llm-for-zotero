@@ -108,6 +108,59 @@ export function normalizeTagAssignmentsFromResolution(
     );
 }
 
+/**
+ * Reads a checklist field's answer off a confirmation resolution.
+ *
+ * The renderer's checklist accessor returns the *checked* row ids as strings
+ * (`agentTrace/render.ts` `getSelectedIds`), so the three states a caller must
+ * tell apart are:
+ *   - `undefined` — no resolution at all (the `auto_approve` / non-HITL path).
+ *     The caller keeps its original operation.
+ *   - `[]` — the user was asked and unchecked everything. This is a decision,
+ *     not an absence, and destructive callers must surface it as an error
+ *     rather than proceeding with the full list.
+ *   - a non-empty array — the rows to act on.
+ *
+ * Row ids are whatever the field author put in `items[].id`: numeric item ids
+ * (trash, merge), array indices including `"0"` (import identifiers), or file
+ * paths (import local files). This returns them verbatim; use
+ * `normalizeChecklistItemIdsFromResolution` when the ids are Zotero item ids.
+ */
+export function normalizeChecklistSelectionFromResolution(
+  resolutionData: unknown,
+  fieldId: string,
+): string[] | undefined {
+  if (!validateObject<Record<string, unknown>>(resolutionData)) {
+    return undefined;
+  }
+  const raw = resolutionData[fieldId];
+  if (raw === undefined || raw === null || !Array.isArray(raw)) {
+    return undefined;
+  }
+  return raw
+    .map((entry) => (typeof entry === "string" ? entry : String(entry ?? "")))
+    .filter((entry) => entry.length > 0);
+}
+
+/**
+ * `normalizeChecklistSelectionFromResolution` for checklists whose row ids are
+ * Zotero item ids. Ids that are not positive integers are dropped, so a
+ * malformed payload narrows the operation rather than widening it.
+ */
+export function normalizeChecklistItemIdsFromResolution(
+  resolutionData: unknown,
+  fieldId: string,
+): number[] | undefined {
+  const selected = normalizeChecklistSelectionFromResolution(
+    resolutionData,
+    fieldId,
+  );
+  if (selected === undefined) return undefined;
+  return selected
+    .map((entry) => normalizePositiveInt(entry))
+    .filter((id): id is number => Boolean(id));
+}
+
 // ── Move assignment helpers ─────────────────────────────────────────────────
 
 export function getMoveAssignmentFieldId(

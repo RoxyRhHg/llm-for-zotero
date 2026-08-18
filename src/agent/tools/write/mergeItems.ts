@@ -16,7 +16,12 @@ import {
   normalizePositiveInt,
   normalizePositiveIntArray,
 } from "../shared";
-import { executeAndRecordUndo } from "./mutateLibraryShared";
+import {
+  executeAndRecordUndo,
+  normalizeChecklistItemIdsFromResolution,
+} from "./mutateLibraryShared";
+
+const DUPLICATES_CHECKLIST_FIELD_ID = "duplicatesChecklist";
 
 type MergeItemsInput = {
   operation: MergeItemsOperation;
@@ -141,7 +146,7 @@ export function createMergeItemsTool(
           },
           {
             type: "checklist" as const,
-            id: "duplicatesChecklist",
+            id: DUPLICATES_CHECKLIST_FIELD_ID,
             label: "Duplicates to merge & trash",
             items: operation.otherItemIds.map((id, i) => ({
               id: `${id}`,
@@ -153,8 +158,34 @@ export function createMergeItemsTool(
       };
     },
 
-    applyConfirmation(input, _resolutionData) {
-      return ok(input);
+    applyConfirmation(input, resolutionData) {
+      const selected = normalizeChecklistItemIdsFromResolution(
+        resolutionData,
+        DUPLICATES_CHECKLIST_FIELD_ID,
+      );
+      // No resolution — auto_approve / non-HITL path.
+      if (selected === undefined) {
+        return ok(input);
+      }
+      // Every duplicate unchecked means "merge nothing". The master is not on
+      // the checklist, so falling through here would merge and trash the full
+      // duplicate list the user just rejected.
+      if (!selected.length) {
+        return fail(
+          "No duplicates were left checked, so nothing was merged. Check the duplicates you want merged into the master, or cancel the operation.",
+        );
+      }
+      const requested = new Set(input.operation.otherItemIds);
+      const otherItemIds = selected.filter((id) => requested.has(id));
+      if (!otherItemIds.length) {
+        return fail(
+          "The confirmed selection did not match any of the duplicates in this request. Nothing was merged.",
+        );
+      }
+      return ok({
+        ...input,
+        operation: { ...input.operation, otherItemIds },
+      });
     },
 
     async execute(input, context) {

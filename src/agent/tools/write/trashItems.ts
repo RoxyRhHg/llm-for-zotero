@@ -9,7 +9,12 @@ import {
 } from "../../services/libraryMutationService";
 import type { ZoteroGateway } from "../../services/zoteroGateway";
 import { ok, fail, validateObject, normalizePositiveIntArray } from "../shared";
-import { executeAndRecordUndo } from "./mutateLibraryShared";
+import {
+  executeAndRecordUndo,
+  normalizeChecklistItemIdsFromResolution,
+} from "./mutateLibraryShared";
+
+const TRASH_CHECKLIST_FIELD_ID = "trashItemsChecklist";
 
 type TrashItemsInput = {
   operation: TrashItemsOperation;
@@ -107,7 +112,7 @@ export function createTrashItemsTool(
         fields: [
           {
             type: "checklist" as const,
-            id: "trashItemsChecklist",
+            id: TRASH_CHECKLIST_FIELD_ID,
             label: "Items to trash",
             items: operation.itemIds.map((id, index) => ({
               id: `${id}`,
@@ -119,9 +124,35 @@ export function createTrashItemsTool(
       };
     },
 
-    applyConfirmation(input, _resolutionData) {
-      // Checklist is informational; pass through unchanged
-      return ok(input);
+    applyConfirmation(input, resolutionData) {
+      const selected = normalizeChecklistItemIdsFromResolution(
+        resolutionData,
+        TRASH_CHECKLIST_FIELD_ID,
+      );
+      // No resolution at all — the auto_approve / non-HITL path. Keep the
+      // operation the model asked for.
+      if (selected === undefined) {
+        return ok(input);
+      }
+      // The user was shown every row and unchecked all of them. That is a
+      // decision to trash nothing, and it must not fall through to trashing
+      // everything.
+      if (!selected.length) {
+        return fail(
+          "No items were left checked, so nothing was trashed. Check the items you want to trash, or cancel the operation.",
+        );
+      }
+      const requested = new Set(input.operation.itemIds);
+      const itemIds = selected.filter((id) => requested.has(id));
+      if (!itemIds.length) {
+        return fail(
+          "The confirmed selection did not match any of the items in this request. Nothing was trashed.",
+        );
+      }
+      return ok({
+        ...input,
+        operation: { ...input.operation, itemIds },
+      });
     },
 
     async execute(input, context) {

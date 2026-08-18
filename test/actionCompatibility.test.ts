@@ -212,6 +212,7 @@ describe("action compatibility after tool refactors", function () {
       moved: 2,
       remaining: 1,
       processed: 3,
+      skippedUnmatched: undefined,
       stopped: undefined,
     });
     assert.include(

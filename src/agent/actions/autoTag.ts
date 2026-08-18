@@ -224,6 +224,13 @@ export const autoTagAction: AgentAction<AutoTagInput, AutoTagOutput> = {
 
     let pageCursor = 0;
     while (pageCursor < pages.length) {
+      // Stop has to stop. The signal already reaches the LLM batch helper,
+      // but without this check an abort mid-page merely fell back to
+      // deterministic tags and then opened the confirmation card anyway.
+      if (ctx.signal?.aborted) {
+        stopped = true;
+        break;
+      }
       const page = pages[pageCursor];
       const pageLabel = formatActionPageLabel(page);
       const pageTargets = page.items;

@@ -15,7 +15,12 @@ import {
   normalizePositiveInt,
   normalizeStringArray,
 } from "../shared";
-import { executeAndRecordUndo } from "./mutateLibraryShared";
+import {
+  executeAndRecordUndo,
+  normalizeChecklistSelectionFromResolution,
+} from "./mutateLibraryShared";
+
+const IDENTIFIERS_CHECKLIST_FIELD_ID = "identifiersChecklist";
 
 type ImportIdentifiersInput = {
   operation: ImportIdentifiersOperation;
@@ -135,7 +140,7 @@ export function createImportIdentifiersTool(
         fields: [
           {
             type: "checklist" as const,
-            id: "identifiersChecklist",
+            id: IDENTIFIERS_CHECKLIST_FIELD_ID,
             label: "Identifiers to import",
             items: operation.identifiers.map((identifier, index) => ({
               id: `${index}`,
@@ -147,9 +152,34 @@ export function createImportIdentifiersTool(
       };
     },
 
-    applyConfirmation(input, _resolutionData) {
-      // Checklist is informational; pass through unchanged
-      return ok(input);
+    applyConfirmation(input, resolutionData) {
+      const selected = normalizeChecklistSelectionFromResolution(
+        resolutionData,
+        IDENTIFIERS_CHECKLIST_FIELD_ID,
+      );
+      // No resolution — auto_approve / non-HITL path.
+      if (selected === undefined) {
+        return ok(input);
+      }
+      if (!selected.length) {
+        return fail(
+          "No identifiers were left checked, so nothing was imported. Check the identifiers you want to import, or cancel the operation.",
+        );
+      }
+      // Row ids are indices into operation.identifiers, so "0" is a valid id.
+      const chosen = new Set(selected);
+      const identifiers = input.operation.identifiers.filter((_, index) =>
+        chosen.has(String(index)),
+      );
+      if (!identifiers.length) {
+        return fail(
+          "The confirmed selection did not match any of the identifiers in this request. Nothing was imported.",
+        );
+      }
+      return ok({
+        ...input,
+        operation: { ...input.operation, identifiers },
+      });
     },
 
     async execute(input, context) {

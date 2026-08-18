@@ -40,17 +40,29 @@ describe("write note destination classifier", function () {
 
   it("recognizes multilingual file destinations", function () {
     const fileRequests = [
-      "把阅读笔记保存到文件夹",
       "写一篇阅读笔记保存为md文件",
       "ノートをファイルに保存してください",
       "노트를 파일로 저장해줘",
       "guardar la nota en un archivo",
-      "enregistre la note dans un dossier",
       "speichere die Notiz als Datei",
       "сохранить заметку в файл",
     ];
     for (const text of fileRequests) {
       assert.equal(classifyWriteNoteDestination(text), "file", text);
+    }
+  });
+
+  /**
+   * These two moved here from the file list above when issue #374 was fixed.
+   * Both name a *folder* (文件夹 / dossier) with no filesystem cue, and in a
+   * Zotero plugin that is a collection. The old reading sent them to disk.
+   */
+  it("routes multilingual folder phrasings to Zotero, not to disk", function () {
+    for (const text of [
+      "把阅读笔记保存到文件夹",
+      "enregistre la note dans un dossier",
+    ]) {
+      assert.equal(classifyWriteNoteDestination(text), "zotero", text);
     }
   });
 
@@ -93,5 +105,46 @@ describe("write note destination classifier", function () {
       "zotero",
     );
     assert.equal(classifyWriteNoteDestination("Décris ce fichier"), "none");
+  });
+
+  /**
+   * Issue #374. Zotero's own UI calls collections "folders", and this
+   * plugin's tool descriptions say "collections (folders)" — so a bare
+   * "folder" is a Zotero collection, not a filesystem path. Routing it to
+   * `file` sent the note to disk, and with no notes directory configured it
+   * went nowhere at all.
+   *
+   * A filesystem destination now needs an explicit cue: a path, an extension,
+   * "file"/"disk", the configured nickname, or Obsidian/vault.
+   */
+  it("treats a bare folder as a Zotero collection, not a filesystem path", function () {
+    const collectionRequests = [
+      "save the answer as a note into a specific folder",
+      "save the answer as a note into the folder Neuroscience",
+      "\u0421\u043e\u0445\u0440\u0430\u043d\u0438 \u043e\u0442\u0432\u0435\u0442 \u043a\u0430\u043a \u0437\u0430\u043c\u0435\u0442\u043a\u0443 \u0432 \u043f\u0430\u043f\u043a\u0443 Machine Learning",
+      "put the note in the Zotero folder Reviews",
+    ];
+    for (const text of collectionRequests) {
+      assert.equal(classifyWriteNoteDestination(text), "zotero", text);
+    }
+  });
+
+  it("still routes a folder to disk when a filesystem cue is present", function () {
+    assert.equal(
+      classifyWriteNoteDestination("save the note to my Obsidian folder"),
+      "file",
+    );
+    assert.equal(
+      classifyWriteNoteDestination("save the note as an md file in that folder"),
+      "file",
+    );
+    assert.equal(
+      classifyWriteNoteDestination("save the note into ~/notes/reading"),
+      "file",
+    );
+    assert.equal(
+      classifyWriteNoteDestination("write the note to my Research Vault folder", "Research Vault"),
+      "file",
+    );
   });
 });

@@ -37,6 +37,7 @@ type OrganizeUnfiledOutput = {
   moved: number;
   remaining: number;
   processed?: number;
+  skippedUnmatched?: number;
   stopped?: boolean;
 };
 
@@ -153,11 +154,17 @@ export const organizeUnfiledAction: AgentAction<
 
     let moved = 0;
     let processed = 0;
+    let skippedUnmatched = 0;
     let stopped = false;
     let confirmed = false;
 
     let pageCursor = 0;
     while (pageCursor < pages.length) {
+      // See autoTag: without this the run kept prompting after Stop.
+      if (ctx.signal?.aborted) {
+        stopped = true;
+        break;
+      }
       const page = pages[pageCursor];
       invalidateLibraryCaches(ctx);
       const collections = await loadFreshCollections(ctx);
@@ -202,15 +209,33 @@ export const organizeUnfiledAction: AgentAction<
         total: page.totalPages,
       });
 
+      // Under native_ui an item with no confident suggestion becomes a blank
+      // row the user can fill in. Under auto_approve there is nobody to fill
+      // it in, so it is dropped — but it must be *reported*, not silently
+      // vanish from a run the user is not watching.
       const includeManualRows = ctx.confirmationMode !== "auto_approve";
+      const unmatched: number[] = [];
       const assignments = page.items.flatMap((item) => {
         const suggestedId = suggestionsByItemId.get(item.itemId);
-        return suggestedId
-          ? [{ itemId: item.itemId, targetCollectionId: suggestedId }]
-          : includeManualRows
-            ? [{ itemId: item.itemId }]
-            : [];
+        if (suggestedId) {
+          return [{ itemId: item.itemId, targetCollectionId: suggestedId }];
+        }
+        if (includeManualRows) {
+          return [{ itemId: item.itemId }];
+        }
+        unmatched.push(item.itemId);
+        return [];
       });
+      if (unmatched.length) {
+        skippedUnmatched += unmatched.length;
+        ctx.onProgress({
+          type: "step_done",
+          step: `${pageLabel}: Assigning items to collections`,
+          summary: `Skipped ${unmatched.length} item${
+            unmatched.length === 1 ? "" : "s"
+          } with no confident collection match (auto-approve leaves nothing to review)`,
+        });
+      }
 
       if (!assignments.length) {
         processed += page.items.length;
@@ -349,6 +374,9 @@ export const organizeUnfiledAction: AgentAction<
         moved,
         remaining: Math.max(0, unfiledItems.length - moved),
         processed,
+        // Surfaced so an unattended auto-approve run reports what it left
+        // behind rather than appearing to have organised everything.
+        skippedUnmatched: skippedUnmatched || undefined,
         stopped: stopped || undefined,
       },
     };

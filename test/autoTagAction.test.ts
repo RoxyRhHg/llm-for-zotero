@@ -866,4 +866,63 @@ describe("autoTag action", function () {
     assert.equal(result.output.stopped, true);
     assert.equal(result.output.tagged, 0);
   });
+
+  /**
+   * `ctx.signal` reached the LLM batch helper but never the outer page loop,
+   * so pressing Stop mid-page aborted the model calls, fell back to
+   * deterministic tags, and then *still opened the confirmation card* as if
+   * nothing had happened. Stop has to stop.
+   */
+  it("stops before opening a confirmation card when the run is aborted", async function () {
+    const registry = new AgentToolRegistry();
+    const executedItemIds: number[] = [];
+    registerReviewApplyTagsTool(registry, (input) => {
+      executedItemIds.push(
+        ...input.assignments.map((assignment) => assignment.itemId),
+      );
+    });
+
+    const controller = new AbortController();
+    controller.abort();
+
+    let confirmationCount = 0;
+    const { ctx } = createActionContext(registry, {
+      signal: controller.signal,
+      zoteroGateway: {
+        listBibliographicItemTargets: async () => ({
+          items: Array.from({ length: 6 }, (_entry, index) =>
+            makeBibliographicTarget(index + 1, `Paper ${index + 1}`),
+          ),
+          totalCount: 6,
+        }),
+        listLibraryTags: async () => [{ name: "existing", type: 0 }],
+        getEditableArticleMetadata: () => ({
+          fields: { abstractNote: "An abstract" },
+        }),
+        getItem: (itemId: number) => ({ id: itemId }),
+      } as never,
+      requestConfirmation: async () => {
+        confirmationCount += 1;
+        return { approved: true, actionId: "confirm", data: {} };
+      },
+    });
+
+    const result = await autoTagAction.execute(
+      { scope: "all", pageSize: 2 },
+      ctx,
+    );
+
+    assert.equal(
+      confirmationCount,
+      0,
+      "an aborted run must not ask the user to approve anything",
+    );
+    assert.deepEqual(executedItemIds, [], "nothing may be applied after Stop");
+    assert.isTrue(result.ok);
+    assert.equal(
+      (result.output as { stopped?: boolean } | undefined)?.stopped,
+      true,
+      "the result should report that the run was stopped",
+    );
+  });
 });

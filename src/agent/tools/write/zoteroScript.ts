@@ -472,9 +472,15 @@ export function createZoteroScriptTool(): AgentToolDefinition<
           "mode 'write' scripts must call env.snapshot(item) before mutating Zotero items, or env.addUndoStep(fn) for custom changes, so undo_last_action can revert the operation",
         );
       }
-      if (mode === "write" && attemptsDirectNoteWrite(script)) {
+      // Not gated on mode: `mode` is a declaration, not a sandbox — the
+      // evaluator passes the real Zotero global either way — so a read-mode
+      // script could otherwise create notes and bypass note validation
+      // entirely. The undo guard above stays write-only on purpose:
+      // env.snapshot no-ops in read mode, so requiring it there would reject
+      // every legitimate read script without preventing a single write.
+      if (attemptsDirectNoteWrite(script)) {
         return fail(
-          "zotero_script write mode cannot create or edit Zotero notes directly. Use note_write so note validation and figure-crop/text-only fallback rules run before saving.",
+          "zotero_script cannot create or edit Zotero notes directly, in either mode. Use note_write so note validation and figure-crop/text-only fallback rules run before saving.",
         );
       }
       const timeoutRaw =
@@ -491,8 +497,46 @@ export function createZoteroScriptTool(): AgentToolDefinition<
       });
     },
 
-    shouldRequireConfirmation() {
-      return false;
+    /**
+     * Write-mode scripts mutate the live library through privileged JS, so the
+     * source is the only meaningful thing to approve — a model-authored
+     * one-line description is not consent. Read mode stays frictionless; the
+     * fact that a read-mode script *can* still write is not fixed by a card,
+     * it is fixed by sandboxing the evaluator.
+     */
+    shouldRequireConfirmation(input) {
+      return input.mode === "write";
+    },
+
+    createPendingAction(input) {
+      return {
+        toolName: "zotero_script",
+        title: "Run Zotero script",
+        description:
+          "Execute JavaScript against your Zotero library. Review the code before approving.",
+        confirmLabel: "Run",
+        cancelLabel: "Cancel",
+        fields: [
+          {
+            type: "text" as const,
+            id: "description",
+            label: "What this does",
+            value: input.description,
+          },
+          {
+            type: "code_preview" as const,
+            id: "script",
+            label: "Script",
+            value: input.script,
+            language: "javascript",
+          },
+        ],
+      };
+    },
+
+    applyConfirmation(input) {
+      // The card is read-only; approving means "run exactly this".
+      return ok(input);
     },
 
     async execute(input, context) {

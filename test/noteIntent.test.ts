@@ -152,3 +152,22 @@ describe("note-intent skill routing force", function () {
     assert.notInclude(resolution.contextForcedSkillIds, "write-note");
   });
 });
+
+describe("noteIntent French conjugations", function () {
+  /**
+   * The file's contract is that note intent triggers "regardless of the
+   * user's language or phrasing". `\benregistrer\b` only matched the
+   * infinitive, so the imperative "enregistre la note" — the natural way to
+   * ask — missed, and the write-note skill (and the user's customizations
+   * in it) were silently skipped.
+   */
+  it("matches conjugated enregistrer, not just the infinitive", function () {
+    assert.isTrue(inferExplicitNoteIntent("enregistre la note"));
+    assert.isTrue(inferExplicitNoteIntent("enregistrer la note"));
+    assert.isTrue(inferExplicitNoteIntent("enregistrez cette note"));
+  });
+
+  it("still does not fire without a note object", function () {
+    assert.isFalse(inferExplicitNoteIntent("enregistre le fichier"));
+  });
+});

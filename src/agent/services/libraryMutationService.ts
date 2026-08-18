@@ -276,6 +276,52 @@ function buildCreateCollectionUndo(
   };
 }
 
+/**
+ * Rebuilds a collection erased by `delete_collection`.
+ *
+ * The restored collection is a new object with a new id — Zotero cannot
+ * resurrect the original — so anything that stored the old id will not
+ * follow. Name, parent and membership are what the user actually cares
+ * about, and those are restored exactly.
+ *
+ * KNOWN GAP (Stage B, item 7): `addItemsToCollections` still filters members
+ * through `resolveBibliographicItem`, so a restored collection loses any
+ * standalone notes or attachments it contained. Retiring that filter fixes
+ * this restore for free; until then the loss is real and undeclared here.
+ */
+function buildDeleteCollectionUndo(
+  zoteroGateway: ZoteroGateway,
+  snapshot: {
+    name: string;
+    parentCollectionId?: number;
+    libraryID: number;
+    itemIds: number[];
+  },
+): LibraryMutationUndo {
+  return {
+    toolName: "library_mutation",
+    description: `Recreate collection "${snapshot.name}"${
+      snapshot.itemIds.length
+        ? ` with its ${snapshot.itemIds.length} item${snapshot.itemIds.length === 1 ? "" : "s"}`
+        : ""
+    }`,
+    revert: async () => {
+      const recreated = await zoteroGateway.createCollection({
+        name: snapshot.name,
+        parentCollectionId: snapshot.parentCollectionId,
+        libraryID: snapshot.libraryID,
+      });
+      if (!snapshot.itemIds.length) return;
+      await zoteroGateway.addItemsToCollections({
+        assignments: snapshot.itemIds.map((itemId) => ({
+          itemId,
+          targetCollectionId: recreated.collectionId,
+        })),
+      });
+    },
+  };
+}
+
 function directTagAssignments(
   operation: ApplyTagsOperation,
 ): BatchTagAssignment[] {
@@ -509,6 +555,20 @@ export class LibraryMutationService {
         };
       }
       case "delete_collection": {
+        // `eraseTx` is permanent — Zotero has no trash for collections — so
+        // capture the state first and hand back an inverse. A collection with
+        // subcollections is refused outright rather than deleted with an
+        // undo that would silently fail to restore the subtree.
+        const snapshot = this.zoteroGateway.snapshotCollectionForDelete({
+          collectionId: operation.collectionId,
+        });
+        if (snapshot && snapshot.childCollectionCount > 0) {
+          throw new Error(
+            `"${snapshot.name}" has ${snapshot.childCollectionCount} subcollection${
+              snapshot.childCollectionCount === 1 ? "" : "s"
+            }. Deleting it would erase them permanently and they could not be restored. Delete the subcollections first, or move them elsewhere.`,
+          );
+        }
         await this.zoteroGateway.deleteCollection({
           collectionId: operation.collectionId,
         });
@@ -519,8 +579,12 @@ export class LibraryMutationService {
             result: {
               collectionId: operation.collectionId,
               status: "deleted",
+              restorableItemCount: snapshot?.itemIds.length ?? 0,
             },
           },
+          undo: snapshot
+            ? buildDeleteCollectionUndo(this.zoteroGateway, snapshot)
+            : undefined,
         };
       }
       case "save_note": {

@@ -164,7 +164,7 @@ export function createManageCollectionsTool(
       const collectionLabel = collection
         ? collection.path || collection.name
         : `Collection ${operation.collectionId}`;
-      const description = `Delete collection "${collectionLabel}". Items in the collection will not be deleted.`;
+      const description = `Delete collection "${collectionLabel}". Items in the collection will not be deleted, and the collection can be restored with undo. A collection containing subcollections cannot be deleted.`;
 
       return {
         toolName: "manage_collections",

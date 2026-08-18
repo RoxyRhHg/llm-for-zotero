@@ -1,3 +1,5 @@
+import { inferExplicitNoteIntent } from "./skills/noteIntent";
+
 export type WriteNoteDestination = "none" | "zotero" | "file";
 
 function escapeRegex(value: string): string {
@@ -35,13 +37,18 @@ function hasFileDestinationSignal(
     return true;
   }
   if (hasPathLikeDestination(text)) return true;
-  // CJK save-to-file/folder phrasings. A file noun alone is NOT a signal
+  // CJK save-to-file phrasings. A file noun alone is NOT a signal
   // (文件 usually names the source PDF); the destination reading needs a
-  // save verb joined to the noun by a directional marker (保存到文件夹,
-  // 保存为md文件, ファイルに保存, 파일로 저장) or a compound write-into verb
-  // (写入文件). Verb→noun and noun→verb orders are both covered.
+  // save verb joined to the noun by a directional marker (保存为md文件,
+  // ファイルに保存, 파일로 저장) or a compound write-into verb (写入文件).
+  // Verb→noun and noun→verb orders are both covered.
+  //
+  // Folder nouns (文件夹 / 目录 / フォルダ / 폴더) are deliberately absent:
+  // in a Zotero plugin a folder is a collection, not a filesystem path
+  // (issue #374). `文件` therefore carries a `(?!夹)` guard so it cannot
+  // match inside the compound 文件夹 and reinstate the old reading.
   if (
-    /(?:保存|存|导出|導出|输出|輸出|エクスポート|書き出し?|저장|내보내\p{L}*)[^\n。]{0,10}?(?:到|至|为|為|成|として)[^\n。]{0,10}(?:文件夹|文件|文檔|檔案|目录|目錄)|(?:写入|寫入|存入|存进|存進)[^\n。]{0,6}(?:文件|文件夹|文檔|檔案|目录|目錄)|(?:文件夹|文件|目录|目錄|ファイル|フォルダ|파일|폴더)(?:に|へ|として|里|中|에|로|으로)[^\n。]{0,10}(?:保存|書き出|出力|エクスポート|导出|導出|写入|寫入|存|저장|내보내)/u.test(
+    /(?:保存|存|导出|導出|输出|輸出|エクスポート|書き出し?|저장|내보내\p{L}*)[^\n。]{0,10}?(?:到|至|为|為|成|として)[^\n。]{0,10}(?:文件(?!夹)|文檔|檔案)|(?:写入|寫入|存入|存进|存進)[^\n。]{0,6}(?:文件(?!夹)|文檔|檔案)|(?:文件(?!夹)|ファイル|파일)(?:に|へ|として|里|中|에|로|으로)[^\n。]{0,10}(?:保存|書き出|出力|エクスポート|导出|導出|写入|寫入|存|저장|내보내)/u.test(
       text,
     )
   ) {
@@ -55,13 +62,13 @@ function hasFileDestinationSignal(
   // with English nouns ("local", "disk") regressed plain-English requests —
   // and finite export forms exclude English "exported".
   if (
-    /(?:\b(?:guarda\p{L}*|export(?:ar|er|e|en|ez|ieren)|salva(?!guard)\p{L}*|enregistr\p{L}*|ecri\p{L}*|speicher\p{L}*|schreib\p{L}*)\b|(?<!\p{L})écri\p{L}*|(?<!\p{L})(?:сохран|экспорт|запис|запиш)\p{L}*)[^\n]{0,60}(?:\b(?:archivo|carpeta|fichier|dossier|datei|ordner)\b|(?<!\p{L})(?:файл|папк)\p{L}*)/iu.test(
+    /(?:\b(?:guarda\p{L}*|export(?:ar|er|e|en|ez|ieren)|salva(?!guard)\p{L}*|enregistr\p{L}*|ecri\p{L}*|speicher\p{L}*|schreib\p{L}*)\b|(?<!\p{L})écri\p{L}*|(?<!\p{L})(?:сохран|экспорт|запис|запиш)\p{L}*)[^\n]{0,60}(?:\b(?:archivo|fichier|datei)\b|(?<!\p{L})файл\p{L}*)/iu.test(
       text,
     )
   ) {
     return true;
   }
-  return /\b(?:save|write|export|send|put|create|make)\b[\s\S]{0,120}\b(?:to|into|as|in|under)\b[\s\S]{0,120}\b(?:files?|folders?|directories|directory|disk|local)\b/i.test(
+  return /\b(?:save|write|export|send|put|create|make)\b[\s\S]{0,120}\b(?:to|into|as|in|under)\b[\s\S]{0,120}\b(?:files?|directories|directory|disk|local)\b/i.test(
     text,
   );
 }
@@ -95,8 +102,15 @@ export function classifyWriteNoteDestination(
 ): WriteNoteDestination {
   const text = (userText || "").trim();
   if (!text) return "none";
-  if (hasFileDestinationSignal(text, notesDirectoryNickname)) return "file";
+  // Zotero first: naming Zotero explicitly should beat an incidental file
+  // cue elsewhere in the sentence ("put this in Zotero, not Obsidian").
   if (hasZoteroDestinationSignal(text)) return "zotero";
+  if (hasFileDestinationSignal(text, notesDirectoryNickname)) return "file";
   if (hasGenericNoteWriteSignal(text)) return "zotero";
+  // `hasGenericNoteWriteSignal` is English-only. The multilingual note-intent
+  // patterns already exist and are shared by every skill router, so a
+  // non-English note request lands on the Zotero route instead of falling
+  // through to "none" and leaving the destination unspecified.
+  if (inferExplicitNoteIntent(text)) return "zotero";
   return "none";
 }
