@@ -67,7 +67,11 @@ describe("change journal revert", function () {
       entries: [
         entry({
           inverseJson: JSON.stringify([
-            { type: "remove_from_collection", itemIds: [1, 2], collectionId: 88 },
+            {
+              type: "remove_from_collection",
+              itemIds: [1, 2],
+              collectionId: 88,
+            },
           ]),
         }),
       ],

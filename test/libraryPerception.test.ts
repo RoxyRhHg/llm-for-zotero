@@ -30,8 +30,18 @@ describe("library perception", function () {
       { libraryID: 4, name: "Lab Group", editable: false },
     ],
     listCollectionSummaries: () => [
-      { collectionId: 12, name: "Neuroscience", libraryID: 1, path: "Neuroscience" },
-      { collectionId: 13, name: "Methods", libraryID: 1, path: "Neuroscience > Methods" },
+      {
+        collectionId: 12,
+        name: "Neuroscience",
+        libraryID: 1,
+        path: "Neuroscience",
+      },
+      {
+        collectionId: 13,
+        name: "Methods",
+        libraryID: 1,
+        path: "Neuroscience > Methods",
+      },
     ],
   } as never;
 
@@ -121,7 +131,10 @@ describe("library_search ordering and paging", function () {
       applyOffset(rows, 2).map((r) => r.itemId),
       [3],
     );
-    assert.deepEqual(applyOffset(rows, 0).map((r) => r.itemId), [1, 2, 3]);
+    assert.deepEqual(
+      applyOffset(rows, 0).map((r) => r.itemId),
+      [1, 2, 3],
+    );
   });
 });
 
@@ -133,24 +146,65 @@ describe("library_search ordering and paging", function () {
  */
 describe("library_search ordering through the tool", function () {
   const context: AgentToolContext = {
-    request: { conversationKey: 5, mode: "agent", userText: "recent", libraryID: 1 },
+    request: {
+      conversationKey: 5,
+      mode: "agent",
+      userText: "recent",
+      libraryID: 1,
+    },
     item: null,
     currentAnswerText: "",
     modelName: "test-model",
   };
 
   const targets = [
-    { itemId: 1, title: "Beta", dateAdded: "2026-01-01", attachments: [{ contextItemId: 101, title: "PDF", contentType: "application/pdf" }], tags: [], collectionIds: [] },
-    { itemId: 2, title: "Alpha", dateAdded: "2026-08-01", attachments: [{ contextItemId: 102, title: "PDF", contentType: "application/pdf" }], tags: [], collectionIds: [] },
-    { itemId: 3, title: "Gamma", dateAdded: "2026-04-01", attachments: [{ contextItemId: 103, title: "PDF", contentType: "application/pdf" }], tags: [], collectionIds: [] },
+    {
+      itemId: 1,
+      title: "Beta",
+      dateAdded: "2026-01-01",
+      attachments: [
+        { contextItemId: 101, title: "PDF", contentType: "application/pdf" },
+      ],
+      tags: [],
+      collectionIds: [],
+    },
+    {
+      itemId: 2,
+      title: "Alpha",
+      dateAdded: "2026-08-01",
+      attachments: [
+        { contextItemId: 102, title: "PDF", contentType: "application/pdf" },
+      ],
+      tags: [],
+      collectionIds: [],
+    },
+    {
+      itemId: 3,
+      title: "Gamma",
+      dateAdded: "2026-04-01",
+      attachments: [
+        { contextItemId: 103, title: "PDF", contentType: "application/pdf" },
+      ],
+      tags: [],
+      collectionIds: [],
+    },
   ];
 
   function makeTool() {
     return createQueryLibraryTool({
       resolveLibraryID: () => 1,
-      listBibliographicItemTargets: async () => ({ items: targets, totalCount: targets.length }),
-      listLibraryPaperTargets: async () => ({ papers: targets, totalCount: targets.length }),
-      listItemsByFilters: async () => ({ items: targets, totalCount: targets.length }),
+      listBibliographicItemTargets: async () => ({
+        items: targets,
+        totalCount: targets.length,
+      }),
+      listLibraryPaperTargets: async () => ({
+        papers: targets,
+        totalCount: targets.length,
+      }),
+      listItemsByFilters: async () => ({
+        items: targets,
+        totalCount: targets.length,
+      }),
       getItemCollectionIds: () => [],
       getItem: () => null,
       getEditableArticleMetadata: () => undefined,
@@ -195,7 +249,12 @@ describe("library_search ordering through the tool", function () {
   });
 
   it("pages with offset instead of returning the same first page", async function () {
-    const first = await run({ entity: "items", mode: "list", sort: "dateAdded", limit: 1 });
+    const first = await run({
+      entity: "items",
+      mode: "list",
+      sort: "dateAdded",
+      limit: 1,
+    });
     const second = await run({
       entity: "items",
       mode: "list",
@@ -223,9 +282,16 @@ describe("library overview stays out of the cached prefix", function () {
 
   it("is absent from the system prompt", async function () {
     setLibraryOverviewGateway({
-      listAllLibraries: () => [{ libraryID: 1, name: "My Library", editable: true }],
+      listAllLibraries: () => [
+        { libraryID: 1, name: "My Library", editable: true },
+      ],
       listCollectionSummaries: () => [
-        { collectionId: 12, name: "Neuroscience", libraryID: 1, path: "Neuroscience" },
+        {
+          collectionId: 12,
+          name: "Neuroscience",
+          libraryID: 1,
+          path: "Neuroscience",
+        },
       ],
     } as never);
 

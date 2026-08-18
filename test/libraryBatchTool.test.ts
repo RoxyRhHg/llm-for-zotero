@@ -80,7 +80,10 @@ describe("library_batch", function () {
   it("refuses in safe mode and says where per-page review lives", async function () {
     installMode("safe");
     const tool = makeTool();
-    const validated = tool.validate({ job: "auto_tag", jobArgs: { scope: "all" } });
+    const validated = tool.validate({
+      job: "auto_tag",
+      jobArgs: { scope: "all" },
+    });
     assert.isTrue(validated.ok);
     if (!validated.ok) return;
 
@@ -98,7 +101,10 @@ describe("library_batch", function () {
   it("runs the job in yolo and reports real counts", async function () {
     installMode("yolo");
     const tool = makeTool();
-    const validated = tool.validate({ job: "auto_tag", jobArgs: { scope: "all" } });
+    const validated = tool.validate({
+      job: "auto_tag",
+      jobArgs: { scope: "all" },
+    });
     assert.isTrue(validated.ok);
     if (!validated.ok) return;
 
@@ -106,7 +112,11 @@ describe("library_batch", function () {
       string,
       unknown
     >;
-    assert.equal(output.appliedCount, 42, "the count must come from the action");
+    assert.equal(
+      output.appliedCount,
+      42,
+      "the count must come from the action",
+    );
     assert.equal(output.job, "auto_tag");
     assert.deepEqual(output.output, { tagged: 42, processed: 50 });
   });
@@ -136,7 +146,10 @@ describe("library_batch", function () {
     if (!validated.ok) return;
     const pending = tool.createPendingAction?.(validated.value, context);
     const preview = pending?.fields.find((f) => f.type === "code_preview");
-    assert.include((preview as never as { value: string })?.value, "collectionId");
+    assert.include(
+      (preview as never as { value: string })?.value,
+      "collectionId",
+    );
     assert.include(
       pending?.description || "",
       "reverted",
@@ -146,7 +159,10 @@ describe("library_batch", function () {
 
   it("propagates a failed job rather than reporting success", async function () {
     installMode("yolo");
-    const tool = makeTool(async () => ({ ok: false, error: "model unreachable" }));
+    const tool = makeTool(async () => ({
+      ok: false,
+      error: "model unreachable",
+    }));
     const validated = tool.validate({ job: "auto_tag", jobArgs: {} });
     assert.isTrue(validated.ok);
     if (!validated.ok) return;

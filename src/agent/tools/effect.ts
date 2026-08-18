@@ -54,7 +54,10 @@ function candidateLevels(content: unknown): Array<Record<string, unknown>> {
   return levels;
 }
 
-function readCount(record: Record<string, unknown>, key: string): number | null {
+function readCount(
+  record: Record<string, unknown>,
+  key: string,
+): number | null {
   const value = record[key];
   return typeof value === "number" && Number.isFinite(value) ? value : null;
 }
@@ -87,7 +90,9 @@ function fromCounts(record: Record<string, unknown>): AgentToolEffect | null {
   return null;
 }
 
-export function deriveToolEffect(content: unknown): AgentToolEffect | undefined {
+export function deriveToolEffect(
+  content: unknown,
+): AgentToolEffect | undefined {
   for (const record of candidateLevels(content)) {
     const items = record.items;
     if (Array.isArray(items) && items.length) {
@@ -142,7 +147,11 @@ export function summarizeMutationOutcome(
       ? `No ${verbs.noun} changed — ${reason}`
       : `No ${verbs.noun} changed`;
   }
-  if (effect === "partial" && counts.applied !== null && counts.total !== null) {
+  if (
+    effect === "partial" &&
+    counts.applied !== null &&
+    counts.total !== null
+  ) {
     const reason = counts.firstReason;
     return `${verbs.applied} ${counts.applied} of ${counts.total} ${verbs.noun}${
       reason ? ` — ${counts.total - counts.applied} skipped: ${reason}` : ""
@@ -175,7 +184,11 @@ function collectRowCounts(content: unknown): {
       total += 1;
       if (APPLIED_STATUSES.has(status)) {
         applied += 1;
-      } else if (!firstReason && typeof row?.reason === "string" && row.reason) {
+      } else if (
+        !firstReason &&
+        typeof row?.reason === "string" &&
+        row.reason
+      ) {
         firstReason = row.reason;
       }
     }

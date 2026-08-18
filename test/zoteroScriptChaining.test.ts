@@ -20,7 +20,12 @@ describe("zotero_script chaining", function () {
   });
 
   const context: AgentToolContext = {
-    request: { conversationKey: 3, mode: "agent", userText: "list", libraryID: 1 },
+    request: {
+      conversationKey: 3,
+      mode: "agent",
+      userText: "list",
+      libraryID: 1,
+    },
     item: null,
     currentAnswerText: "",
     modelName: "test-model",
@@ -100,7 +105,12 @@ describe("zotero_script write-mode snapshotting", function () {
   });
 
   const context: AgentToolContext = {
-    request: { conversationKey: 4, mode: "agent", userText: "tag", libraryID: 1 },
+    request: {
+      conversationKey: 4,
+      mode: "agent",
+      userText: "tag",
+      libraryID: 1,
+    },
     item: null,
     currentAnswerText: "",
     modelName: "test-model",
@@ -242,7 +252,8 @@ describe("zotero_script scope control", function () {
     const tool = createZoteroScriptTool();
     const validated = tool.validate({
       mode: "read",
-      script: "const rows = await Zotero.DB.queryAsync('SELECT 1'); return rows.length;",
+      script:
+        "const rows = await Zotero.DB.queryAsync('SELECT 1'); return rows.length;",
       description: "count",
     });
     assert.isTrue(validated.ok);
@@ -344,7 +355,8 @@ describe("zotero_script sandbox engagement", function () {
     const tool = createZoteroScriptTool();
     const validated = tool.validate({
       mode: "write",
-      script: "env.addUndoStep(async () => {}); await Zotero.DB.queryAsync('x');",
+      script:
+        "env.addUndoStep(async () => {}); await Zotero.DB.queryAsync('x');",
       description: "sql",
     });
     assert.isTrue(validated.ok);

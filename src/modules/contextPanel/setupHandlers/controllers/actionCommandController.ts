@@ -1381,7 +1381,6 @@ export function createActionCommandController(
     deps.persistDraftInputForCurrentConversation();
   };
 
-
   const handleSkillSelection = (skill: AgentSkill): void => {
     clearForcedSkill();
     clearCommandChip();

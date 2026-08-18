@@ -32,7 +32,10 @@ describe("zotero_script confirmation", function () {
       script,
       description: "Tidy collections",
     });
-    assert.isTrue(result.ok, `fixture should validate: ${JSON.stringify(result)}`);
+    assert.isTrue(
+      result.ok,
+      `fixture should validate: ${JSON.stringify(result)}`,
+    );
     if (!result.ok) throw new Error("unreachable");
     return result.value;
   }
@@ -43,7 +46,10 @@ describe("zotero_script confirmation", function () {
   it("requires confirmation for a write-mode script", async function () {
     const input = validated("write", WRITE_SCRIPT);
     const required = await tool.shouldRequireConfirmation?.(input, context);
-    assert.isTrue(required, "write scripts mutate the library and must be confirmed");
+    assert.isTrue(
+      required,
+      "write scripts mutate the library and must be confirmed",
+    );
   });
 
   it("shows the actual source in a code_preview field, not a summary", async function () {

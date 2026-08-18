@@ -193,7 +193,8 @@ export function createAnnotatePdfTool(
         resolutionData && typeof resolutionData === "object"
           ? (resolutionData as Record<string, unknown>)
           : undefined;
-      const edited = data && typeof data.comment === "string" ? data.comment : undefined;
+      const edited =
+        data && typeof data.comment === "string" ? data.comment : undefined;
       return ok(edited === undefined ? input : { ...input, comment: edited });
     },
 

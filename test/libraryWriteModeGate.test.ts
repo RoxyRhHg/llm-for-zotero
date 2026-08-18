@@ -27,7 +27,12 @@ describe("library write mode gate", function () {
   }
 
   const context: AgentToolContext = {
-    request: { conversationKey: 1, mode: "agent", userText: "go", libraryID: 1 },
+    request: {
+      conversationKey: 1,
+      mode: "agent",
+      userText: "go",
+      libraryID: 1,
+    },
     item: null,
     currentAnswerText: "",
     modelName: "test",

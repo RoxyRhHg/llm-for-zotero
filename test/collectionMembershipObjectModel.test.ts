@@ -189,7 +189,10 @@ describe("tag writes follow the object model", function () {
       assignments: [{ itemId: 21, tags: ["scanned"] }],
     });
 
-    assert.isTrue(child.tagSet.has("scanned"), "the attachment carries its own tags");
+    assert.isTrue(
+      child.tagSet.has("scanned"),
+      "the attachment carries its own tags",
+    );
     assert.isFalse(
       parent.tagSet.has("scanned"),
       "the old resolver tagged the parent and reported the parent's id",

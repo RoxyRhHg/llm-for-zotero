@@ -50,8 +50,13 @@ describe("destructive checklist consent", function () {
       const pending = tool.createPendingAction?.(input, baseContext);
       const field = pending?.fields.find((f) => f.type === "checklist");
       assert.exists(field, "expected a checklist field");
-      assert.equal((field as never as { id: string }).id, "trashItemsChecklist");
-      const items = (field as never as { items: Array<{ id: string; checked: boolean }> }).items;
+      assert.equal(
+        (field as never as { id: string }).id,
+        "trashItemsChecklist",
+      );
+      const items = (
+        field as never as { items: Array<{ id: string; checked: boolean }> }
+      ).items;
       assert.deepEqual(
         items.map((i) => i.id),
         ["101", "102", "103"],
@@ -64,10 +69,14 @@ describe("destructive checklist consent", function () {
       const applied = tool.applyConfirmation?.(input, {
         trashItemsChecklist: ["101", "103"],
       });
-      assert.isTrue(applied?.ok, "expected the narrowed selection to be accepted");
+      assert.isTrue(
+        applied?.ok,
+        "expected the narrowed selection to be accepted",
+      );
       if (!applied?.ok) return;
       assert.deepEqual(
-        (applied.value as { operation: { itemIds: number[] } }).operation.itemIds,
+        (applied.value as { operation: { itemIds: number[] } }).operation
+          .itemIds,
         [101, 103],
         "unchecked item 102 must not be trashed",
       );
@@ -90,7 +99,8 @@ describe("destructive checklist consent", function () {
       assert.isTrue(applied?.ok);
       if (!applied?.ok) return;
       assert.deepEqual(
-        (applied.value as { operation: { itemIds: number[] } }).operation.itemIds,
+        (applied.value as { operation: { itemIds: number[] } }).operation
+          .itemIds,
         [101, 102, 103],
       );
     });
@@ -99,7 +109,10 @@ describe("destructive checklist consent", function () {
   describe("merge_items", function () {
     function validated() {
       const tool = createMergeItemsTool(fakeGateway);
-      const result = tool.validate({ masterItemId: 200, otherItemIds: [201, 202] });
+      const result = tool.validate({
+        masterItemId: 200,
+        otherItemIds: [201, 202],
+      });
       assert.isTrue(result.ok, "fixture should validate");
       if (!result.ok) throw new Error("unreachable");
       return { tool, input: result.value };
@@ -112,15 +125,28 @@ describe("destructive checklist consent", function () {
       });
       assert.isTrue(applied?.ok);
       if (!applied?.ok) return;
-      const op = (applied.value as { operation: { masterItemId: number; otherItemIds: number[] } })
-        .operation;
-      assert.equal(op.masterItemId, 200, "the master is not part of the checklist");
-      assert.deepEqual(op.otherItemIds, [202], "unchecked duplicate 201 must survive");
+      const op = (
+        applied.value as {
+          operation: { masterItemId: number; otherItemIds: number[] };
+        }
+      ).operation;
+      assert.equal(
+        op.masterItemId,
+        200,
+        "the master is not part of the checklist",
+      );
+      assert.deepEqual(
+        op.otherItemIds,
+        [202],
+        "unchecked duplicate 201 must survive",
+      );
     });
 
     it("fails when every duplicate is unchecked", function () {
       const { tool, input } = validated();
-      const applied = tool.applyConfirmation?.(input, { duplicatesChecklist: [] });
+      const applied = tool.applyConfirmation?.(input, {
+        duplicatesChecklist: [],
+      });
       assert.isFalse(applied?.ok);
     });
 
@@ -130,13 +156,14 @@ describe("destructive checklist consent", function () {
       assert.isTrue(applied?.ok);
       if (!applied?.ok) return;
       assert.deepEqual(
-        (applied.value as { operation: { otherItemIds: number[] } }).operation.otherItemIds,
+        (applied.value as { operation: { otherItemIds: number[] } }).operation
+          .otherItemIds,
         [201, 202],
       );
     });
   });
 
-  describe("import_identifiers (row ids are array indices, so \"0\" is valid)", function () {
+  describe('import_identifiers (row ids are array indices, so "0" is valid)', function () {
     function validated() {
       const tool = createImportIdentifiersTool(fakeGateway);
       const result = tool.validate({

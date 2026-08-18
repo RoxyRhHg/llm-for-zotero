@@ -59,9 +59,10 @@ export function buildLibraryOverviewSection(
   zoteroGateway: OverviewGateway,
   libraryID: number | undefined,
 ): string {
-  const activeLibraryID = Number.isFinite(libraryID) && Number(libraryID) > 0
-    ? Math.floor(Number(libraryID))
-    : 1;
+  const activeLibraryID =
+    Number.isFinite(libraryID) && Number(libraryID) > 0
+      ? Math.floor(Number(libraryID))
+      : 1;
 
   const lines: string[] = ["Zotero library:"];
 
@@ -130,7 +131,7 @@ export function buildLibraryOverviewSection(
   // `library_search({ entity:'tags' })` covers it on demand.
 
   lines.push(
-    '- Resolve any other name to an ID with library_search({ entity:\'collections\', mode:\'list\' }) rather than asking the user for one.',
+    "- Resolve any other name to an ID with library_search({ entity:'collections', mode:'list' }) rather than asking the user for one.",
   );
 
   return lines.join("\n");

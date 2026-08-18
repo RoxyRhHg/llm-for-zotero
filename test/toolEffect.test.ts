@@ -19,7 +19,10 @@ describe("deriveToolEffect", function () {
     );
     assert.equal(
       deriveToolEffect({
-        items: [{ status: "moved" }, { status: "missing", reason: "wrong type" }],
+        items: [
+          { status: "moved" },
+          { status: "missing", reason: "wrong type" },
+        ],
         movedCount: 1,
       }),
       "partial",
@@ -45,7 +48,10 @@ describe("deriveToolEffect", function () {
     assert.equal(
       deriveToolEffect({
         operation: "create_collection",
-        result: { result: { collection: { collectionId: 3 } }, status: "created" },
+        result: {
+          result: { collection: { collectionId: 3 } },
+          status: "created",
+        },
       }),
       "applied",
     );
@@ -60,8 +66,14 @@ describe("deriveToolEffect", function () {
   });
 
   it("treats single-object statuses as applied", function () {
-    assert.equal(deriveToolEffect({ status: "standalone_created", noteId: 5 }), "applied");
-    assert.equal(deriveToolEffect({ status: "deleted", collectionId: 9 }), "applied");
+    assert.equal(
+      deriveToolEffect({ status: "standalone_created", noteId: 5 }),
+      "applied",
+    );
+    assert.equal(
+      deriveToolEffect({ status: "deleted", collectionId: 9 }),
+      "applied",
+    );
   });
 
   it("returns undefined when nothing granular is reported", function () {

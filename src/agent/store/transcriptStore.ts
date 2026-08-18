@@ -190,7 +190,11 @@ function dropOrphanToolCalls(
   const result: AgentModelMessage[] = [];
   for (const message of messages) {
     const calls = (message as { tool_calls?: unknown }).tool_calls;
-    if (message?.role !== "assistant" || !Array.isArray(calls) || !calls.length) {
+    if (
+      message?.role !== "assistant" ||
+      !Array.isArray(calls) ||
+      !calls.length
+    ) {
       result.push(message);
       continue;
     }

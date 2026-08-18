@@ -69,7 +69,9 @@ function hasDb(): boolean {
 }
 
 function normalizeStatus(value: unknown): JournalEntryStatus {
-  return value === "irreversible" || value === "reverted" ? value : "reversible";
+  return value === "irreversible" || value === "reverted"
+    ? value
+    : "reversible";
 }
 
 function toEntry(row: JournalRow): ChangeJournalEntry {

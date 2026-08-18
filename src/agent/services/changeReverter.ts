@@ -60,8 +60,7 @@ export async function revertEntries(params: {
       skipped.push({
         entryId: entry.entryId,
         reason:
-          entry.irreversibleReason ||
-          "No inverse was recorded for this change",
+          entry.irreversibleReason || "No inverse was recorded for this change",
       });
       continue;
     }
@@ -115,10 +114,12 @@ export async function revertEntries(params: {
  * unrecognised shape reached `executeOperation`, fell through its switch, and
  * was counted as a successful revert.
  */
-function isMutationOperation(value: unknown): value is LibraryMutationOperation {
+function isMutationOperation(
+  value: unknown,
+): value is LibraryMutationOperation {
   return Boolean(
     value &&
-      typeof value === "object" &&
-      typeof (value as { type?: unknown }).type === "string",
+    typeof value === "object" &&
+    typeof (value as { type?: unknown }).type === "string",
   );
 }

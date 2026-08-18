@@ -39,7 +39,13 @@ describe("transcript orphan tool_calls", function () {
       {
         role: "assistant",
         content: "",
-        tool_calls: [{ id: "a", type: "function", function: { name: "t", arguments: "{}" } }],
+        tool_calls: [
+          {
+            id: "a",
+            type: "function",
+            function: { name: "t", arguments: "{}" },
+          },
+        ],
       } as never,
       { role: "tool", tool_call_id: "a", content: "ok" } as never,
     ]);
@@ -55,8 +61,16 @@ describe("transcript orphan tool_calls", function () {
         role: "assistant",
         content: "",
         tool_calls: [
-          { id: "a", type: "function", function: { name: "t", arguments: "{}" } },
-          { id: "b", type: "function", function: { name: "t", arguments: "{}" } },
+          {
+            id: "a",
+            type: "function",
+            function: { name: "t", arguments: "{}" },
+          },
+          {
+            id: "b",
+            type: "function",
+            function: { name: "t", arguments: "{}" },
+          },
         ],
       } as never,
       { role: "tool", tool_call_id: "a", content: "ok" } as never,
@@ -76,7 +90,13 @@ describe("transcript orphan tool_calls", function () {
       {
         role: "assistant",
         content: "",
-        tool_calls: [{ id: "a", type: "function", function: { name: "t", arguments: "{}" } }],
+        tool_calls: [
+          {
+            id: "a",
+            type: "function",
+            function: { name: "t", arguments: "{}" },
+          },
+        ],
       } as never,
     ]);
     assert.isUndefined(
@@ -90,7 +110,13 @@ describe("transcript orphan tool_calls", function () {
       {
         role: "assistant",
         content: "Let me file those.",
-        tool_calls: [{ id: "a", type: "function", function: { name: "t", arguments: "{}" } }],
+        tool_calls: [
+          {
+            id: "a",
+            type: "function",
+            function: { name: "t", arguments: "{}" },
+          },
+        ],
       } as never,
     ]);
     const assistant = stored.find((m) => m.role === "assistant") as never as {

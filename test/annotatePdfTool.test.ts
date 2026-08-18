@@ -20,7 +20,12 @@ describe("annotate_pdf", function () {
   });
 
   const context: AgentToolContext = {
-    request: { conversationKey: 2, mode: "agent", userText: "highlight", libraryID: 1 },
+    request: {
+      conversationKey: 2,
+      mode: "agent",
+      userText: "highlight",
+      libraryID: 1,
+    },
     item: null,
     currentAnswerText: "",
     modelName: "test",
@@ -30,7 +35,10 @@ describe("annotate_pdf", function () {
     const saved: Array<Record<string, unknown>> = [];
     (globalThis as typeof globalThis & { Zotero?: unknown }).Zotero = {
       Annotations: {
-        saveFromJSON: async (_attachment: unknown, json: Record<string, unknown>) => {
+        saveFromJSON: async (
+          _attachment: unknown,
+          json: Record<string, unknown>,
+        ) => {
           saved.push(json);
           return { id: 900 };
         },
@@ -98,7 +106,11 @@ describe("annotate_pdf", function () {
       message = error instanceof Error ? error.message : String(error);
     }
     assert.include(message, "not an attachment");
-    assert.include(message, "attachments", "the message must say how to find it");
+    assert.include(
+      message,
+      "attachments",
+      "the message must say how to find it",
+    );
   });
 
   it("rejects a colour Zotero would throw on rather than losing the highlight", function () {

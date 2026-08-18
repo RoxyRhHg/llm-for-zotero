@@ -135,7 +135,9 @@ describe("write note destination classifier", function () {
       "file",
     );
     assert.equal(
-      classifyWriteNoteDestination("save the note as an md file in that folder"),
+      classifyWriteNoteDestination(
+        "save the note as an md file in that folder",
+      ),
       "file",
     );
     assert.equal(
@@ -143,7 +145,10 @@ describe("write note destination classifier", function () {
       "file",
     );
     assert.equal(
-      classifyWriteNoteDestination("write the note to my Research Vault folder", "Research Vault"),
+      classifyWriteNoteDestination(
+        "write the note to my Research Vault folder",
+        "Research Vault",
+      ),
       "file",
     );
   });

@@ -75,7 +75,10 @@ export function createRevertChangesTool(
     },
 
     validate(args) {
-      if (args !== undefined && !validateObject<Record<string, unknown>>(args)) {
+      if (
+        args !== undefined &&
+        !validateObject<Record<string, unknown>>(args)
+      ) {
         return fail("Expected an object, for example { count: 1 }");
       }
       const record = (args || {}) as Record<string, unknown>;

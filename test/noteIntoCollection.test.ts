@@ -100,10 +100,19 @@ describe("note into a collection (issue #374)", function () {
     );
 
     assert.equal(saved.length, 1);
-    assert.deepEqual(saved[0].collections, [88], "the collection must reach the gateway");
+    assert.deepEqual(
+      saved[0].collections,
+      [88],
+      "the collection must reach the gateway",
+    );
 
-    const result = (outcome.result as { result: Record<string, unknown> }).result;
-    assert.equal(result.noteId, 555, "the note id must survive the trip back up");
+    const result = (outcome.result as { result: Record<string, unknown> })
+      .result;
+    assert.equal(
+      result.noteId,
+      555,
+      "the note id must survive the trip back up",
+    );
     assert.deepEqual(result.collections, [88]);
     assert.exists(outcome.undo, "creating a note must be undoable");
   });
