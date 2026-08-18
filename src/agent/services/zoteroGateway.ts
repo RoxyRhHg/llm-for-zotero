@@ -782,6 +782,49 @@ export type AgentLibraryFilters = {
   tag?: string;
 };
 
+/**
+ * Applies the exact year range in JS.
+ *
+ * The SQL side can only narrow: Zotero compares dates as strings, and an
+ * `isAfter` on a bare year matches everything later in *that same* year. So
+ * the range is enforced here, on the parsed year, exactly as the in-memory
+ * fallback path already did. Items with no parseable year are excluded, which
+ * is what a year-bounded question means.
+ */
+function libraryItemTargetMatchesYear(
+  target: LibraryItemTarget,
+  filters?: { yearFrom?: number; yearTo?: number },
+): boolean {
+  if (filters?.yearFrom == null && filters?.yearTo == null) return true;
+  const year = parseInt(String(target.year ?? ""), 10);
+  if (Number.isNaN(year)) return false;
+  if (filters.yearFrom != null && year < filters.yearFrom) return false;
+  if (filters.yearTo != null && year > filters.yearTo) return false;
+  return true;
+}
+
+/**
+ * Builds the `Zotero.Search` behind the agent's structured filters.
+ *
+ * Two conditions here were wrong in ways that silently produced empty or
+ * over-broad results:
+ *
+ * 1. `year` was given `isGreaterThan`/`isLessThan`, which it does not accept
+ *    (`searchConditions.js` allows only is/isNot/contains/doesNotContain).
+ *    `addCondition` *throws* on an unsupported operator, and both callers
+ *    swallowed the throw — so every text search combined with a year filter
+ *    reported "no matching library results", always. The list path happened
+ *    to fall back to an in-memory filter, which is why this went unnoticed.
+ *    Year is now narrowed with `date`, which does support ranges, and made
+ *    exact by `libraryItemTargetMatchesYear`.
+ *
+ * 2. The author filter was an OR block. Any block sets `hasQuicksearch`, and
+ *    `joinModeAny` is `_joinMode == 'any' || hasQuicksearch` — so opening a
+ *    block flipped *every other condition* in the query from AND to OR. A
+ *    search for "papers by Peyrache in collection X" returned everything by
+ *    Peyrache plus everything in X. `creator` matches all creator roles in
+ *    one condition, so no block is needed.
+ */
 function buildAgentLibrarySearch(
   libraryID: number,
   filters: AgentLibraryFilters,
@@ -797,17 +840,17 @@ function buildAgentLibrarySearch(
     search.addCondition("itemType", "is", filters.itemType);
   }
   if (filters.author) {
-    search.addCondition("blockStart");
-    search.addCondition("author", "contains", filters.author);
-    search.addCondition("editor", "contains", filters.author);
-    search.addCondition("bookAuthor", "contains", filters.author);
-    search.addCondition("blockEnd");
+    // `creator` spans author, editor, bookAuthor and the rest.
+    search.addCondition("creator", "contains", filters.author);
   }
   if (filters.yearFrom != null) {
-    search.addCondition("year", "isGreaterThan", String(filters.yearFrom - 1));
+    // `> 'YYYY-00-00'`, so this may admit part of the preceding year; the
+    // exact bound is applied afterwards.
+    search.addCondition("date", "isAfter", String(filters.yearFrom - 1));
   }
   if (filters.yearTo != null) {
-    search.addCondition("year", "isLessThan", String(filters.yearTo + 1));
+    // `< 'YYYY-00-00'` for the following year, which is an exact upper bound.
+    search.addCondition("date", "isBefore", String(filters.yearTo + 1));
   }
   if (filters.tag) {
     search.addCondition("tag", "is", filters.tag);
@@ -1666,7 +1709,11 @@ export class ZoteroGateway {
         const raw = this.getItem(id);
         if (!raw) continue;
         const target = buildItemTargetFromItem(raw);
-        if (target && libraryItemTargetMatchesFilters(target, params.filters)) {
+        if (
+          target &&
+          libraryItemTargetMatchesFilters(target, params.filters) &&
+          libraryItemTargetMatchesYear(target, params.filters)
+        ) {
           items.push(target);
         }
       }
@@ -1674,8 +1721,16 @@ export class ZoteroGateway {
         items: normalizedLimit ? items.slice(0, normalizedLimit) : items,
         totalCount: items.length,
       };
-    } catch (_error) {
-      void _error;
+    } catch (error) {
+      // A genuine fallback: the in-memory path applies the same filters and
+      // returns correct results, so this stays a fallback rather than a
+      // rethrow. It is logged because it silently masked the `year` operator
+      // bug for as long as that bug existed.
+      Zotero.debug(
+        `[agent] Zotero.Search listing failed, falling back to in-memory filtering: ${
+          error instanceof Error ? error.message : String(error)
+        }`,
+      );
       return this._listItemsByFiltersInMemory(params);
     }
   }
@@ -1859,7 +1914,11 @@ export class ZoteroGateway {
         const item = this.getItem(itemId);
         if (!item) continue;
         const target = buildItemTargetFromItem(item);
-        if (target && libraryItemTargetMatchesFilters(target, params.filters)) {
+        if (
+          target &&
+          libraryItemTargetMatchesFilters(target, params.filters) &&
+          libraryItemTargetMatchesYear(target, params.filters)
+        ) {
           targets.push(target);
         }
       }
@@ -1870,9 +1929,13 @@ export class ZoteroGateway {
             : targets,
         totalCount: targets.length,
       };
-    } catch (_error) {
-      void _error;
-      return { items: [], totalCount: 0 };
+    } catch (error) {
+      // Deliberately not swallowed into an empty result. Reporting "no
+      // matching library results" for a *broken query* is indistinguishable
+      // from a genuine miss, which is exactly how the `year` operator bug
+      // stayed invisible: the agent confidently told users their library had
+      // nothing. A thrown error surfaces as a tool failure instead.
+      throw error instanceof Error ? error : new Error(String(error));
     }
   }
 
