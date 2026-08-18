@@ -14,6 +14,7 @@ import { createReadAttachmentTool } from "./read/readAttachment";
 import { clearPdfToolCaches } from "./read/pdfToolUtils";
 import { createSearchLiteratureOnlineTool } from "./read/searchLiteratureOnline";
 import { createToolResultReadTool } from "./read/toolResultRead";
+import { createCiteExportTool } from "./read/citeExport";
 import { createDelegatingTool, createRenamedTool } from "./facade";
 
 import { createEditCurrentNoteTool } from "./write/editCurrentNote";
@@ -29,6 +30,7 @@ import { createTrashItemsTool } from "./write/trashItems";
 import { createRestoreFromTrashTool } from "./write/restoreFromTrash";
 import { createWriteNotesBatchTool } from "./write/writeNotesBatch";
 import { createSavedSearchTool } from "./write/savedSearches";
+import { createLibrarySettingsTool } from "./write/librarySettings";
 import {
   createSetItemTagsTool,
   createUpdateLibraryTagTool,
@@ -619,6 +621,8 @@ export function createBuiltInToolRegistry(
     }),
   );
   registry.register(savedSearchUpdate);
+  registry.register(createCiteExportTool(deps.zoteroGateway));
+  registry.register(createLibrarySettingsTool(deps.zoteroGateway));
   registry.register(
     createLibraryImportTool({
       importIdentifiers,

@@ -358,6 +358,74 @@ const NON_EDITABLE_METADATA_FIELDS = new Set([
  * both happy, and falling back to the string keeps this callable from the
  * node test harness.
  */
+/**
+ * Zotero preferences the agent may read and write.
+ *
+ * An allowlist rather than open access to `Zotero.Prefs`: the pref tree
+ * includes sync credentials, data directory paths and proxy settings, and an
+ * agent that can rewrite those can lock a user out of their own library. Each
+ * entry here changes behaviour the user might reasonably ask about.
+ */
+const AGENT_WRITABLE_PREFS: Record<
+  string,
+  { type: "boolean" | "number" | "string"; description: string }
+> = {
+  recursiveCollections: {
+    type: "boolean",
+    description: "Show items from subcollections in a collection",
+  },
+  sortNotesChronologically: {
+    type: "boolean",
+    description: "Sort child notes by date rather than title",
+  },
+  showTrashWhenEmpty: {
+    type: "boolean",
+    description: "Keep the Trash row visible when it is empty",
+  },
+  automaticSnapshots: {
+    type: "boolean",
+    description: "Save a snapshot when creating an item from a web page",
+  },
+  automaticTags: {
+    type: "boolean",
+    description: "Add keywords and subject headings as automatic tags",
+  },
+  trashAutoEmptyDays: {
+    type: "number",
+    description: "Days before trashed items are erased automatically",
+  },
+  "export.quickCopy.setting": {
+    type: "string",
+    description: "The Quick Copy citation style or export format",
+  },
+  "export.quickCopy.locale": {
+    type: "string",
+    description: "Locale used for Quick Copy citations",
+  },
+  attachmentRenameTemplate: {
+    type: "string",
+    description: "Filename template used when renaming attachments",
+  },
+  autoRenameFiles: {
+    type: "boolean",
+    description: "Rename attachment files from their parent's metadata",
+  },
+  "annotations.noteTemplates.title": {
+    type: "string",
+    description: "Template for the title of a note built from annotations",
+  },
+  "annotations.noteTemplates.note": {
+    type: "string",
+    description: "Template for each annotation in such a note",
+  },
+  fontSize: { type: "number", description: "Interface font size" },
+  "note.fontSize": { type: "number", description: "Note editor font size" },
+  layout: {
+    type: "string",
+    description: "Item pane layout ('standard' or 'stacked')",
+  },
+};
+
 function toLocalFileHandle(filePath: string): unknown {
   try {
     const components = (
@@ -4254,6 +4322,373 @@ export class ZoteroGateway {
     (search as unknown as { deleted: boolean }).deleted = true;
     await search.saveTx?.();
     return { savedSearchId: params.savedSearchId, status: "trashed" };
+  }
+
+  /** Reads the preferences the agent is allowed to see. */
+  listSettings(): Array<{
+    key: string;
+    value: unknown;
+    type: string;
+    description: string;
+  }> {
+    const prefs = (
+      Zotero as unknown as { Prefs?: { get?: (key: string) => unknown } }
+    ).Prefs;
+    return Object.entries(AGENT_WRITABLE_PREFS).map(([key, spec]) => {
+      let value: unknown = undefined;
+      try {
+        value = prefs?.get?.(key);
+      } catch {
+        // An unset pref reads as undefined rather than failing the listing.
+      }
+      return { key, value, type: spec.type, description: spec.description };
+    });
+  }
+
+  /**
+   * Writes one allowlisted preference.
+   *
+   * Anything outside the allowlist is refused by name. `Zotero.Prefs` also
+   * holds sync credentials, the data directory and proxy settings, and an
+   * agent that can rewrite those can lock a user out of their own library.
+   */
+  async updateSetting(params: { key: string; value: unknown }): Promise<{
+    key: string;
+    previousValue: unknown;
+    value: unknown;
+    status: "updated" | "unchanged" | "refused";
+    reason?: string;
+  }> {
+    const spec = AGENT_WRITABLE_PREFS[params.key];
+    if (!spec) {
+      return {
+        key: params.key,
+        previousValue: undefined,
+        value: params.value,
+        status: "refused",
+        reason: `"${params.key}" is not a preference the agent may change. The ones it may are listed by library_settings with action:'list'.`,
+      };
+    }
+    const prefs = (
+      Zotero as unknown as {
+        Prefs?: {
+          get?: (key: string) => unknown;
+          set?: (key: string, value: unknown) => void;
+        };
+      }
+    ).Prefs;
+    if (!prefs?.set) {
+      return {
+        key: params.key,
+        previousValue: undefined,
+        value: params.value,
+        status: "refused",
+        reason: "Zotero.Prefs is not available in this build",
+      };
+    }
+
+    let coerced: unknown = params.value;
+    if (spec.type === "boolean") coerced = Boolean(params.value);
+    else if (spec.type === "number") {
+      const numeric = Number(params.value);
+      if (!Number.isFinite(numeric)) {
+        return {
+          key: params.key,
+          previousValue: prefs.get?.(params.key),
+          value: params.value,
+          status: "refused",
+          reason: `"${params.key}" expects a number`,
+        };
+      }
+      coerced = numeric;
+    } else coerced = String(params.value ?? "");
+
+    const previousValue = prefs.get?.(params.key);
+    if (previousValue === coerced) {
+      return {
+        key: params.key,
+        previousValue,
+        value: coerced,
+        status: "unchanged",
+      };
+    }
+    prefs.set(params.key, coerced);
+    return {
+      key: params.key,
+      previousValue,
+      value: coerced,
+      status: "updated",
+    };
+  }
+
+  /** Sync state, and a way to start one. */
+  getSyncStatus(): {
+    configured: boolean;
+    username?: string;
+    lastSyncAt?: number;
+    inProgress: boolean;
+  } {
+    const sync = Zotero as unknown as {
+      Sync?: {
+        Runner?: { syncInProgress?: boolean; lastSyncStatus?: string };
+      };
+      Users?: { getCurrentUsername?: () => string };
+      Prefs?: { get?: (key: string) => unknown };
+    };
+    let username: string | undefined;
+    try {
+      username = sync.Users?.getCurrentUsername?.() || undefined;
+    } catch {
+      username = undefined;
+    }
+    return {
+      configured: Boolean(username),
+      username,
+      inProgress: Boolean(sync.Sync?.Runner?.syncInProgress),
+    };
+  }
+
+  /** The export formats Zotero can write. */
+  listExportFormats(): Array<{ id: string; label: string }> {
+    const translators = (
+      Zotero as unknown as {
+        Translators?: {
+          getAllForType?: (
+            type: string,
+          ) => Promise<Array<{ translatorID: string; label: string }>>;
+        };
+      }
+    ).Translators;
+    void translators;
+    // Deliberately synchronous and static: the async translator listing is a
+    // separate call shape, and these are the formats users actually name.
+    return [
+      { id: "14763d24-8ba0-45df-8f52-b8d1108e7ac9", label: "BibTeX" },
+      { id: "9cb70025-a888-4a29-a210-93ec52da40d4", label: "BibLaTeX" },
+      { id: "32d59d2d-b65a-4da4-b0a3-bdd3cfb979e7", label: "RIS" },
+      { id: "bc03b4fe-436d-4a1f-ba59-de4d2d7a63f7", label: "CSL JSON" },
+      { id: "14763d25-8ba0-45df-8f52-b8d1108e7ac9", label: "Zotero RDF" },
+      { id: "b8f9f5e6-b6a9-4b0e-a3f0-9e29ff9e14cf", label: "Simple Evernote" },
+    ];
+  }
+
+  /**
+   * Exports items through a Zotero translator.
+   *
+   * All export was unreachable: the census found the whole domain at zero
+   * covered operations, so "give me these as BibTeX" had no path.
+   */
+  async exportItems(params: {
+    itemIds: number[];
+    translatorId: string;
+  }): Promise<{ output: string; itemCount: number }> {
+    const TranslateExport = (
+      Zotero as unknown as {
+        Translate?: { Export?: new () => unknown };
+      }
+    ).Translate?.Export;
+    if (!TranslateExport) {
+      throw new Error("Zotero.Translate.Export is not available in this build");
+    }
+    const items = params.itemIds
+      .map((itemId) => this.getItem(itemId))
+      .filter((item): item is Zotero.Item => Boolean(item));
+    if (!items.length) {
+      throw new Error("None of those item IDs resolved to an item.");
+    }
+
+    const translation = new TranslateExport() as {
+      setItems: (items: unknown[]) => void;
+      setTranslator: (id: string) => void;
+      setHandler: (
+        event: string,
+        handler: (...args: unknown[]) => void,
+      ) => void;
+      translate: () => void;
+      string?: string;
+    };
+    translation.setItems(items);
+    translation.setTranslator(params.translatorId);
+
+    return new Promise((resolve, reject) => {
+      translation.setHandler("done", (_obj: unknown, worked: unknown) => {
+        if (!worked) {
+          reject(
+            new Error(
+              `Zotero could not export with translator ${params.translatorId}.`,
+            ),
+          );
+          return;
+        }
+        resolve({
+          output: String(translation.string || ""),
+          itemCount: items.length,
+        });
+      });
+      try {
+        translation.translate();
+      } catch (error) {
+        reject(error instanceof Error ? error : new Error(String(error)));
+      }
+    });
+  }
+
+  /** The citation styles installed in Zotero. */
+  listCitationStyles(): Array<{ id: string; title: string }> {
+    const styles = (
+      Zotero as unknown as {
+        Styles?: {
+          getVisible?: () => Array<{ styleID: string; title: string }>;
+          getAll?: () => Record<string, { styleID: string; title: string }>;
+        };
+      }
+    ).Styles;
+    try {
+      const visible = styles?.getVisible?.();
+      if (visible?.length) {
+        return visible.map((style) => ({
+          id: String(style.styleID),
+          title: normalizeText(style.title),
+        }));
+      }
+      return Object.values(styles?.getAll?.() || {}).map((style) => ({
+        id: String(style.styleID),
+        title: normalizeText(style.title),
+      }));
+    } catch {
+      return [];
+    }
+  }
+
+  /**
+   * Formats citations or a bibliography through Zotero's own CSL engine.
+   *
+   * The most dangerous everyday gap in the whole census: asked for "the APA
+   * reference for this paper" the agent had no tool at all, so it produced a
+   * plausible-looking citation from memory. A fabricated reference is worse
+   * than a refusal in a reference manager, and it is the one thing this
+   * product exists to get right.
+   */
+  formatBibliography(params: {
+    itemIds: number[];
+    styleId?: string;
+    locale?: string;
+    format?: "text" | "html";
+    mode?: "bibliography" | "citation";
+  }): {
+    styleId: string;
+    styleTitle: string;
+    output: string;
+    format: "text" | "html";
+    itemCount: number;
+  } {
+    const Styles = (
+      Zotero as unknown as {
+        Styles?: {
+          get?: (id: string) => unknown;
+          getVisible?: () => Array<{ styleID: string; title: string }>;
+        };
+      }
+    ).Styles;
+    const Cite = (
+      Zotero as unknown as {
+        Cite?: {
+          makeFormattedBibliographyOrCitationList?: (
+            engine: unknown,
+            items: unknown[],
+            format: string,
+          ) => string;
+        };
+      }
+    ).Cite;
+    if (!Styles?.get || !Cite?.makeFormattedBibliographyOrCitationList) {
+      throw new Error(
+        "Zotero's citation engine is not available in this build, so a citation cannot be formatted. Do not write one from memory.",
+      );
+    }
+
+    const styleId =
+      params.styleId ||
+      String(
+        (
+          Zotero as unknown as {
+            Prefs?: { get?: (key: string) => unknown };
+          }
+        ).Prefs?.get?.("export.quickCopy.setting") || "",
+      ).replace(/^bibliography(?:\/[^/]*)?=/, "") ||
+      "http://www.zotero.org/styles/apa";
+
+    const style = Styles.get(styleId) as {
+      title?: string;
+      getCiteProc?: (
+        locale: string,
+        format: string,
+        options?: { cache?: boolean },
+      ) => {
+        free?: () => void;
+        updateItems?: (ids: number[]) => void;
+        previewCitationCluster?: (
+          citation: unknown,
+          a: unknown[],
+          b: unknown[],
+          format: string,
+        ) => string;
+      };
+    } | null;
+    if (!style?.getCiteProc) {
+      throw new Error(
+        `Citation style "${styleId}" is not installed. List the available ones with library_search({ entity:'citationStyles', mode:'list' }).`,
+      );
+    }
+
+    const items = params.itemIds
+      .map((itemId) => this.getItem(itemId))
+      .filter((item): item is Zotero.Item => Boolean(item))
+      .filter((item) => !item.isNote?.());
+    if (!items.length) {
+      throw new Error("None of those item IDs resolved to a citable item.");
+    }
+
+    const outputFormat = params.format === "html" ? "html" : "text";
+    const locale = params.locale || "en-US";
+    const engine = style.getCiteProc(locale, outputFormat, { cache: true });
+    try {
+      if (params.mode === "citation") {
+        engine.updateItems?.(items.map((item) => Number(item.id)));
+        const output =
+          engine.previewCitationCluster?.(
+            {
+              citationItems: items.map((item) => ({ id: item.id })),
+              properties: {},
+            },
+            [],
+            [],
+            outputFormat,
+          ) || "";
+        return {
+          styleId,
+          styleTitle: normalizeText(style.title) || styleId,
+          output,
+          format: outputFormat,
+          itemCount: items.length,
+        };
+      }
+      const output =
+        Cite.makeFormattedBibliographyOrCitationList(
+          engine,
+          items,
+          outputFormat,
+        ) || "";
+      return {
+        styleId,
+        styleTitle: normalizeText(style.title) || styleId,
+        output,
+        format: outputFormat,
+        itemCount: items.length,
+      };
+    } finally {
+      engine.free?.();
+    }
   }
 
   async deleteCollection(params: {
