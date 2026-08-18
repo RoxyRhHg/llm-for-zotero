@@ -294,9 +294,16 @@ export function createQueryLibraryTool(
         properties: {
           entity: {
             type: "string",
-            enum: ["items", "collections", "notes", "tags", "libraries"],
+            enum: [
+              "items",
+              "collections",
+              "notes",
+              "tags",
+              "libraries",
+              "itemTypes",
+            ],
             description:
-              "What to query: 'items' for any library item, 'collections' for folders, 'notes' to search/list notes (mode:'search' finds all notes including child notes, mode:'list' lists standalone notes only), 'tags' to list/search all tags in the library, 'libraries' to enumerate all libraries (personal + group).",
+              "What to query: 'items' for any library item, 'collections' for folders, 'notes' to search/list notes (mode:'search' finds all notes including child notes, mode:'list' lists standalone notes only), 'tags' to list/search all tags in the library, 'libraries' to enumerate all libraries (personal + group), 'itemTypes' to discover Zotero's item types and the exact fields and creator types each one accepts (use this before creating an item or setting an unfamiliar field — a field the type does not have is rejected, not ignored).",
           },
           mode: {
             type: "string",
@@ -527,7 +534,8 @@ export function createQueryLibraryTool(
         normalizedArgs.entity === "collections" ||
         normalizedArgs.entity === "notes" ||
         normalizedArgs.entity === "tags" ||
-        normalizedArgs.entity === "libraries"
+        normalizedArgs.entity === "libraries" ||
+        normalizedArgs.entity === "itemTypes"
           ? (normalizedArgs.entity as QueryLibraryEntity)
           : null;
       const mode =
@@ -551,6 +559,9 @@ export function createQueryLibraryTool(
       }
       if (entity === "libraries" && mode !== "list") {
         return fail("libraries only support mode:'list'");
+      }
+      if (entity === "itemTypes" && !["list", "search"].includes(mode)) {
+        return fail("itemTypes only support mode:'list' or mode:'search'");
       }
       const conditions = normalizeConditions(normalizedArgs.conditions);
       if (conditions && entity !== "items") {
@@ -701,6 +712,18 @@ export function createQueryLibraryTool(
           },
           { totalCount: result.totalCount },
         );
+      }
+      if (input.entity === "itemTypes") {
+        // Fields come back for a named type only. All ~35 types with their
+        // full field lists is a large payload to spend on "what types exist".
+        const result = zoteroGateway.listItemTypes({
+          itemType: input.filters?.itemType || input.text,
+        });
+        return withResultCounts({
+          entity: input.entity,
+          mode: input.mode,
+          results: result.itemTypes,
+        });
       }
       if (input.entity === "libraries") {
         const results = zoteroGateway.listAllLibraries();

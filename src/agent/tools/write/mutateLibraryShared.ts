@@ -760,6 +760,15 @@ export function normalizeCreatorsList(
  * the "creators"/"authors" alias, and string/number/boolean field coercion.
  * Skips un-normalizable fields instead of aborting the entire patch.
  */
+/**
+ * Keys in a patch that are not metadata fields.
+ *
+ * `creators`/`authors` are handled separately below, and `fields` is the
+ * wrapper this function flattens. Everything else is left for the gateway to
+ * validate against the item's own type.
+ */
+const STRUCTURAL_PATCH_KEYS = new Set(["creators", "authors", "fields"]);
+
 export function normalizeMetadataPatch(
   value: unknown,
 ): EditableArticleMetadataPatch | null {
@@ -772,9 +781,13 @@ export function normalizeMetadataPatch(
       }
     : value;
   const metadata: EditableArticleMetadataPatch = {};
-  for (const fieldName of EDITABLE_ARTICLE_METADATA_FIELDS) {
-    if (!Object.prototype.hasOwnProperty.call(normalizedValue, fieldName))
-      continue;
+  // This loop -- not the gateway -- was the real allowlist: it filtered the
+  // patch down to 18 names before the gateway ever saw it, so widening the
+  // gateway alone changed nothing. Any string-valued key is now carried
+  // through, and whether it is a real field for *this item's type* is decided
+  // by the gateway, which is the only layer that knows the item.
+  for (const fieldName of Object.keys(normalizedValue)) {
+    if (STRUCTURAL_PATCH_KEYS.has(fieldName)) continue;
     const normalized = normalizeStringValue(normalizedValue[fieldName]);
     if (normalized === null) continue;
     metadata[fieldName as EditableArticleMetadataField] = normalized;

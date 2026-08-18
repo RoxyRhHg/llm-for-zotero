@@ -300,26 +300,112 @@ function getItemTypeName(item: Zotero.Item): string {
   }
 }
 
+/**
+ * Fields that are never patchable, whatever the item type.
+ *
+ * These are primary or computed columns rather than `itemData` fields.
+ * `setField` throws for most of them, and the few it accepts (`dateAdded`,
+ * `dateModified`) would let the agent rewrite provenance -- so they are
+ * refused here with a reason rather than surfacing as a raw Zotero throw.
+ */
+const NON_EDITABLE_METADATA_FIELDS = new Set([
+  "id",
+  "key",
+  "libraryID",
+  "itemID",
+  "itemType",
+  "itemTypeID",
+  "dateAdded",
+  "dateModified",
+  "version",
+  "synced",
+  "deleted",
+  "firstCreator",
+  "numChildren",
+  "parentItem",
+  "parentID",
+  "parentKey",
+  "relations",
+  "collections",
+  "tags",
+  "note",
+  "createdByUserID",
+  "lastModifiedByUserID",
+]);
+
+/**
+ * Whether a field can be written on this particular item.
+ *
+ * Two defects here, both of which reported success while doing the wrong
+ * thing:
+ *
+ * - No base-field mapping. `publicationTitle` is a *base* field whose
+ *   type-specific name is `bookTitle` on a book section and
+ *   `proceedingsTitle` on a conference paper. Checking the base id against
+ *   the type said "invalid" for fields Zotero writes happily. `setField`
+ *   itself resolves this with `getFieldIDFromTypeAndBase`, so the check has
+ *   to as well or it disagrees with the write it is guarding.
+ * - Fail-open. The `catch` returned `true`, so if `Zotero.ItemFields` were
+ *   missing every field was declared valid and the error surfaced later as a
+ *   raw throw from `setField`. No test defines `ItemFields`, so that branch
+ *   has never run in CI.
+ */
 function isFieldValidForItemType(
   item: Zotero.Item,
-  fieldName: EditableArticleMetadataField,
+  fieldName: string,
 ): boolean {
+  if (NON_EDITABLE_METADATA_FIELDS.has(fieldName)) return false;
+  const itemFields = (
+    Zotero as unknown as {
+      ItemFields?: {
+        getID?: (name: string) => number | false;
+        isValidForType?: (fieldId: number, itemTypeId: number) => boolean;
+        getFieldIDFromTypeAndBase?: (
+          itemTypeId: number,
+          baseFieldId: number,
+        ) => number | false;
+      };
+    }
+  ).ItemFields;
+  // Fail closed: without the schema there is no way to tell a valid field
+  // from a typo, and guessing "valid" turns a typo into a thrown write.
+  if (!itemFields?.getID || typeof itemFields.isValidForType !== "function") {
+    return false;
+  }
   try {
-    const itemFields = (
-      Zotero as unknown as {
-        ItemFields?: {
-          getID?: (name: string) => number | false;
-          isValidForType?: (fieldId: number, itemTypeId: number) => boolean;
-        };
-      }
-    ).ItemFields;
-    const fieldId = itemFields?.getID?.(fieldName);
-    if (fieldId === false || !fieldId) return false;
-    if (typeof itemFields?.isValidForType !== "function") return true;
-    return Boolean(itemFields.isValidForType(fieldId, item.itemTypeID));
-  } catch (_error) {
-    void _error;
-    return true;
+    const baseFieldId = itemFields.getID(fieldName);
+    if (!baseFieldId) return false;
+    const itemTypeID = item.itemTypeID;
+    // Mirrors setField: prefer the type-specific field, fall back to the base.
+    const fieldId =
+      itemFields.getFieldIDFromTypeAndBase?.(itemTypeID, baseFieldId) ||
+      baseFieldId;
+    return Boolean(itemFields.isValidForType(fieldId, itemTypeID));
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Every field this item type accepts, for telling the model what it may set.
+ */
+export function listEditableFieldsForItem(item: Zotero.Item): string[] {
+  const itemFields = (
+    Zotero as unknown as {
+      ItemFields?: {
+        getItemTypeFields?: (itemTypeId: number) => number[];
+        getName?: (fieldId: number) => string;
+      };
+    }
+  ).ItemFields;
+  if (!itemFields?.getItemTypeFields || !itemFields.getName) return [];
+  try {
+    return itemFields
+      .getItemTypeFields(item.itemTypeID)
+      .map((fieldId) => itemFields.getName?.(fieldId) || "")
+      .filter((name) => name && !NON_EDITABLE_METADATA_FIELDS.has(name));
+  } catch {
+    return [];
   }
 }
 
@@ -1398,13 +1484,41 @@ export class ZoteroGateway {
   getEditableArticleMetadata(
     item: Zotero.Item | null | undefined,
   ): EditableArticleMetadataSnapshot | null {
-    const target = resolveRegularItem(item);
-    if (!target) return null;
+    // Matches the write path: resolveRegularItem redirects a child
+    // attachment to its parent, so reading back after writing on an
+    // attachment returned the parent's fields and confirmed a change that
+    // never happened to the object the user named.
+    const resolution = resolveMatrixItem(item, Number(item?.id) || 0, "update");
+    if ("refusal" in resolution) return null;
+    const target = resolution.item;
+    // Every field this item type actually has, not the fixed 18. The union
+    // keeps the well-known names present (as empty strings) so existing card
+    // layouts and callers still find them.
+    const typeFields = listEditableFieldsForItem(target);
+    const fieldNames = Array.from(
+      new Set<string>([
+        ...(EDITABLE_ARTICLE_METADATA_FIELDS as readonly string[]),
+        ...typeFields,
+      ]),
+    );
     const fields = Object.fromEntries(
-      EDITABLE_ARTICLE_METADATA_FIELDS.map((fieldName) => {
+      fieldNames.map((fieldName) => {
         let value = "";
         try {
-          value = normalizeMetadataValue(target.getField(fieldName));
+          // includeBaseMapped: `publicationTitle` is stored as `bookTitle` on
+          // a book section and `proceedingsTitle` on a conference paper, so
+          // without this it reads back empty on nine item types.
+          value = normalizeMetadataValue(
+            (
+              target as unknown as {
+                getField: (
+                  name: string,
+                  unformatted?: boolean,
+                  includeBaseMapped?: boolean,
+                ) => string;
+              }
+            ).getField(fieldName, false, true),
+          );
         } catch (_error) {
           void _error;
         }
@@ -1919,6 +2033,92 @@ export class ZoteroGateway {
       returnedCount: items.length,
       offset,
       nextOffset: nextOffset < resolved.length ? nextOffset : undefined,
+    };
+  }
+
+  /**
+   * Lists Zotero's item types and, optionally, the fields each one accepts.
+   *
+   * Without this the model guesses field names, and a guess is not a soft
+   * failure: `setField` throws for a field the type does not have. Creating an
+   * item of any type is impossible without knowing what types exist.
+   */
+  listItemTypes(params?: { itemType?: string; includeFields?: boolean }): {
+    itemTypes: Array<{
+      itemType: string;
+      localized?: string;
+      fields?: string[];
+      creatorTypes?: string[];
+    }>;
+  } {
+    const itemTypes = (
+      Zotero as unknown as {
+        ItemTypes?: {
+          getTypes?: () => Array<{ id: number; name: string }>;
+          getAll?: () => Array<{ id: number; name: string }>;
+          getLocalizedString?: (idOrName: number | string) => string;
+        };
+      }
+    ).ItemTypes;
+    const itemFields = (
+      Zotero as unknown as {
+        ItemFields?: {
+          getItemTypeFields?: (itemTypeId: number) => number[];
+          getName?: (fieldId: number) => string;
+        };
+      }
+    ).ItemFields;
+    const creatorTypes = (
+      Zotero as unknown as {
+        CreatorTypes?: {
+          getTypesForItemType?: (
+            itemTypeId: number,
+          ) => Array<{ id: number; name: string }>;
+        };
+      }
+    ).CreatorTypes;
+
+    const all = itemTypes?.getTypes?.() || itemTypes?.getAll?.() || [];
+    const wanted = params?.itemType
+      ? all.filter((entry) => entry.name === params.itemType)
+      : all;
+
+    return {
+      itemTypes: wanted.map((entry) => {
+        const row: {
+          itemType: string;
+          localized?: string;
+          fields?: string[];
+          creatorTypes?: string[];
+        } = { itemType: entry.name };
+        try {
+          const localized = itemTypes?.getLocalizedString?.(entry.id);
+          if (localized) row.localized = localized;
+        } catch {
+          // A missing localisation must not hide the type itself.
+        }
+        // Fields are only included on request or for a single type: all ~35
+        // types with their fields is a large payload to spend on a lookup.
+        if (params?.includeFields || params?.itemType) {
+          try {
+            row.fields = (itemFields?.getItemTypeFields?.(entry.id) || [])
+              .map((fieldId) => itemFields?.getName?.(fieldId) || "")
+              .filter(
+                (name) => name && !NON_EDITABLE_METADATA_FIELDS.has(name),
+              );
+          } catch {
+            row.fields = [];
+          }
+          try {
+            row.creatorTypes = (
+              creatorTypes?.getTypesForItemType?.(entry.id) || []
+            ).map((creator) => creator.name);
+          } catch {
+            row.creatorTypes = [];
+          }
+        }
+        return row;
+      }),
     };
   }
 
@@ -3464,28 +3664,62 @@ export class ZoteroGateway {
     title: string;
     changedFields: string[];
   }> {
-    const item = resolveRegularItem(params.item);
-    if (!item) {
-      throw new Error(
-        "No Zotero bibliographic item is active for metadata editing",
-      );
-    }
+    // resolveRegularItem silently substitutes the PARENT for a child
+    // attachment, so writing metadata on an attachment edited a different
+    // object and then read the parent back as confirmation -- a self-verifying
+    // false success. The matrix answers per kind instead.
+    const resolution = resolveMatrixItem(
+      params.item,
+      Number(params.item?.id) || 0,
+      "update",
+    );
+    if ("refusal" in resolution) throw new Error(resolution.refusal);
+    const item = resolution.item;
 
-    const fieldNames = EDITABLE_ARTICLE_METADATA_FIELDS.filter((fieldName) =>
-      Object.prototype.hasOwnProperty.call(params.metadata, fieldName),
+    // Every key in the patch is a candidate now. The 18-name allowlist was
+    // never the real schema -- Zotero's own field table is -- and it silently
+    // dropped anything outside it, so "set the publisher on this book"
+    // reported success with nothing written.
+    const fieldNames = Object.keys(params.metadata).filter(
+      (fieldName) => fieldName !== "creators",
     );
     const unsupportedFields = fieldNames.filter(
       (fieldName) => !isFieldValidForItemType(item, fieldName),
     );
     if (unsupportedFields.length) {
       const itemTypeName = getItemTypeName(item) || "this item type";
+      const available = listEditableFieldsForItem(item);
       throw new Error(
-        `Unsupported metadata fields for ${itemTypeName}: ${unsupportedFields.join(", ")}`,
+        `Unsupported metadata fields for ${itemTypeName}: ${unsupportedFields.join(", ")}.` +
+          (available.length
+            ? ` Fields this item type accepts: ${available.join(", ")}.`
+            : ""),
       );
     }
 
+    const rejectedFields: string[] = [];
     for (const fieldName of fieldNames) {
-      item.setField(fieldName, params.metadata[fieldName] || "");
+      const value =
+        (params.metadata as Record<string, unknown>)[fieldName] ?? "";
+      // setField returns false rather than throwing for a value it cannot
+      // parse -- `accessDate: "yesterday"` is the common case -- and the old
+      // code ignored that and reported success anyway.
+      // The bundled typings declare setField as void; Zotero returns a
+      // boolean (item.js:653), false meaning the value was not taken.
+      const accepted = (
+        item as unknown as {
+          setField: (field: string, value: string) => boolean | void;
+        }
+      ).setField(fieldName, String(value));
+      if (accepted === false && String(value).trim()) {
+        const before = normalizeText(item.getField?.(fieldName));
+        if (before !== String(value).trim()) rejectedFields.push(fieldName);
+      }
+    }
+    if (rejectedFields.length) {
+      throw new Error(
+        `Zotero rejected these values: ${rejectedFields.join(", ")}. Check the format — dates must be real dates, not phrases like "yesterday".`,
+      );
     }
 
     if (Array.isArray(params.metadata.creators)) {
