@@ -3406,9 +3406,27 @@ export class ZoteroGateway {
   // ── Merge duplicates ──────────────────────────────────────────────
 
   /**
-   * Merge duplicate items.  Keeps the `masterItemId` as the surviving item,
-   * moves all child notes, attachments, and tags from `otherItemIds` into it,
-   * then trashes the other items.
+   * Merges duplicates, delegating to Zotero's own merge.
+   *
+   * This used to be hand-rolled, and diverged from Zotero in ways that
+   * quietly damaged the library:
+   *
+   * - It never wrote the `dc:replaces` relation onto the survivor.
+   *   `integration.js` resolves a Word or LibreOffice citation pointing at a
+   *   merged-away item *only* through that predicate, so on the next citation
+   *   refresh the user got "the item could not be found in your library" and
+   *   had to hand-pick a replacement for every affected citation. Zotero's
+   *   own merge repoints them silently.
+   * - It never deduplicated identical PDF attachments by hash, so the
+   *   survivor accumulated a copy of the same file per duplicate.
+   * - It never remapped old item keys inside merged note HTML
+   *   (`Zotero.Notes.replaceItemKey`), leaving dead links in notes.
+   * - It never took the earliest `dateAdded`.
+   * - It ran outside a transaction, saving each object separately, so a
+   *   failure part-way left the library half-merged.
+   * - It dropped tag types, turning manual tags into automatic ones.
+   *
+   * Zotero's implementation does all of this inside one transaction.
    */
   async mergeItems(params: {
     masterItemId: number;
@@ -3425,66 +3443,47 @@ export class ZoteroGateway {
     const masterTitle = String(
       masterItem.getField?.("title") || `Item ${params.masterItemId}`,
     );
-    const trashedIds: number[] = [];
-    const touchedLibraryIDs = new Set<number>();
 
+    const others: Zotero.Item[] = [];
     for (const otherId of params.otherItemIds) {
       if (otherId === params.masterItemId) continue;
       const otherItem = this.getItem(otherId);
       if (!otherItem) continue;
-
-      // Move child attachments to master
-      for (const attachmentId of otherItem.getAttachments?.() ?? []) {
-        const att = this.getItem(attachmentId);
-        if (att) {
-          att.parentID = params.masterItemId;
-          await att.saveTx();
-        }
+      if (Number(otherItem.libraryID) !== Number(masterItem.libraryID)) {
+        throw new Error(
+          `Item ${otherId} is in a different library than the master item, and Zotero cannot merge across libraries.`,
+        );
       }
-
-      // Move child notes to master
-      for (const noteId of otherItem.getNotes?.() ?? []) {
-        const note = this.getItem(noteId);
-        if (note) {
-          note.parentID = params.masterItemId;
-          await note.saveTx();
-        }
-      }
-
-      // Copy tags from other → master
-      for (const tag of otherItem.getTags?.() ?? []) {
-        if (tag && typeof tag === "object" && "tag" in tag) {
-          masterItem.addTag(String(tag.tag));
-        }
-      }
-
-      // Copy collections from other → master
-      for (const collectionId of otherItem.getCollections?.() ?? []) {
-        masterItem.addToCollection(collectionId);
-      }
-
-      // Copy "related" links
-      for (const relatedKey of otherItem.relatedItems ?? []) {
-        if (relatedKey) {
-          const relatedItem = (Zotero.Items as any).getByLibraryAndKey?.(
-            otherItem.libraryID,
-            relatedKey,
-          );
-          if (relatedItem) masterItem.addRelatedItem(relatedItem);
-        }
-      }
-
-      // Trash the duplicate
-      otherItem.deleted = true;
-      await otherItem.saveTx();
-      trashedIds.push(otherId);
-      touchedLibraryIDs.add(Number(otherItem.libraryID));
+      others.push(otherItem);
+    }
+    if (!others.length) {
+      return {
+        mergedCount: 0,
+        masterItemId: params.masterItemId,
+        masterTitle,
+        trashedIds: [],
+      };
     }
 
-    await masterItem.saveTx();
-    touchedLibraryIDs.add(Number(masterItem.libraryID));
+    const merge = (
+      Zotero.Items as unknown as {
+        merge?: (item: Zotero.Item, otherItems: Zotero.Item[]) => Promise<void>;
+      }
+    ).merge;
+    if (typeof merge !== "function") {
+      // Refuse rather than fall back to the hand-rolled path: a merge that
+      // silently omits dc:replaces breaks the user's citations, and they
+      // would not find out until the next time they refreshed a document.
+      throw new Error(
+        "This Zotero build does not expose Zotero.Items.merge, so duplicates cannot be merged safely.",
+      );
+    }
+    await merge.call(Zotero.Items, masterItem, others);
+
+    const trashedIds = others.map((item) => Number(item.id));
+    const touchedLibraryIDs = new Set<number>([Number(masterItem.libraryID)]);
     for (const libraryID of touchedLibraryIDs) {
-      invalidatePaperSearchCache(libraryID);
+      if (libraryID > 0) invalidatePaperSearchCache(libraryID);
     }
 
     return {

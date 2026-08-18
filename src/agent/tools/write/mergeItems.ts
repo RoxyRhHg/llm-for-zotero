@@ -134,7 +134,7 @@ export function createMergeItemsTool(
       return {
         toolName: "merge_items",
         title: `Merge ${operation.otherItemIds.length + 1} items`,
-        description: `Keep "${masterTitle}" as the master and merge ${operation.otherItemIds.length} duplicate${operation.otherItemIds.length === 1 ? "" : "s"} into it. Attachments, notes, tags, and collections will be moved to the master. Duplicates will be trashed.`,
+        description: `Keep "${masterTitle}" as the master and merge ${operation.otherItemIds.length} duplicate${operation.otherItemIds.length === 1 ? "" : "s"} into it. Attachments, notes, tags and collections move to the master, identical PDFs are deduplicated, and citations in your documents that point at the duplicates are repointed to the master. The duplicates go to the trash, but merging is not fully reversible: restoring them returns records without their attachments, notes or tags.`,
         confirmLabel: "Merge",
         cancelLabel: "Cancel",
         fields: [

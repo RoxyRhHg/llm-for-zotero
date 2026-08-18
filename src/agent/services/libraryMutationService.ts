@@ -953,13 +953,19 @@ export class LibraryMutationService {
             operationId: operation.id,
             result,
           },
+          // A merge is not fully reversible: Zotero moves children onto the
+          // survivor and deduplicates identical attachments by hash, so the
+          // originals no longer exist to give back. Bringing the duplicates
+          // out of the trash returns records stripped of their attachments,
+          // notes and tags -- so the description says exactly that rather
+          // than promising a restore it cannot perform.
           undo:
             result.mergedCount > 0
               ? {
                   toolName: "merge_items",
-                  description: `Restore ${result.mergedCount} merged item${
+                  description: `Bring ${result.mergedCount} merged item${
                     result.mergedCount === 1 ? "" : "s"
-                  }`,
+                  } back from the trash (their attachments, notes and tags stay with the surviving item, so this does not fully un-merge them)`,
                   revert: async () => {
                     await this.zoteroGateway.restoreItems({
                       itemIds: result.trashedIds,
