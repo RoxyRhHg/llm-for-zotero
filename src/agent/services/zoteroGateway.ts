@@ -350,6 +350,42 @@ const NON_EDITABLE_METADATA_FIELDS = new Set([
  *   raw throw from `setField`. No test defines `ItemFields`, so that branch
  *   has never run in CI.
  */
+/**
+ * Builds the file handle Zotero's file APIs expect.
+ *
+ * Zotero accepts an `nsIFile` on these paths and a plain path string on some
+ * of them; constructing the `nsIFile` when `Components` is available keeps
+ * both happy, and falling back to the string keeps this callable from the
+ * node test harness.
+ */
+function toLocalFileHandle(filePath: string): unknown {
+  try {
+    const components = (
+      globalThis as unknown as {
+        Components?: {
+          classes: Record<
+            string,
+            { createInstance: (iid: unknown) => unknown }
+          >;
+          interfaces: Record<string, unknown>;
+        };
+      }
+    ).Components;
+    if (components?.classes?.["@mozilla.org/file/local;1"]) {
+      const file = components.classes[
+        "@mozilla.org/file/local;1"
+      ].createInstance(components.interfaces.nsIFile) as {
+        initWithPath: (path: string) => void;
+      };
+      file.initWithPath(filePath);
+      return file;
+    }
+  } catch {
+    // Fall through to the path string.
+  }
+  return filePath;
+}
+
 function isFieldValidForItemType(
   item: Zotero.Item,
   fieldName: string,
@@ -1386,10 +1422,27 @@ export class ZoteroGateway {
     );
   }
 
+  /**
+   * The note an edit applies to.
+   *
+   * `noteId` makes any note in the library editable. Without it only the note
+   * the user happened to have open could be edited, so "fix the typo in the
+   * note on paper X" was unreachable unless they opened it first -- and
+   * `targetNoteId` already existed in the schema, stripped by `validate()`
+   * for every mode except append.
+   */
   resolveActiveNoteItem(params: {
     request?: AgentRuntimeRequest;
     item?: Zotero.Item | null;
+    noteId?: number;
   }): Zotero.Item | null {
+    const explicitNoteId = Number(params.noteId || 0);
+    if (Number.isFinite(explicitNoteId) && explicitNoteId > 0) {
+      const explicit = this.getItem(Math.floor(explicitNoteId));
+      // Deliberately no fallback: a bad id must surface as "note not found"
+      // rather than silently editing whatever note happened to be open.
+      return (explicit as any)?.isNote?.() ? explicit : null;
+    }
     const requestNoteId = Number(
       params.request?.activeNoteContext?.noteId || 0,
     );
@@ -1409,6 +1462,7 @@ export class ZoteroGateway {
   getActiveNoteSnapshot(params: {
     request?: AgentRuntimeRequest;
     item?: Zotero.Item | null;
+    noteId?: number;
   }) {
     return readNoteSnapshot(this.resolveActiveNoteItem(params));
   }
@@ -1416,6 +1470,7 @@ export class ZoteroGateway {
   async replaceCurrentNote(params: {
     request?: AgentRuntimeRequest;
     item?: Zotero.Item | null;
+    noteId?: number;
     content: string;
     expectedOriginalHtml?: string;
     /** Pre-patched HTML that bypasses the text→HTML conversion.  When
@@ -4561,14 +4616,98 @@ export class ZoteroGateway {
   // ── Import local files ──────────────────────────────────────────
 
   /**
+   * Imports a bibliography file through Zotero's translators.
+   *
+   * `importLocalFiles` attached whatever it was given, so handing it a
+   * `.ris` or `.bib` produced **one dead attachment row named refs.ris** and
+   * reported "Imported 1 file" -- not a single reference reached the library.
+   * This is the path that actually reads the file.
+   */
+  async importBibliographyFile(params: {
+    filePath: string;
+    libraryID: number;
+    targetCollectionId?: number;
+  }): Promise<{
+    status: "imported" | "unsupported" | "error";
+    itemIds: number[];
+    reason?: string;
+  }> {
+    const TranslateImport = (
+      Zotero as unknown as {
+        Translate?: { Import?: new () => unknown };
+      }
+    ).Translate?.Import;
+    if (!TranslateImport) {
+      return {
+        status: "error",
+        itemIds: [],
+        reason: "Zotero.Translate.Import is not available in this build",
+      };
+    }
+    try {
+      const translation = new TranslateImport() as {
+        setLocation: (file: unknown) => void;
+        getTranslators: () => Promise<unknown[]>;
+        setTranslator: (translator: unknown) => void;
+        translate: (options: {
+          libraryID: number;
+          collections: number[] | null;
+        }) => Promise<Array<{ id: number }>>;
+      };
+      translation.setLocation(toLocalFileHandle(params.filePath));
+      const translators = await translation.getTranslators();
+      if (!translators.length) {
+        // Distinct from an error: the file is fine, Zotero just has no
+        // translator for it. Reported so the caller can fall back to
+        // attaching rather than failing outright.
+        return {
+          status: "unsupported",
+          itemIds: [],
+          reason: `No Zotero translator recognises ${params.filePath}`,
+        };
+      }
+      translation.setTranslator(translators[0]);
+      const imported = await translation.translate({
+        libraryID: params.libraryID,
+        collections: params.targetCollectionId
+          ? [params.targetCollectionId]
+          : null,
+      });
+      const itemIds = (imported || [])
+        .map((item) => Number(item?.id))
+        .filter((id) => Number.isFinite(id) && id > 0);
+      if (params.libraryID > 0) invalidatePaperSearchCache(params.libraryID);
+      return { status: "imported", itemIds };
+    } catch (error) {
+      return {
+        status: "error",
+        itemIds: [],
+        // Zotero rejects with a bare string, not an Error.
+        reason:
+          error instanceof Error
+            ? error.message
+            : String(error) || "Import failed",
+      };
+    }
+  }
+
+  /**
    * Import local files (PDFs, etc.) into the Zotero library.
    * Uses Zotero.Attachments.importFromFile to create items with attached files.
-   * For PDFs, Zotero automatically attempts to retrieve metadata.
    */
   async importLocalFiles(params: {
     filePaths: string[];
     libraryID?: number;
     targetCollectionId?: number;
+    /**
+     * `translate` reads bibliography files (.ris, .bib, .enw, .nbib, RDF)
+     * through Zotero's translators. `attach` stores the file as an
+     * attachment. `auto` picks by extension, which is what a user means by
+     * "import this file".
+     */
+    mode?: "auto" | "translate" | "attach";
+    /** Run Zotero's PDF metadata recognition on imported PDFs. */
+    recognize?: boolean;
   }): Promise<{
     succeeded: number;
     failed: number;
@@ -4636,6 +4775,48 @@ export class ZoteroGateway {
           nsFile.initWithPath(filePath);
         }
 
+        // Bibliography files are read, not attached. Handing a .ris to
+        // importFromFile produced one dead attachment row and reported
+        // success, so not a single reference reached the library.
+        const isBibliography =
+          /\.(ris|bib|bibtex|enw|nbib|rdf|xml|json|mods|refer|txt)$/i.test(
+            filePath,
+          );
+        const wantsTranslate =
+          params.mode === "translate" ||
+          (params.mode !== "attach" && isBibliography);
+        if (wantsTranslate) {
+          const translated = await this.importBibliographyFile({
+            filePath,
+            libraryID: targetLibraryID,
+            targetCollectionId: targetCollection?.id,
+          });
+          if (translated.status === "imported") {
+            items.push({
+              filePath,
+              status: "imported",
+              itemId: translated.itemIds[0],
+              title: `${translated.itemIds.length} reference${
+                translated.itemIds.length === 1 ? "" : "s"
+              } from ${filePath.split(/[\\/]/).pop()}`,
+            });
+            succeeded++;
+            continue;
+          }
+          if (params.mode === "translate") {
+            // Explicitly asked to translate, so falling back to attaching
+            // would answer a different question than the one asked.
+            items.push({
+              filePath,
+              status: "error",
+              reason: translated.reason || "No translator recognised the file",
+            });
+            failed++;
+            continue;
+          }
+          // Auto mode: an unrecognised file is still worth attaching.
+        }
+
         let attachmentItem: any;
 
         if (Attachments?.importFromFile && nsFile) {
@@ -4685,15 +4866,57 @@ export class ZoteroGateway {
           ? this.getItem(parentId) || attachmentItem
           : attachmentItem;
 
-        if (targetCollection && targetItem.isRegularItem?.()) {
+        // importFromFile returns a top-level ATTACHMENT, so isRegularItem()
+        // is false and the gate silently dropped targetCollectionId for
+        // every local-file import. Zotero files top-level attachments into
+        // collections perfectly well.
+        if (targetCollection && !targetItem.parentID) {
           targetItem.addToCollection(targetCollection.id);
           await targetItem.saveTx();
+        }
+
+        // Metadata retrieval never ran for any file, PDFs included --
+        // Attachments.importFromFile has no recognition step, and Zotero
+        // wires autoRecognizeItems only to the UI drop handlers and the
+        // browser connector. The tool description promised it anyway, so a
+        // PDF import produced a bare attachment titled paper.pdf with no
+        // title, authors, year or DOI.
+        let recognizedParentId: number | undefined;
+        if (params.recognize !== false && attachmentItem.isPDFAttachment?.()) {
+          const recognizer = (
+            Zotero as unknown as {
+              RecognizeDocument?: {
+                recognizeItems?: (items: unknown[]) => Promise<unknown>;
+              };
+            }
+          ).RecognizeDocument;
+          if (recognizer?.recognizeItems) {
+            try {
+              await recognizer.recognizeItems([attachmentItem]);
+              const newParent = Number(attachmentItem.parentID);
+              if (Number.isFinite(newParent) && newParent > 0) {
+                recognizedParentId = newParent;
+              }
+            } catch {
+              // A failed lookup leaves a plain attachment, which is the old
+              // behaviour -- it must not fail the import.
+            }
+          }
+        }
+        // Recognition creates a parent item, and that is what belongs in the
+        // collection, not the attachment underneath it.
+        if (recognizedParentId && targetCollection) {
+          const parent = this.getItem(recognizedParentId);
+          if (parent) {
+            parent.addToCollection(targetCollection.id);
+            await parent.saveTx();
+          }
         }
 
         items.push({
           filePath,
           status: "imported",
-          itemId: parentId || itemId,
+          itemId: recognizedParentId || parentId || itemId,
           title,
         });
         succeeded++;
@@ -4733,8 +4956,41 @@ export class ZoteroGateway {
    * validation hint suggested `"arXiv:2301.00001"` with a capital V, which
    * failed its own check.
    */
+  /**
+   * Works out what kind of identifier a string is.
+   *
+   * The hand-rolled version had four branches and fell through to "assume
+   * DOI", which mis-sent several forms the schema advertises:
+   *
+   * - a bare arXiv ID (`2301.00001`) failed the ISBN test because of the dot
+   *   and became a DOI -- and that is the form a literature search most often
+   *   produces, so the most common arXiv case never worked
+   * - a bare PMID (8-9 digits) fell under the 10-character ISBN threshold and
+   *   became a DOI
+   * - ADS bibcodes had no branch at all
+   *
+   * `Zotero.Utilities.extractIdentifiers` is the same parser Zotero's own
+   * "Add Item by Identifier" uses, so these all resolve correctly. It has no
+   * URL branch either, which is why URLs are handled separately below rather
+   * than being silently turned into a DOI.
+   */
   private parseImportIdentifier(rawIdentifier: string): Record<string, string> {
     const trimmed = rawIdentifier.trim();
+    const extract = (
+      Zotero as unknown as {
+        Utilities?: {
+          extractIdentifiers?: (text: string) => Array<Record<string, string>>;
+        };
+      }
+    ).Utilities?.extractIdentifiers;
+    if (extract) {
+      try {
+        const found = extract(trimmed);
+        if (found?.length) return found[0];
+      } catch {
+        // Fall through to the legacy branches below.
+      }
+    }
     if (/^arxiv:/i.test(trimmed)) {
       return { arXiv: trimmed.replace(/^arxiv:/i, "").trim() };
     }
@@ -4746,6 +5002,28 @@ export class ZoteroGateway {
       return { PMID: trimmed.replace(/^pmid[:\s]?/i, "").trim() };
     }
     return { DOI: trimmed.replace(/^https?:\/\/doi\.org\//i, "") };
+  }
+
+  /**
+   * Whether this identifier can be resolved at all.
+   *
+   * `Translate.Search.setIdentifier` throws for anything outside
+   * DOI/ISBN/PMID/arXiv/adsBibcode, and a plain URL is not among them --
+   * Zotero's own Add-by-Identifier box does not accept URLs either. The
+   * schemas advertised URL import, so pasting an arXiv abstract page, a
+   * Nature article page or a PubMed page came back "No translator could
+   * resolve this identifier". URLs whose path happens to contain a DOI worked
+   * by accident, which made the failure look random rather than systematic.
+   */
+  private describeUnresolvableIdentifier(raw: string): string | null {
+    const trimmed = raw.trim();
+    if (!/^https?:\/\//i.test(trimmed)) return null;
+    // A DOI anywhere in the URL is extractable, so those still work.
+    if (/10\.\d{4,}\/[^\s]+/.test(trimmed)) return null;
+    return (
+      "Zotero cannot import from a page URL — only DOIs, ISBNs, PMIDs, arXiv IDs and ADS bibcodes. " +
+      "Open the page and use the DOI or arXiv ID from it instead."
+    );
   }
 
   async fetchMetadataByIdentifier(
@@ -4961,7 +5239,9 @@ export class ZoteroGateway {
           rows.push({
             identifier: rawId,
             status: "not_found",
-            reason: "No translator could resolve this identifier",
+            reason:
+              this.describeUnresolvableIdentifier(rawId) ||
+              "No translator could resolve this identifier",
           });
           continue;
         }
@@ -5024,7 +5304,16 @@ export class ZoteroGateway {
         rows.push({
           identifier: rawId,
           status: "error",
-          reason: error instanceof Error ? error.message : "Import failed",
+          // Zotero rejects a translation with a bare STRING, not an Error
+          // ("No items returned from any translator"), so assuming Error
+          // flattened every real translator failure to the two words "Import
+          // failed" and told the user nothing.
+          reason:
+            error instanceof Error
+              ? error.message
+              : typeof error === "string" && error.trim()
+                ? error.trim()
+                : "Import failed",
         });
       }
     }

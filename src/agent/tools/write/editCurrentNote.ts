@@ -429,7 +429,7 @@ export function createEditCurrentNoteTool(
           targetNoteId: {
             type: "number",
             description:
-              "For mode 'append': append to this specific existing Zotero note ID.",
+              "The Zotero note to write to, by ID. For mode 'append' it names the note to append to; for mode 'edit' it names the note to rewrite or patch, which is how you edit a note the user does not currently have open. Omit it to act on the open note.",
           },
           collections: {
             type: "array",
@@ -567,8 +567,11 @@ export function createEditCurrentNoteTool(
           mode === "create" || mode === "append"
             ? normalizePositiveInt(args.targetItemId)
             : undefined,
+        // Also carried in edit mode now. It was stripped for every mode but
+        // append, so editing any note other than the one already open was
+        // impossible even though the parameter existed.
         targetNoteId:
-          mode === "append"
+          mode === "append" || mode === "edit"
             ? normalizePositiveInt(args.targetNoteId)
             : undefined,
         // Only meaningful when creating a standalone note; a child note
@@ -709,10 +712,13 @@ export function createEditCurrentNoteTool(
       const snapshot = zoteroGateway.getActiveNoteSnapshot({
         request: context.request,
         item: context.item,
+        noteId: input.targetNoteId,
       });
       if (!snapshot) {
         throw new Error(
-          "No active note is available to edit. Use mode 'create' with target 'item' when the user asks to write or save a new paper note.",
+          input.targetNoteId
+            ? `Note ${input.targetNoteId} was not found, or is not a note.`
+            : "No active note is available to edit. Pass targetNoteId to edit a specific note, or use mode 'create' with target 'item' when the user asks to write a new paper note.",
         );
       }
 
@@ -1037,6 +1043,7 @@ export function createEditCurrentNoteTool(
       const result = await zoteroGateway.replaceCurrentNote({
         request: context.request,
         item: context.item,
+        noteId: input.targetNoteId,
         content: contentToSave,
         expectedOriginalHtml: input.expectedOriginalHtml,
         preRenderedHtml: input._isHtml

@@ -228,6 +228,9 @@ export type ImportLocalFilesOperation = {
   filePaths: string[];
   libraryID?: number;
   targetCollectionId?: number;
+  /** See ZoteroGateway.importLocalFiles. */
+  mode?: "auto" | "translate" | "attach";
+  recognize?: boolean;
 };
 
 export type ImportIdentifiersOperation = {
@@ -1321,6 +1324,8 @@ export class LibraryMutationService {
           filePaths: operation.filePaths,
           libraryID: operation.libraryID,
           targetCollectionId: operation.targetCollectionId,
+          mode: operation.mode,
+          recognize: operation.recognize,
         });
         return {
           result: {

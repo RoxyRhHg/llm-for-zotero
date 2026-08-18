@@ -133,7 +133,8 @@ const LIBRARY_IMPORT_GUIDANCE: ToolGuidance = {
       request.userText || "",
     ),
   instruction:
-    "Use library_import with kind:'files' to import local files (PDFs, etc.) from the user's filesystem into Zotero. First use run_command to list files when paths are unknown, then call library_import with kind:'files' and the selected paths. Zotero automatically retrieves metadata for recognized PDFs. Optionally specify a targetCollectionId to organize imported items into a collection.",
+    "Use library_import with kind:'files' to import local files from the user's filesystem into Zotero. First use run_command to list files when paths are unknown, then call library_import with kind:'files' and the selected paths. A bibliography file (.ris, .bib, .enw, .nbib, RDF) has its references imported as real items; other files are attached, and PDFs go through Zotero's metadata lookup so they arrive with a title and authors. Optionally specify a targetCollectionId to file the results into a collection." +
+    "\n\nkind:'identifiers' resolves DOIs, ISBNs, PMIDs, arXiv IDs and ADS bibcodes. It cannot import from a page URL — Zotero has no translator path for that — so take the DOI or arXiv ID off the page instead.",
 };
 
 const LIBRARY_DELETE_GUIDANCE: ToolGuidance = {
