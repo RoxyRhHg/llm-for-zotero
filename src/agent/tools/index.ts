@@ -27,6 +27,11 @@ import { createManageCollectionsTool } from "./write/manageCollections";
 import { createImportIdentifiersTool } from "./write/importIdentifiers";
 import { createTrashItemsTool } from "./write/trashItems";
 import { createRestoreFromTrashTool } from "./write/restoreFromTrash";
+import {
+  createCreateItemsTool,
+  createRelateItemsTool,
+  createReparentItemsTool,
+} from "./write/itemStructure";
 import { createMergeItemsTool } from "./write/mergeItems";
 import { createManageAttachmentsTool } from "./write/manageAttachments";
 import { createRunCommandTool } from "./write/runCommand";
@@ -170,12 +175,14 @@ function createLibraryUpdateTool(tools: {
   applyTags: AgentToolDefinition<any, any>;
   moveToCollection: AgentToolDefinition<any, any>;
   updateMetadata: AgentToolDefinition<any, any>;
+  reparentItems: AgentToolDefinition<any, any>;
+  relateItems: AgentToolDefinition<any, any>;
 }): AgentToolDefinition<any, unknown> {
   return createDelegatingTool({
     name: "library_update",
     label: "Update Library",
     description:
-      "Apply non-destructive Zotero item changes: tags, collection membership, or metadata. Use kind:'tags', kind:'collections', or kind:'metadata'.",
+      "Apply non-destructive Zotero item changes. kind:'tags' for tags, kind:'collections' for collection membership, kind:'metadata' for item fields, kind:'parent' to move a note or attachment to a different parent item (or detach it), kind:'related' for Zotero's Related links.",
     mutability: "write",
     requiresConfirmation: true,
     inputSchema: {
@@ -185,7 +192,7 @@ function createLibraryUpdateTool(tools: {
       properties: {
         kind: {
           type: "string",
-          enum: ["tags", "collections", "metadata"],
+          enum: ["tags", "collections", "metadata", "parent", "related"],
         },
         action: {
           type: "string",
@@ -211,11 +218,16 @@ function createLibraryUpdateTool(tools: {
               tags: STRING_ARRAY_SCHEMA,
               targetCollectionId: { type: "number" },
               targetCollectionName: { type: "string" },
+              parentItemId: {
+                type: ["number", "null"],
+                description:
+                  "For kind:'parent': the item this note or attachment should belong to, or null to detach it to top level.",
+              },
             },
             required: ["itemId"],
           },
           description:
-            "Per-item tag or collection assignments for kind:'tags' or kind:'collections'.",
+            "Per-item assignments: tags for kind:'tags', target collections for kind:'collections', parentItemId for kind:'parent'.",
         },
         targetCollectionId: {
           type: "number",
@@ -225,6 +237,15 @@ function createLibraryUpdateTool(tools: {
           type: "string",
           description:
             "Target collection name for kind:'collections'; resolved in the confirmation card.",
+        },
+        itemId: {
+          type: "number",
+          description:
+            "Single Zotero item ID for kind:'metadata' or the source item for kind:'related'.",
+        },
+        relatedItemIds: {
+          ...NUMBER_ARRAY_SCHEMA,
+          description: "For kind:'related': the items to link to or unlink.",
         },
         mode: {
           type: "string",
@@ -247,10 +268,6 @@ function createLibraryUpdateTool(tools: {
           type: "array",
           items: LIBRARY_UPDATE_OPERATION_SCHEMA,
           description: "Batch metadata operations when kind:'metadata'.",
-        },
-        itemId: {
-          type: "number",
-          description: "Single Zotero item ID for kind:'metadata'.",
         },
         paperContext: PAPER_CONTEXT_REF_SCHEMA,
       },
@@ -281,7 +298,15 @@ function createLibraryUpdateTool(tools: {
       if (args.kind === "metadata") {
         return ok({ tool: tools.updateMetadata, args: delegateArgs });
       }
-      return fail("kind must be one of: tags, collections, metadata");
+      if (args.kind === "parent") {
+        return ok({ tool: tools.reparentItems, args: delegateArgs });
+      }
+      if (args.kind === "related") {
+        return ok({ tool: tools.relateItems, args: delegateArgs });
+      }
+      return fail(
+        "kind must be one of: tags, collections, metadata, parent, related",
+      );
     },
   });
 }
@@ -289,12 +314,13 @@ function createLibraryUpdateTool(tools: {
 function createLibraryImportTool(tools: {
   importIdentifiers: AgentToolDefinition<any, any>;
   importLocalFiles: AgentToolDefinition<any, any>;
+  createItems: AgentToolDefinition<any, any>;
 }): AgentToolDefinition<any, unknown> {
   return createDelegatingTool({
     name: "library_import",
     label: "Import to Library",
     description:
-      "Import papers or files into Zotero. Use kind:'identifiers' for DOI/ISBN/arXiv/URL imports and kind:'files' for local file imports.",
+      "Add items to Zotero. kind:'identifiers' for DOI/ISBN/arXiv lookups, kind:'files' for local files, kind:'manual' to create items from scratch when neither applies (a book with no DOI, a thesis, a dataset).",
     mutability: "write",
     requiresConfirmation: true,
     inputSchema: {
@@ -304,7 +330,7 @@ function createLibraryImportTool(tools: {
       properties: {
         kind: {
           type: "string",
-          enum: ["identifiers", "files"],
+          enum: ["identifiers", "files", "manual"],
         },
         identifiers: {
           ...STRING_ARRAY_SCHEMA,
@@ -314,6 +340,12 @@ function createLibraryImportTool(tools: {
         filePaths: {
           ...STRING_ARRAY_SCHEMA,
           description: "Absolute local file paths to import when kind:'files'.",
+        },
+        items: {
+          type: "array",
+          description:
+            "For kind:'manual': the items to create, each { itemType, fields, creators, tags, collections }. Check the type's valid fields first with library_search({ entity:'itemTypes', mode:'list', text:'<itemType>' }).",
+          items: { type: "object", additionalProperties: true },
         },
         targetCollectionId: {
           type: "number",
@@ -349,7 +381,10 @@ function createLibraryImportTool(tools: {
       if (args.kind === "files") {
         return ok({ tool: tools.importLocalFiles, args: delegateArgs });
       }
-      return fail("kind must be one of: identifiers, files");
+      if (args.kind === "manual") {
+        return ok({ tool: tools.createItems, args: delegateArgs });
+      }
+      return fail("kind must be one of: identifiers, files, manual");
     },
   });
 }
@@ -462,6 +497,9 @@ export function createBuiltInToolRegistry(
   const importIdentifiers = createImportIdentifiersTool(deps.zoteroGateway);
   const trashItems = createTrashItemsTool(deps.zoteroGateway);
   const restoreFromTrash = createRestoreFromTrashTool(deps.zoteroGateway);
+  const createItems = createCreateItemsTool(deps.zoteroGateway);
+  const reparentItems = createReparentItemsTool(deps.zoteroGateway);
+  const relateItems = createRelateItemsTool(deps.zoteroGateway);
   const mergeItems = createMergeItemsTool(deps.zoteroGateway);
   const manageAttachments = createManageAttachmentsTool(deps.zoteroGateway);
   const editCurrentNote = createEditCurrentNoteTool(deps.zoteroGateway);
@@ -515,6 +553,8 @@ export function createBuiltInToolRegistry(
       applyTags,
       moveToCollection,
       updateMetadata,
+      reparentItems,
+      relateItems,
     }),
   );
   registry.register(
@@ -539,6 +579,7 @@ export function createBuiltInToolRegistry(
     createLibraryImportTool({
       importIdentifiers,
       importLocalFiles,
+      createItems,
     }),
   );
   registry.register(
@@ -576,6 +617,9 @@ export function createBuiltInToolRegistry(
     importIdentifiers,
     trashItems,
     restoreFromTrash,
+    createItems,
+    reparentItems,
+    relateItems,
     mergeItems,
     manageAttachments,
     editCurrentNote,

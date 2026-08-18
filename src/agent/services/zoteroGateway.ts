@@ -2122,6 +2122,352 @@ export class ZoteroGateway {
     };
   }
 
+  /**
+   * Creates items from scratch.
+   *
+   * Everything the agent could add came from outside — an identifier lookup
+   * or a file import — so a book with no DOI, a thesis, a dataset, or a
+   * personal communication simply could not be entered. That is an ordinary
+   * thing to ask of a reference manager.
+   */
+  async createItems(params: {
+    libraryID: number;
+    items: Array<{
+      itemType: string;
+      fields?: Record<string, string>;
+      creators?: EditableArticleCreator[];
+      tags?: string[];
+      collections?: number[];
+    }>;
+  }): Promise<{
+    createdCount: number;
+    items: Array<{
+      itemId?: number;
+      itemType: string;
+      title: string;
+      status: "created" | "error";
+      reason?: string;
+    }>;
+  }> {
+    const results: Array<{
+      itemId?: number;
+      itemType: string;
+      title: string;
+      status: "created" | "error";
+      reason?: string;
+    }> = [];
+    let createdCount = 0;
+
+    for (const spec of params.items) {
+      const itemType = String(spec.itemType || "").trim();
+      const title = String(spec.fields?.title || "").trim();
+      try {
+        const itemTypeId = (
+          Zotero as unknown as {
+            ItemTypes?: { getID?: (name: string) => number | false };
+          }
+        ).ItemTypes?.getID?.(itemType);
+        if (!itemTypeId) {
+          results.push({
+            itemType,
+            title,
+            status: "error",
+            reason: `"${itemType}" is not a Zotero item type. Use library_search({ entity:'itemTypes', mode:'list' }) to see the valid ones.`,
+          });
+          continue;
+        }
+        const item = new Zotero.Item(itemType as never);
+        item.libraryID = params.libraryID;
+
+        const invalid: string[] = [];
+        for (const [fieldName, value] of Object.entries(spec.fields || {})) {
+          if (!isFieldValidForItemType(item, fieldName)) {
+            invalid.push(fieldName);
+            continue;
+          }
+          item.setField(fieldName, String(value ?? ""));
+        }
+        if (invalid.length) {
+          results.push({
+            itemType,
+            title,
+            status: "error",
+            reason: `Fields not valid for ${itemType}: ${invalid.join(", ")}. Valid fields: ${listEditableFieldsForItem(item).join(", ")}.`,
+          });
+          continue;
+        }
+
+        if (spec.creators?.length) {
+          item.setCreators(spec.creators as never);
+        }
+        for (const tag of spec.tags || []) {
+          if (tag) item.addTag(String(tag));
+        }
+        for (const collectionId of spec.collections || []) {
+          if (collectionId > 0) item.addToCollection(collectionId);
+        }
+
+        await item.saveTx();
+        createdCount += 1;
+        results.push({
+          itemId: Number(item.id),
+          itemType,
+          title: title || String(item.getDisplayTitle?.() || ""),
+          status: "created",
+        });
+      } catch (error) {
+        results.push({
+          itemType,
+          title,
+          status: "error",
+          reason: error instanceof Error ? error.message : String(error),
+        });
+      }
+    }
+
+    if (createdCount > 0 && params.libraryID > 0) {
+      invalidatePaperSearchCache(params.libraryID);
+    }
+    return { createdCount, items: results };
+  }
+
+  /**
+   * Moves an item under a different parent, or detaches it to top level.
+   *
+   * The capability matrix declared reparent allowed for notes and attachments
+   * and nothing implemented it, so "move this note onto that paper" — an
+   * everyday tidy-up — had no path but a raw script.
+   */
+  async reparentItems(params: {
+    assignments: Array<{ itemId: number; parentItemId: number | null }>;
+  }): Promise<{
+    changedCount: number;
+    items: Array<{
+      itemId: number;
+      title: string;
+      status: "reparented" | "skipped" | "error";
+      previousParentId?: number | null;
+      reason?: string;
+    }>;
+  }> {
+    const results: Array<{
+      itemId: number;
+      title: string;
+      status: "reparented" | "skipped" | "error";
+      previousParentId?: number | null;
+      reason?: string;
+    }> = [];
+    const touchedLibraryIDs = new Set<number>();
+    let changedCount = 0;
+
+    for (const assignment of params.assignments) {
+      const rawItem = this.getItem(assignment.itemId);
+      const resolution = resolveMatrixItem(
+        rawItem,
+        assignment.itemId,
+        "reparent",
+      );
+      if ("refusal" in resolution) {
+        results.push({
+          itemId: assignment.itemId,
+          title: rawItem
+            ? normalizeText(rawItem.getDisplayTitle?.()) ||
+              `Item ${assignment.itemId}`
+            : `Item ${assignment.itemId}`,
+          status: "error",
+          reason: resolution.refusal,
+        });
+        continue;
+      }
+      const item = resolution.item;
+      const title =
+        normalizeText(item.getDisplayTitle?.()) || `Item ${item.id}`;
+      const previousParentId =
+        (item as unknown as { parentID?: number | false }).parentID || null;
+
+      // A parent must be a regular item: Zotero cannot nest a note under an
+      // attachment, and attaching to a child would silently produce an
+      // unreachable item.
+      if (assignment.parentItemId != null) {
+        const parent = this.getItem(assignment.parentItemId);
+        if (!parent) {
+          results.push({
+            itemId: Number(item.id),
+            title,
+            status: "error",
+            reason: `No item with ID ${assignment.parentItemId} exists in this library`,
+          });
+          continue;
+        }
+        if (!parent.isRegularItem?.()) {
+          results.push({
+            itemId: Number(item.id),
+            title,
+            status: "error",
+            reason:
+              "A parent must be a regular bibliographic item; notes and attachments cannot hold children",
+          });
+          continue;
+        }
+      }
+
+      if (previousParentId === (assignment.parentItemId ?? null)) {
+        results.push({
+          itemId: Number(item.id),
+          title,
+          status: "skipped",
+          previousParentId,
+          reason: "Already attached there",
+        });
+        continue;
+      }
+
+      try {
+        (item as unknown as { parentID: number | false }).parentID =
+          assignment.parentItemId ?? false;
+        await item.saveTx();
+        changedCount += 1;
+        touchedLibraryIDs.add(Number(item.libraryID));
+        results.push({
+          itemId: Number(item.id),
+          title,
+          status: "reparented",
+          previousParentId,
+        });
+      } catch (error) {
+        results.push({
+          itemId: Number(item.id),
+          title,
+          status: "error",
+          reason: error instanceof Error ? error.message : String(error),
+        });
+      }
+    }
+
+    for (const libraryID of touchedLibraryIDs) {
+      if (libraryID > 0) invalidatePaperSearchCache(libraryID);
+    }
+    return { changedCount, items: results };
+  }
+
+  /**
+   * Adds or removes Zotero's "Related" links between items.
+   *
+   * Relations are bidirectional in Zotero, so both sides are saved together;
+   * writing one side leaves the pair inconsistent.
+   */
+  async relateItems(params: {
+    itemId: number;
+    relatedItemIds: number[];
+    action: "add" | "remove";
+  }): Promise<{
+    itemId: number;
+    changedCount: number;
+    items: Array<{
+      relatedItemId: number;
+      status: "related" | "unrelated" | "skipped" | "error";
+      reason?: string;
+    }>;
+  }> {
+    const rawItem = this.getItem(params.itemId);
+    const resolution = resolveMatrixItem(rawItem, params.itemId, "relate");
+    if ("refusal" in resolution) throw new Error(resolution.refusal);
+    const item = resolution.item;
+
+    const results: Array<{
+      relatedItemId: number;
+      status: "related" | "unrelated" | "skipped" | "error";
+      reason?: string;
+    }> = [];
+    let changedCount = 0;
+
+    for (const relatedItemId of params.relatedItemIds) {
+      if (relatedItemId === params.itemId) {
+        results.push({
+          relatedItemId,
+          status: "skipped",
+          reason: "An item cannot be related to itself",
+        });
+        continue;
+      }
+      const otherRaw = this.getItem(relatedItemId);
+      const otherResolution = resolveMatrixItem(
+        otherRaw,
+        relatedItemId,
+        "relate",
+      );
+      if ("refusal" in otherResolution) {
+        results.push({
+          relatedItemId,
+          status: "error",
+          reason: otherResolution.refusal,
+        });
+        continue;
+      }
+      const other = otherResolution.item;
+      try {
+        // Both sides are evaluated, never short-circuited: `a && b` would
+        // apply one direction and skip the other, leaving Zotero's
+        // bidirectional relation half-written and permanently inconsistent.
+        let forward: boolean;
+        let backward: boolean;
+        if (params.action === "add") {
+          forward = item.addRelatedItem(other);
+          backward = other.addRelatedItem(item);
+        } else {
+          forward = await item.removeRelatedItem(other);
+          backward = await other.removeRelatedItem(item);
+        }
+        if (forward !== backward) {
+          // One side was already in the target state. Put the other side back
+          // so the pair stays symmetric rather than half-applied.
+          if (params.action === "add") {
+            if (forward) await item.removeRelatedItem(other);
+            if (backward) await other.removeRelatedItem(item);
+          } else {
+            if (forward) item.addRelatedItem(other);
+            if (backward) other.addRelatedItem(item);
+          }
+        }
+        const changed = forward && backward;
+        if (!changed) {
+          results.push({
+            relatedItemId,
+            status: "skipped",
+            reason:
+              params.action === "add" ? "Already related" : "Was not related",
+          });
+          continue;
+        }
+        changedCount += 1;
+        results.push({
+          relatedItemId,
+          status: params.action === "add" ? "related" : "unrelated",
+        });
+      } catch (error) {
+        results.push({
+          relatedItemId,
+          status: "error",
+          reason: error instanceof Error ? error.message : String(error),
+        });
+      }
+    }
+
+    if (changedCount > 0) {
+      await item.saveTx();
+      for (const entry of results) {
+        if (entry.status === "related" || entry.status === "unrelated") {
+          const other = this.getItem(entry.relatedItemId);
+          if (other) await other.saveTx();
+        }
+      }
+      if (Number(item.libraryID) > 0) {
+        invalidatePaperSearchCache(Number(item.libraryID));
+      }
+    }
+    return { itemId: params.itemId, changedCount, items: results };
+  }
+
   async listItemsByFilters(params: {
     libraryID: number;
     filters?: AgentLibraryFilters;

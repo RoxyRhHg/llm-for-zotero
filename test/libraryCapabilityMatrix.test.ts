@@ -131,7 +131,7 @@ describe("library capability matrix", function () {
 
     it("keeps unimplemented distinct from refused at runtime", function () {
       // Both stop the write, but only one of them is a permanent answer.
-      const notBuilt = checkCapability("reparent", "childNote");
+      const notBuilt = checkCapability("update", "tag");
       assert.equal(notBuilt.status, "unimplemented");
 
       const impossible = checkCapability("addToCollection", "childAttachment");

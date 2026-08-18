@@ -125,9 +125,7 @@ const MATRIX: Record<LibraryObjectKind, Row> = {
     delete: no("Permanent erase is not offered; trash the item instead"),
     addToCollection: A,
     removeFromCollection: A,
-    relate: todo(
-      "Related-item links are not exposed by any tool yet; use zotero_script",
-    ),
+    relate: A,
     reparent: no("A regular item is already top-level"),
   },
   standaloneNote: {
@@ -140,12 +138,8 @@ const MATRIX: Record<LibraryObjectKind, Row> = {
     // This is the capability issue #374 was really about.
     addToCollection: A,
     removeFromCollection: A,
-    relate: todo(
-      "Related-item links are not exposed by any tool yet; use zotero_script",
-    ),
-    reparent: todo(
-      "Attaching a standalone note to an item is not exposed by any tool yet; use zotero_script",
-    ),
+    relate: A,
+    reparent: A,
   },
   childNote: {
     create: A,
@@ -156,12 +150,8 @@ const MATRIX: Record<LibraryObjectKind, Row> = {
     delete: no("Permanent erase is not offered; trash the note instead"),
     addToCollection: no(CHILD_NOT_TOP_LEVEL),
     removeFromCollection: no(CHILD_NOT_TOP_LEVEL),
-    relate: todo(
-      "Related-item links are not exposed by any tool yet; use zotero_script",
-    ),
-    reparent: todo(
-      "Moving a note to a different parent is not exposed by any tool yet; use zotero_script",
-    ),
+    relate: A,
+    reparent: A,
   },
   standaloneAttachment: {
     create: A,
@@ -172,12 +162,8 @@ const MATRIX: Record<LibraryObjectKind, Row> = {
     delete: no("Permanent erase is not offered; trash the attachment instead"),
     addToCollection: A,
     removeFromCollection: A,
-    relate: todo(
-      "Related-item links are not exposed by any tool yet; use zotero_script",
-    ),
-    reparent: todo(
-      "Attaching a standalone attachment to an item is not exposed by any tool yet; use zotero_script",
-    ),
+    relate: A,
+    reparent: A,
   },
   childAttachment: {
     create: A,
@@ -191,12 +177,8 @@ const MATRIX: Record<LibraryObjectKind, Row> = {
     delete: no("Permanent erase is not offered; trash the attachment instead"),
     addToCollection: no(CHILD_NOT_TOP_LEVEL),
     removeFromCollection: no(CHILD_NOT_TOP_LEVEL),
-    relate: todo(
-      "Related-item links are not exposed by any tool yet; use zotero_script",
-    ),
-    reparent: todo(
-      "Moving an attachment to a different parent is not exposed by any tool yet; use zotero_script",
-    ),
+    relate: A,
+    reparent: A,
   },
   annotation: {
     create: A,
@@ -314,6 +296,7 @@ export const IMPLEMENTED_BY: Partial<
   "regularItem:restore": "library_delete",
   "regularItem:addToCollection": "library_update",
   "regularItem:removeFromCollection": "library_update",
+  "regularItem:relate": "library_update",
 
   "standaloneNote:create": "note_write",
   "standaloneNote:read": "library_read",
@@ -322,12 +305,16 @@ export const IMPLEMENTED_BY: Partial<
   "standaloneNote:restore": "library_delete",
   "standaloneNote:addToCollection": "library_update",
   "standaloneNote:removeFromCollection": "library_update",
+  "standaloneNote:relate": "library_update",
+  "standaloneNote:reparent": "library_update",
 
   "childNote:create": "note_write",
   "childNote:read": "library_read",
   "childNote:update": "note_write",
   "childNote:trash": "library_delete",
   "childNote:restore": "library_delete",
+  "childNote:relate": "library_update",
+  "childNote:reparent": "library_update",
 
   "standaloneAttachment:create": "library_import",
   "standaloneAttachment:read": "library_read",
@@ -336,12 +323,16 @@ export const IMPLEMENTED_BY: Partial<
   "standaloneAttachment:restore": "library_delete",
   "standaloneAttachment:addToCollection": "library_update",
   "standaloneAttachment:removeFromCollection": "library_update",
+  "standaloneAttachment:relate": "library_update",
+  "standaloneAttachment:reparent": "library_update",
 
   "childAttachment:create": "library_import",
   "childAttachment:read": "library_read",
   "childAttachment:update": "attachment_update",
   "childAttachment:trash": "library_delete",
   "childAttachment:restore": "library_delete",
+  "childAttachment:relate": "library_update",
+  "childAttachment:reparent": "library_update",
 
   "annotation:create": "annotate_pdf",
   "annotation:read": "library_read",

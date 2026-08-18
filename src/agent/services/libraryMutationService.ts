@@ -67,6 +67,38 @@ export type MoveToCollectionOperation = {
  * would unfile the item from the destination and never put back the
  * collections the move took it out of.
  */
+export type CreateItemsOperation = {
+  id?: string;
+  type: "create_items";
+  libraryID?: number;
+  items: Array<{
+    itemType: string;
+    fields?: Record<string, string>;
+    creators?: Array<{
+      creatorType: string;
+      firstName?: string;
+      lastName?: string;
+      name?: string;
+    }>;
+    tags?: string[];
+    collections?: number[];
+  }>;
+};
+
+export type ReparentItemsOperation = {
+  id?: string;
+  type: "reparent_items";
+  assignments: Array<{ itemId: number; parentItemId: number | null }>;
+};
+
+export type RelateItemsOperation = {
+  id?: string;
+  type: "relate_items";
+  itemId: number;
+  relatedItemIds: number[];
+  action: "add" | "remove";
+};
+
 export type SetItemCollectionsOperation = {
   id?: string;
   type: "set_item_collections";
@@ -193,6 +225,9 @@ export type LibraryMutationOperation =
   | RemoveFromCollectionOperation
   | CreateCollectionOperation
   | SetItemCollectionsOperation
+  | CreateItemsOperation
+  | ReparentItemsOperation
+  | RelateItemsOperation
   | DeleteCollectionOperation
   | SaveNoteOperation
   | ImportIdentifiersOperation
@@ -676,6 +711,131 @@ export class LibraryMutationService {
                       collectionId: item.targetCollectionId as number,
                     })),
                 ),
+        };
+      }
+      case "create_items": {
+        const libraryID = this.zoteroGateway.resolveLibraryID({
+          request: context.request,
+          item: context.item,
+          libraryID: operation.libraryID,
+        });
+        if (!libraryID) {
+          throw new Error("No active library available for item creation");
+        }
+        const result = await this.zoteroGateway.createItems({
+          libraryID,
+          items: operation.items as never,
+        });
+        const createdIds = result.items
+          .filter((row) => row.status === "created" && row.itemId)
+          .map((row) => row.itemId as number);
+        return {
+          result: {
+            operation: operation.type,
+            operationId: operation.id,
+            result,
+          },
+          // Trash rather than erase, matching every other delete here: the
+          // user may want the item back after undoing by mistake.
+          undo: createdIds.length
+            ? {
+                toolName: "library_mutation",
+                inverseOperations: [
+                  { type: "trash_items", itemIds: createdIds },
+                ],
+                description: `Trash ${createdIds.length} newly created item${
+                  createdIds.length === 1 ? "" : "s"
+                }`,
+                revert: async () => {
+                  await this.zoteroGateway.trashItems({ itemIds: createdIds });
+                },
+              }
+            : null,
+        };
+      }
+      case "reparent_items": {
+        const result = await this.zoteroGateway.reparentItems({
+          assignments: operation.assignments,
+        });
+        const moved = result.items.filter((row) => row.status === "reparented");
+        return {
+          result: {
+            operation: operation.type,
+            operationId: operation.id,
+            result,
+          },
+          // Each item goes back to its own previous parent, which may be a
+          // different item or top level; one blanket inverse cannot express
+          // that.
+          undo: moved.length
+            ? {
+                toolName: "library_mutation",
+                inverseOperations: [
+                  {
+                    type: "reparent_items" as const,
+                    assignments: moved.map((row) => ({
+                      itemId: row.itemId,
+                      parentItemId: row.previousParentId ?? null,
+                    })),
+                  },
+                ],
+                description: `Move ${moved.length} item${
+                  moved.length === 1 ? "" : "s"
+                } back to their previous parents`,
+                revert: async () => {
+                  await this.zoteroGateway.reparentItems({
+                    assignments: moved.map((row) => ({
+                      itemId: row.itemId,
+                      parentItemId: row.previousParentId ?? null,
+                    })),
+                  });
+                },
+              }
+            : null,
+        };
+      }
+      case "relate_items": {
+        const result = await this.zoteroGateway.relateItems({
+          itemId: operation.itemId,
+          relatedItemIds: operation.relatedItemIds,
+          action: operation.action,
+        });
+        const affected = result.items
+          .filter(
+            (row) => row.status === "related" || row.status === "unrelated",
+          )
+          .map((row) => row.relatedItemId);
+        const inverseAction = operation.action === "add" ? "remove" : "add";
+        return {
+          result: {
+            operation: operation.type,
+            operationId: operation.id,
+            result,
+          },
+          undo: affected.length
+            ? {
+                toolName: "library_mutation",
+                inverseOperations: [
+                  {
+                    type: "relate_items" as const,
+                    itemId: operation.itemId,
+                    relatedItemIds: affected,
+                    action: inverseAction as "add" | "remove",
+                  },
+                ],
+                description:
+                  operation.action === "add"
+                    ? `Unlink ${affected.length} related item${affected.length === 1 ? "" : "s"}`
+                    : `Re-link ${affected.length} related item${affected.length === 1 ? "" : "s"}`,
+                revert: async () => {
+                  await this.zoteroGateway.relateItems({
+                    itemId: operation.itemId,
+                    relatedItemIds: affected,
+                    action: inverseAction,
+                  });
+                },
+              }
+            : null,
         };
       }
       case "set_item_collections": {
