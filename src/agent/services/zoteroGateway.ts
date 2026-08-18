@@ -2536,13 +2536,13 @@ export class ZoteroGateway {
   }
 
   /**
-   * Captures everything needed to rebuild a collection after `eraseTx`.
+   * Describes a collection before it is deleted.
    *
-   * `eraseTx` is permanent — Zotero has no trash for collections — so the
-   * only way `delete_collection` can be reversible is to record its state
-   * first. Returns `null` when the collection does not exist, and reports
-   * `childCollectionCount` so callers can refuse a delete whose subtree this
-   * flat snapshot could not faithfully restore.
+   * Deleting now trashes rather than erases, so the inverse is a restore by
+   * id and this snapshot is no longer load-bearing for undo. It still
+   * describes the collection for the confirmation card, and
+   * `childCollectionCount` tells the user how much of their tree a delete
+   * would take with it. Returns `null` when the collection does not exist.
    */
   snapshotCollectionForDelete(params: { collectionId: number }): {
     name: string;
@@ -2573,20 +2573,120 @@ export class ZoteroGateway {
     }
     const parentID = Number((collection as { parentID?: unknown }).parentID);
     return {
-      name: normalizeText(collection.name) || `Collection ${params.collectionId}`,
-      parentCollectionId: Number.isFinite(parentID) && parentID > 0 ? parentID : undefined,
+      name:
+        normalizeText(collection.name) || `Collection ${params.collectionId}`,
+      parentCollectionId:
+        Number.isFinite(parentID) && parentID > 0 ? parentID : undefined,
       libraryID: Number(collection.libraryID) || 0,
       itemIds,
       childCollectionCount,
     };
   }
 
-  async deleteCollection(params: { collectionId: number }): Promise<void> {
+  /**
+   * Moves a collection to the trash, matching what Zotero's own UI does.
+   *
+   * This used to call `eraseTx()`, which is Zotero's *permanent* erase — it
+   * wipes the collection and every descendant with no way back. Zotero has
+   * had a collection trash since `deletedCollections` landed, and its own
+   * "Delete Collection" sets `deleted = true`; only "Delete Permanently"
+   * erases. The agent was therefore more destructive than the UI while
+   * telling the user the opposite ("Zotero has no trash for collections").
+   *
+   * Setting `deleted` routes through `Zotero.Collection.trash()`, which
+   * trashes descendant collections too and preserves every id, so a restore
+   * brings back the original objects rather than rebuilding lookalikes.
+   *
+   * Items are left in the library unless `deleteItems` is set — again
+   * matching Zotero, whose menu offers "Delete Collection" and "Delete
+   * Collection and Items" as separate commands.
+   */
+  async deleteCollection(params: {
+    collectionId: number;
+    deleteItems?: boolean;
+    permanent?: boolean;
+  }): Promise<void> {
     const collection = this.getCollection(params.collectionId);
     if (!collection) return;
     const libraryID = Number(collection.libraryID) || 0;
-    await (collection as unknown as { eraseTx: () => Promise<void> }).eraseTx();
+    if (params.permanent) {
+      await (
+        collection as unknown as {
+          eraseTx: (options?: { deleteItems?: boolean }) => Promise<void>;
+        }
+      ).eraseTx({ deleteItems: !!params.deleteItems });
+    } else {
+      (collection as unknown as { deleted: boolean }).deleted = true;
+      await (
+        collection as unknown as {
+          saveTx: (options?: { deleteItems?: boolean }) => Promise<unknown>;
+        }
+      ).saveTx({ deleteItems: !!params.deleteItems });
+    }
     if (libraryID > 0) invalidatePaperSearchCache(libraryID);
+  }
+
+  /**
+   * Brings collections back out of the trash.
+   *
+   * Descendants are restored alongside their parent, mirroring both what
+   * `trash()` took down and what Zotero's own "Restore to Library" does
+   * (`zoteroPane.js` restores `getDescendents(false, 'collection', true)`).
+   * Without that, restoring a parent would leave its subtree stranded in the
+   * trash.
+   */
+  async restoreCollections(params: {
+    collectionIds: number[];
+  }): Promise<{ restoredCount: number }> {
+    const touchedLibraryIDs = new Set<number>();
+    const seen = new Set<number>();
+    let restoredCount = 0;
+    for (const collectionId of params.collectionIds) {
+      const collection = this.getCollection(collectionId) as
+        | (Zotero.Collection & {
+            deleted?: boolean;
+            getDescendents?: (
+              nested: boolean,
+              type: "collection" | "item" | null,
+              includeDeletedItems?: boolean,
+            ) => Array<{ id: number; type: string }>;
+          })
+        | null;
+      if (!collection) continue;
+      const targets: Array<Zotero.Collection & { deleted?: boolean }> = [
+        collection,
+      ];
+      try {
+        for (const descendent of collection.getDescendents?.(
+          false,
+          "collection",
+          true,
+        ) || []) {
+          const child = this.getCollection(descendent.id) as
+            | (Zotero.Collection & { deleted?: boolean })
+            | null;
+          if (child) targets.push(child);
+        }
+      } catch {
+        // A missing descendant must not block restoring the parent.
+      }
+      for (const target of targets) {
+        const id = Number(target.id);
+        if (seen.has(id)) continue;
+        seen.add(id);
+        if (!target.deleted) continue;
+        target.deleted = false;
+        await (
+          target as unknown as { saveTx: () => Promise<unknown> }
+        ).saveTx();
+        restoredCount += 1;
+        touchedLibraryIDs.add(Number(target.libraryID));
+      }
+    }
+    for (const libraryID of touchedLibraryIDs) {
+      if (libraryID > 0) invalidatePaperSearchCache(libraryID);
+    }
+    return { restoredCount };
   }
 
   /**
@@ -2968,18 +3068,53 @@ export class ZoteroGateway {
     return { trashedCount, items };
   }
 
-  async restoreItems(params: { itemIds: number[] }): Promise<void> {
+  /**
+   * Brings items back out of the trash.
+   *
+   * Reports which ids it actually restored, rather than `void`: an item that
+   * was never trashed is skipped, so a caller that assumed every requested id
+   * came back would build an inverse that re-trashes items this call never
+   * touched.
+   */
+  async restoreItems(params: {
+    itemIds: number[];
+  }): Promise<{ restoredCount: number; itemIds: number[] }> {
     const touchedLibraryIDs = new Set<number>();
+    const restored: number[] = [];
     for (const itemId of params.itemIds) {
       const item = this.getItem(itemId);
       if (!item || !item.deleted) continue;
       item.deleted = false;
       await item.saveTx();
+      restored.push(Number(item.id));
       touchedLibraryIDs.add(Number(item.libraryID));
     }
     for (const libraryID of touchedLibraryIDs) {
       invalidatePaperSearchCache(libraryID);
     }
+    return { restoredCount: restored.length, itemIds: restored };
+  }
+
+  /**
+   * Brings saved searches back out of the trash. Zotero tracks these in
+   * `deletedSearches`, exactly as it does collections.
+   */
+  async restoreSavedSearches(params: {
+    savedSearchIds: number[];
+  }): Promise<{ restoredCount: number }> {
+    let restoredCount = 0;
+    for (const savedSearchId of params.savedSearchIds) {
+      const search = (
+        Zotero.Searches as unknown as {
+          get?: (id: number) => (Zotero.Search & { deleted?: boolean }) | null;
+        }
+      ).get?.(savedSearchId);
+      if (!search || !search.deleted) continue;
+      (search as unknown as { deleted: boolean }).deleted = false;
+      await (search as unknown as { saveTx: () => Promise<unknown> }).saveTx();
+      restoredCount += 1;
+    }
+    return { restoredCount };
   }
 
   // ── Merge duplicates ──────────────────────────────────────────────

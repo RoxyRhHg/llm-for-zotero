@@ -2,17 +2,23 @@ import { assert } from "chai";
 import { LibraryMutationService } from "../src/agent/services/libraryMutationService";
 
 /**
- * `delete_collection` calls `eraseTx`, which is permanent — Zotero has no
- * trash for collections. It previously recorded no undo at all, so a
- * mis-targeted delete was unrecoverable.
+ * `delete_collection` used to call `eraseTx`, Zotero's *permanent* erase,
+ * on the false premise that "Zotero has no trash for collections". It does:
+ * `deletedCollections` has backed the Trash pane for years, and Zotero's own
+ * "Delete Collection" sets `deleted = true`.
+ *
+ * So the agent was more destructive than the UI, and the confirmation card
+ * told the user the opposite. Deleting now trashes, which also means the
+ * inverse is a restore by id rather than a rebuild that minted a new
+ * collection and stranded any subtree.
  */
 describe("delete_collection reversibility", function () {
   function makeGateway(overrides: Record<string, unknown> = {}) {
-    const calls: { deleted: number[]; created: unknown[]; added: unknown[] } = {
-      deleted: [],
-      created: [],
-      added: [],
-    };
+    const calls: {
+      deleted: unknown[];
+      restoredCollections: unknown[];
+      restoredItems: unknown[];
+    } = { deleted: [], restoredCollections: [], restoredItems: [] };
     const gateway = {
       snapshotCollectionForDelete: () => ({
         name: "Neuro",
@@ -21,22 +27,16 @@ describe("delete_collection reversibility", function () {
         itemIds: [11, 12],
         childCollectionCount: 0,
       }),
-      deleteCollection: async ({ collectionId }: { collectionId: number }) => {
-        calls.deleted.push(collectionId);
+      deleteCollection: async (params: unknown) => {
+        calls.deleted.push(params);
       },
-      createCollection: async (params: unknown) => {
-        calls.created.push(params);
-        return { collectionId: 99, name: "Neuro", libraryID: 1, path: "Neuro" };
+      restoreCollections: async (params: unknown) => {
+        calls.restoredCollections.push(params);
+        return { restoredCount: 1 };
       },
-      addItemsToCollections: async (params: unknown) => {
-        calls.added.push(params);
-        return {
-          selectedCount: 2,
-          movedCount: 2,
-          skippedCount: 0,
-          collections: [],
-          items: [],
-        };
+      restoreItems: async (params: unknown) => {
+        calls.restoredItems.push(params);
+        return { restoredCount: 2, itemIds: [11, 12] };
       },
       ...overrides,
     };
@@ -45,7 +45,7 @@ describe("delete_collection reversibility", function () {
 
   const context = { request: { conversationKey: 1, libraryID: 1 } } as never;
 
-  it("records an undo that recreates the collection and its membership", async function () {
+  it("trashes the collection rather than erasing it", async function () {
     const { gateway, calls } = makeGateway();
     const service = new LibraryMutationService(gateway as never);
 
@@ -54,24 +54,33 @@ describe("delete_collection reversibility", function () {
       context,
     );
 
-    assert.deepEqual(calls.deleted, [42]);
-    assert.exists(outcome.undo, "a permanent delete must record an inverse");
-
-    await outcome.undo?.revert();
-    assert.deepEqual(calls.created, [
-      { name: "Neuro", parentCollectionId: 5, libraryID: 1 },
+    assert.deepEqual(calls.deleted, [
+      { collectionId: 42, deleteItems: undefined, permanent: undefined },
     ]);
-    assert.deepEqual(calls.added, [
-      {
-        assignments: [
-          { itemId: 11, targetCollectionId: 99 },
-          { itemId: 12, targetCollectionId: 99 },
-        ],
-      },
-    ]);
+    const result = (outcome.result as { result: { status: string } }).result;
+    assert.equal(result.status, "trashed");
   });
 
-  it("refuses to delete a collection with subcollections it cannot restore", async function () {
+  it("records an undo that restores the original collection by id", async function () {
+    const { gateway, calls } = makeGateway();
+    const service = new LibraryMutationService(gateway as never);
+
+    const outcome = await service.executeOperation(
+      { type: "delete_collection", collectionId: 42 },
+      context,
+    );
+    assert.exists(outcome.undo, "a delete must record an inverse");
+
+    await outcome.undo?.revert();
+
+    // The original id comes back, so anything referencing it still resolves.
+    // The old undo created a *new* collection with a new id instead.
+    assert.deepEqual(calls.restoredCollections, [{ collectionIds: [42] }]);
+    // Items were never trashed, so restoring them would be wrong.
+    assert.deepEqual(calls.restoredItems, []);
+  });
+
+  it("deletes a collection with subcollections instead of refusing", async function () {
     const { gateway, calls } = makeGateway({
       snapshotCollectionForDelete: () => ({
         name: "Parent",
@@ -82,18 +91,54 @@ describe("delete_collection reversibility", function () {
     });
     const service = new LibraryMutationService(gateway as never);
 
-    let message = "";
-    try {
-      await service.executeOperation(
-        { type: "delete_collection", collectionId: 7 },
-        context,
-      );
-      assert.fail("expected the delete to be refused");
-    } catch (error) {
-      message = error instanceof Error ? error.message : String(error);
-    }
+    // Previously this threw: a flat snapshot could not restore a subtree, so
+    // the only safe answer was refusal. The trash restores the subtree
+    // intact, so the refusal is gone.
+    const outcome = await service.executeOperation(
+      { type: "delete_collection", collectionId: 7 },
+      context,
+    );
 
-    assert.include(message, "subcollection");
-    assert.deepEqual(calls.deleted, [], "nothing may be erased on refusal");
+    assert.lengthOf(calls.deleted, 1);
+    const result = (
+      outcome.result as {
+        result: { status: string; childCollectionCount: number };
+      }
+    ).result;
+    assert.equal(result.status, "trashed");
+    assert.equal(result.childCollectionCount, 2);
+    assert.exists(outcome.undo);
+  });
+
+  it("restores trashed items too, but only when the delete took them", async function () {
+    const { gateway, calls } = makeGateway();
+    const service = new LibraryMutationService(gateway as never);
+
+    const outcome = await service.executeOperation(
+      { type: "delete_collection", collectionId: 42, deleteItems: true },
+      context,
+    );
+    await outcome.undo?.revert();
+
+    assert.deepEqual(calls.restoredCollections, [{ collectionIds: [42] }]);
+    assert.deepEqual(calls.restoredItems, [{ itemIds: [11, 12] }]);
+  });
+
+  it("records no undo for a permanent erase, which has no inverse", async function () {
+    const { gateway, calls } = makeGateway();
+    const service = new LibraryMutationService(gateway as never);
+
+    const outcome = await service.executeOperation(
+      { type: "delete_collection", collectionId: 42, permanent: true },
+      context,
+    );
+
+    assert.deepEqual(calls.deleted, [
+      { collectionId: 42, deleteItems: undefined, permanent: true },
+    ]);
+    const result = (outcome.result as { result: { status: string } }).result;
+    assert.equal(result.status, "erased");
+    // Promising a revert it cannot honour would be worse than admitting none.
+    assert.notExists(outcome.undo);
   });
 });

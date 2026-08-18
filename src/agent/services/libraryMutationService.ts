@@ -70,6 +70,16 @@ export type DeleteCollectionOperation = {
   id?: string;
   type: "delete_collection";
   collectionId: number;
+  /**
+   * Trash the collection's items too. Off by default, matching Zotero, whose
+   * "Delete Collection" leaves items in the library and offers "Delete
+   * Collection and Items" as a separate command.
+   */
+  deleteItems?: boolean;
+  /**
+   * Erase instead of trashing. Irreversible, so it records no undo.
+   */
+  permanent?: boolean;
 };
 
 export type SaveNoteOperation = {
@@ -93,6 +103,21 @@ export type TrashItemsOperation = {
   id?: string;
   type: "trash_items";
   itemIds: number[];
+};
+
+/**
+ * Brings items, collections or saved searches back out of the Zotero trash.
+ *
+ * Restoring was previously reachable only as the inverse of an action the
+ * agent itself had just taken, so anything the *user* trashed — or anything
+ * trashed in an earlier session — was unreachable.
+ */
+export type RestoreFromTrashOperation = {
+  id?: string;
+  type: "restore_from_trash";
+  itemIds?: number[];
+  collectionIds?: number[];
+  savedSearchIds?: number[];
 };
 
 export type MergeItemsOperation = {
@@ -149,6 +174,7 @@ export type LibraryMutationOperation =
   | SaveNoteOperation
   | ImportIdentifiersOperation
   | TrashItemsOperation
+  | RestoreFromTrashOperation
   | MergeItemsOperation
   | DeleteAttachmentOperation
   | RenameAttachmentOperation
@@ -320,55 +346,62 @@ function buildCreateCollectionUndo(
     ],
     description: `Undo creation of collection "${collection.name}"`,
     revert: async () => {
+      // Erase rather than trash: undoing a creation should leave nothing
+      // behind, not park an unwanted collection in the user's trash.
       await zoteroGateway.deleteCollection({
         collectionId: collection.collectionId,
+        permanent: true,
       });
     },
   };
 }
 
 /**
- * Rebuilds a collection erased by `delete_collection`.
+ * Restores a collection that `delete_collection` moved to the trash.
  *
- * The restored collection is a new object with a new id — Zotero cannot
- * resurrect the original — so anything that stored the old id will not
- * follow. Name, parent and membership are what the user actually cares
- * about, and those are restored exactly.
+ * This used to rebuild the collection from a flat snapshot, which minted a
+ * new id — so anything holding the old id silently stopped following it, and
+ * subcollections could not come back at all (which is why deleting a
+ * collection with subcollections was refused outright).
  *
- * Membership is restored through `addItemsToCollections`, which since the
- * capability matrix landed accepts standalone notes and attachments as well
- * as regular items — so a collection of mixed contents comes back intact.
- * Child items were never members to begin with.
+ * Now that deleting trashes rather than erases, the inverse is simply to
+ * clear the `deleted` flag: every id survives, and descendants are restored
+ * with their parent. Items trashed alongside the collection are restored too,
+ * but only when the delete actually took them.
  */
 function buildDeleteCollectionUndo(
   zoteroGateway: ZoteroGateway,
   snapshot: {
+    collectionId: number;
     name: string;
-    parentCollectionId?: number;
-    libraryID: number;
     itemIds: number[];
+    childCollectionCount: number;
+    deleteItems: boolean;
   },
 ): LibraryMutationUndo {
+  const parts: string[] = [];
+  if (snapshot.childCollectionCount > 0) {
+    parts.push(
+      `${snapshot.childCollectionCount} subcollection${snapshot.childCollectionCount === 1 ? "" : "s"}`,
+    );
+  }
+  if (snapshot.deleteItems && snapshot.itemIds.length) {
+    parts.push(
+      `${snapshot.itemIds.length} item${snapshot.itemIds.length === 1 ? "" : "s"}`,
+    );
+  }
   return {
     toolName: "library_mutation",
-    description: `Recreate collection "${snapshot.name}"${
-      snapshot.itemIds.length
-        ? ` with its ${snapshot.itemIds.length} item${snapshot.itemIds.length === 1 ? "" : "s"}`
-        : ""
+    description: `Restore collection "${snapshot.name}"${
+      parts.length ? ` with its ${parts.join(" and ")}` : ""
     }`,
     revert: async () => {
-      const recreated = await zoteroGateway.createCollection({
-        name: snapshot.name,
-        parentCollectionId: snapshot.parentCollectionId,
-        libraryID: snapshot.libraryID,
+      await zoteroGateway.restoreCollections({
+        collectionIds: [snapshot.collectionId],
       });
-      if (!snapshot.itemIds.length) return;
-      await zoteroGateway.addItemsToCollections({
-        assignments: snapshot.itemIds.map((itemId) => ({
-          itemId,
-          targetCollectionId: recreated.collectionId,
-        })),
-      });
+      if (snapshot.deleteItems && snapshot.itemIds.length) {
+        await zoteroGateway.restoreItems({ itemIds: snapshot.itemIds });
+      }
     },
   };
 }
@@ -648,22 +681,18 @@ export class LibraryMutationService {
         };
       }
       case "delete_collection": {
-        // `eraseTx` is permanent — Zotero has no trash for collections — so
-        // capture the state first and hand back an inverse. A collection with
-        // subcollections is refused outright rather than deleted with an
-        // undo that would silently fail to restore the subtree.
+        // Deleting trashes the collection, exactly as Zotero's own "Delete
+        // Collection" does, so subcollections travel with it and the inverse
+        // is a restore by id rather than a rebuild. That is why the old
+        // refusal of collections with subcollections is gone: a flat snapshot
+        // could not restore a subtree, but the trash restores it intact.
         const snapshot = this.zoteroGateway.snapshotCollectionForDelete({
           collectionId: operation.collectionId,
         });
-        if (snapshot && snapshot.childCollectionCount > 0) {
-          throw new Error(
-            `"${snapshot.name}" has ${snapshot.childCollectionCount} subcollection${
-              snapshot.childCollectionCount === 1 ? "" : "s"
-            }. Deleting it would erase them permanently and they could not be restored. Delete the subcollections first, or move them elsewhere.`,
-          );
-        }
         await this.zoteroGateway.deleteCollection({
           collectionId: operation.collectionId,
+          deleteItems: operation.deleteItems,
+          permanent: operation.permanent,
         });
         return {
           result: {
@@ -671,13 +700,22 @@ export class LibraryMutationService {
             operationId: operation.id,
             result: {
               collectionId: operation.collectionId,
-              status: "deleted",
-              restorableItemCount: snapshot?.itemIds.length ?? 0,
+              status: operation.permanent ? "erased" : "trashed",
+              childCollectionCount: snapshot?.childCollectionCount ?? 0,
+              itemCount: snapshot?.itemIds.length ?? 0,
+              itemsTrashed: !!operation.deleteItems,
             },
           },
-          undo: snapshot
-            ? buildDeleteCollectionUndo(this.zoteroGateway, snapshot)
-            : undefined,
+          // A permanent erase has no inverse, so it deliberately records no
+          // undo rather than promising one it cannot honour.
+          undo:
+            snapshot && !operation.permanent
+              ? buildDeleteCollectionUndo(this.zoteroGateway, {
+                  ...snapshot,
+                  collectionId: operation.collectionId,
+                  deleteItems: !!operation.deleteItems,
+                })
+              : undefined,
         };
       }
       case "save_note": {
@@ -772,6 +810,54 @@ export class LibraryMutationService {
                   },
                 }
               : null,
+        };
+      }
+      case "restore_from_trash": {
+        const itemIds = operation.itemIds || [];
+        const collectionIds = operation.collectionIds || [];
+        const savedSearchIds = operation.savedSearchIds || [];
+        const restoredItems = itemIds.length
+          ? await this.zoteroGateway.restoreItems({ itemIds })
+          : { restoredCount: 0, itemIds: [] as number[] };
+        const restoredCollections = collectionIds.length
+          ? await this.zoteroGateway.restoreCollections({ collectionIds })
+          : { restoredCount: 0 };
+        const restoredSearches = savedSearchIds.length
+          ? await this.zoteroGateway.restoreSavedSearches({ savedSearchIds })
+          : { restoredCount: 0 };
+        const total =
+          restoredItems.restoredCount +
+          restoredCollections.restoredCount +
+          restoredSearches.restoredCount;
+        return {
+          result: {
+            operation: operation.type,
+            operationId: operation.id,
+            result: {
+              restoredItemCount: restoredItems.restoredCount,
+              restoredCollectionCount: restoredCollections.restoredCount,
+              restoredSavedSearchCount: restoredSearches.restoredCount,
+              restoredCount: total,
+            },
+          },
+          // The inverse re-trashes only what this call actually restored, so
+          // undoing a partial restore cannot sweep up untouched siblings.
+          undo: total
+            ? {
+                toolName: "library_mutation",
+                description: `Move ${total} restored object${total === 1 ? "" : "s"} back to the trash`,
+                revert: async () => {
+                  if (restoredItems.itemIds.length) {
+                    await this.zoteroGateway.trashItems({
+                      itemIds: restoredItems.itemIds,
+                    });
+                  }
+                  for (const collectionId of collectionIds) {
+                    await this.zoteroGateway.deleteCollection({ collectionId });
+                  }
+                },
+              }
+            : null,
         };
       }
       case "merge_items": {

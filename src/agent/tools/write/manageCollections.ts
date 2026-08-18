@@ -24,7 +24,8 @@ export function createManageCollectionsTool(
   return {
     spec: {
       name: "manage_collections",
-      description: "Create or delete Zotero collections (folders).",
+      description:
+        "Create or delete Zotero collections (folders). Deleting moves the collection to the Zotero trash, where the user can restore it, and takes any subcollections with it.",
       inputSchema: {
         type: "object",
         additionalProperties: false,
@@ -45,6 +46,16 @@ export function createManageCollectionsTool(
           collectionId: {
             type: "number",
             description: "Collection ID to delete (required for 'delete').",
+          },
+          deleteItems: {
+            type: "boolean",
+            description:
+              "For 'delete': also move the collection's items to the trash. Defaults to false, which leaves the items in the library, matching Zotero's own 'Delete Collection'.",
+          },
+          permanent: {
+            type: "boolean",
+            description:
+              "For 'delete': erase permanently instead of trashing. This cannot be undone, so only use it when the user has explicitly asked to delete permanently.",
           },
           libraryID: {
             type: "number",
@@ -117,6 +128,8 @@ export function createManageCollectionsTool(
         const operation: DeleteCollectionOperation = {
           type: "delete_collection",
           collectionId,
+          deleteItems: args.deleteItems === true,
+          permanent: args.permanent === true,
         };
         return ok({ operation });
       }
@@ -164,13 +177,30 @@ export function createManageCollectionsTool(
       const collectionLabel = collection
         ? collection.path || collection.name
         : `Collection ${operation.collectionId}`;
-      const description = `Delete collection "${collectionLabel}". Items in the collection will not be deleted, and the collection can be restored with undo. A collection containing subcollections cannot be deleted.`;
+      // The card has to be exact about what is destroyed: this used to promise
+      // items were safe and the delete was undoable while calling `eraseTx`,
+      // which permanently erased the collection and every subcollection.
+      const snapshot = zoteroGateway.snapshotCollectionForDelete({
+        collectionId: operation.collectionId,
+      });
+      const subcollectionCount = snapshot?.childCollectionCount ?? 0;
+      const subcollectionNote = subcollectionCount
+        ? ` Its ${subcollectionCount} subcollection${subcollectionCount === 1 ? "" : "s"} will go with it.`
+        : "";
+      const itemsNote = operation.deleteItems
+        ? " The items it contains will be moved to the trash as well."
+        : " The items it contains will stay in your library.";
+      const description = operation.permanent
+        ? `Permanently erase collection "${collectionLabel}".${subcollectionNote}${itemsNote} This cannot be undone.`
+        : `Move collection "${collectionLabel}" to the Zotero trash.${subcollectionNote}${itemsNote} You can restore it from the trash, or undo this.`;
 
       return {
         toolName: "manage_collections",
-        title: "Delete collection",
+        title: operation.permanent
+          ? "Permanently erase collection"
+          : "Delete collection",
         description,
-        confirmLabel: "Delete",
+        confirmLabel: operation.permanent ? "Erase permanently" : "Delete",
         cancelLabel: "Cancel",
         fields: [
           {

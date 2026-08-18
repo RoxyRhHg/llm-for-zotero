@@ -26,6 +26,7 @@ import { createUpdateMetadataTool } from "./write/updateMetadata";
 import { createManageCollectionsTool } from "./write/manageCollections";
 import { createImportIdentifiersTool } from "./write/importIdentifiers";
 import { createTrashItemsTool } from "./write/trashItems";
+import { createRestoreFromTrashTool } from "./write/restoreFromTrash";
 import { createMergeItemsTool } from "./write/mergeItems";
 import { createManageAttachmentsTool } from "./write/manageAttachments";
 import { createRunCommandTool } from "./write/runCommand";
@@ -126,9 +127,12 @@ const LIBRARY_IMPORT_GUIDANCE: ToolGuidance = {
 
 const LIBRARY_DELETE_GUIDANCE: ToolGuidance = {
   matches: (request) =>
-    /\b(merge|dedupe|dedup|duplicat|combine)\b/i.test(request.userText || ""),
+    /\b(merge|dedupe|dedup|duplicat|combine|restore|recover|undelete|trash|deleted)\b/i.test(
+      request.userText || "",
+    ),
   instruction:
-    "To merge duplicates: first use library_search({ entity:'items', mode:'duplicates' }) to find duplicate groups, then use library_read to compare metadata and decide which item is the best master, then call library_delete({ mode:'merge', ... }) with the master and the others. The master keeps all children (attachments, notes, tags, collections) from the merged items.",
+    "To merge duplicates: first use library_search({ entity:'items', mode:'duplicates' }) to find duplicate groups, then use library_read to compare metadata and decide which item is the best master, then call library_delete({ mode:'merge', ... }) with the master and the others. The master keeps all children (attachments, notes, tags, collections) from the merged items." +
+    "\n\nTo bring something back from the trash, call library_delete with mode:'restore' and itemIds, collectionIds, or savedSearchIds. Restoring a collection restores its subcollections too. Deleting a collection trashes it rather than erasing it, so a collection the user deleted earlier can still be restored this way.",
 };
 
 const ATTACHMENT_UPDATE_GUIDANCE: ToolGuidance = {
@@ -337,12 +341,13 @@ function createLibraryImportTool(tools: {
 function createLibraryDeleteTool(tools: {
   trashItems: AgentToolDefinition<any, any>;
   mergeItems: AgentToolDefinition<any, any>;
+  restoreFromTrash: AgentToolDefinition<any, any>;
 }): AgentToolDefinition<any, unknown> {
   return createDelegatingTool({
     name: "library_delete",
-    label: "Delete / Merge Library Items",
+    label: "Delete / Restore / Merge Library Items",
     description:
-      "Destructive Zotero item operations. Use mode:'trash' to move items to trash or mode:'merge' to merge duplicates into a master item.",
+      "Trash, restore, or merge Zotero objects. Use mode:'trash' to move items to the trash, mode:'restore' to bring trashed items, collections, or saved searches back, or mode:'merge' to merge duplicates into a master item.",
     mutability: "write",
     requiresConfirmation: true,
     inputSchema: {
@@ -352,11 +357,21 @@ function createLibraryDeleteTool(tools: {
       properties: {
         mode: {
           type: "string",
-          enum: ["trash", "merge"],
+          enum: ["trash", "restore", "merge"],
         },
         itemIds: {
           ...NUMBER_ARRAY_SCHEMA,
-          description: "Zotero item IDs to trash when mode:'trash'.",
+          description:
+            "Zotero item IDs to trash when mode:'trash', or to restore when mode:'restore'.",
+        },
+        collectionIds: {
+          ...NUMBER_ARRAY_SCHEMA,
+          description:
+            "Collection IDs to restore when mode:'restore'. Subcollections come back with their parent.",
+        },
+        savedSearchIds: {
+          ...NUMBER_ARRAY_SCHEMA,
+          description: "Saved search IDs to restore when mode:'restore'.",
         },
         masterItemId: {
           type: "number",
@@ -370,11 +385,11 @@ function createLibraryDeleteTool(tools: {
       },
     },
     summaries: {
-      onCall: "Preparing destructive library change",
-      onPending: "Waiting for confirmation on destructive library change",
-      onApproved: "Applying destructive library change",
-      onDenied: "Library delete/merge cancelled",
-      onSuccess: "Library delete/merge completed",
+      onCall: "Preparing library change",
+      onPending: "Waiting for confirmation on library change",
+      onApproved: "Applying library change",
+      onDenied: "Library delete/restore/merge cancelled",
+      onSuccess: "Library delete/restore/merge completed",
     },
     guidance: LIBRARY_DELETE_GUIDANCE,
     chooseDelegate(args) {
@@ -386,10 +401,13 @@ function createLibraryDeleteTool(tools: {
       if (args.mode === "trash") {
         return ok({ tool: tools.trashItems, args: delegateArgs });
       }
+      if (args.mode === "restore") {
+        return ok({ tool: tools.restoreFromTrash, args: delegateArgs });
+      }
       if (args.mode === "merge") {
         return ok({ tool: tools.mergeItems, args: delegateArgs });
       }
-      return fail("mode must be one of: trash, merge");
+      return fail("mode must be one of: trash, restore, merge");
     },
   });
 }
@@ -427,6 +445,7 @@ export function createBuiltInToolRegistry(
   const manageCollections = createManageCollectionsTool(deps.zoteroGateway);
   const importIdentifiers = createImportIdentifiersTool(deps.zoteroGateway);
   const trashItems = createTrashItemsTool(deps.zoteroGateway);
+  const restoreFromTrash = createRestoreFromTrashTool(deps.zoteroGateway);
   const mergeItems = createMergeItemsTool(deps.zoteroGateway);
   const manageAttachments = createManageAttachmentsTool(deps.zoteroGateway);
   const editCurrentNote = createEditCurrentNoteTool(deps.zoteroGateway);
@@ -506,7 +525,9 @@ export function createBuiltInToolRegistry(
       importLocalFiles,
     }),
   );
-  registry.register(createLibraryDeleteTool({ trashItems, mergeItems }));
+  registry.register(
+    createLibraryDeleteTool({ trashItems, mergeItems, restoreFromTrash }),
+  );
   registry.register(
     createRenamedTool({
       tool: manageAttachments,
@@ -538,6 +559,7 @@ export function createBuiltInToolRegistry(
     manageCollections,
     importIdentifiers,
     trashItems,
+    restoreFromTrash,
     mergeItems,
     manageAttachments,
     editCurrentNote,

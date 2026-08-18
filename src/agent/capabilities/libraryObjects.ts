@@ -181,10 +181,13 @@ const MATRIX: Record<LibraryObjectKind, Row> = {
     create: A,
     read: A,
     update: A,
-    trash: no("Zotero has no trash for collections; deleting one is permanent"),
-    restore: no("Zotero has no trash for collections"),
-    // Permitted, but the mutation service refuses a collection that has
-    // subcollections, because a flat snapshot cannot restore a subtree.
+    // Zotero has had a collection trash since `deletedCollections`; its own
+    // "Delete Collection" sets `deleted = true` and the Trash pane restores
+    // it. This previously claimed the opposite and erased instead.
+    trash: A,
+    restore: A,
+    // Permanent erase, behind an explicit `permanent` flag. It has no
+    // inverse, so it records no undo.
     delete: A,
     addToCollection: no(NOT_AN_ITEM("A collection")),
     removeFromCollection: no(NOT_AN_ITEM("A collection")),
@@ -195,8 +198,9 @@ const MATRIX: Record<LibraryObjectKind, Row> = {
     create: A,
     read: A,
     update: A,
-    trash: no("Zotero has no trash for saved searches"),
-    restore: no("Zotero has no trash for saved searches"),
+    // Saved searches have `deletedSearches`, the same as collections.
+    trash: A,
+    restore: A,
     delete: A,
     addToCollection: no(NOT_AN_ITEM("A saved search")),
     removeFromCollection: no(NOT_AN_ITEM("A saved search")),
@@ -290,7 +294,10 @@ export function refusalFor(
   }
   const kind = classifyLibraryItem(item);
   if (!kind) {
-    return `Item ${itemId ?? ""}`.trim() + " is not a kind of object this operation understands";
+    return (
+      `Item ${itemId ?? ""}`.trim() +
+      " is not a kind of object this operation understands"
+    );
   }
   const verdict = checkCapability(operation, kind);
   if (verdict.status === "allowed") return null;
