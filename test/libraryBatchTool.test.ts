@@ -159,4 +159,61 @@ describe("library_batch", function () {
     }
     assert.include(message, "model unreachable");
   });
+
+  /**
+   * `discover_related` calls ctx.requestConfirmation directly — it is an
+   * interactive review workflow, not a batch pass — so running it through a
+   * tool call would throw partway, after some work had already happened.
+   * Advertising a job that cannot work is the kind of lie this whole effort
+   * exists to remove.
+   */
+  it("refuses an interactive-only job up front, with somewhere to go", function () {
+    const actionRegistry = new ActionRegistry();
+    actionRegistry.register({
+      name: "discover_related",
+      description: "Find related papers",
+      inputSchema: { type: "object" },
+      execute: async () => ({ ok: true, output: {} }),
+    } as never);
+    const tool = createLibraryBatchTool({
+      actionRegistry,
+      toolRegistry: {} as never,
+      zoteroGateway: {} as never,
+      services: {} as never,
+    });
+
+    const result = tool.validate({ job: "discover_related" });
+    assert.isFalse(result.ok);
+    if (result.ok) return;
+    assert.include(result.error, "interactive");
+    assert.include(result.error, "/discover_related");
+  });
+
+  it("does not list an interactive-only job as available", function () {
+    const actionRegistry = new ActionRegistry();
+    actionRegistry.register({
+      name: "discover_related",
+      description: "Find related papers",
+      inputSchema: { type: "object" },
+      execute: async () => ({ ok: true, output: {} }),
+    } as never);
+    actionRegistry.register({
+      name: "auto_tag",
+      description: "Tag papers",
+      inputSchema: { type: "object" },
+      execute: async () => ({ ok: true, output: {} }),
+    } as never);
+    const tool = createLibraryBatchTool({
+      actionRegistry,
+      toolRegistry: {} as never,
+      zoteroGateway: {} as never,
+      services: {} as never,
+    });
+
+    const result = tool.validate({ job: "" });
+    assert.isFalse(result.ok);
+    if (result.ok) return;
+    assert.include(result.error, "auto_tag");
+    assert.notInclude(result.error, "discover_related");
+  });
 });

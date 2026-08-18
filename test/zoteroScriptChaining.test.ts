@@ -255,3 +255,108 @@ describe("zotero_script scope control", function () {
     assert.equal(result.returnValue, 1);
   });
 });
+
+/**
+ * The sandbox branch was unreachable in every runtime: the constructor was
+ * looked up on `globalThis.Cu` (which the plugin scope does not define)
+ * falling back to `ChromeUtils.Sandbox` (which does not exist), while the
+ * evaluator was read off `ChromeUtils` separately. Constructor and evaluator
+ * came from two different objects, so every script silently took the
+ * in-realm fallback while the commit message claimed otherwise — and 3557
+ * green tests never touched the branch, because none installed a fake Cu.
+ */
+describe("zotero_script sandbox engagement", function () {
+  const originalZotero = (
+    globalThis as typeof globalThis & { Zotero?: unknown }
+  ).Zotero;
+  const originalComponents = (
+    globalThis as typeof globalThis & { Components?: unknown }
+  ).Components;
+  const originalServices = (
+    globalThis as typeof globalThis & { Services?: unknown }
+  ).Services;
+
+  afterEach(function () {
+    const g = globalThis as typeof globalThis & Record<string, unknown>;
+    g.Zotero = originalZotero;
+    g.Components = originalComponents;
+    g.Services = originalServices;
+  });
+
+  const context: AgentToolContext = {
+    request: { conversationKey: 8, mode: "agent", userText: "x", libraryID: 1 },
+    item: null,
+    currentAnswerText: "",
+    modelName: "test-model",
+  };
+
+  it("compiles inside the sandbox when Components.utils is available", async function () {
+    const g = globalThis as typeof globalThis & Record<string, unknown>;
+    let sandboxBuilt = 0;
+    let evaluated = 0;
+    g.Zotero = { Items: { get: () => null }, debug: () => undefined };
+    g.Services = {
+      scriptSecurityManager: { getSystemPrincipal: () => ({}) },
+    };
+    g.Components = {
+      utils: {
+        Sandbox: function FakeSandbox(this: Record<string, unknown>) {
+          sandboxBuilt += 1;
+          return this;
+        },
+        evalInSandbox: (source: string) => {
+          evaluated += 1;
+          // Faithful enough: compile the same factory the real call would.
+          return (0, eval)(source);
+        },
+      },
+    };
+
+    const tool = createZoteroScriptTool();
+    const validated = tool.validate({
+      mode: "read",
+      script: "return 7;",
+      description: "seven",
+    });
+    assert.isTrue(validated.ok);
+    if (!validated.ok) return;
+
+    const result = (await tool.execute(validated.value, context)) as Record<
+      string,
+      unknown
+    >;
+
+    assert.equal(sandboxBuilt, 1, "the sandbox constructor must be reached");
+    assert.equal(evaluated, 1, "the evaluator must come from the same object");
+    assert.equal(result.returnValue, 7);
+  });
+
+  it("still runs when no sandbox is available, keeping the DB guard", async function () {
+    const g = globalThis as typeof globalThis & Record<string, unknown>;
+    g.Components = undefined;
+    g.Services = undefined;
+    g.Zotero = {
+      DB: { queryAsync: async () => [] },
+      Items: { get: () => null },
+      debug: () => undefined,
+    };
+
+    const tool = createZoteroScriptTool();
+    const validated = tool.validate({
+      mode: "write",
+      script: "env.addUndoStep(async () => {}); await Zotero.DB.queryAsync('x');",
+      description: "sql",
+    });
+    assert.isTrue(validated.ok);
+    if (!validated.ok) return;
+    const result = (await tool.execute(validated.value, context)) as Record<
+      string,
+      unknown
+    >;
+    assert.include(
+      String(result.error),
+      "Zotero.DB",
+      "the guard must hold on the fallback path too",
+    );
+  });
+});

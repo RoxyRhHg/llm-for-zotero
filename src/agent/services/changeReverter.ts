@@ -89,6 +89,10 @@ export async function revertEntries(params: {
     }
     try {
       for (const operation of operations) {
+        // Deliberately `executeOperation`, NOT `executeAndRecordUndo`: the
+        // latter journals what it does, so routing reverts through it would
+        // file each revert as its own undoable change and make "undo" an
+        // infinite ping-pong. Keep this direct.
         await service.executeOperation(operation, params.context);
       }
       await markChangeReverted(entry.entryId, now());

@@ -601,9 +601,10 @@ async function journalMutation(params: {
   undo: LibraryMutationUndo | null;
 }): Promise<void> {
   const { context, operation, undo } = params;
-  // Grouped per conversation: the request carries no run id, and a
-  // conversation-scoped group is what the history panel lists anyway.
-  const runId = `conv-${context.request.conversationKey}`;
+  // A batch job supplies its own run id so its pages revert as one unit;
+  // ordinary turns group by conversation, which is what the history lists.
+  const runId =
+    context.request.agentRunId || `conv-${context.request.conversationKey}`;
   journalSequence += 1;
   try {
     await recordChange({
@@ -652,16 +653,24 @@ export async function executeAndRecordUndoBatch(
   facadeToolName: string,
 ): Promise<{ appliedCount: number; results: unknown[] }> {
   const results: unknown[] = [];
-  const undoEntries: Array<{
-    description: string;
-    revert: () => Promise<void>;
-  }> = [];
+  const undoEntries: LibraryMutationUndo[] = [];
   for (const operation of operations) {
     const executed = await mutationService.executeOperation(operation, context);
     results.push(executed.result);
     if (executed.undo) {
       undoEntries.push(executed.undo);
     }
+  }
+  // Journal each operation individually so a batch is as revertible as a
+  // single write. This helper journalled nothing at all, so update_metadata
+  // over several items -- its only caller -- left no history.
+  for (let index = 0; index < operations.length; index += 1) {
+    await journalMutation({
+      context,
+      operation: operations[index],
+      facadeToolName,
+      undo: undoEntries[index] ?? null,
+    });
   }
   if (undoEntries.length) {
     pushUndoEntry(context.request.conversationKey, {

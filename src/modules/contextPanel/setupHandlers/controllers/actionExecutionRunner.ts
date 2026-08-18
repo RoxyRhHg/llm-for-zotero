@@ -85,6 +85,9 @@ export async function runAgentActionWithLifecycle(params: {
     const agentApi = getAgentApi();
     const commonOptions = {
       libraryID,
+      // Files the run's changes under the user's conversation so undo and
+      // the change history can find them.
+      conversationKey: conversationKey ?? undefined,
       requestContext,
       llm,
       signal: abortSlot.signal,

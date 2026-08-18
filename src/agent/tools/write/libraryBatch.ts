@@ -40,6 +40,20 @@ type LibraryBatchInput = {
  * is what the mode means — and every page is journalled with its inverse, so
  * the run is reviewable and revertible after the fact rather than during.
  */
+/**
+ * Jobs that cannot run headlessly, and why.
+ *
+ * These call `ctx.requestConfirmation` directly — they are interactive review
+ * workflows, not batch passes — so the bridged context's throwing stub would
+ * fire partway through. Advertising them here and failing mid-run would be
+ * worse than not offering them, so they are refused up front with somewhere
+ * to go.
+ */
+const INTERACTIVE_ONLY_JOBS: Record<string, string> = {
+  discover_related:
+    "discover_related is an interactive review workflow — it presents candidate papers for you to pick from — so it cannot run unattended.",
+};
+
 export function createLibraryBatchTool(deps: {
   actionRegistry: ActionRegistry;
   toolRegistry: AgentToolRegistry;
@@ -108,6 +122,7 @@ export function createLibraryBatchTool(deps: {
       if (!job) {
         const available = deps.actionRegistry
           .listActions()
+          .filter((entry) => !INTERACTIVE_ONLY_JOBS[entry.name])
           .map((entry) => entry.name)
           .join(", ");
         return fail(`job is required. Available jobs: ${available}`);
@@ -116,9 +131,16 @@ export function createLibraryBatchTool(deps: {
       if (!action) {
         const available = deps.actionRegistry
           .listActions()
+          .filter((entry) => !INTERACTIVE_ONLY_JOBS[entry.name])
           .map((entry) => `${entry.name} — ${entry.description}`)
           .join("; ");
         return fail(`Unknown job "${job}". Available: ${available}`);
+      }
+      const interactiveReason = INTERACTIVE_ONLY_JOBS[job];
+      if (interactiveReason) {
+        return fail(
+          `${interactiveReason} Run it from the chat surface with /${job} instead.`,
+        );
       }
       const jobArgs = validateObject<Record<string, unknown>>(args.jobArgs)
         ? args.jobArgs
@@ -201,6 +223,9 @@ export function createLibraryBatchTool(deps: {
         // The model's judgement decides. Inner tool confirmations
         // self-approve; the run is journalled instead of interrogated.
         confirmationMode: "auto_approve",
+        // Groups every page's changes under this job so the whole run
+        // reverts as a unit.
+        runId: jobId,
         onProgress: (event) => {
           if (event.type === "step_done" && event.summary) {
             progress.push(event.summary);
@@ -214,11 +239,17 @@ export function createLibraryBatchTool(deps: {
           result.ok && result.output && typeof result.output === "object"
             ? (result.output as Record<string, unknown>)
             : {};
+        // Each action names its own outcome field. Probing a fixed list
+        // meant audit_library (metadataFixed) reported zero changes having
+        // fixed many, so unknown shapes fall back to the largest reported
+        // count rather than silently to 0.
         const appliedCount =
           readCount(output.moved) ??
           readCount(output.tagged) ??
           readCount(output.updated) ??
-          readCount(output.processed) ??
+          readCount(output.metadataFixed) ??
+          readCount(output.imported) ??
+          largestCount(output) ??
           0;
 
         await advanceBatchJob({
@@ -252,6 +283,20 @@ export function createLibraryBatchTool(deps: {
       }
     },
   };
+}
+
+/**
+ * The largest numeric field an action reported, used when none of the known
+ * outcome names are present. `processed` is excluded because it counts items
+ * *considered*, not items changed, and reporting it as "applied" would
+ * overstate the run.
+ */
+function largestCount(output: Record<string, unknown>): number | undefined {
+  const counts = Object.entries(output)
+    .filter(([key]) => key !== "processed" && key !== "remaining")
+    .map(([, value]) => readCount(value))
+    .filter((value): value is number => value !== undefined);
+  return counts.length ? Math.max(...counts) : undefined;
 }
 
 function readCount(value: unknown): number | undefined {

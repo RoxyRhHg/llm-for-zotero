@@ -115,9 +115,9 @@ function compileScript(
   source: string,
   isWrite: boolean,
 ): (zotero: unknown, env: unknown) => Promise<unknown> {
+  const cu = getComponentsUtils();
   const sandbox = createScriptSandbox(isWrite);
-  if (sandbox) {
-    const cu = getChromeUtils();
+  if (sandbox && typeof cu?.evalInSandbox === "function") {
     try {
       // Evaluated inside the sandbox, so the compiled function closes over
       // the sandbox's globals rather than the plugin realm's.
@@ -126,9 +126,19 @@ function compileScript(
         sandbox,
       ) as (zotero: unknown, env: unknown) => Promise<unknown>;
       if (typeof factory === "function") return factory;
-    } catch {
-      /* fall through to the in-realm compile */
+    } catch (error) {
+      // Loud, not silent: a sandbox that fails to compile means the mode
+      // boundary is not being enforced, and that should be discoverable.
+      Zotero.debug?.(
+        `[llm-for-zotero] zotero_script sandbox compile failed, falling back to the plugin realm: ${
+          error instanceof Error ? error.message : String(error)
+        }`,
+      );
     }
+  } else {
+    Zotero.debug?.(
+      "[llm-for-zotero] zotero_script sandbox unavailable; running in the plugin realm. Zotero.DB is still withheld from write mode.",
+    );
   }
   const AsyncFunction = Object.getPrototypeOf(
     async function () {},
@@ -139,8 +149,22 @@ function compileScript(
   ) => Promise<unknown>;
 }
 
-function getChromeUtils(): any {
-  return (globalThis as any).ChromeUtils;
+/**
+ * `Components.utils` — the object that carries BOTH `Sandbox` and
+ * `evalInSandbox`.
+ *
+ * An earlier version looked the constructor up on `globalThis.Cu` (which the
+ * plugin scope does not define) falling back to `ChromeUtils.Sandbox` (which
+ * does not exist — the typings put both members on `nsIXPCComponents_utils`,
+ * not on the `ChromeUtils` namespace), and then read the evaluator off
+ * `ChromeUtils` separately. Constructor and evaluator resolved from two
+ * different objects that can never both be `Components.utils`, so the branch
+ * was unreachable in every runtime and every script silently took the
+ * in-realm fallback.
+ */
+function getComponentsUtils(): any {
+  const globals = globalThis as any;
+  return globals.Components?.utils || globals.Cu || null;
 }
 
 /**
@@ -153,15 +177,24 @@ function getChromeUtils(): any {
  * construction.
  */
 function createScriptSandbox(isWrite: boolean): unknown | null {
-  const cu = getChromeUtils();
-  const sandboxCtor = (globalThis as any).Cu?.Sandbox || (cu as any)?.Sandbox;
+  const cu = getComponentsUtils();
+  const sandboxCtor = cu?.Sandbox;
   const principal = (globalThis as any).Services?.scriptSecurityManager
     ?.getSystemPrincipal?.();
   if (typeof sandboxCtor !== "function" || !principal) return null;
   try {
     const sandbox = new sandboxCtor(principal, {
       sandboxName: "llm-for-zotero:zotero_script",
-      wantGlobalProperties: ["atob", "btoa", "fetch"],
+      // TextDecoder/TextEncoder are here because the tool's own guidance
+      // tells the model to use them; omitting them would throw a
+      // ReferenceError the first time the sandbox actually engaged.
+      wantGlobalProperties: [
+        "atob",
+        "btoa",
+        "fetch",
+        "TextDecoder",
+        "TextEncoder",
+      ],
       wantComponents: false,
     });
     Object.assign(sandbox, {

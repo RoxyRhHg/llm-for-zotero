@@ -25,7 +25,11 @@ function buildToolContext(
   return {
     // Actions run outside an agent turn, so we build a synthetic request.
     request: {
-      conversationKey: 0,
+      // Carried from the caller. Hard-coding 0 filed every action-driven
+      // change under a conversation nothing queries, so neither undo path
+      // could find them.
+      conversationKey: ctx.conversationKey ?? 0,
+      agentRunId: ctx.runId,
       mode: "agent",
       userText: stepDescription,
       libraryID: ctx.libraryID,

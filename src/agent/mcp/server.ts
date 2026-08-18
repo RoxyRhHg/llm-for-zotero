@@ -76,7 +76,30 @@ export const ZOTERO_MCP_WRITE_TOOL_NAMES = [
   "file_io",
   "zotero_script",
   "undo_last_action",
+  "revert_changes",
+  "annotate_pdf",
 ] as const;
+
+/**
+ * Registered tools deliberately NOT exposed over MCP, and why.
+ *
+ * This list exists so a missing tool reads as a decision rather than drift —
+ * the registry and these curated arrays are maintained by hand and have
+ * silently diverged before.
+ */
+export const ZOTERO_MCP_EXCLUDED_TOOL_NAMES: Record<string, string> = {
+  // Runs unattended for minutes and reports only at the end. The MCP
+  // transport has no progress channel and no way to drive the per-page
+  // review the in-plugin surface offers, so an external backend would see a
+  // single opaque call that either succeeds or times out. Revisit when the
+  // paged result contract ({done, nextOffset, remaining}) lands.
+  library_batch:
+    "library_batch runs unattended with no progress channel over MCP; use the in-plugin agent or the slash-command surface.",
+  // Deliberately absent and gated on a metadata flag the MCP path never
+  // sets, so advertising it would offer a permanently unavailable tool.
+  tool_result_read:
+    "tool_result_read is gated on an in-plugin metadata flag that the MCP path does not set.",
+};
 const CURATED_READ_TOOL_NAMES = new Set<string>(
   ZOTERO_MCP_SAFE_READ_TOOL_NAMES,
 );

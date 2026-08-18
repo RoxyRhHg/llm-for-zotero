@@ -94,16 +94,19 @@ export function createRevertChangesTool(
       const entries = await listChangeJournal({
         conversationKey: context.request.conversationKey,
         limit: input.count,
+        pendingOnly: true,
       });
-      return entries.some((entry) => entry.status !== "reverted");
+      return entries.length > 0;
     },
 
     async createPendingAction(input, context) {
-      const entries = await listChangeJournal({
+      // pendingOnly at the SQL level: filtering after LIMIT would spend the
+      // budget on rows a previous undo already reverted.
+      const pending = await listChangeJournal({
         conversationKey: context.request.conversationKey,
         limit: input.count,
+        pendingOnly: true,
       });
-      const pending = entries.filter((entry) => entry.status !== "reverted");
       return {
         toolName: "revert_changes",
         title: `Undo ${pending.length} change${pending.length === 1 ? "" : "s"}`,
@@ -126,11 +129,11 @@ export function createRevertChangesTool(
     },
 
     async execute(input, context) {
-      const entries = await listChangeJournal({
+      const pending = await listChangeJournal({
         conversationKey: context.request.conversationKey,
         limit: input.count,
+        pendingOnly: true,
       });
-      const pending = entries.filter((entry) => entry.status !== "reverted");
 
       if (input.dryRun) {
         return {

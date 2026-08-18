@@ -505,6 +505,11 @@ export type ClassifiedTurnIntent = {
 };
 
 export type AgentRuntimeRequest = AgentRequest & {
+  /**
+   * Groups a run's journalled changes so they can be reverted as a unit.
+   * Set by batch jobs; absent for ordinary turns, which group by conversation.
+   */
+  agentRunId?: string;
   /** Generation captured when this turn started; Clear advances it. */
   conversationGeneration?: number;
   /** Set by the runtime after per-turn classification; absent on fallback. */

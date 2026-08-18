@@ -151,6 +151,15 @@ export async function recordChange(entry: {
 export async function listChangeJournal(params: {
   conversationKey: number;
   limit?: number;
+  /**
+   * Exclude already-reverted entries at the SQL level.
+   *
+   * Callers that want "the last N undoable changes" must pass this: applying
+   * LIMIT first and filtering in JavaScript afterwards spends the budget on
+   * rows that are already reverted, so "undo the last 3" could return one, or
+   * none, after a previous undo.
+   */
+  pendingOnly?: boolean;
 }): Promise<ChangeJournalEntry[]> {
   if (!hasDb()) return [];
   const limit =
@@ -159,7 +168,9 @@ export async function listChangeJournal(params: {
       : 50;
   const rows = (await Zotero.DB.queryAsync(
     `SELECT * FROM ${JOURNAL_TABLE}
-     WHERE conversation_key = ?
+     WHERE conversation_key = ?${
+       params.pendingOnly ? " AND status != 'reverted'" : ""
+     }
      ORDER BY created_at DESC, rowid DESC
      LIMIT ?`,
     [params.conversationKey, limit],

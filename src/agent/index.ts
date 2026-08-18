@@ -324,6 +324,7 @@ export function getAgentApi() {
       opts: {
         libraryID?: number;
         requestContext?: import("./actions").ActionRequestContext;
+        conversationKey?: number;
         confirmationMode?: import("./actions").ActionConfirmationMode;
         onProgress?: (event: import("./actions").ActionProgressEvent) => void;
         requestConfirmation?: (
@@ -346,6 +347,9 @@ export function getAgentApi() {
           .Libraries.userLibraryID;
       const ctx: import("./actions").ActionExecutionContext = {
         registry: _toolRegistry,
+        // Without this, every change an action makes is journalled under
+        // conversation 0 and neither undo path can find it.
+        conversationKey: opts.conversationKey,
         zoteroGateway: _zoteroGateway,
         services: {} as import("./actions").ActionServices,
         libraryID,

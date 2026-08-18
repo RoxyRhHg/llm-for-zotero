@@ -839,6 +839,42 @@ export function createActionCommandController(
     }
   };
 
+  /**
+   * Narrows a paged action to the user's selected chips.
+   *
+   * Scope used to be resolved by the pre-turn natural-language interceptor,
+   * which also handled explicit slash commands on its way past. Removing that
+   * interceptor took this with it, so "/auto_tag this folder" with the
+   * Dynamical_System chip selected silently fell back to `scope: "all"` and
+   * paged the entire library — with no card mentioning the change.
+   *
+   * Only applied when the command did not name a scope itself: an explicit
+   * `collection <name>` must still win over whatever happens to be selected.
+   */
+  const applySelectedChipScope = (
+    actionName: string,
+    input: Record<string, unknown>,
+  ): Record<string, unknown> => {
+    if (input.scope && input.scope !== "all") return input;
+    // organize_unfiled operates on unfiled items by definition; narrowing it
+    // to a collection is meaningless and the resolver rejects it outright.
+    if (actionName === "organize_unfiled") return input;
+    const requestContext = buildActionRequestContext();
+    const collectionIds = (requestContext.selectedCollectionContexts || [])
+      .map((entry) => Number(entry.collectionId))
+      .filter((id) => Number.isFinite(id) && id > 0);
+    if (collectionIds.length) {
+      return { ...input, scope: "collection", collectionIds };
+    }
+    const tags = (requestContext.selectedTagContexts || [])
+      .map((entry) => String(entry.name || "").trim())
+      .filter(Boolean);
+    if (tags.length) {
+      return { ...input, scope: "tag", tags };
+    }
+    return input;
+  };
+
   const resolvePagedLibraryActionInput = (
     actionName: string,
     params: string,
@@ -863,7 +899,7 @@ export function createActionCommandController(
         );
         return null;
       }
-      return resolution.input;
+      return applySelectedChipScope(actionName, resolution.input);
     } catch (error) {
       deps.logError(`LLM: failed to resolve /${actionName} input`, error);
       setStatus("Agent system unavailable", "error");

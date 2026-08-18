@@ -25,6 +25,7 @@ export function buildActionExecutionContext(params: {
   zoteroGateway: ZoteroGateway;
   services: ActionServices;
   confirmationMode: ActionConfirmationMode;
+  runId?: string;
   onProgress?: (event: ActionProgressEvent) => void;
   requestConfirmation?: ActionExecutionContext["requestConfirmation"];
 }): ActionExecutionContext {
@@ -35,6 +36,11 @@ export function buildActionExecutionContext(params: {
     // registry / zoteroGateway / services are constructor dependencies of the
     // tool that calls this, not data carried on the context.
     registry: params.registry,
+    // Carried so every change an action makes is filed under the user's real
+    // conversation. Without this the executor's synthetic request used 0,
+    // and neither undo path could ever find the entries.
+    conversationKey: request.conversationKey,
+    runId: params.runId,
     zoteroGateway: params.zoteroGateway,
     services: params.services,
     libraryID: Number(request.libraryID) > 0 ? Number(request.libraryID) : 1,

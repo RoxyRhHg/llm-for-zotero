@@ -68,6 +68,11 @@ import {
   runCodexAppServerConnectionTest,
 } from "../utils/providerConnectionTest";
 import { normalizeAgentPermissionMode } from "../shared/agentPermissionMode";
+import { normalizeAgentLibraryWriteMode } from "../shared/agentLibraryWriteMode";
+import {
+  getAgentLibraryWriteMode,
+  setAgentLibraryWriteMode,
+} from "../agent/libraryWriteMode";
 import {
   startCopilotDeviceFlow,
   pollCopilotDeviceAuth,
@@ -2798,6 +2803,9 @@ export async function registerPrefsScripts(_window: Window | undefined | null) {
   const agentClaudeConfigSourceSelect = doc.querySelector(
     `#${config.addonRef}-agent-claude-config-source`,
   ) as HTMLSelectElement | null;
+  const agentLibraryWriteModeSelect = doc.querySelector(
+    `#${config.addonRef}-agent-library-write-mode`,
+  ) as HTMLSelectElement | null;
   const agentPermissionModeSelect = doc.querySelector(
     `#${config.addonRef}-agent-permission-mode`,
   ) as HTMLSelectElement | null;
@@ -3694,6 +3702,14 @@ export async function registerPrefsScripts(_window: Window | undefined | null) {
     }
   }
 
+  if (agentLibraryWriteModeSelect) {
+    agentLibraryWriteModeSelect.value = getAgentLibraryWriteMode();
+    agentLibraryWriteModeSelect.addEventListener("change", () => {
+      setAgentLibraryWriteMode(
+        normalizeAgentLibraryWriteMode(agentLibraryWriteModeSelect.value),
+      );
+    });
+  }
   if (agentPermissionModeSelect) {
     agentPermissionModeSelect.value = getClaudePermissionModePref();
     agentPermissionModeSelect.addEventListener("change", () => {
