@@ -33,7 +33,8 @@
     "test:unit": "npx tsx node_modules/mocha/bin/mocha.js --require ./test/register.cjs 'test/**/*.test.ts'",
     "test:workflow": "node scripts/run-workflow-tests.mjs",
     "test:webchat:live": "node scripts/run-workflow-tests.mjs --webchat-live",
-    "update-deps": "npm update --save"
+    "update-deps": "npm update --save",
+    "test:agent:live": "node scripts/run-workflow-tests.mjs --agent-live"
   },
   "dependencies": {
     "fflate": "^0.8.2",

@@ -9,8 +9,10 @@ const PREF_KEY = `${config.prefsPrefix}.agentLibraryWriteMode`;
 /**
  * Reads the in-plugin agent's library write mode.
  *
- * Defaults to `safe` on anything unreadable — a missing or corrupt pref must
- * never be the reason an unattended whole-library rewrite is permitted.
+ * A missing or unset pref normalises to `auto`, the shipped default. A pref
+ * that cannot be READ at all falls back to `safe`, which is deliberately
+ * stricter than the default: a corrupt or inaccessible preference must never
+ * be the reason a write goes unreviewed.
  */
 export function getAgentLibraryWriteMode(): AgentLibraryWriteMode {
   try {
@@ -31,7 +33,9 @@ export function setAgentLibraryWriteMode(mode: AgentLibraryWriteMode): void {
   try {
     (
       Zotero as unknown as {
-        Prefs?: { set?: (key: string, value: unknown, global?: boolean) => void };
+        Prefs?: {
+          set?: (key: string, value: unknown, global?: boolean) => void;
+        };
       }
     ).Prefs?.set?.(PREF_KEY, mode === "yolo" ? "yolo" : "safe", true);
   } catch {

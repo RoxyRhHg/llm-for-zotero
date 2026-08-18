@@ -3774,7 +3774,11 @@ describe("shallow guard round-limit safety", function () {
               {
                 kind: "tool_calls",
                 calls: [
-                  { id: "c1", name: "library_update", arguments: { kind: "collections" } },
+                  {
+                    id: "c1",
+                    name: "library_update",
+                    arguments: { kind: "collections" },
+                  },
                 ],
                 assistantMessage: { role: "assistant", content: "" },
               },
@@ -3884,6 +3888,21 @@ describe("shallow guard round-limit safety", function () {
           ),
       });
 
+      // "safe" is what this test is about: declining a card the user was
+      // shown. Under the default "auto" mode these writes are reversible and
+      // apply without a card, so there would be nothing to decline.
+      const previousZotero = (globalThis as Record<string, any>).Zotero;
+      (globalThis as Record<string, any>).Zotero = {
+        ...(previousZotero || {}),
+        Prefs: {
+          ...(previousZotero?.Prefs || {}),
+          get: (key: string, ...rest: unknown[]) =>
+            String(key).endsWith("agentLibraryWriteMode")
+              ? "safe"
+              : previousZotero?.Prefs?.get?.(key, ...rest),
+        },
+      };
+
       let denials = 0;
       const outcome = await runtime.runTurn({
         request: {
@@ -3902,6 +3921,8 @@ describe("shallow guard round-limit safety", function () {
           }
         },
       });
+
+      (globalThis as Record<string, any>).Zotero = previousZotero;
 
       assert.equal(denials, 3, "all three confirmations were declined");
 

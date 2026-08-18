@@ -1,3 +1,4 @@
+import { writeNeedsConfirmation } from "../capabilities/writeReversibility";
 import type {
   AgentToolArtifact,
   AgentToolExecutionOutput,
@@ -276,13 +277,23 @@ export class AgentToolRegistry {
       return runWithInput(validation.value);
     };
 
+    const toolWantsConfirmation =
+      (await tool.shouldRequireConfirmation?.(validation.value, context)) ??
+      tool.spec.requiresConfirmation;
+    // The tool says whether this call is a write worth reviewing; the user's
+    // write mode says how much review they want. Confirming every write made
+    // one ordinary request raise a card per step, which is a wizard rather
+    // than an agent -- and bought little once every reversible write gained a
+    // journalled inverse. In `auto`, only what cannot be undone still asks.
     const shouldRequireConfirmation =
       options.forceConfirmation && tool.createPendingAction
         ? true
-        : ((await tool.shouldRequireConfirmation?.(
-            validation.value,
-            context,
-          )) ?? tool.spec.requiresConfirmation);
+        : toolWantsConfirmation &&
+          writeNeedsConfirmation({
+            mode: getAgentLibraryWriteMode(),
+            toolName: tool.spec.name,
+            input: validation.value,
+          });
     const acceptsInheritedApproval =
       shouldRequireConfirmation &&
       options.inheritedApproval &&
