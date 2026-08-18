@@ -76,6 +76,61 @@ export type MoveToCollectionOperation = {
  * approvals. That, not the round budget, is what made the request
  * impractical.
  */
+export type SaveSavedSearchOperation = {
+  id?: string;
+  type: "save_saved_search";
+  name: string;
+  conditions: Array<{
+    condition: string;
+    operator: string;
+    value?: string | number;
+    mode?: string;
+    required?: boolean;
+  }>;
+  joinMode?: "all" | "any";
+  savedSearchId?: number;
+  libraryID?: number;
+};
+
+export type DeleteSavedSearchOperation = {
+  id?: string;
+  type: "delete_saved_search";
+  savedSearchId: number;
+  permanent?: boolean;
+};
+
+export type UpdateCollectionOperation = {
+  id?: string;
+  type: "update_collection";
+  collectionId: number;
+  name?: string;
+  /** `null` promotes the collection to top level. */
+  parentCollectionId?: number | null;
+};
+
+export type UpdateLibraryTagOperation = {
+  id?: string;
+  type: "update_library_tag";
+  action: "rename" | "delete" | "merge" | "setColor";
+  tag: string;
+  newTag?: string;
+  color?: string;
+  position?: number;
+  libraryID?: number;
+};
+
+/**
+ * Replaces each item's tags with exactly the given set.
+ *
+ * The add-only path is why "give my library exactly these 20 tags" drifted:
+ * each batch added its own and nothing removed a previous batch's choices.
+ */
+export type SetItemTagsOperation = {
+  id?: string;
+  type: "set_item_tags";
+  assignments: Array<{ itemId: number; tags: string[] }>;
+};
+
 export type SaveNotesBatchOperation = {
   id?: string;
   type: "save_notes_batch";
@@ -250,6 +305,11 @@ export type LibraryMutationOperation =
   | CreateCollectionOperation
   | SetItemCollectionsOperation
   | SaveNotesBatchOperation
+  | SaveSavedSearchOperation
+  | DeleteSavedSearchOperation
+  | UpdateCollectionOperation
+  | UpdateLibraryTagOperation
+  | SetItemTagsOperation
   | CreateItemsOperation
   | ReparentItemsOperation
   | RelateItemsOperation
@@ -736,6 +796,211 @@ export class LibraryMutationService {
                       collectionId: item.targetCollectionId as number,
                     })),
                 ),
+        };
+      }
+      case "save_saved_search": {
+        const libraryID = this.zoteroGateway.resolveLibraryID({
+          request: context.request,
+          item: context.item,
+          libraryID: operation.libraryID,
+        });
+        const result = await this.zoteroGateway.saveSavedSearch({
+          libraryID,
+          name: operation.name,
+          conditions: operation.conditions,
+          joinMode: operation.joinMode,
+          savedSearchId: operation.savedSearchId,
+        });
+        return {
+          result: {
+            operation: operation.type,
+            operationId: operation.id,
+            result,
+          },
+          // Only a newly created search has a clean inverse; replacing an
+          // existing one's conditions discards what they were.
+          undo:
+            result.status === "created"
+              ? {
+                  toolName: "library_mutation",
+                  inverseOperations: [
+                    {
+                      type: "delete_saved_search" as const,
+                      savedSearchId: result.savedSearchId,
+                      permanent: true,
+                    },
+                  ],
+                  description: `Delete the saved search "${result.name}"`,
+                  revert: async () => {
+                    await this.zoteroGateway.deleteSavedSearch({
+                      savedSearchId: result.savedSearchId,
+                      permanent: true,
+                    });
+                  },
+                }
+              : null,
+        };
+      }
+      case "delete_saved_search": {
+        const result = await this.zoteroGateway.deleteSavedSearch({
+          savedSearchId: operation.savedSearchId,
+          permanent: operation.permanent,
+        });
+        return {
+          result: {
+            operation: operation.type,
+            operationId: operation.id,
+            result,
+          },
+          undo:
+            result.status === "trashed"
+              ? {
+                  toolName: "library_mutation",
+                  description: `Restore the saved search from the trash`,
+                  revert: async () => {
+                    await this.zoteroGateway.restoreSavedSearches({
+                      savedSearchIds: [operation.savedSearchId],
+                    });
+                  },
+                }
+              : null,
+        };
+      }
+      case "update_collection": {
+        const result = await this.zoteroGateway.updateCollection({
+          collectionId: operation.collectionId,
+          name: operation.name,
+          parentCollectionId: operation.parentCollectionId,
+        });
+        return {
+          result: {
+            operation: operation.type,
+            operationId: operation.id,
+            result,
+          },
+          undo:
+            result.status === "updated"
+              ? {
+                  toolName: "library_mutation",
+                  inverseOperations: [
+                    {
+                      type: "update_collection" as const,
+                      collectionId: operation.collectionId,
+                      name: result.previousName,
+                      parentCollectionId: result.previousParentCollectionId,
+                    },
+                  ],
+                  description: `Rename "${result.name}" back to "${result.previousName}"`,
+                  revert: async () => {
+                    await this.zoteroGateway.updateCollection({
+                      collectionId: operation.collectionId,
+                      name: result.previousName,
+                      parentCollectionId: result.previousParentCollectionId,
+                    });
+                  },
+                }
+              : null,
+        };
+      }
+      case "update_library_tag": {
+        const libraryID = this.zoteroGateway.resolveLibraryID({
+          request: context.request,
+          item: context.item,
+          libraryID: operation.libraryID,
+        });
+        const result = await this.zoteroGateway.updateLibraryTag({
+          libraryID,
+          action: operation.action,
+          tag: operation.tag,
+          newTag: operation.newTag,
+          color: operation.color,
+          position: operation.position,
+        });
+        return {
+          result: {
+            operation: operation.type,
+            operationId: operation.id,
+            result,
+          },
+          // A rename is reversible by renaming back. A library-wide delete is
+          // not: which items carried the tag is gone with it, so it says so
+          // rather than offering an undo that would restore nothing.
+          undo:
+            result.status === "applied" &&
+            (operation.action === "rename" || operation.action === "merge") &&
+            result.newTag
+              ? {
+                  toolName: "library_mutation",
+                  inverseOperations: [
+                    {
+                      type: "update_library_tag" as const,
+                      action: "rename" as const,
+                      tag: result.newTag,
+                      newTag: operation.tag,
+                      libraryID,
+                    },
+                  ],
+                  description: `Rename tag "${result.newTag}" back to "${operation.tag}"`,
+                  revert: async () => {
+                    await this.zoteroGateway.updateLibraryTag({
+                      libraryID,
+                      action: "rename",
+                      tag: result.newTag as string,
+                      newTag: operation.tag,
+                    });
+                  },
+                }
+              : result.status === "applied" && operation.action === "delete"
+                ? {
+                    toolName: "library_mutation",
+                    irreversibleReason: `Deleting the tag "${operation.tag}" library-wide also discards which items carried it, so it cannot be restored.`,
+                    description: `Delete tag "${operation.tag}"`,
+                    revert: async () => {
+                      throw new Error(
+                        `Deleting a tag library-wide cannot be undone: which items carried "${operation.tag}" is not recorded anywhere.`,
+                      );
+                    },
+                  }
+                : null,
+        };
+      }
+      case "set_item_tags": {
+        const result = await this.zoteroGateway.setItemTags({
+          assignments: operation.assignments,
+        });
+        const changed = result.items.filter((row) => row.status === "updated");
+        return {
+          result: {
+            operation: operation.type,
+            operationId: operation.id,
+            result,
+          },
+          // The inverse of replacing a set is the set it had before.
+          undo: changed.length
+            ? {
+                toolName: "library_mutation",
+                inverseOperations: [
+                  {
+                    type: "set_item_tags" as const,
+                    assignments: changed.map((row) => ({
+                      itemId: row.itemId,
+                      tags: row.previousTags || [],
+                    })),
+                  },
+                ],
+                description: `Restore the previous tags on ${changed.length} item${
+                  changed.length === 1 ? "" : "s"
+                }`,
+                revert: async () => {
+                  await this.zoteroGateway.setItemTags({
+                    assignments: changed.map((row) => ({
+                      itemId: row.itemId,
+                      tags: row.previousTags || [],
+                    })),
+                  });
+                },
+              }
+            : null,
         };
       }
       case "save_notes_batch": {

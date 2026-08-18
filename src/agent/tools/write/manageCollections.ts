@@ -5,6 +5,7 @@
 import type { AgentToolDefinition } from "../../types";
 import {
   LibraryMutationService,
+  type UpdateCollectionOperation,
   type CreateCollectionOperation,
   type DeleteCollectionOperation,
 } from "../../services/libraryMutationService";
@@ -13,7 +14,10 @@ import { ok, fail, validateObject, normalizePositiveInt } from "../shared";
 import { executeAndRecordUndo } from "./mutateLibraryShared";
 
 type ManageCollectionsInput = {
-  operation: CreateCollectionOperation | DeleteCollectionOperation;
+  operation:
+    | CreateCollectionOperation
+    | DeleteCollectionOperation
+    | UpdateCollectionOperation;
 };
 
 export function createManageCollectionsTool(
@@ -32,16 +36,22 @@ export function createManageCollectionsTool(
         properties: {
           action: {
             type: "string",
-            enum: ["create", "delete"],
-            description: "Whether to create or delete a collection.",
+            enum: ["create", "delete", "rename", "move"],
+            description:
+              "'create' makes a new collection, 'delete' trashes one, 'rename' changes its name, 'move' puts it under a different parent (or at top level with parentCollectionId:null).",
           },
           name: {
             type: "string",
             description: "Collection name (required for 'create').",
           },
           parentCollectionId: {
-            type: "number",
-            description: "Parent collection for nested creation.",
+            type: ["number", "null"],
+            description:
+              "Parent collection for 'create', or the new parent for 'move'. Pass null with 'move' to promote the collection to top level.",
+          },
+          newName: {
+            type: "string",
+            description: "The new name, for action 'rename'.",
           },
           collectionId: {
             type: "number",
@@ -134,8 +144,48 @@ export function createManageCollectionsTool(
         return ok({ operation });
       }
 
+      if (action === "rename" || action === "move") {
+        const collectionId = normalizePositiveInt(args.collectionId);
+        if (!collectionId) {
+          return fail(
+            `action "${action}" requires a collectionId. Example: { action: "${action}", collectionId: 42${action === "rename" ? ', newName: "Methods"' : ", parentCollectionId: 7"} }`,
+          );
+        }
+        const newName =
+          typeof args.newName === "string" && args.newName.trim()
+            ? args.newName.trim()
+            : typeof args.name === "string" && args.name.trim()
+              ? args.name.trim()
+              : undefined;
+        if (action === "rename" && !newName) {
+          return fail(
+            'action "rename" requires newName. Example: { action: "rename", collectionId: 42, newName: "Methods" }',
+          );
+        }
+        const hasParentKey = Object.prototype.hasOwnProperty.call(
+          args,
+          "parentCollectionId",
+        );
+        if (action === "move" && !hasParentKey) {
+          return fail(
+            'action "move" requires parentCollectionId (or null to move it to the top level). Example: { action: "move", collectionId: 42, parentCollectionId: 7 }',
+          );
+        }
+        const operation: UpdateCollectionOperation = {
+          type: "update_collection",
+          collectionId,
+          name: newName,
+          parentCollectionId: hasParentKey
+            ? args.parentCollectionId === null
+              ? null
+              : normalizePositiveInt(args.parentCollectionId) || null
+            : undefined,
+        };
+        return ok({ operation });
+      }
+
       return fail(
-        'action must be "create" or "delete". Example: { action: "create", name: "My Folder" }',
+        'action must be one of: create, delete, rename, move. Example: { action: "create", name: "My Folder" }',
       );
     },
 
@@ -170,13 +220,49 @@ export function createManageCollectionsTool(
         };
       }
 
-      // delete_collection
       const collection = zoteroGateway.getCollectionSummary(
         operation.collectionId,
       );
       const collectionLabel = collection
         ? collection.path || collection.name
         : `Collection ${operation.collectionId}`;
+
+      if (operation.type === "update_collection") {
+        const parts: string[] = [];
+        if (operation.name) {
+          parts.push(`rename it to "${operation.name}"`);
+        }
+        if (operation.parentCollectionId !== undefined) {
+          if (operation.parentCollectionId === null) {
+            parts.push("move it to the top level");
+          } else {
+            const parent = zoteroGateway.getCollectionSummary(
+              operation.parentCollectionId,
+            );
+            parts.push(
+              `move it under "${parent ? parent.path || parent.name : `Collection ${operation.parentCollectionId}`}"`,
+            );
+          }
+        }
+        const description = `For "${collectionLabel}": ${parts.join(" and ")}. Items stay where they are, and this can be undone.`;
+        return {
+          toolName: "manage_collections",
+          title: operation.name ? "Rename collection" : "Move collection",
+          description,
+          confirmLabel: operation.name ? "Rename" : "Move",
+          cancelLabel: "Cancel",
+          fields: [
+            {
+              type: "text" as const,
+              id: "description",
+              label: "Action",
+              value: description,
+            },
+          ],
+        };
+      }
+
+      // delete_collection
       // The card has to be exact about what is destroyed: this used to promise
       // items were safe and the delete was undoable while calling `eraseTx`,
       // which permanently erased the collection and every subcollection.

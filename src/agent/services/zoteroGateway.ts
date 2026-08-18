@@ -3719,6 +3719,543 @@ export class ZoteroGateway {
    * matching Zotero, whose menu offers "Delete Collection" and "Delete
    * Collection and Items" as separate commands.
    */
+  /**
+   * Renames a collection, moves it under a different parent, or promotes it
+   * to top level.
+   *
+   * The matrix declared collection update and reparent allowed and nothing
+   * implemented them, so `collection_update` could only create and delete --
+   * a typo in a folder name meant deleting it and rebuilding it, losing the
+   * id every filed item referenced.
+   */
+  async updateCollection(params: {
+    collectionId: number;
+    name?: string;
+    parentCollectionId?: number | null;
+  }): Promise<{
+    collectionId: number;
+    name: string;
+    previousName: string;
+    previousParentCollectionId: number | null;
+    status: "updated" | "unchanged" | "not_found";
+    reason?: string;
+  }> {
+    const collection = this.getCollection(params.collectionId) as
+      | (Zotero.Collection & { parentID?: number | false })
+      | null;
+    if (!collection) {
+      return {
+        collectionId: params.collectionId,
+        name: "",
+        previousName: "",
+        previousParentCollectionId: null,
+        status: "not_found",
+      };
+    }
+    const previousName = normalizeText(collection.name);
+    const previousParentRaw = Number(collection.parentID);
+    const previousParentCollectionId =
+      Number.isFinite(previousParentRaw) && previousParentRaw > 0
+        ? previousParentRaw
+        : null;
+
+    const nextName = params.name?.trim();
+    const wantsReparent = params.parentCollectionId !== undefined;
+    const nextParent =
+      params.parentCollectionId === null
+        ? null
+        : params.parentCollectionId === undefined
+          ? previousParentCollectionId
+          : Math.floor(params.parentCollectionId);
+
+    if (wantsReparent && nextParent !== null) {
+      if (nextParent === params.collectionId) {
+        return {
+          collectionId: params.collectionId,
+          name: previousName,
+          previousName,
+          previousParentCollectionId,
+          status: "not_found",
+          reason: "A collection cannot be its own parent",
+        };
+      }
+      const target = this.getCollection(nextParent);
+      if (!target) {
+        return {
+          collectionId: params.collectionId,
+          name: previousName,
+          previousName,
+          previousParentCollectionId,
+          status: "not_found",
+          reason: `No collection with ID ${nextParent} exists in this library`,
+        };
+      }
+      // Zotero would accept this and produce an orphaned cycle that no
+      // longer appears anywhere in the tree.
+      const descendants = new Set(
+        (
+          (
+            collection as unknown as {
+              getDescendents?: (
+                nested: boolean,
+                type: "collection" | null,
+              ) => Array<{ id: number; type: string }>;
+            }
+          ).getDescendents?.(false, "collection") || []
+        ).map((entry) => Number(entry.id)),
+      );
+      if (descendants.has(nextParent)) {
+        return {
+          collectionId: params.collectionId,
+          name: previousName,
+          previousName,
+          previousParentCollectionId,
+          status: "not_found",
+          reason:
+            "That collection is inside this one, so moving it there would detach the whole subtree from the library",
+        };
+      }
+    }
+
+    const nameChanged = Boolean(nextName) && nextName !== previousName;
+    const parentChanged =
+      wantsReparent && nextParent !== previousParentCollectionId;
+    if (!nameChanged && !parentChanged) {
+      return {
+        collectionId: params.collectionId,
+        name: previousName,
+        previousName,
+        previousParentCollectionId,
+        status: "unchanged",
+      };
+    }
+
+    if (nameChanged) collection.name = nextName as string;
+    if (parentChanged) {
+      (collection as unknown as { parentID: number | false }).parentID =
+        nextParent ?? false;
+    }
+    await (
+      collection as unknown as { saveTx: () => Promise<unknown> }
+    ).saveTx();
+    const libraryID = Number(collection.libraryID) || 0;
+    if (libraryID > 0) invalidatePaperSearchCache(libraryID);
+
+    return {
+      collectionId: params.collectionId,
+      name: normalizeText(collection.name),
+      previousName,
+      previousParentCollectionId,
+      status: "updated",
+    };
+  }
+
+  /**
+   * Operates on a tag as an object, across the whole library.
+   *
+   * The existing tag path only ever put tags on items or took them off. A
+   * *tag* — the thing in the tag selector — could not be renamed, deleted,
+   * merged or coloured, so fixing a typo in a tag used by 500 papers meant
+   * 500 removals and 500 additions.
+   */
+  async updateLibraryTag(params: {
+    libraryID: number;
+    action: "rename" | "delete" | "merge" | "setColor";
+    tag: string;
+    newTag?: string;
+    color?: string;
+    position?: number;
+  }): Promise<{
+    action: string;
+    tag: string;
+    newTag?: string;
+    status: "applied" | "not_found" | "error";
+    itemCount?: number;
+    reason?: string;
+  }> {
+    const tags = (
+      Zotero as unknown as {
+        Tags?: {
+          getID?: (name: string) => number | false;
+          getTagItems?: (libraryID: number, tagID: number) => Promise<number[]>;
+          rename?: (
+            libraryID: number,
+            oldName: string,
+            newName: string,
+          ) => Promise<void>;
+          removeFromLibrary?: (
+            libraryID: number,
+            tagIDs: number[],
+          ) => Promise<void>;
+          setColor?: (
+            libraryID: number,
+            name: string,
+            color: string,
+            position: number,
+          ) => Promise<void>;
+        };
+      }
+    ).Tags;
+    if (!tags?.getID) {
+      return {
+        action: params.action,
+        tag: params.tag,
+        status: "error",
+        reason: "Zotero.Tags is not available in this build",
+      };
+    }
+
+    const tagId = tags.getID(params.tag);
+    if (params.action !== "setColor" && (tagId === false || !tagId)) {
+      return {
+        action: params.action,
+        tag: params.tag,
+        status: "not_found",
+        reason: `No tag named "${params.tag}" exists in this library`,
+      };
+    }
+
+    let itemCount: number | undefined;
+    try {
+      if (tagId) {
+        itemCount = (await tags.getTagItems?.(params.libraryID, tagId))?.length;
+      }
+    } catch {
+      // A count is nice to report but must not block the operation.
+    }
+
+    try {
+      switch (params.action) {
+        case "rename":
+        case "merge": {
+          const newTag = params.newTag?.trim();
+          if (!newTag) {
+            return {
+              action: params.action,
+              tag: params.tag,
+              status: "error",
+              reason: `"${params.action}" needs newTag`,
+            };
+          }
+          // Zotero's rename merges when the destination already exists, so
+          // rename and merge are the same call -- the distinction is only
+          // what the user is told on the card.
+          await tags.rename?.(params.libraryID, params.tag, newTag);
+          return {
+            action: params.action,
+            tag: params.tag,
+            newTag,
+            status: "applied",
+            itemCount,
+          };
+        }
+        case "delete": {
+          await tags.removeFromLibrary?.(params.libraryID, [tagId as number]);
+          return {
+            action: params.action,
+            tag: params.tag,
+            status: "applied",
+            itemCount,
+          };
+        }
+        case "setColor": {
+          const color = params.color?.trim();
+          if (!color) {
+            return {
+              action: params.action,
+              tag: params.tag,
+              status: "error",
+              reason: '"setColor" needs a color, e.g. "#FF6666"',
+            };
+          }
+          await tags.setColor?.(
+            params.libraryID,
+            params.tag,
+            color,
+            Number.isFinite(params.position) ? Number(params.position) : 0,
+          );
+          return {
+            action: params.action,
+            tag: params.tag,
+            status: "applied",
+            itemCount,
+          };
+        }
+      }
+    } catch (error) {
+      return {
+        action: params.action,
+        tag: params.tag,
+        status: "error",
+        reason: error instanceof Error ? error.message : String(error),
+      };
+    }
+    return {
+      action: params.action,
+      tag: params.tag,
+      status: "error",
+      reason: `Unknown tag action "${params.action}"`,
+    };
+  }
+
+  /**
+   * Sets an item's tags to exactly the given list.
+   *
+   * The existing path is add-only, which is why "give my library exactly
+   * these 20 tags" drifted: each batch added its own tags and nothing ever
+   * removed the ones a previous batch had chosen. Replacing the set is what
+   * that request actually means.
+   */
+  async setItemTags(params: {
+    assignments: Array<{ itemId: number; tags: string[] }>;
+  }): Promise<{
+    changedCount: number;
+    items: Array<{
+      itemId: number;
+      title: string;
+      status: "updated" | "skipped" | "error";
+      previousTags?: string[];
+      reason?: string;
+    }>;
+  }> {
+    const results: Array<{
+      itemId: number;
+      title: string;
+      status: "updated" | "skipped" | "error";
+      previousTags?: string[];
+      reason?: string;
+    }> = [];
+    const touchedLibraryIDs = new Set<number>();
+    let changedCount = 0;
+
+    for (const assignment of params.assignments) {
+      const rawItem = this.getItem(assignment.itemId);
+      const resolution = resolveMatrixItem(
+        rawItem,
+        assignment.itemId,
+        "update",
+      );
+      if ("refusal" in resolution) {
+        results.push({
+          itemId: assignment.itemId,
+          title: rawItem
+            ? normalizeText(rawItem.getDisplayTitle?.()) ||
+              `Item ${assignment.itemId}`
+            : `Item ${assignment.itemId}`,
+          status: "error",
+          reason: resolution.refusal,
+        });
+        continue;
+      }
+      const item = resolution.item;
+      const title =
+        normalizeText(item.getDisplayTitle?.()) || `Item ${item.id}`;
+      const previousTags = (item.getTags?.() || []).map((entry) =>
+        String(entry.tag),
+      );
+      const nextTags = Array.from(new Set(assignment.tags || []))
+        .map((tag) => String(tag).trim())
+        .filter(Boolean);
+
+      const unchanged =
+        previousTags.length === nextTags.length &&
+        previousTags.every((tag) => nextTags.includes(tag));
+      if (unchanged) {
+        results.push({
+          itemId: Number(item.id),
+          title,
+          status: "skipped",
+          previousTags,
+        });
+        continue;
+      }
+
+      try {
+        item.setTags(nextTags);
+        await item.saveTx();
+        changedCount += 1;
+        touchedLibraryIDs.add(Number(item.libraryID));
+        results.push({
+          itemId: Number(item.id),
+          title,
+          status: "updated",
+          // The prior set is the only thing an inverse can restore.
+          previousTags,
+        });
+      } catch (error) {
+        results.push({
+          itemId: Number(item.id),
+          title,
+          status: "error",
+          reason: error instanceof Error ? error.message : String(error),
+        });
+      }
+    }
+
+    for (const libraryID of touchedLibraryIDs) {
+      if (libraryID > 0) invalidatePaperSearchCache(libraryID);
+    }
+    return { changedCount, items: results };
+  }
+
+  /**
+   * Lists saved searches and the conditions behind them.
+   *
+   * Saved searches were entirely invisible: the matrix declared CRUD allowed
+   * and nothing implemented any of it, and no query path enumerated them.
+   */
+  listSavedSearches(libraryID: number): Array<{
+    savedSearchId: number;
+    name: string;
+    conditions: Array<{ condition: string; operator: string; value: string }>;
+  }> {
+    const searches = (
+      Zotero as unknown as {
+        Searches?: {
+          getByLibrary?: (libraryID: number) => Array<{
+            id: number;
+            name: string;
+            getConditions?: () => Record<
+              string,
+              { condition: string; operator: string; value: string }
+            >;
+          }>;
+        };
+      }
+    ).Searches;
+    try {
+      return (searches?.getByLibrary?.(libraryID) || []).map((search) => ({
+        savedSearchId: Number(search.id),
+        name: normalizeText(search.name),
+        conditions: Object.values(search.getConditions?.() || {}).map(
+          (entry) => ({
+            condition: String(entry.condition || ""),
+            operator: String(entry.operator || ""),
+            value: String(entry.value ?? ""),
+          }),
+        ),
+      }));
+    } catch {
+      return [];
+    }
+  }
+
+  /**
+   * Creates or replaces a saved search from a condition set.
+   *
+   * A saved search *is* a set of conditions, which is why this had to wait
+   * for the condition vocabulary: without it there was nothing to save.
+   */
+  async saveSavedSearch(params: {
+    libraryID: number;
+    name: string;
+    conditions: AgentSearchCondition[];
+    joinMode?: "all" | "any";
+    savedSearchId?: number;
+  }): Promise<{
+    savedSearchId: number;
+    name: string;
+    status: "created" | "updated";
+  }> {
+    const errors = validateSearchConditions(params.conditions);
+    if (errors.length) {
+      const detail = errors
+        .map((error) =>
+          error.validOperators?.length
+            ? `${error.reason}. Valid operators: ${error.validOperators.join(", ")}`
+            : error.reason,
+        )
+        .join("; ");
+      throw new Error(`Invalid search conditions: ${detail}`);
+    }
+
+    const existing = params.savedSearchId
+      ? (
+          Zotero as unknown as {
+            Searches?: { get?: (id: number) => unknown };
+          }
+        ).Searches?.get?.(params.savedSearchId)
+      : null;
+
+    const search = (existing ||
+      new (Zotero as unknown as { Search: new () => unknown }).Search()) as {
+      id?: number;
+      libraryID: number;
+      name: string;
+      addCondition: (
+        condition: string,
+        operator: string,
+        value?: string | number,
+        required?: boolean,
+      ) => void;
+      removeCondition: (id: number) => void;
+      getConditions?: () => Record<string, unknown>;
+      saveTx: () => Promise<unknown>;
+    };
+
+    search.libraryID = params.libraryID;
+    search.name = params.name;
+    // Replace rather than append: updating a saved search means the
+    // conditions given, not those plus whatever was there before.
+    for (const conditionId of Object.keys(search.getConditions?.() || {})) {
+      try {
+        search.removeCondition(Number(conditionId));
+      } catch {
+        // A condition that will not come off must not block the save.
+      }
+    }
+    if (params.joinMode) {
+      search.addCondition("joinMode", params.joinMode, "");
+    }
+    for (const entry of params.conditions) {
+      search.addCondition(
+        entry.mode ? `${entry.condition}/${entry.mode}` : entry.condition,
+        entry.operator,
+        entry.value === undefined ? "" : entry.value,
+        entry.required,
+      );
+    }
+    await search.saveTx();
+    return {
+      savedSearchId: Number(search.id),
+      name: params.name,
+      status: existing ? "updated" : "created",
+    };
+  }
+
+  /** Moves a saved search to the trash. Zotero tracks these in `deletedSearches`. */
+  async deleteSavedSearch(params: {
+    savedSearchId: number;
+    permanent?: boolean;
+  }): Promise<{
+    savedSearchId: number;
+    status: "trashed" | "erased" | "not_found";
+  }> {
+    const search = (
+      Zotero as unknown as {
+        Searches?: {
+          get?: (id: number) =>
+            | (Zotero.Search & {
+                deleted?: boolean;
+                eraseTx?: () => Promise<void>;
+                saveTx?: () => Promise<unknown>;
+              })
+            | null;
+        };
+      }
+    ).Searches?.get?.(params.savedSearchId);
+    if (!search) {
+      return { savedSearchId: params.savedSearchId, status: "not_found" };
+    }
+    if (params.permanent) {
+      await search.eraseTx?.();
+      return { savedSearchId: params.savedSearchId, status: "erased" };
+    }
+    (search as unknown as { deleted: boolean }).deleted = true;
+    await search.saveTx?.();
+    return { savedSearchId: params.savedSearchId, status: "trashed" };
+  }
+
   async deleteCollection(params: {
     collectionId: number;
     deleteItems?: boolean;

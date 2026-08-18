@@ -129,13 +129,30 @@ describe("library capability matrix", function () {
       assert.deepEqual(unhelpful, []);
     });
 
-    it("keeps unimplemented distinct from refused at runtime", function () {
-      // Both stop the write, but only one of them is a permanent answer.
-      const notBuilt = checkCapability("update", "tag");
-      assert.equal(notBuilt.status, "unimplemented");
+    it("has no capability left declared but unbuilt", function () {
+      // Every cell is now either backed by a tool or refused for a stated
+      // reason. This is the coverage statement, so it fails loudly the moment
+      // a new operation or object kind is added without an implementation.
+      const unbuilt: string[] = [];
+      for (const kind of LIBRARY_OBJECT_KINDS) {
+        for (const operation of LIBRARY_OPERATIONS) {
+          if (checkCapability(operation, kind).status === "unimplemented") {
+            unbuilt.push(`${kind}:${operation}`);
+          }
+        }
+      }
+      assert.deepEqual(unbuilt, []);
+    });
 
+    it("keeps unimplemented distinct from refused", function () {
+      // Both stop the write, but only one is a permanent answer -- a refusal
+      // states a fact about Zotero, an unimplemented cell states a gap here.
       const impossible = checkCapability("addToCollection", "childAttachment");
       assert.equal(impossible.status, "refused");
+      assert.include(
+        impossible.status === "refused" ? impossible.reason : "",
+        "top-level",
+      );
     });
   });
 

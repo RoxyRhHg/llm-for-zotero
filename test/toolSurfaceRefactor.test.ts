@@ -121,6 +121,7 @@ describe("semantic tool surface", function () {
       "paper_read",
       "revert_changes",
       "run_command",
+      "saved_search_update",
       "undo_last_action",
       "zotero_script",
     ]);

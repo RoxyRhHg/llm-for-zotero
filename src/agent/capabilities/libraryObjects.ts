@@ -200,9 +200,7 @@ const MATRIX: Record<LibraryObjectKind, Row> = {
   collection: {
     create: A,
     read: A,
-    update: todo(
-      "Renaming a collection is not exposed by any tool yet; use zotero_script",
-    ),
+    update: A,
     // Zotero has had a collection trash since `deletedCollections`; its own
     // "Delete Collection" sets `deleted = true` and the Trash pane restores
     // it. This previously claimed the opposite and erased instead.
@@ -214,27 +212,16 @@ const MATRIX: Record<LibraryObjectKind, Row> = {
     addToCollection: no(NOT_AN_ITEM("A collection")),
     removeFromCollection: no(NOT_AN_ITEM("A collection")),
     relate: no(NOT_AN_ITEM("A collection")),
-    reparent: todo(
-      "Moving a collection under a different parent is not exposed by any tool yet; use zotero_script",
-    ),
+    reparent: A,
   },
   savedSearch: {
-    create: todo(
-      "Creating a saved search is not exposed by any tool yet; use zotero_script",
-    ),
+    create: A,
     read: A,
-    update: todo(
-      "Editing a saved search is not exposed by any tool yet; use zotero_script",
-    ),
+    update: A,
     // Saved searches have `deletedSearches`, the same as collections.
-    trash: todo(
-      "Trashing a saved search is not exposed by any tool yet; use zotero_script",
-    ),
-    // Restoring is reachable: library_delete mode:'restore' takes savedSearchIds.
+    trash: A,
     restore: A,
-    delete: todo(
-      "Erasing a saved search is not exposed by any tool yet; use zotero_script",
-    ),
+    delete: A,
     addToCollection: no(NOT_AN_ITEM("A saved search")),
     removeFromCollection: no(NOT_AN_ITEM("A saved search")),
     relate: no(NOT_AN_ITEM("A saved search")),
@@ -244,14 +231,10 @@ const MATRIX: Record<LibraryObjectKind, Row> = {
     // Creating a tag means putting it on an item, which library_update does.
     create: A,
     read: A,
-    update: todo(
-      "Renaming a tag library-wide is not exposed by any tool yet; use zotero_script",
-    ),
+    update: A,
     trash: no("Zotero has no trash for tags"),
     restore: no("Zotero has no trash for tags"),
-    delete: todo(
-      "Deleting a tag library-wide is not exposed by any tool yet; use zotero_script",
-    ),
+    delete: A,
     addToCollection: no(NOT_AN_ITEM("A tag")),
     removeFromCollection: no(NOT_AN_ITEM("A tag")),
     relate: no(NOT_AN_ITEM("A tag")),
@@ -341,16 +324,24 @@ export const IMPLEMENTED_BY: Partial<
   "annotation:restore": "library_delete",
 
   "collection:create": "collection_update",
+  "collection:update": "collection_update",
+  "collection:reparent": "collection_update",
   "collection:read": "library_search",
   "collection:trash": "collection_update",
   "collection:restore": "library_delete",
   "collection:delete": "collection_update",
 
+  "savedSearch:create": "saved_search_update",
   "savedSearch:read": "library_search",
+  "savedSearch:update": "saved_search_update",
+  "savedSearch:trash": "saved_search_update",
   "savedSearch:restore": "library_delete",
+  "savedSearch:delete": "saved_search_update",
 
   "tag:create": "library_update",
   "tag:read": "library_search",
+  "tag:update": "library_update",
+  "tag:delete": "library_update",
 
   "library:read": "library_search",
 };

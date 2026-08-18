@@ -28,6 +28,11 @@ import { createImportIdentifiersTool } from "./write/importIdentifiers";
 import { createTrashItemsTool } from "./write/trashItems";
 import { createRestoreFromTrashTool } from "./write/restoreFromTrash";
 import { createWriteNotesBatchTool } from "./write/writeNotesBatch";
+import { createSavedSearchTool } from "./write/savedSearches";
+import {
+  createSetItemTagsTool,
+  createUpdateLibraryTagTool,
+} from "./write/tagObjects";
 import {
   createCreateItemsTool,
   createRelateItemsTool,
@@ -179,12 +184,14 @@ function createLibraryUpdateTool(tools: {
   updateMetadata: AgentToolDefinition<any, any>;
   reparentItems: AgentToolDefinition<any, any>;
   relateItems: AgentToolDefinition<any, any>;
+  updateLibraryTag: AgentToolDefinition<any, any>;
+  setItemTags: AgentToolDefinition<any, any>;
 }): AgentToolDefinition<any, unknown> {
   return createDelegatingTool({
     name: "library_update",
     label: "Update Library",
     description:
-      "Apply non-destructive Zotero item changes. kind:'tags' for tags, kind:'collections' for collection membership, kind:'metadata' for item fields, kind:'parent' to move a note or attachment to a different parent item (or detach it), kind:'related' for Zotero's Related links.",
+      "Apply Zotero library changes. kind:'tags' for tags on items (action 'add', 'remove', or 'set' to replace an item's whole tag list), kind:'tag' for the tag object itself across the library (rename, merge, delete, setColor), kind:'collections' for collection membership, kind:'metadata' for item fields, kind:'parent' to move a note or attachment to a different parent item (or detach it), kind:'related' for Zotero's Related links.",
     mutability: "write",
     requiresConfirmation: true,
     inputSchema: {
@@ -194,13 +201,21 @@ function createLibraryUpdateTool(tools: {
       properties: {
         kind: {
           type: "string",
-          enum: ["tags", "collections", "metadata", "parent", "related"],
+          enum: ["tags", "collections", "metadata", "parent", "related", "tag"],
         },
         action: {
           type: "string",
-          enum: ["add", "remove"],
+          enum: [
+            "add",
+            "remove",
+            "set",
+            "rename",
+            "merge",
+            "delete",
+            "setColor",
+          ],
           description:
-            "For tags and collections: whether to add or remove entries.",
+            "For kind:'tags' and kind:'collections': 'add' or 'remove'. For kind:'tags', 'set' replaces each item's tags with exactly the ones given — use it when the user wants a definite set, since adding is cumulative and drifts across batches. For kind:'tag' (the tag object itself): 'rename', 'merge', 'delete' or 'setColor'.",
         },
         itemIds: {
           ...NUMBER_ARRAY_SCHEMA,
@@ -292,8 +307,19 @@ function createLibraryUpdateTool(tools: {
       }
       const delegateArgs = { ...args };
       delete delegateArgs.kind;
-      if (args.kind === "tags")
+      if (args.kind === "tags") {
+        // "set" is a different operation, not a variant of add: it replaces
+        // the item's whole tag list rather than merging into it.
+        if (args.action === "set") {
+          const setArgs = { ...delegateArgs };
+          delete setArgs.action;
+          return ok({ tool: tools.setItemTags, args: setArgs });
+        }
         return ok({ tool: tools.applyTags, args: delegateArgs });
+      }
+      if (args.kind === "tag") {
+        return ok({ tool: tools.updateLibraryTag, args: delegateArgs });
+      }
       if (args.kind === "collections") {
         return ok({ tool: tools.moveToCollection, args: delegateArgs });
       }
@@ -307,7 +333,7 @@ function createLibraryUpdateTool(tools: {
         return ok({ tool: tools.relateItems, args: delegateArgs });
       }
       return fail(
-        "kind must be one of: tags, collections, metadata, parent, related",
+        "kind must be one of: tags, collections, metadata, parent, related, tag",
       );
     },
   });
@@ -503,6 +529,9 @@ export function createBuiltInToolRegistry(
   const reparentItems = createReparentItemsTool(deps.zoteroGateway);
   const relateItems = createRelateItemsTool(deps.zoteroGateway);
   const writeNotesBatch = createWriteNotesBatchTool(deps.zoteroGateway);
+  const updateLibraryTag = createUpdateLibraryTagTool(deps.zoteroGateway);
+  const setItemTags = createSetItemTagsTool(deps.zoteroGateway);
+  const savedSearchUpdate = createSavedSearchTool(deps.zoteroGateway);
   const mergeItems = createMergeItemsTool(deps.zoteroGateway);
   const manageAttachments = createManageAttachmentsTool(deps.zoteroGateway);
   const editCurrentNote = createEditCurrentNoteTool(deps.zoteroGateway);
@@ -558,6 +587,8 @@ export function createBuiltInToolRegistry(
       updateMetadata,
       reparentItems,
       relateItems,
+      updateLibraryTag,
+      setItemTags,
     }),
   );
   registry.register(
@@ -587,6 +618,7 @@ export function createBuiltInToolRegistry(
         "Write a note onto each of many items in one approved operation. Use this whenever the user asks for a note on several papers — calling note_write once per paper means one confirmation dialog per paper.",
     }),
   );
+  registry.register(savedSearchUpdate);
   registry.register(
     createLibraryImportTool({
       importIdentifiers,
@@ -633,6 +665,8 @@ export function createBuiltInToolRegistry(
     reparentItems,
     relateItems,
     writeNotesBatch,
+    updateLibraryTag,
+    setItemTags,
     mergeItems,
     manageAttachments,
     editCurrentNote,

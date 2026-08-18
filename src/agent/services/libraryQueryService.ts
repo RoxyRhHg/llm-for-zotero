@@ -16,7 +16,8 @@ export type QueryLibraryEntity =
   | "notes"
   | "tags"
   | "libraries"
-  | "itemTypes";
+  | "itemTypes"
+  | "savedSearches";
 export type QueryLibraryMode = "search" | "list" | "related" | "duplicates";
 export type QueryLibraryInclude =
   | "metadata"

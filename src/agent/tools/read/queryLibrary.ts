@@ -301,9 +301,10 @@ export function createQueryLibraryTool(
               "tags",
               "libraries",
               "itemTypes",
+              "savedSearches",
             ],
             description:
-              "What to query: 'items' for any library item, 'collections' for folders, 'notes' to search/list notes (mode:'search' finds all notes including child notes, mode:'list' lists standalone notes only), 'tags' to list/search all tags in the library, 'libraries' to enumerate all libraries (personal + group), 'itemTypes' to discover Zotero's item types and the exact fields and creator types each one accepts (use this before creating an item or setting an unfamiliar field — a field the type does not have is rejected, not ignored).",
+              "What to query: 'items' for any library item, 'collections' for folders, 'notes' to search/list notes (mode:'search' finds all notes including child notes, mode:'list' lists standalone notes only), 'tags' to list/search all tags in the library, 'libraries' to enumerate all libraries (personal + group), 'itemTypes' to discover Zotero's item types and the exact fields and creator types each one accepts (use this before creating an item or setting an unfamiliar field — a field the type does not have is rejected, not ignored), 'savedSearches' to list the library's saved searches and the conditions behind them.",
           },
           mode: {
             type: "string",
@@ -535,7 +536,8 @@ export function createQueryLibraryTool(
         normalizedArgs.entity === "notes" ||
         normalizedArgs.entity === "tags" ||
         normalizedArgs.entity === "libraries" ||
-        normalizedArgs.entity === "itemTypes"
+        normalizedArgs.entity === "itemTypes" ||
+        normalizedArgs.entity === "savedSearches"
           ? (normalizedArgs.entity as QueryLibraryEntity)
           : null;
       const mode =
@@ -562,6 +564,9 @@ export function createQueryLibraryTool(
       }
       if (entity === "itemTypes" && !["list", "search"].includes(mode)) {
         return fail("itemTypes only support mode:'list' or mode:'search'");
+      }
+      if (entity === "savedSearches" && !["list", "search"].includes(mode)) {
+        return fail("savedSearches only support mode:'list' or mode:'search'");
       }
       const conditions = normalizeConditions(normalizedArgs.conditions);
       if (conditions && entity !== "items") {
@@ -712,6 +717,21 @@ export function createQueryLibraryTool(
           },
           { totalCount: result.totalCount },
         );
+      }
+      if (input.entity === "savedSearches") {
+        const results = zoteroGateway.listSavedSearches(libraryID);
+        const query = (input.text || "").trim().toLowerCase();
+        const filtered =
+          input.mode === "search" && query
+            ? results.filter((entry) =>
+                entry.name.toLowerCase().includes(query),
+              )
+            : results;
+        return withResultCounts({
+          entity: input.entity,
+          mode: input.mode,
+          results: filtered,
+        });
       }
       if (input.entity === "itemTypes") {
         // Fields come back for a named type only. All ~35 types with their
