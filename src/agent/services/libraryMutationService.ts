@@ -922,6 +922,22 @@ export class LibraryMutationService {
             operationId: operation.id,
             result,
           },
+          // Renaming recorded no inverse at all, so "undo that" after a
+          // rename popped an unrelated earlier entry. Only a rename that
+          // actually moved the file is reversible.
+          undo:
+            result.status === "renamed" && result.previousName
+              ? {
+                  toolName: "library_mutation",
+                  description: `Rename attachment back to "${result.previousName}"`,
+                  revert: async () => {
+                    await this.zoteroGateway.renameAttachment({
+                      attachmentId: operation.attachmentId,
+                      newName: result.previousName,
+                    });
+                  },
+                }
+              : null,
         };
       }
       case "relink_attachment": {
@@ -935,6 +951,22 @@ export class LibraryMutationService {
             operationId: operation.id,
             result,
           },
+          // Only offer to undo when there was a resolvable file to go back
+          // to; re-linking an attachment whose file was already missing has
+          // no previous path to restore.
+          undo:
+            result.status === "relinked" && result.previousPath
+              ? {
+                  toolName: "library_mutation",
+                  description: `Re-link attachment back to ${result.previousPath}`,
+                  revert: async () => {
+                    await this.zoteroGateway.relinkAttachment({
+                      attachmentId: operation.attachmentId,
+                      newPath: result.previousPath,
+                    });
+                  },
+                }
+              : null,
         };
       }
       case "import_local_files": {

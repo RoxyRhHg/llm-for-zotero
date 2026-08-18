@@ -3240,6 +3240,20 @@ export class ZoteroGateway {
   /**
    * Rename an attachment's filename on disk.
    */
+  /**
+   * Renames an attachment's file on disk.
+   *
+   * This used to probe `Zotero.Attachments.renameAttachmentFile`, which does
+   * not exist — the method lives on `Zotero.Item.prototype`. The probe was
+   * therefore always false, every rename silently fell through to setting the
+   * *title* field, and the result still said `status: "renamed"`. The file on
+   * disk never moved.
+   *
+   * `updateTitle` mirrors Zotero's own behaviour: the title follows the
+   * filename only when it was tracking it to begin with. `unique` means a
+   * name collision produces `paper-1.pdf` rather than failing, so the actual
+   * filename is read back rather than assumed.
+   */
   async renameAttachment(params: {
     attachmentId: number;
     newName: string;
@@ -3247,7 +3261,8 @@ export class ZoteroGateway {
     attachmentId: number;
     previousName: string;
     newName: string;
-    status: "renamed" | "not_found" | "error";
+    status: "renamed" | "unchanged" | "not_found" | "no_file" | "error";
+    titleUpdated?: boolean;
     reason?: string;
   }> {
     const item = this.getItem(params.attachmentId);
@@ -3259,26 +3274,95 @@ export class ZoteroGateway {
         status: "not_found",
       };
     }
-    const previousName = String(
-      (item as unknown as { attachmentFilename?: string }).attachmentFilename ||
-        item.getField?.("title") ||
-        "",
-    );
-    try {
-      // Zotero.Attachments.renameAttachmentFile(item, newName)
-      const Attachments = (Zotero as any).Attachments;
-      if (Attachments?.renameAttachmentFile) {
-        await Attachments.renameAttachmentFile(item, params.newName);
-      } else {
-        // Fallback: update the title field
+    const attachment = item as unknown as {
+      attachmentFilename?: string;
+      attachmentLinkMode?: number;
+      renameAttachmentFile?: (
+        newName: string,
+        options?: {
+          overwrite?: boolean;
+          unique?: boolean;
+          updateTitle?: boolean;
+          out?: { noChange?: boolean; titleUpdated?: boolean };
+        },
+      ) => Promise<boolean | -1 | -2>;
+    };
+    const previousName = String(attachment.attachmentFilename || "");
+
+    // A linked URL has no file, so "rename" can only mean the title. Handled
+    // explicitly rather than by silently falling through, which is what made
+    // the old bug invisible.
+    if (
+      attachment.attachmentLinkMode === 3 ||
+      !attachment.renameAttachmentFile
+    ) {
+      try {
         item.setField("title", params.newName);
         await item.saveTx();
+        return {
+          attachmentId: params.attachmentId,
+          previousName: String(item.getField?.("title") || previousName),
+          newName: params.newName,
+          status: "renamed",
+          titleUpdated: true,
+        };
+      } catch (error) {
+        return {
+          attachmentId: params.attachmentId,
+          previousName,
+          newName: params.newName,
+          status: "error",
+          reason: error instanceof Error ? error.message : String(error),
+        };
       }
+    }
+
+    try {
+      const out: { noChange?: boolean; titleUpdated?: boolean } = {};
+      const outcome = await attachment.renameAttachmentFile(params.newName, {
+        unique: true,
+        updateTitle: true,
+        out,
+      });
+      if (outcome === false) {
+        return {
+          attachmentId: params.attachmentId,
+          previousName,
+          newName: params.newName,
+          status: "no_file",
+          reason:
+            "The attachment's file is missing, so there is nothing to rename. Re-link it to a file first.",
+        };
+      }
+      if (outcome === -1) {
+        return {
+          attachmentId: params.attachmentId,
+          previousName,
+          newName: params.newName,
+          status: "error",
+          reason: "A file with that name already exists.",
+        };
+      }
+      if (outcome === -2) {
+        return {
+          attachmentId: params.attachmentId,
+          previousName,
+          newName: params.newName,
+          status: "error",
+          reason: "Zotero could not rename the file.",
+        };
+      }
+      // `unique` may have appended a suffix, so report what the file is
+      // actually called rather than what was requested.
+      const actualName = String(
+        attachment.attachmentFilename || params.newName,
+      );
       return {
         attachmentId: params.attachmentId,
         previousName,
-        newName: params.newName,
-        status: "renamed",
+        newName: actualName,
+        status: out.noChange ? "unchanged" : "renamed",
+        titleUpdated: !!out.titleUpdated,
       };
     } catch (error) {
       return {
@@ -3292,7 +3376,17 @@ export class ZoteroGateway {
   }
 
   /**
-   * Re-link a linked-file attachment to a new file path.
+   * Points an attachment at a different file on disk.
+   *
+   * This used to refuse anything that was not `linkMode === 2`, so a user
+   * whose *stored* PDF had gone missing — the common case, and exactly what
+   * Zotero's own "Locate File…" repairs — was told "Only linked-file
+   * attachments can be re-linked". Zotero refuses only linked *URLs*.
+   *
+   * It also assigned `attachmentPath` directly, skipping filename
+   * sanitisation, the copy-into-storage step that stored attachments need,
+   * the cached file-state refresh, and the notifier event that clears the
+   * missing-file emblem. Delegating to Zotero's own method gets all four.
    */
   async relinkAttachment(params: {
     attachmentId: number;
@@ -3313,27 +3407,37 @@ export class ZoteroGateway {
         status: "not_found",
       };
     }
-    const rawLinkMode = (item as any).attachmentLinkMode;
-    // linkMode 2 = linked_file
-    if (rawLinkMode !== 2) {
+    const attachment = item as unknown as {
+      attachmentLinkMode?: number;
+      attachmentPath?: string;
+      getFilePathAsync?: () => Promise<string | false>;
+      relinkAttachmentFile?: (path: string) => Promise<boolean>;
+    };
+    // 3 = LINK_MODE_LINKED_URL, the only mode Zotero itself rejects.
+    if (attachment.attachmentLinkMode === 3) {
       return {
         attachmentId: params.attachmentId,
         previousPath: "",
         newPath: params.newPath,
         status: "not_linked_file",
-        reason: "Only linked-file attachments can be re-linked",
+        reason:
+          "This attachment is a linked URL, which has no file to re-link.",
       };
     }
-    const previousPath = String(
-      (await (item as any).getFilePathAsync?.()) || "",
-    );
+    const previousPath = String((await attachment.getFilePathAsync?.()) || "");
     try {
-      (item as any).attachmentPath = params.newPath;
-      await item.saveTx();
+      if (attachment.relinkAttachmentFile) {
+        await attachment.relinkAttachmentFile(params.newPath);
+      } else {
+        attachment.attachmentPath = params.newPath;
+        await item.saveTx();
+      }
       return {
         attachmentId: params.attachmentId,
         previousPath,
-        newPath: params.newPath,
+        newPath: String(
+          (await attachment.getFilePathAsync?.()) || params.newPath,
+        ),
         status: "relinked",
       };
     } catch (error) {
@@ -3346,7 +3450,6 @@ export class ZoteroGateway {
       };
     }
   }
-
   // ── Embed image in note ──────────────────────────────────────────
 
   /**

@@ -141,7 +141,7 @@ const ATTACHMENT_UPDATE_GUIDANCE: ToolGuidance = {
       request.userText || "",
     ),
   instruction:
-    "Use attachment_update to delete, rename, or re-link a single attachment. To find attachments, use library_read with sections:['attachments'] first. Re-linking only works for linked-file attachments, not imported copies. For batch renaming with computed filenames, use zotero_script instead.",
+    "Use attachment_update to delete, rename, or re-link a single attachment. To find attachments, use library_read with sections:['attachments'] first. Renaming renames the file on disk, not just the title. Re-linking repairs an attachment whose file has moved or gone missing, and works for stored attachments as well as linked files; only linked URLs cannot be re-linked. For batch renaming with computed filenames, use zotero_script instead.",
 };
 
 function markInternalTool<TInput, TResult>(
