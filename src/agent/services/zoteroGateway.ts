@@ -39,7 +39,10 @@ import {
   isPaperPortalItem,
   resolvePaperPortalBaseItem,
 } from "../../modules/contextPanel/portalScope";
-import { refusalFor } from "../capabilities/libraryObjects";
+import {
+  refusalFor,
+  type LibraryOperation,
+} from "../capabilities/libraryObjects";
 
 export const EDITABLE_ARTICLE_METADATA_FIELDS = [
   "title",
@@ -236,9 +239,10 @@ function normalizeText(value: unknown): string {
  * Portal pseudo-items are still unwrapped first — they stand in for a real
  * paper and must be resolved before the matrix sees them.
  */
-function resolveCollectionMemberItem(
+function resolveMatrixItem(
   item: Zotero.Item | null | undefined,
   itemId: number,
+  operation: LibraryOperation,
 ): { item: Zotero.Item } | { refusal: string } {
   if (!item) {
     return { refusal: `No item with ID ${itemId} exists in this library` };
@@ -252,7 +256,7 @@ function resolveCollectionMemberItem(
   if (!resolved) {
     return { refusal: `No item with ID ${itemId} exists in this library` };
   }
-  const refusal = refusalFor("addToCollection", resolved, itemId);
+  const refusal = refusalFor(operation, resolved, itemId);
   return refusal ? { refusal } : { item: resolved };
 }
 
@@ -2107,9 +2111,16 @@ export class ZoteroGateway {
     const results: BatchTagItemResult[] = [];
     let updatedCount = 0;
     for (const assignment of normalizedAssignments) {
-      const item = this.resolveBibliographicItem(
+      // Tags live on the item itself. The old resolver redirected a child
+      // attachment to its parent -- a wrong-object write that then reported
+      // the PARENT's id and title as the target -- and rejected standalone
+      // notes outright as "Item not found".
+      const resolution = resolveMatrixItem(
         this.getItem(assignment.itemId),
+        assignment.itemId,
+        "update",
       );
+      const item = "item" in resolution ? resolution.item : null;
       if (!item) {
         results.push({
           itemId: assignment.itemId,
@@ -2117,7 +2128,10 @@ export class ZoteroGateway {
           status: "missing",
           addedTags: [],
           skippedTags: assignment.tags,
-          reason: "Item not found",
+          reason:
+            "refusal" in resolution
+              ? resolution.refusal
+              : `Item ${assignment.itemId} could not be resolved`,
         });
         continue;
       }
@@ -2230,9 +2244,10 @@ export class ZoteroGateway {
         continue;
       }
       const rawItem = this.getItem(assignment.itemId);
-      const resolution = resolveCollectionMemberItem(
+      const resolution = resolveMatrixItem(
         rawItem,
         assignment.itemId,
+        "addToCollection",
       );
       const item = "item" in resolution ? resolution.item : null;
       if (!item) {
@@ -2591,7 +2606,7 @@ export class ZoteroGateway {
     // attachments, which the regular-item filter used to exclude — so this
     // resolves through the capability matrix rather than the paper map.
     const raw = this.getItem(params.itemId);
-    const resolution = resolveCollectionMemberItem(raw, params.itemId);
+    const resolution = resolveMatrixItem(raw, params.itemId, "update");
     const item = "item" in resolution ? resolution.item : null;
     if (!item || !params.tags.length) return { removed: [] };
     const removed: string[] = [];
@@ -2642,9 +2657,10 @@ export class ZoteroGateway {
     itemId: number;
     collectionId: number;
   }): Promise<{ removed: boolean; reason?: string }> {
-    const resolution = resolveCollectionMemberItem(
+    const resolution = resolveMatrixItem(
       this.getItem(params.itemId),
       params.itemId,
+      "removeFromCollection",
     );
     if (!("item" in resolution)) {
       return { removed: false, reason: resolution.refusal };

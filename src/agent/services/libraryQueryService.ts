@@ -154,7 +154,13 @@ function applyLimit<T>(items: T[], limit: unknown): T[] {
     : items;
 }
 
-export type LibrarySortKey = "dateAdded" | "dateModified" | "title";
+/**
+ * `dateModified` is deliberately absent: neither LibraryPaperTarget nor
+ * LibraryItemTarget carries the field, so sorting by it would read "" for
+ * every row and silently do nothing. Add the field to those targets before
+ * adding the key back.
+ */
+export type LibrarySortKey = "dateAdded" | "title";
 export type LibrarySortOrder = "asc" | "desc";
 
 function readSortValue(entry: unknown, key: LibrarySortKey): string {
@@ -177,7 +183,7 @@ export function applySort<T>(
   sort: unknown,
   order: unknown,
 ): T[] {
-  if (sort !== "dateAdded" && sort !== "dateModified" && sort !== "title") {
+  if (sort !== "dateAdded" && sort !== "title") {
     return items;
   }
   const key = sort as LibrarySortKey;

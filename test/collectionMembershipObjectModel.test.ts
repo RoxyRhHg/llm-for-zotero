@@ -133,3 +133,93 @@ describe("collection membership follows the object model", function () {
     assert.include(result.items[0]?.reason || "", "No item with ID 99");
   });
 });
+
+/**
+ * The matrix declared `childAttachment.update: allowed` with a comment
+ * calling the parent-redirect "a wrong-object write, not a limitation", and a
+ * test named for it — while the tag path still ran the old resolver. So the
+ * table said one thing and the shipped behaviour did another, and the suite
+ * stayed green. These exercise the write itself.
+ */
+describe("tag writes follow the object model", function () {
+  const originalZotero = (
+    globalThis as typeof globalThis & { Zotero?: unknown }
+  ).Zotero;
+
+  afterEach(function () {
+    (globalThis as typeof globalThis & { Zotero?: unknown }).Zotero =
+      originalZotero;
+  });
+
+  function makeItem(over: Record<string, unknown>) {
+    const tags = new Set<string>();
+    return {
+      id: over.id,
+      libraryID: 1,
+      isAnnotation: () => false,
+      isNote: () => false,
+      isAttachment: () => false,
+      isRegularItem: () => false,
+      getDisplayTitle: () => `Item ${over.id}`,
+      getField: () => "",
+      getAttachments: () => [],
+      getNotes: () => [],
+      hasTag: (t: string) => tags.has(t),
+      addTag: (t: string) => tags.add(t),
+      removeTag: (t: string) => tags.delete(t),
+      saveTx: async () => undefined,
+      tagSet: tags,
+      ...over,
+    };
+  }
+
+  function installZotero(items: Record<number, unknown>) {
+    (globalThis as typeof globalThis & { Zotero?: unknown }).Zotero = {
+      Items: { get: (id: number) => items[id] || null },
+      Collections: { get: () => null },
+    };
+  }
+
+  it("tags a child attachment itself, not its parent", async function () {
+    const parent = makeItem({ id: 20, isRegularItem: () => true });
+    const child = makeItem({ id: 21, isAttachment: () => true, parentID: 20 });
+    installZotero({ 20: parent, 21: child });
+
+    const result = await new ZoteroGateway().applyTagAssignments({
+      assignments: [{ itemId: 21, tags: ["scanned"] }],
+    });
+
+    assert.isTrue(child.tagSet.has("scanned"), "the attachment carries its own tags");
+    assert.isFalse(
+      parent.tagSet.has("scanned"),
+      "the old resolver tagged the parent and reported the parent's id",
+    );
+    assert.equal(result.items[0]?.itemId, 21);
+  });
+
+  it("tags a standalone note, which the old resolver called missing", async function () {
+    const note = makeItem({ id: 31, isNote: () => true });
+    installZotero({ 31: note });
+
+    const result = await new ZoteroGateway().applyTagAssignments({
+      assignments: [{ itemId: 31, tags: ["idea"] }],
+    });
+
+    assert.isTrue(note.tagSet.has("idea"));
+    assert.notEqual(result.items[0]?.status, "missing");
+  });
+
+  it("removes a tag from a standalone note and says so", async function () {
+    const note = makeItem({ id: 41, isNote: () => true });
+    note.tagSet.add("idea");
+    installZotero({ 41: note });
+
+    const outcome = await new ZoteroGateway().removeTagsFromItem({
+      itemId: 41,
+      tags: ["idea"],
+    });
+
+    assert.deepEqual(outcome.removed, ["idea"]);
+    assert.isFalse(note.tagSet.has("idea"));
+  });
+});

@@ -61,11 +61,11 @@ export const AGENT_PERSONA_INSTRUCTIONS: string[] = [
     "mode:'write' for per-item-computed mutations with undo (e.g. rename attachments using metadata, " +
     "tag papers based on their venue, move papers to collections by year, conditional multi-step pipelines). " +
     "For write mode, call env.snapshot(item) before mutating each item to enable undo; use env.addUndoStep(fn) for creations, deletions, file changes, or custom changes not covered by item snapshots. " +
-    "Write straightforward mutation code — no dry-run branching needed. zotero_script runs directly, so missing undo instrumentation is invalid. " +
-    "After zotero_script write mode completes, the changes are already applied. Report what was done, do NOT say 'review the confirmation card'. " +
+    "Write straightforward mutation code — no dry-run branching needed. Undo instrumentation is mandatory: missing it is invalid. " +
+    "Write-mode zotero_script pauses and shows the user the script source for approval before it runs, so report what was done only after it completes. " +
     "Do NOT use zotero_script when a dedicated semantic tool handles the operation natively — " +
     "e.g. library_update for uniform tags/moves/metadata and paper_read or library_read for reading. " +
-    "Dedicated tools provide better UX with structured confirmation cards and field-level review.",
+    "Dedicated tools review at the level the user cares about — which papers, which tags, which destination — rather than asking them to read code.",
   "To understand the collection hierarchy before organizing papers, use library_search({ entity:'collections', mode:'list', view:'tree' }).",
   "Use library_search({ entity:'tags', mode:'list' }) to enumerate all tags in the active library. Use library_search({ entity:'libraries', mode:'list' }) to discover all available libraries (personal and group libraries) — use the returned libraryID when the user refers to a group library by name.",
   "## Paper content sources",

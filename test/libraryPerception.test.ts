@@ -8,6 +8,8 @@ import {
   applySort,
   applyOffset,
 } from "../src/agent/services/libraryQueryService";
+import { createQueryLibraryTool } from "../src/agent/tools/read/queryLibrary";
+import type { AgentToolContext } from "../src/agent/types";
 
 /**
  * The system prompt described the user's machine in concrete detail — shell,
@@ -119,5 +121,89 @@ describe("library_search ordering and paging", function () {
       [3],
     );
     assert.deepEqual(applyOffset(rows, 0).map((r) => r.itemId), [1, 2, 3]);
+  });
+});
+
+/**
+ * The unit tests above call applySort/applyOffset directly, which cannot
+ * catch a path that never passes them through — and the review found exactly
+ * that: hasPdf:true short-circuited into a head slice, and order:'desc' was
+ * normalized away before it reached the service. These drive the real tool.
+ */
+describe("library_search ordering through the tool", function () {
+  const context: AgentToolContext = {
+    request: { conversationKey: 5, mode: "agent", userText: "recent", libraryID: 1 },
+    item: null,
+    currentAnswerText: "",
+    modelName: "test-model",
+  };
+
+  const targets = [
+    { itemId: 1, title: "Beta", dateAdded: "2026-01-01", attachments: [{ contextItemId: 101, title: "PDF", contentType: "application/pdf" }], tags: [], collectionIds: [] },
+    { itemId: 2, title: "Alpha", dateAdded: "2026-08-01", attachments: [{ contextItemId: 102, title: "PDF", contentType: "application/pdf" }], tags: [], collectionIds: [] },
+    { itemId: 3, title: "Gamma", dateAdded: "2026-04-01", attachments: [{ contextItemId: 103, title: "PDF", contentType: "application/pdf" }], tags: [], collectionIds: [] },
+  ];
+
+  function makeTool() {
+    return createQueryLibraryTool({
+      resolveLibraryID: () => 1,
+      listBibliographicItemTargets: async () => ({ items: targets, totalCount: targets.length }),
+      listLibraryPaperTargets: async () => ({ papers: targets, totalCount: targets.length }),
+      listItemsByFilters: async () => ({ items: targets, totalCount: targets.length }),
+      getItemCollectionIds: () => [],
+      getItem: () => null,
+      getEditableArticleMetadata: () => undefined,
+      getCollectionSummary: () => null,
+    } as never);
+  }
+
+  async function run(args: Record<string, unknown>) {
+    const tool = makeTool();
+    const validated = tool.validate(args);
+    assert.isTrue(validated.ok, JSON.stringify(validated));
+    if (!validated.ok) throw new Error("unreachable");
+    const output = (await tool.execute(validated.value, context)) as {
+      results?: Array<{ itemId: number }>;
+    };
+    return (output.results || []).map((r) => r.itemId);
+  }
+
+  it("sorts newest first on the PDF-only path, which used to head-slice", async function () {
+    const ids = await run({
+      entity: "items",
+      mode: "list",
+      filters: { hasPdf: true },
+      sort: "dateAdded",
+      limit: 2,
+    });
+    assert.deepEqual(ids, [2, 3], "library order would have returned [1, 2]");
+  });
+
+  it("honours an explicit descending title order", async function () {
+    const ids = await run({
+      entity: "items",
+      mode: "list",
+      sort: "title",
+      order: "desc",
+    });
+    assert.deepEqual(
+      ids,
+      [3, 1, 2],
+      "order:'desc' used to be normalized away, silently returning A-Z",
+    );
+  });
+
+  it("pages with offset instead of returning the same first page", async function () {
+    const first = await run({ entity: "items", mode: "list", sort: "dateAdded", limit: 1 });
+    const second = await run({
+      entity: "items",
+      mode: "list",
+      sort: "dateAdded",
+      limit: 1,
+      offset: 1,
+    });
+    assert.notDeepEqual(first, second, "a paging chain would loop forever");
+    assert.deepEqual(first, [2]);
+    assert.deepEqual(second, [3]);
   });
 });

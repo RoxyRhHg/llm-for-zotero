@@ -322,7 +322,7 @@ export function createQueryLibraryTool(
           },
           sort: {
             type: "string",
-            enum: ["dateAdded", "dateModified", "title"],
+            enum: ["dateAdded", "title"],
             description:
               "Order results before limit/offset are applied. Use sort:'dateAdded' for requests like 'the most recently added papers'. Applies to entity:'items' with mode:'list'; text search returns relevance order and ignores this.",
           },
@@ -491,11 +491,16 @@ export function createQueryLibraryTool(
             : undefined,
         sort:
           normalizedArgs.sort === "dateAdded" ||
-          normalizedArgs.sort === "dateModified" ||
           normalizedArgs.sort === "title"
             ? normalizedArgs.sort
             : undefined,
-        order: normalizedArgs.order === "asc" ? "asc" : undefined,
+        // Pass the direction through verbatim. Collapsing anything that was
+        // not "asc" to undefined made an explicit order:'desc' on a title
+        // sort silently return A-Z.
+        order:
+          normalizedArgs.order === "asc" || normalizedArgs.order === "desc"
+            ? normalizedArgs.order
+            : undefined,
         include: normalizeInclude(normalizedArgs.include),
         view,
       });
