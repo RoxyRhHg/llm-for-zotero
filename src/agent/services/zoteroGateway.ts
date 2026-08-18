@@ -192,6 +192,19 @@ export type BatchMoveAssignment = {
   targetCollectionId: number;
 };
 
+/**
+ * The exact collection membership an item should end up with.
+ *
+ * This is the primitive a real "move" needs. Membership is a *set*, so the
+ * only way to move an item without corrupting it is to state the whole set
+ * at once — and the only inverse that restores a move is the set it had
+ * before. Expressing a move as add-then-remove cannot do either.
+ */
+export type ItemCollectionSet = {
+  itemId: number;
+  collectionIds: number[];
+};
+
 export type PaperNoteRecord = {
   noteId: number;
   title: string;
@@ -2252,14 +2265,184 @@ export class ZoteroGateway {
     });
   }
 
+  /**
+   * Sets an item's collection membership to exactly the given set.
+   *
+   * Every other collection write in this file was an add or a single remove,
+   * which is why "move" was a lie: `addItemsToCollections` only ever called
+   * `addToCollection`, so a move left the item in both the old and the new
+   * collection while reporting `status: "moved"`.
+   *
+   * Membership is a set, so it has to be written as one:
+   *
+   * - The whole destination set for an item is resolved before any write.
+   *   One item can legitimately carry several destinations in a single call,
+   *   and applying them pairwise makes the second assignment undo the first.
+   * - Both `addToCollection` and `removeFromCollection` are checked against
+   *   the capability matrix *before* anything is written. The matrix refuses
+   *   child items for removal, so an add-then-refuse would leave the item
+   *   filed in both places — the exact corruption this replaces.
+   * - Adds and removes for one item share a single `saveTx`, so an item is
+   *   never observable in a half-moved state.
+   */
+  async setItemCollections(params: {
+    assignments: ItemCollectionSet[];
+  }): Promise<{
+    items: BatchMoveItemResult[];
+    changedCount: number;
+    priorCollections: ItemCollectionSet[];
+  }> {
+    // Collapse to one destination set per item before touching anything.
+    const desired = new Map<number, Set<number>>();
+    const order: number[] = [];
+    for (const entry of params.assignments) {
+      const itemId = Number.isFinite(entry.itemId)
+        ? Math.floor(entry.itemId)
+        : 0;
+      if (!itemId) continue;
+      if (!desired.has(itemId)) {
+        desired.set(itemId, new Set());
+        order.push(itemId);
+      }
+      const set = desired.get(itemId) as Set<number>;
+      for (const raw of entry.collectionIds || []) {
+        const collectionId = Number.isFinite(raw) ? Math.floor(raw) : 0;
+        if (collectionId > 0) set.add(collectionId);
+      }
+    }
+
+    const results: BatchMoveItemResult[] = [];
+    const priorCollections: ItemCollectionSet[] = [];
+    const touchedLibraryIDs = new Set<number>();
+    let changedCount = 0;
+
+    for (const itemId of order) {
+      const targets = desired.get(itemId) as Set<number>;
+      const rawItem = this.getItem(itemId);
+
+      // Check both verbs up front: a move that may not remove must not add.
+      const addResolution = resolveMatrixItem(
+        rawItem,
+        itemId,
+        "addToCollection",
+      );
+      const removeResolution = resolveMatrixItem(
+        rawItem,
+        itemId,
+        "removeFromCollection",
+      );
+      const blocked =
+        "refusal" in addResolution
+          ? addResolution.refusal
+          : "refusal" in removeResolution
+            ? removeResolution.refusal
+            : null;
+      if (blocked || !("item" in addResolution)) {
+        results.push({
+          itemId,
+          title: rawItem
+            ? normalizeText(rawItem.getDisplayTitle?.()) || `Item ${itemId}`
+            : `Item ${itemId}`,
+          status: "missing",
+          targetCollectionId: 0,
+          reason: blocked || `Item ${itemId} could not be resolved`,
+        });
+        continue;
+      }
+      const item = addResolution.item;
+
+      const prior = this.getItemCollectionIds(Number(item.id));
+      const priorSet = new Set(prior);
+      const toAdd = [...targets].filter((id) => !priorSet.has(id));
+      const toRemove = prior.filter((id) => !targets.has(id));
+
+      const title =
+        normalizeText(item.getDisplayTitle?.()) || `Item ${item.id}`;
+      const primaryTarget = [...targets][0] ?? 0;
+      const targetSummary = primaryTarget
+        ? this.getCollectionSummary(primaryTarget)
+        : null;
+
+      if (!toAdd.length && !toRemove.length) {
+        results.push({
+          itemId: Number(item.id),
+          title,
+          status: "skipped",
+          targetCollectionId: primaryTarget,
+          targetCollectionName: targetSummary?.path || targetSummary?.name,
+          reason: "Already filed exactly here",
+        });
+        continue;
+      }
+
+      try {
+        for (const collectionId of toAdd) {
+          item.addToCollection(collectionId);
+        }
+        for (const collectionId of toRemove) {
+          item.removeFromCollection(collectionId);
+        }
+        // One transaction per item: never observable half-moved.
+        await item.saveTx();
+      } catch (error) {
+        results.push({
+          itemId: Number(item.id),
+          title,
+          status: "missing",
+          targetCollectionId: primaryTarget,
+          targetCollectionName: targetSummary?.path || targetSummary?.name,
+          reason: error instanceof Error ? error.message : String(error),
+        });
+        continue;
+      }
+
+      // Recorded per item, so the inverse restores the exact prior set —
+      // including items that were in three collections, or in none.
+      priorCollections.push({ itemId: Number(item.id), collectionIds: prior });
+      changedCount += 1;
+      touchedLibraryIDs.add(Number(item.libraryID));
+      results.push({
+        itemId: Number(item.id),
+        title,
+        status: "moved",
+        targetCollectionId: primaryTarget,
+        targetCollectionName: targetSummary?.path || targetSummary?.name,
+      });
+    }
+
+    for (const libraryID of touchedLibraryIDs) {
+      if (libraryID > 0) invalidatePaperSearchCache(libraryID);
+    }
+    return { items: results, changedCount, priorCollections };
+  }
+
+  /**
+   * Files items into collections.
+   *
+   * `mode: "add"` is the historical behaviour and stays the default: the item
+   * gains the destination and keeps everything else.
+   *
+   * `mode: "move"` actually moves. Until now the vocabulary said "moved"
+   * everywhere — the result field, the row status, the button — while the
+   * code only ever added, so asking to move a paper left it filed in both
+   * the old and the new collection.
+   *
+   * `from` is required for a move and never inferred: `from: <collectionId>`
+   * takes it out of that one collection, `from: "all"` makes the destination
+   * set exhaustive. Guessing would silently unfile items from collections the
+   * user never mentioned.
+   */
   async addItemsToCollections(params: {
     assignments: BatchMoveAssignment[];
+    mode?: "add" | "move";
+    from?: number | "all";
   }): Promise<{
     selectedCount: number;
     movedCount: number;
     skippedCount: number;
     collections: CollectionSummary[];
     items: BatchMoveItemResult[];
+    priorCollections?: ItemCollectionSet[];
   }> {
     const normalizedAssignments: BatchMoveAssignment[] = [];
     const seen = new Set<string>();
@@ -2292,6 +2475,46 @@ export class ZoteroGateway {
       }
       collectionMap.set(assignment.targetCollectionId, collection);
     }
+
+    if (params.mode === "move") {
+      if (params.from == null) {
+        throw new Error(
+          'A move needs an explicit source: pass from:<collectionId> to take items out of one collection, or from:"all" to replace their collection membership entirely.',
+        );
+      }
+      // Collapse every assignment into one destination set per item first.
+      // Handling them pairwise would let the second assignment for an item
+      // undo the first.
+      const destinations = new Map<number, Set<number>>();
+      for (const assignment of normalizedAssignments) {
+        const set = destinations.get(assignment.itemId) || new Set<number>();
+        set.add(assignment.targetCollectionId);
+        destinations.set(assignment.itemId, set);
+      }
+      const sets: ItemCollectionSet[] = [];
+      for (const [itemId, targets] of destinations) {
+        const keep =
+          params.from === "all"
+            ? []
+            : this.getItemCollectionIds(itemId).filter(
+                (id) => id !== params.from,
+              );
+        sets.push({
+          itemId,
+          collectionIds: Array.from(new Set([...keep, ...targets])),
+        });
+      }
+      const outcome = await this.setItemCollections({ assignments: sets });
+      return {
+        selectedCount: sets.length,
+        movedCount: outcome.changedCount,
+        skippedCount: outcome.items.length - outcome.changedCount,
+        collections: Array.from(collectionMap.values()),
+        items: outcome.items,
+        priorCollections: outcome.priorCollections,
+      };
+    }
+
     const results: BatchMoveItemResult[] = [];
     let movedCount = 0;
     for (const assignment of normalizedAssignments) {

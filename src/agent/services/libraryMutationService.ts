@@ -49,6 +49,28 @@ export type MoveToCollectionOperation = {
   targetCollectionId?: number;
   targetCollectionName?: string;
   targetCollectionPath?: string;
+  /**
+   * `"add"` (the default) files the item and leaves its other collections
+   * alone. `"move"` takes it out of `from` as well — until this existed, the
+   * tool said "moved" while only ever adding.
+   */
+  mode?: "add" | "move";
+  /** Required for a move: the collection to leave, or `"all"`. */
+  from?: number | "all";
+};
+
+/**
+ * Restores exact collection membership.
+ *
+ * A move's only correct inverse is the set the item had beforehand.
+ * `remove_from_collection` cannot express it: undoing a move with a removal
+ * would unfile the item from the destination and never put back the
+ * collections the move took it out of.
+ */
+export type SetItemCollectionsOperation = {
+  id?: string;
+  type: "set_item_collections";
+  assignments: Array<{ itemId: number; collectionIds: number[] }>;
 };
 
 export type RemoveFromCollectionOperation = {
@@ -170,6 +192,7 @@ export type LibraryMutationOperation =
   | MoveToCollectionOperation
   | RemoveFromCollectionOperation
   | CreateCollectionOperation
+  | SetItemCollectionsOperation
   | DeleteCollectionOperation
   | SaveNoteOperation
   | ImportIdentifiersOperation
@@ -305,6 +328,35 @@ function buildCollectionAddUndo(
           collectionId,
         });
       }
+    },
+  };
+}
+
+/**
+ * Puts items back into exactly the collections they were in.
+ *
+ * The inverse of a move is a *set*, not a removal. `buildCollectionAddUndo`
+ * emits `remove_from_collection`, so using it to undo a move would take the
+ * item out of its destination and never restore the collections it was moved
+ * out of — silently unfiling it.
+ */
+function buildCollectionSetUndo(
+  zoteroGateway: ZoteroGateway,
+  priorCollections: Array<{ itemId: number; collectionIds: number[] }>,
+): LibraryMutationUndo | null {
+  if (!priorCollections.length) return null;
+  return {
+    toolName: "library_mutation",
+    inverseOperations: [
+      { type: "set_item_collections" as const, assignments: priorCollections },
+    ],
+    description: `Restore the previous collections of ${priorCollections.length} item${
+      priorCollections.length === 1 ? "" : "s"
+    }`,
+    revert: async () => {
+      await zoteroGateway.setItemCollections({
+        assignments: priorCollections,
+      });
     },
   };
 }
@@ -594,6 +646,8 @@ export class LibraryMutationService {
         }
         const result = await this.zoteroGateway.addItemsToCollections({
           assignments,
+          mode: operation.mode,
+          from: operation.from,
         });
         return {
           result: {
@@ -601,17 +655,45 @@ export class LibraryMutationService {
             operationId: operation.id,
             result,
           },
-          undo: buildCollectionAddUndo(
-            this.zoteroGateway,
-            result.items
-              .filter(
-                (item) => item.status === "moved" && item.targetCollectionId,
+          // A move's inverse has to restore the whole prior membership set.
+          // The add-undo below only removes the destination, which for a move
+          // would leave the item unfiled from wherever it came.
+          undo:
+            operation.mode === "move" && result.priorCollections?.length
+              ? buildCollectionSetUndo(
+                  this.zoteroGateway,
+                  result.priorCollections,
+                )
+              : buildCollectionAddUndo(
+                  this.zoteroGateway,
+                  result.items
+                    .filter(
+                      (item) =>
+                        item.status === "moved" && item.targetCollectionId,
+                    )
+                    .map((item) => ({
+                      itemId: item.itemId,
+                      collectionId: item.targetCollectionId as number,
+                    })),
+                ),
+        };
+      }
+      case "set_item_collections": {
+        const result = await this.zoteroGateway.setItemCollections({
+          assignments: operation.assignments,
+        });
+        return {
+          result: {
+            operation: operation.type,
+            operationId: operation.id,
+            result,
+          },
+          undo: result.priorCollections.length
+            ? buildCollectionSetUndo(
+                this.zoteroGateway,
+                result.priorCollections,
               )
-              .map((item) => ({
-                itemId: item.itemId,
-                collectionId: item.targetCollectionId as number,
-              })),
-          ),
+            : null,
         };
       }
       case "remove_from_collection": {

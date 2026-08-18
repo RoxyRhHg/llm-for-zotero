@@ -82,7 +82,7 @@ const LIBRARY_SEARCH_GUIDANCE: ToolGuidance = {
       request.userText || "",
     ),
   instruction:
-    "For library-organization requests, gather the item IDs first with library_search({ entity:'items', mode:'list', filters:{ unfiled:true } }) when needed. If the user wants you to file or move papers and the exact destination collection IDs are not known yet, call library_update with {kind:'collections', action:'add', itemIds:[...]} and let the confirmation card collect the target folders. Use library_search({ entity:'collections', mode:'list', view:'tree' }) when you need the collection hierarchy to prefill or explain choices.",
+    "For library-organization requests, gather the item IDs first with library_search({ entity:'items', mode:'list', filters:{ unfiled:true } }) when needed. If the user wants you to file or move papers and the exact destination collection IDs are not known yet, call library_update with {kind:'collections', action:'add', itemIds:[...]} and let the confirmation card collect the target folders. Use library_search({ entity:'collections', mode:'list', view:'tree' }) when you need the collection hierarchy to prefill or explain choices. When the user asks to MOVE or reorganize rather than merely file, pass mode:'move' with from:<collectionId> or from:'all'; the default adds, which would leave each item in both its old and new collection.",
 };
 
 const LITERATURE_SEARCH_GUIDANCE: ToolGuidance = {
@@ -220,6 +220,17 @@ function createLibraryUpdateTool(tools: {
           type: "string",
           description:
             "Target collection name for kind:'collections'; resolved in the confirmation card.",
+        },
+        mode: {
+          type: "string",
+          enum: ["add", "move"],
+          description:
+            "For kind:'collections' with action:'add'. 'add' (default) files the item and leaves its other collections alone. 'move' also takes it out of the collection named by 'from', so the item ends up filed only where the user asked. Use 'move' whenever the user says move, reorganize, or re-file — 'add' leaves the item in both places.",
+        },
+        from: {
+          description:
+            "Required when mode:'move'. A collection ID to take the items out of, or the string 'all' to replace their collection membership entirely. Never inferred, because guessing would unfile items from collections the user never mentioned.",
+          anyOf: [{ type: "number" }, { type: "string", enum: ["all"] }],
         },
         collectionId: {
           type: "number",
