@@ -1082,7 +1082,15 @@ export class AgentRuntime {
         await persistIfLive(() =>
           finishAgentRun(runId, status, redactedFinalText),
         );
-        if (status === "completed") {
+        // The transcript and the read/coverage ledgers record what this run
+        // DID. Gating them on a clean finish meant a run that exhausted its
+        // rounds -- or was failed by three cancellations -- threw away its own
+        // memory *after* its library writes had already landed, so "continue"
+        // started blind on a library that had already changed.
+        //
+        // recordAgentTurn stays gated below: it is the turn summary, and
+        // summarising an unfinished turn as an answer would be its own lie.
+        {
           await persistIfLive(() =>
             commitAgentReadActivities({
               conversationKey: request.conversationKey,
@@ -1105,7 +1113,7 @@ export class AgentRuntime {
               ),
             }),
           );
-          if (redactedFinalText) {
+          if (status === "completed" && redactedFinalText) {
             await persistIfLive(() =>
               recordAgentTurn(
                 request.conversationKey,
@@ -1535,9 +1543,17 @@ export class AgentRuntime {
             timestamp: this.now(),
           });
         } else {
-          consecutiveToolErrors += 1;
           const rawError = readToolError(toolResult);
-          if (rawError && rawError.toLowerCase() !== "user denied action") {
+          const userDenied =
+            !!rawError && rawError.toLowerCase() === "user denied action";
+          // A denial is the user steering, not the tool failing. Counting it
+          // meant three careful "Cancel" clicks failed the run outright and
+          // -- because persistence is gated on completion -- discarded its
+          // memory along with it.
+          if (!userDenied) {
+            consecutiveToolErrors += 1;
+          }
+          if (rawError && !userDenied) {
             await emit({
               type: "tool_error",
               callId: toolResult.callId,

@@ -30,6 +30,7 @@ import {
 } from "../claudeCode/runtime";
 import { clearCodexZoteroMcpPreflightCache } from "../codexAppServer/mcpSetup";
 import { getConversationWriteGeneration } from "../shared/conversationWriteFence";
+import { setLibraryOverviewGateway } from "./context/libraryOverview";
 
 let runtime: AgentRuntime | null = null;
 let runtimeInitTask: Promise<AgentRuntime> | null = null;
@@ -97,6 +98,9 @@ async function createAgentSubsystemRuntime(
 
   assertAgentInitCurrent(generation);
   _zoteroGateway = zoteroGateway;
+  // The prompt layer cannot import this module without creating a cycle,
+  // so the gateway is pushed to it instead.
+  setLibraryOverviewGateway(zoteroGateway);
   _toolRegistry = toolRegistry;
   runtime = nextRuntime;
   _actionRegistry = actionRegistry;
@@ -131,6 +135,7 @@ export function shutdownAgentSubsystem(): void {
   resetClaudeBridgeRuntime();
   runtime = null;
   _zoteroGateway = null;
+  setLibraryOverviewGateway(null);
 }
 
 export function getCoreAgentRuntime(): AgentRuntime {

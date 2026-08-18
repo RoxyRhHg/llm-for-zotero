@@ -3825,4 +3825,95 @@ describe("shallow guard round-limit safety", function () {
       restoreDb();
     }
   });
+
+  /**
+   * Chain survival. Three careful "Cancel" clicks used to fail the run
+   * outright, because a denial incremented the same counter as a broken tool
+   * -- and persistence was gated on a clean finish, so the run discarded its
+   * own transcript *after* its library writes had landed.
+   */
+  it("does not fail the run when the user declines three confirmations", async function () {
+    const restoreDb = installMockDb();
+    try {
+      const registry = new AgentToolRegistry();
+      registry.register({
+        spec: {
+          name: "library_update",
+          description: "update",
+          inputSchema: { type: "object" },
+          mutability: "write",
+          requiresConfirmation: true,
+        },
+        validate: (args) => ({ ok: true, value: args as never }),
+        createPendingAction: () => ({
+          toolName: "library_update",
+          title: "Confirm",
+          confirmLabel: "Apply",
+          cancelLabel: "Cancel",
+          fields: [],
+        }),
+        async execute() {
+          return { movedCount: 1, items: [{ itemId: 1, status: "moved" }] };
+        },
+      } as never);
+
+      const toolStep = (id: string) => ({
+        kind: "tool_calls" as const,
+        calls: [{ id, name: "library_update", arguments: {} }],
+        assistantMessage: { role: "assistant" as const, content: "" },
+      });
+
+      const runtime = new AgentRuntime({
+        registry,
+        adapterFactory: () =>
+          new MockAdapter(
+            [
+              toolStep("c1"),
+              toolStep("c2"),
+              toolStep("c3"),
+              {
+                kind: "final",
+                text: "You cancelled all three, so nothing changed.",
+                assistantMessage: {
+                  role: "assistant",
+                  content: "You cancelled all three, so nothing changed.",
+                },
+              },
+            ],
+            { streaming: false, toolCalls: true, multimodal: false },
+          ),
+      });
+
+      let denials = 0;
+      const outcome = await runtime.runTurn({
+        request: {
+          conversationKey: 992,
+          mode: "agent",
+          userText: "file these",
+          model: "gpt-4o-mini",
+          apiBase: "https://api.openai.com/v1/chat/completions",
+          apiKey: "test",
+          libraryID: 1,
+        },
+        onEvent: async (event) => {
+          if (event.type === "confirmation_required") {
+            denials += 1;
+            runtime.resolveConfirmation(event.requestId, false);
+          }
+        },
+      });
+
+      assert.equal(denials, 3, "all three confirmations were declined");
+
+      assert.equal(
+        outcome.kind,
+        "completed",
+        "declining is the user steering, not the tool failing",
+      );
+      if (outcome.kind !== "completed") return;
+      assert.include(outcome.text, "nothing changed");
+    } finally {
+      restoreDb();
+    }
+  });
 });

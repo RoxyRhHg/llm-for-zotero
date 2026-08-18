@@ -26,10 +26,38 @@ type ItemSnapshot = {
   tags: Array<{ tag: string }>;
   collectionIds: number[];
   creators: unknown[];
+  /**
+   * State outside the editable-metadata field list.
+   *
+   * `SNAPSHOT_FIELDS` is a copy of the 18 fields the metadata tool can edit,
+   * which meant a script that reparented a note, changed an item type, or
+   * trashed something satisfied the undo-instrumentation check and then could
+   * not be reverted at all. Changing an item's type is the worst case: Zotero
+   * drops fields that are invalid for the new type, so the data is gone and
+   * the snapshot never knew it existed.
+   */
+  parentID?: number;
+  deleted?: boolean;
+  itemTypeID?: number;
+  noteHtml?: string;
+  /** Full pre-image, used to restore fields the flat list above misses. */
+  json?: unknown;
 };
 
 type ScriptResult = {
   output: string;
+  /**
+   * Whatever the script returned.
+   *
+   * This used to be thrown away — `raceResult` was only ever compared to
+   * `"timeout"` — so the only channel back to the model was `env.log`, capped
+   * at 8000 characters. A script that enumerated 400 ids reported about 180
+   * of them and nothing said the rest were missing, which is what made
+   * multi-step work over a real library impossible.
+   */
+  returnValue?: unknown;
+  /** True when `output` was cut short, so the caller can say so out loud. */
+  outputTruncated?: boolean;
   snapshots: Map<number, ItemSnapshot>;
   undoSteps: Array<() => Promise<void>>;
   error?: string;
@@ -87,7 +115,30 @@ function captureItemSnapshot(item: any): ItemSnapshot {
   } catch {
     /* ignore */
   }
-  return { itemId: item.id, fields, tags, collectionIds, creators };
+  // A full pre-image covers everything the flat field list does not. It is
+  // cheap next to the Zotero API calls already made above, and it is the only
+  // thing that can restore an item after a type change.
+  let json: unknown;
+  try {
+    json = item.toJSON?.();
+  } catch {
+    /* some item types refuse toJSON; the flat fields still apply */
+  }
+  const readNumber = (value: unknown): number | undefined =>
+    typeof value === "number" && Number.isFinite(value) ? value : undefined;
+  return {
+    itemId: item.id,
+    fields,
+    tags,
+    collectionIds,
+    creators,
+    parentID: readNumber(item.parentID),
+    deleted: item.deleted === true,
+    itemTypeID: readNumber(item.itemTypeID),
+    noteHtml:
+      typeof item.getNote === "function" ? String(item.getNote() ?? "") : undefined,
+    json,
+  };
 }
 
 // ── Undo ────────────────────────────────────────────────────────────────────
@@ -102,6 +153,56 @@ function buildRevertFunction(
       try {
         const item = (Zotero as any).Items.get(snapshot.itemId);
         if (!item) continue;
+
+        // Restore the item type FIRST. Zotero drops fields that are invalid
+        // for the current type, so setting fields before the type would throw
+        // them away again.
+        try {
+          if (
+            snapshot.itemTypeID !== undefined &&
+            item.itemTypeID !== snapshot.itemTypeID
+          ) {
+            item.setType(snapshot.itemTypeID);
+          }
+        } catch {
+          /* ignore */
+        }
+
+        // Restore anything the flat field list does not cover, from the full
+        // pre-image, before the explicit restores below take precedence.
+        try {
+          if (snapshot.json && typeof item.fromJSON === "function") {
+            item.fromJSON(snapshot.json);
+          }
+        } catch {
+          /* a partial restore is better than none */
+        }
+
+        // Restore parenting and trash state.
+        try {
+          if (item.parentID !== snapshot.parentID) {
+            item.parentID = snapshot.parentID ?? false;
+          }
+        } catch {
+          /* ignore */
+        }
+        try {
+          if (snapshot.deleted !== undefined && item.deleted !== snapshot.deleted) {
+            item.deleted = snapshot.deleted;
+          }
+        } catch {
+          /* ignore */
+        }
+        try {
+          if (
+            snapshot.noteHtml !== undefined &&
+            typeof item.setNote === "function"
+          ) {
+            item.setNote(snapshot.noteHtml);
+          }
+        } catch {
+          /* ignore */
+        }
 
         // Restore fields
         for (const [field, value] of Object.entries(snapshot.fields)) {
@@ -251,12 +352,14 @@ async function executeScript(params: {
 
     const maxLen = 8000;
     const output = logBuffer.join("\n");
+    const truncated = output.length > maxLen;
     return {
-      output:
-        output.length > maxLen
-          ? output.slice(0, maxLen) +
-            `\n... [truncated, ${output.length} chars total]`
-          : output,
+      output: truncated
+        ? output.slice(0, maxLen) +
+          `\n... [log truncated, ${output.length} chars total. Return data from the script instead of logging it — the return value is delivered in full.]`
+        : output,
+      outputTruncated: truncated,
+      returnValue: raceResult,
       snapshots,
       undoSteps,
     };
@@ -335,6 +438,16 @@ env.log(\`Total: \${count} items\`);
 \`\`\`
 
 ### Common APIs
+Beyond items and collections, the full local Zotero API is available here, and
+several areas have no typed tool at all — reach for them directly:
+\`Zotero.Tags\` (rename/delete/colour a tag library-wide),
+\`Zotero.Attachments.importFromFile / linkFromFile\`,
+\`Zotero.Searches\` (saved searches),
+\`Zotero.Annotations\` (highlights and their comments),
+\`Zotero.FullText\` (reindexing),
+\`Zotero.Duplicates\`,
+\`Zotero.Translate.Export\` (BibTeX/RIS/bibliographies).
+
 - Get all items: \`await Zotero.Items.getAll(env.libraryID, false, false, false)\`
 - Get item by ID: \`Zotero.Items.get(id)\`
 - Fields: \`item.getField(name)\`, \`item.setField(name, value)\`
@@ -356,7 +469,8 @@ env.log(\`Total: \${count} items\`);
 ### Rules
 1. Write mode: ALWAYS call \`env.snapshot(item)\` before mutating any item (enables undo)
 2. Write mode: ALWAYS call \`await item.saveTx()\` after mutations
-3. Use \`env.log(msg)\` to report progress — this output is shown to the user
+3. Use \`env.log(msg)\` for PROGRESS ONLY — the log is capped at 8000 characters and is truncated silently past that. **Return your data instead**: whatever the script returns is delivered to you in full. \`return itemIds\` beats logging four hundred lines of them.
+3a. For results too large to hold in one turn, write them to a file with \`IOUtils.writeUTF8(path, JSON.stringify(data))\` and read them back in pages with \`file_io\`. The filesystem is your scratch space between steps.
 4. The script body is an async function — top-level await is supported
 5. Do NOT use \`eraseTx()\` — use Zotero trash instead (item.deleted = true; await item.saveTx())
 6. Do NOT create or edit Zotero notes here. Use note_write for all Zotero note creation, edits, and appends so note validation still runs.
@@ -566,6 +680,11 @@ export function createZoteroScriptTool(): AgentToolDefinition<
         mode: input.mode,
         description: input.description,
         output: result.output,
+        // The script's own return value, delivered whole. Logging is for
+        // progress; data should be returned, and large results should be
+        // written to a file and read back in pages.
+        returnValue: result.returnValue,
+        outputTruncated: result.outputTruncated || undefined,
         itemsAffected: result.snapshots.size,
         error: result.error || undefined,
       };

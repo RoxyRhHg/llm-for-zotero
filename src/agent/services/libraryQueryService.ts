@@ -154,6 +154,64 @@ function applyLimit<T>(items: T[], limit: unknown): T[] {
     : items;
 }
 
+export type LibrarySortKey = "dateAdded" | "dateModified" | "title";
+export type LibrarySortOrder = "asc" | "desc";
+
+function readSortValue(entry: unknown, key: LibrarySortKey): string {
+  const record =
+    entry && typeof entry === "object" ? (entry as Record<string, unknown>) : {};
+  const value = record[key];
+  return typeof value === "string" ? value : "";
+}
+
+/**
+ * Orders results before the window is taken.
+ *
+ * There was no sort of any kind, and `applyLimit` is a head slice, so "the 50
+ * most recently added papers" was simply not expressible — even though
+ * `dateAdded` has always been on the item targets and `autoTag` sorts by it
+ * internally.
+ */
+export function applySort<T>(
+  items: T[],
+  sort: unknown,
+  order: unknown,
+): T[] {
+  if (sort !== "dateAdded" && sort !== "dateModified" && sort !== "title") {
+    return items;
+  }
+  const key = sort as LibrarySortKey;
+  // Titles default ascending, dates default descending ("most recent first"
+  // is what someone asking for recent papers means).
+  const descending = key === "title" ? order === "desc" : order !== "asc";
+  return [...items].sort((left, right) => {
+    const a = readSortValue(left, key);
+    const b = readSortValue(right, key);
+    // Empty values sort last in BOTH directions, so undated items never
+    // displace real hits. Reversing a sorted array would have floated them to
+    // the top of a descending list, which is why the direction is applied
+    // inside the comparator rather than afterwards.
+    if (!a && !b) return 0;
+    if (!a) return 1;
+    if (!b) return -1;
+    const compared =
+      key === "title" ? a.localeCompare(b) : a < b ? -1 : a > b ? 1 : 0;
+    return descending ? -compared : compared;
+  });
+}
+
+/**
+ * Takes a window after sorting. Without this every list was a head slice, so
+ * a chain could never walk past the first page of its own results.
+ */
+export function applyOffset<T>(items: T[], offset: unknown): T[] {
+  const normalized =
+    Number.isFinite(offset) && Number(offset) > 0
+      ? Math.floor(Number(offset))
+      : 0;
+  return normalized > 0 ? items.slice(normalized) : items;
+}
+
 export class LibraryQueryService {
   constructor(private readonly zoteroGateway: ZoteroGateway) {}
 
@@ -191,6 +249,9 @@ export class LibraryQueryService {
     libraryID: number;
     filters?: QueryLibraryFilters;
     limit?: number;
+    offset?: number;
+    sort?: LibrarySortKey;
+    order?: LibrarySortOrder;
     include?: QueryLibraryInclude[];
   }): Promise<{
     results: QueryLibraryItemResult[];
@@ -289,6 +350,9 @@ export class LibraryQueryService {
     libraryID: number;
     filters?: QueryLibraryFilters;
     limit?: number;
+    offset?: number;
+    sort?: LibrarySortKey;
+    order?: LibrarySortOrder;
     include?: QueryLibraryInclude[];
   }): Promise<{
     results: QueryLibraryItemResult[];
@@ -323,7 +387,11 @@ export class LibraryQueryService {
         });
       }
       const totalCount = items.length;
-      const enriched = applyLimit(items, params.limit).map((item) =>
+      const windowed = applyLimit(
+        applyOffset(applySort(items, params.sort, params.order), params.offset),
+        params.limit,
+      );
+      const enriched = windowed.map((item) =>
         enrichItemTarget(item, this.zoteroGateway, params.include),
       );
       return { results: enriched, totalCount, warnings: [] };
@@ -340,12 +408,26 @@ export class LibraryQueryService {
       yearTo: filters.yearTo,
       tag: filters.tag,
     };
+    // A sort or an offset has to be applied across the whole result set, so
+    // the gateway's own limit is withheld and the window is taken last.
+    // Truncating first and sorting the truncation would answer a different
+    // question than the one asked.
+    const needsFullSet = Boolean(params.sort) || Boolean(params.offset);
     const result = await this.zoteroGateway.listItemsByFilters({
       libraryID: params.libraryID,
       filters: agentFilters,
-      limit: params.limit,
+      limit: needsFullSet ? undefined : params.limit,
     });
-    const enriched = result.items.map((item) =>
+    const windowed = needsFullSet
+      ? applyLimit(
+          applyOffset(
+            applySort(result.items, params.sort, params.order),
+            params.offset,
+          ),
+          params.limit,
+        )
+      : result.items;
+    const enriched = windowed.map((item) =>
       enrichItemTarget(item, this.zoteroGateway, params.include),
     );
     return { results: enriched, totalCount: result.totalCount, warnings: [] };

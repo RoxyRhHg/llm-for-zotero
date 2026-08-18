@@ -668,12 +668,28 @@ export class LibraryMutationService {
           operation.libraryID,
           operation.targetCollectionId,
         );
+        const importedIds = result.itemIds || [];
         return {
           result: {
             operation: operation.type,
             operationId: operation.id,
             result,
           },
+          // Previously no undo at all — so after "create a collection, import
+          // 50 papers into it", the top of the undo stack was the *collection
+          // creation*. "Undo that" deleted the folder and left all 50 items
+          // behind, which is worse than a no-op.
+          undo: importedIds.length
+            ? {
+                toolName: "library_mutation",
+                description: `Trash the ${importedIds.length} imported item${
+                  importedIds.length === 1 ? "" : "s"
+                }`,
+                revert: async () => {
+                  await this.zoteroGateway.trashItems({ itemIds: importedIds });
+                },
+              }
+            : undefined,
         };
       }
       case "trash_items": {

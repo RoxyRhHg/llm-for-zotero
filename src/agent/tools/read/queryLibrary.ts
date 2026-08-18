@@ -1,6 +1,8 @@
 import type { PaperContextRef } from "../../../shared/types";
 import type { AgentToolDefinition } from "../../types";
 import {
+  type LibrarySortKey,
+  type LibrarySortOrder,
   LibraryQueryService,
   type QueryLibraryEntity,
   type QueryLibraryFilters,
@@ -17,6 +19,9 @@ type QueryLibraryInput = {
   refs?: Array<number | PaperContextRef>;
   filters?: QueryLibraryFilters;
   limit?: number;
+  offset?: number;
+  sort?: LibrarySortKey;
+  order?: LibrarySortOrder;
   include?: QueryLibraryInclude[];
   view?: "flat" | "tree";
 };
@@ -310,6 +315,23 @@ export function createQueryLibraryTool(
               "For entity:'collections' mode:'list': 'flat' returns a list, 'tree' returns the full hierarchy with paper counts. Default: flat.",
           },
           limit: { type: "number" },
+          offset: {
+            type: "number",
+            description:
+              "Skip this many results before returning. Use with limit to page through a large result set across several calls.",
+          },
+          sort: {
+            type: "string",
+            enum: ["dateAdded", "dateModified", "title"],
+            description:
+              "Order results before limit/offset are applied. Use sort:'dateAdded' for requests like 'the most recently added papers'.",
+          },
+          order: {
+            type: "string",
+            enum: ["asc", "desc"],
+            description:
+              "Sort direction. Defaults to 'desc' for dates (newest first) and 'asc' for title.",
+          },
           include: {
             type: "array",
             items: {
@@ -460,6 +482,20 @@ export function createQueryLibraryTool(
         refs: normalizeRefs(normalizedArgs.refs),
         filters: normalizeFilters(normalizedArgs.filters),
         limit: normalizePositiveInt(normalizedArgs.limit),
+        // offset is deliberately not normalizePositiveInt: 0 is a valid
+        // starting offset and that helper rejects it.
+        offset:
+          Number.isFinite(normalizedArgs.offset) &&
+          Number(normalizedArgs.offset) > 0
+            ? Math.floor(Number(normalizedArgs.offset))
+            : undefined,
+        sort:
+          normalizedArgs.sort === "dateAdded" ||
+          normalizedArgs.sort === "dateModified" ||
+          normalizedArgs.sort === "title"
+            ? normalizedArgs.sort
+            : undefined,
+        order: normalizedArgs.order === "asc" ? "asc" : undefined,
         include: normalizeInclude(normalizedArgs.include),
         view,
       });
@@ -574,6 +610,9 @@ export function createQueryLibraryTool(
           libraryID,
           filters: input.filters,
           limit: input.limit,
+          offset: input.offset,
+          sort: input.sort,
+          order: input.order,
           include: input.include,
         });
         return withResultCounts(

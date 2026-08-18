@@ -94,6 +94,16 @@ export class LibraryReadService {
           itemId,
           title: noteContent?.title || `Note ${itemId}`,
           notes: noteContent ? [noteContent] : undefined,
+          // A standalone note can be a collection member, and this branch
+          // never reported that — so filing a note could not be verified.
+          collections: sectionSet.has("collections")
+            ? this.zoteroGateway
+                .getItemCollectionIds(itemId)
+                .map((collectionId) =>
+                  this.zoteroGateway.getCollectionSummary(collectionId),
+                )
+                .filter((entry): entry is CollectionSummary => Boolean(entry))
+            : undefined,
         };
         continue;
       }
@@ -105,7 +115,10 @@ export class LibraryReadService {
         ? this.zoteroGateway.getEditableArticleMetadata(item)
         : undefined;
       const target = targetMap.get(itemId);
-      const collectionIds = target?.collectionIds || [];
+      // Read membership from the item itself. The paper-target map is
+      // PDF-gated, so a book or a PDF-less paper reported no collections at
+      // all — the exact items most likely to be filed by hand.
+      const collectionIds = this.zoteroGateway.getItemCollectionIds(itemId);
       results[String(itemId)] = {
         itemId,
         title:

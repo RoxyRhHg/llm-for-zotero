@@ -2599,6 +2599,30 @@ export class ZoteroGateway {
    * requested id as removed — so a request to unfile ten notes reported
    * "removedCount: 10" having done nothing at all.
    */
+  /**
+   * Reads an item's real collection membership.
+   *
+   * The read path used to take this from the paper-target map, which is built
+   * by `buildPaperTargetFromItem` and returns `null` for any item without a
+   * PDF child — so a book sitting in three collections reported none, and a
+   * note reported nothing at all. That is the channel an agent uses to verify
+   * a filing operation, so it silently failed exactly where it mattered.
+   */
+  getItemCollectionIds(itemId: number): number[] {
+    const item = this.getItem(itemId);
+    if (!item) return [];
+    try {
+      const ids = (
+        item as unknown as { getCollections?: () => number[] }
+      ).getCollections?.();
+      return Array.isArray(ids)
+        ? ids.filter((id) => Number.isFinite(id) && id > 0)
+        : [];
+    } catch {
+      return [];
+    }
+  }
+
   async removeItemFromCollection(params: {
     itemId: number;
     collectionId: number;
@@ -3334,6 +3358,31 @@ export class ZoteroGateway {
    * Falls back to creating a temporary item and reading its fields if the
    * translator does not support libraryID: false.
    */
+  /**
+   * Parses a user- or model-supplied identifier into Zotero's translator
+   * shape.
+   *
+   * The import path used to have its own two-branch version: a
+   * case-SENSITIVE `arxiv:` prefix, else "assume DOI". So the ISBNs and URLs
+   * both schemas advertised silently failed, and — worse — the tool's own
+   * validation hint suggested `"arXiv:2301.00001"` with a capital V, which
+   * failed its own check.
+   */
+  private parseImportIdentifier(rawIdentifier: string): Record<string, string> {
+    const trimmed = rawIdentifier.trim();
+    if (/^arxiv:/i.test(trimmed)) {
+      return { arXiv: trimmed.replace(/^arxiv:/i, "").trim() };
+    }
+    const withoutIsbnPrefix = trimmed.replace(/^isbn[:\s]?/i, "");
+    if (/^[\d-]{10,}$/.test(withoutIsbnPrefix)) {
+      return { ISBN: withoutIsbnPrefix.trim() };
+    }
+    if (/^pmid[:\s]?\d+$/i.test(trimmed)) {
+      return { PMID: trimmed.replace(/^pmid[:\s]?/i, "").trim() };
+    }
+    return { DOI: trimmed.replace(/^https?:\/\/doi\.org\//i, "") };
+  }
+
   async fetchMetadataByIdentifier(
     rawIdentifier: string,
   ): Promise<EditableArticleMetadataPatch | null> {
@@ -3489,10 +3538,28 @@ export class ZoteroGateway {
     identifiers: string[],
     libraryID?: number,
     targetCollectionId?: number,
-  ): Promise<{ succeeded: number; failed: number; itemIds?: number[] }> {
+  ): Promise<{
+    succeeded: number;
+    failed: number;
+    itemIds?: number[];
+    items: Array<{
+      identifier: string;
+      status: "imported" | "not_found" | "error";
+      itemId?: number;
+      reason?: string;
+    }>;
+  }> {
     let succeeded = 0;
     let failed = 0;
     const itemIds: number[] = [];
+    // Per-identifier rows: "10 of 50 failed" was previously unattributable,
+    // so a user had no way to know which ten to retry.
+    const rows: Array<{
+      identifier: string;
+      status: "imported" | "not_found" | "error";
+      itemId?: number;
+      reason?: string;
+    }> = [];
     const targetLibraryID =
       libraryID ??
       (Zotero as unknown as { Libraries?: { userLibraryID?: number } })
@@ -3507,10 +3574,7 @@ export class ZoteroGateway {
 
     for (const rawId of identifiers) {
       try {
-        const isArXiv = rawId.startsWith("arxiv:");
-        const identifier: Record<string, string> = isArXiv
-          ? { arXiv: rawId.slice("arxiv:".length) }
-          : { DOI: rawId.replace(/^https?:\/\/doi\.org\//i, "") };
+        const identifier = this.parseImportIdentifier(rawId);
 
         const translate = new (
           Zotero as unknown as {
@@ -3529,6 +3593,11 @@ export class ZoteroGateway {
         const translators = await translate.getTranslators();
         if (!translators || translators.length === 0) {
           failed++;
+          rows.push({
+            identifier: rawId,
+            status: "not_found",
+            reason: "No translator could resolve this identifier",
+          });
           continue;
         }
         translate.setTranslator(translators);
@@ -3560,15 +3629,46 @@ export class ZoteroGateway {
             }
           }
           itemIds.push(...importedRegularItemIds);
-          succeeded += importedRegularItemIds.length || items.length;
+          // Previously `|| items.length`, which reported success when the
+          // translator returned something but nothing survived the
+          // regular-item filter — so nothing was filed and it still counted.
+          if (importedRegularItemIds.length) {
+            succeeded += importedRegularItemIds.length;
+            for (const itemId of importedRegularItemIds) {
+              rows.push({ identifier: rawId, status: "imported", itemId });
+            }
+          } else {
+            failed++;
+            rows.push({
+              identifier: rawId,
+              status: "error",
+              reason:
+                "The translator returned no regular item for this identifier",
+            });
+          }
         } else {
           failed++;
+          rows.push({
+            identifier: rawId,
+            status: "not_found",
+            reason: "The translator returned no items",
+          });
         }
-      } catch {
+      } catch (error) {
         failed++;
+        rows.push({
+          identifier: rawId,
+          status: "error",
+          reason: error instanceof Error ? error.message : "Import failed",
+        });
       }
     }
 
-    return { succeeded, failed, itemIds };
+    // A follow-up library_search would not have seen the new items.
+    if (itemIds.length && targetLibraryID > 0) {
+      invalidatePaperSearchCache(targetLibraryID);
+    }
+
+    return { succeeded, failed, itemIds, items: rows };
   }
 }

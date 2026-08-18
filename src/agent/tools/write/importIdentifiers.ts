@@ -103,7 +103,7 @@ export function createImportIdentifiersTool(
       if (!identifiers?.length) {
         return fail(
           "identifiers must be a non-empty array of strings. " +
-            'Example: { identifiers: ["10.1234/example", "arXiv:2301.00001"] }',
+            'Example: { identifiers: ["10.1234/example", "arxiv:2301.00001"] }',
         );
       }
 

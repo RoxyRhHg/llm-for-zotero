@@ -4,7 +4,7 @@
  * Supports two input modes:
  * - Single item: `{ itemId?, metadata: {...} }` — used by the LLM directly
  * - Batch: `{ operations: [{ itemId, metadata, paperContext? }, ...] }` — used
- *   internally by the syncMetadata action and review cards
+ *   internally by review cards
  */
 import type { PaperContextRef } from "../../../shared/types";
 import type { AgentToolDefinition } from "../../types";

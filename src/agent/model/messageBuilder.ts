@@ -1,3 +1,5 @@
+import { renderLibraryOverviewSection } from "../context/libraryOverview";
+
 import type {
   AgentContentInputCapabilities,
   AgentModelMessage,
@@ -589,6 +591,16 @@ export async function buildAgentInitialMessages(
     {
       id: "notes-directory-config",
       lines: [buildNotesDirectoryConfigSection()],
+    },
+    {
+      // The library the agent is actually operating on. Everything above
+      // described the user's machine; this describes the workspace.
+      //
+      // Degrades to nothing rather than throwing: the shared gateway is not
+      // available before the agent subsystem is initialized, and a missing
+      // enhancement must never be able to fail a turn.
+      id: "library-overview",
+      lines: [renderLibraryOverviewSection(request.libraryID)],
     },
   ];
   const stableResourceBlock =

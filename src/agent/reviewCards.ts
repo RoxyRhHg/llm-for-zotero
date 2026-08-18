@@ -1000,6 +1000,19 @@ export function resolveSearchLiteratureReview(
           kind: "identifiers",
           identifiers,
           libraryID: normalizedArgs.libraryID || context.request.libraryID,
+          // The card dropped this entirely, so the path the UI actually
+          // steers users toward — search, review, Import — could never file
+          // into a collection and dumped everything into the library root.
+          // The collection the turn was scoped to is the obvious default.
+          targetCollectionId:
+            readPositiveInt(
+              (normalizedArgs as { targetCollectionId?: unknown })
+                .targetCollectionId,
+            ) ||
+            readPositiveInt(
+              context.request.selectedCollectionContexts?.[0]?.collectionId,
+            ) ||
+            undefined,
         },
         inheritedApproval: {
           sourceToolName: "literature_search",

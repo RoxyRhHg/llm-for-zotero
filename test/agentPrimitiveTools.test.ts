@@ -229,6 +229,7 @@ describe("primitive agent tools", function () {
           ],
           totalCount: 3,
         }) as any,
+      getItemCollectionIds: (itemId: number) => (itemId === 7 ? [12] : []),
       getPaperTargetsByItemIds: () => [
         {
           itemId: 99,
@@ -355,6 +356,7 @@ describe("primitive agent tools", function () {
         groups: [],
       }),
       getCollectionSummary: () => null,
+      getItemCollectionIds: (itemId: number) => (itemId === 7 ? [12] : []),
       getPaperTargetsByItemIds: () => [],
     } as never);
 
@@ -411,6 +413,7 @@ describe("primitive agent tools", function () {
         groups: [],
       }),
       getCollectionSummary: () => null,
+      getItemCollectionIds: (itemId: number) => (itemId === 7 ? [12] : []),
       getPaperTargetsByItemIds: () => [],
     } as never);
 
@@ -447,6 +450,7 @@ describe("primitive agent tools", function () {
     } as any;
     const tool = createReadLibraryTool({
       listPaperContexts: () => [],
+      getItemCollectionIds: (itemId: number) => (itemId === 7 ? [12] : []),
       getPaperTargetsByItemIds: () => [
         {
           itemId: 7,
@@ -531,6 +535,7 @@ describe("primitive agent tools", function () {
     } as any;
     const tool = createReadLibraryTool({
       listPaperContexts: () => [],
+      getItemCollectionIds: (itemId: number) => (itemId === 7 ? [12] : []),
       getPaperTargetsByItemIds: (itemIds: number[]) => {
         requestedTargets = itemIds;
         return [];
@@ -575,6 +580,7 @@ describe("primitive agent tools", function () {
     } as any;
     const tool = createReadLibraryTool({
       listPaperContexts: () => [],
+      getItemCollectionIds: (itemId: number) => (itemId === 7 ? [12] : []),
       getPaperTargetsByItemIds: () => [],
       getItem: (itemId: number) => (itemId === 7 ? fakeItem : null),
       resolveMetadataItem: ({ itemId }: { itemId?: number }) =>
@@ -3811,6 +3817,7 @@ env.log('updated');
 
   it("apply_tags paged actions render through the shared review-card layout", function () {
     const tool = createApplyTagsTool({
+      getItemCollectionIds: (itemId: number) => (itemId === 7 ? [12] : []),
       getPaperTargetsByItemIds: () => [
         {
           itemId: 101,
