@@ -78,11 +78,16 @@ const LIBRARY_UPDATE_OPERATION_SCHEMA = {
 
 const LIBRARY_SEARCH_GUIDANCE: ToolGuidance = {
   matches: (request) =>
-    /\b(unfiled|folder|folders|collection|collections|move|file|organize|organise|categorize|categorise)\b/i.test(
+    /\b(unfiled|folder|folders|collection|collections|move|file|organize|organise|categorize|categorise|full[- ]?text|abstract|doi|publisher|isbn|issn|added|modified|since|before|after|retracted|annotation|highlight|citation key|advanced search|trash|deleted)\b/i.test(
       request.userText || "",
     ),
   instruction:
-    "For library-organization requests, gather the item IDs first with library_search({ entity:'items', mode:'list', filters:{ unfiled:true } }) when needed. If the user wants you to file or move papers and the exact destination collection IDs are not known yet, call library_update with {kind:'collections', action:'add', itemIds:[...]} and let the confirmation card collect the target folders. Use library_search({ entity:'collections', mode:'list', view:'tree' }) when you need the collection hierarchy to prefill or explain choices. When the user asks to MOVE or reorganize rather than merely file, pass mode:'move' with from:<collectionId> or from:'all'; the default adds, which would leave each item in both its old and new collection.",
+    "For library-organization requests, gather the item IDs first with library_search({ entity:'items', mode:'list', filters:{ unfiled:true } }) when needed. If the user wants you to file or move papers and the exact destination collection IDs are not known yet, call library_update with {kind:'collections', action:'add', itemIds:[...]} and let the confirmation card collect the target folders. Use library_search({ entity:'collections', mode:'list', view:'tree' }) when you need the collection hierarchy to prefill or explain choices. When the user asks to MOVE or reorganize rather than merely file, pass mode:'move' with from:<collectionId> or from:'all'; the default adds, which would leave each item in both its old and new collection." +
+    "\n\nFor anything the simple filters cannot express, pass conditions[] — Zotero's own advanced-search vocabulary. Each clause is {condition, operator, value}. Useful conditions: fulltextContent (the PDF text), abstractNote, DOI, ISBN, publisher, publicationTitle, dateAdded, dateModified, note, annotationText, citationKey, retracted, itemType, tag, collection. If a condition and operator do not pair up, the error lists the operators that condition accepts — read it and retry rather than falling back to a plain text search." +
+    "\n\nTwo rules that decide whether an advanced search works at all:" +
+    "\n- fulltextContent, annotationText and childNote match a child item (an attachment or a note), so pass resolveToParents:true or those matches are dropped and the search looks empty." +
+    "\n- joinMode:'all' is the default; use joinMode:'any' for an OR search. There are no grouping blocks, because opening one in Zotero flips every other condition in the query to OR." +
+    "\n\nTo see the trash, pass filters:{ deleted:true }. That is the only way to enumerate trashed items, and it is what you need before calling library_delete with mode:'restore'.",
 };
 
 const LITERATURE_SEARCH_GUIDANCE: ToolGuidance = {

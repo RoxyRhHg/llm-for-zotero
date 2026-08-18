@@ -34,6 +34,13 @@ export type QueryLibraryFilters = {
   yearTo?: number;
   itemType?: string;
   tag?: string;
+  /**
+   * List the trash rather than the library. Zotero excludes trashed items
+   * from every search unless told otherwise, so without this nothing could
+   * enumerate what was in the trash -- which made restoring anything the
+   * user had deleted impossible.
+   */
+  deleted?: boolean;
 };
 
 export type QueryLibraryItemResult = LibraryItemTarget & {
@@ -165,7 +172,9 @@ export type LibrarySortOrder = "asc" | "desc";
 
 function readSortValue(entry: unknown, key: LibrarySortKey): string {
   const record =
-    entry && typeof entry === "object" ? (entry as Record<string, unknown>) : {};
+    entry && typeof entry === "object"
+      ? (entry as Record<string, unknown>)
+      : {};
   const value = record[key];
   return typeof value === "string" ? value : "";
 }
@@ -178,11 +187,7 @@ function readSortValue(entry: unknown, key: LibrarySortKey): string {
  * `dateAdded` has always been on the item targets and `autoTag` sorts by it
  * internally.
  */
-export function applySort<T>(
-  items: T[],
-  sort: unknown,
-  order: unknown,
-): T[] {
+export function applySort<T>(items: T[], sort: unknown, order: unknown): T[] {
   if (sort !== "dateAdded" && sort !== "title") {
     return items;
   }
@@ -415,6 +420,7 @@ export class LibraryQueryService {
       yearFrom: filters.yearFrom,
       yearTo: filters.yearTo,
       tag: filters.tag,
+      deleted: filters.deleted,
     };
     // A sort or an offset has to be applied across the whole result set, so
     // the gateway's own limit is withheld and the window is taken last.

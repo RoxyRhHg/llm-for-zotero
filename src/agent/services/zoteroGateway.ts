@@ -793,7 +793,98 @@ export type AgentLibraryFilters = {
   yearFrom?: number;
   yearTo?: number;
   tag?: string;
+  /** List the trash instead of the library. */
+  deleted?: boolean;
 };
+
+/**
+ * One clause of an advanced search, forwarded to `Zotero.Search`.
+ *
+ * The agent previously had nine hand-written filters against Zotero's own
+ * ~130 conditions x 15 operators. Re-implementing that vocabulary a filter at
+ * a time is how it stayed nine for so long, so this forwards the vocabulary
+ * instead of mirroring it: new Zotero versions add conditions for free.
+ */
+export type AgentSearchCondition = {
+  condition: string;
+  operator: string;
+  value?: string | number;
+  /**
+   * Sub-mode for the few conditions that take one, e.g. `fulltextContent`
+   * with `phrase` or `regexp`. Zotero spells this `condition/mode`.
+   */
+  mode?: string;
+  /** Zotero's per-condition `required` flag. */
+  required?: boolean;
+};
+
+export type AgentSearchConditionError = {
+  condition: string;
+  reason: string;
+  validOperators?: string[];
+};
+
+/**
+ * Checks conditions before any of them reach `Zotero.Search`.
+ *
+ * `addCondition` throws for both an unknown condition and an unsupported
+ * operator, and a throw mid-build leaves a half-populated search. Worse, the
+ * callers used to swallow it into an empty result, which is how a year filter
+ * silently reported "no matching library results" on every library. Validate
+ * first, and tell the model which operators the condition actually takes --
+ * an error it cannot act on is as useless as an empty result.
+ */
+export function validateSearchConditions(
+  conditions: AgentSearchCondition[],
+): AgentSearchConditionError[] {
+  const registry = (
+    Zotero as unknown as {
+      SearchConditions?: {
+        get?: (
+          name: string,
+        ) => { operators?: Record<string, boolean> } | undefined;
+      };
+    }
+  ).SearchConditions;
+  if (!registry?.get) return [];
+  const errors: AgentSearchConditionError[] = [];
+  for (const entry of conditions) {
+    const name = String(entry?.condition || "").trim();
+    if (!name) {
+      errors.push({ condition: "", reason: "A condition name is required" });
+      continue;
+    }
+    // A block flips joinMode for the WHOLE query: any block sets
+    // hasQuicksearch, and joinModeAny is `_joinMode == 'any' || hasQuicksearch`.
+    // Exposing them would let one clause silently turn an AND search into OR.
+    if (name === "blockStart" || name === "blockEnd") {
+      errors.push({
+        condition: name,
+        reason:
+          "Grouping blocks are not available: opening one flips every other condition in the query from AND to OR. Use joinMode instead, or run separate searches.",
+      });
+      continue;
+    }
+    const declared = registry.get(name);
+    if (!declared) {
+      errors.push({
+        condition: name,
+        reason: `"${name}" is not a Zotero search condition`,
+      });
+      continue;
+    }
+    const operator = String(entry?.operator || "").trim();
+    const validOperators = Object.keys(declared.operators || {});
+    if (!operator || !declared.operators?.[operator]) {
+      errors.push({
+        condition: name,
+        reason: `"${operator || "(missing)"}" is not a valid operator for "${name}"`,
+        validOperators,
+      });
+    }
+  }
+  return errors;
+}
 
 /**
  * Applies the exact year range in JS.
@@ -867,6 +958,12 @@ function buildAgentLibrarySearch(
   }
   if (filters.tag) {
     search.addCondition("tag", "is", filters.tag);
+  }
+  if (filters.deleted) {
+    // Zotero excludes trashed items from every search unless asked, so
+    // without this the trash could not be enumerated -- and restoring
+    // something the user deleted meant knowing its id already.
+    search.addCondition("deleted", "true" as never, "");
   }
   return search;
 }
@@ -1694,6 +1791,137 @@ export class ZoteroGateway {
     };
   }
 
+  /**
+   * Runs an advanced search expressed in Zotero's own condition vocabulary.
+   *
+   * The nine hand-written filters could express a fraction of what the
+   * Advanced Search window can. Rather than growing them one at a time, this
+   * forwards conditions straight to `Zotero.Search`, so the agent inherits
+   * every condition Zotero has — including ones added in future versions.
+   *
+   * Three things this must get right:
+   *
+   * - **Page before enriching.** The existing paths enrich every match and
+   *   then slice, so a condition matching 20k items built 20k objects to show
+   *   50. Here the id array is windowed first.
+   * - **Resolve to parents.** `Zotero.Search` returns child items, and
+   *   list-style callers drop anything with a `parentID` — so `fulltextContent`,
+   *   `annotationText` and `childNote` would match and then vanish.
+   * - **Never omit the library.** A `Zotero.Search` with no `libraryID`
+   *   searches *every* library, including group libraries the user did not ask
+   *   about.
+   */
+  async searchItemsByConditions(params: {
+    libraryID: number;
+    conditions: AgentSearchCondition[];
+    joinMode?: "all" | "any";
+    resolveToParents?: boolean;
+    includeTrashed?: boolean;
+    limit?: number;
+    offset?: number;
+  }): Promise<{
+    items: LibraryItemTarget[];
+    totalCount: number;
+    returnedCount: number;
+    offset: number;
+    nextOffset?: number;
+  }> {
+    const libraryID = Number.isFinite(params.libraryID)
+      ? Math.floor(params.libraryID)
+      : 0;
+    if (!libraryID) throw new Error("No active library available");
+
+    const errors = validateSearchConditions(params.conditions);
+    if (errors.length) {
+      const detail = errors
+        .map((error) =>
+          error.validOperators?.length
+            ? `${error.reason}. Valid operators: ${error.validOperators.join(", ")}`
+            : error.reason,
+        )
+        .join("; ");
+      throw new Error(`Invalid search conditions: ${detail}`);
+    }
+
+    const search = new Zotero.Search({ libraryID });
+    if (params.joinMode === "any" || params.joinMode === "all") {
+      search.addCondition("joinMode", params.joinMode as never, "");
+    }
+    // Zotero excludes trashed items unless told otherwise, so listing the
+    // trash was impossible without this -- which in turn made restore
+    // unusable, because nothing could enumerate what was in there.
+    if (params.includeTrashed) {
+      search.addCondition("deleted", "true" as never, "");
+    }
+    for (const entry of params.conditions) {
+      const name = entry.mode
+        ? `${entry.condition}/${entry.mode}`
+        : entry.condition;
+      search.addCondition(
+        name as never,
+        entry.operator as never,
+        entry.value === undefined ? "" : (entry.value as never),
+        entry.required,
+      );
+    }
+
+    const rawIds: number[] = await search.search();
+
+    const resolved: number[] = [];
+    const seen = new Set<number>();
+    for (const id of rawIds) {
+      const item = Zotero.Items.get(id);
+      if (!item) continue;
+      let targetId = Number(id);
+      if (params.resolveToParents) {
+        const parentID = (item as { parentID?: number | false }).parentID;
+        if (parentID) targetId = Number(parentID);
+      } else if (
+        (item as { parentID?: number | false }).parentID ||
+        item.isAnnotation?.()
+      ) {
+        continue;
+      }
+      if (seen.has(targetId)) continue;
+      seen.add(targetId);
+      resolved.push(targetId);
+    }
+
+    const offset =
+      Number.isFinite(params.offset) && Number(params.offset) > 0
+        ? Math.floor(Number(params.offset))
+        : 0;
+    const limit = Math.min(
+      Math.max(
+        Number.isFinite(params.limit) && Number(params.limit) > 0
+          ? Math.floor(Number(params.limit))
+          : 50,
+        1,
+      ),
+      200,
+    );
+    // The window is taken on ids, so enrichment only runs for what is
+    // actually returned.
+    const page = resolved.slice(offset, offset + limit);
+
+    const items: LibraryItemTarget[] = [];
+    for (const itemId of page) {
+      const item = this.getItem(itemId);
+      if (!item) continue;
+      const target = buildItemTargetFromItem(item);
+      if (target) items.push(target);
+    }
+
+    const nextOffset = offset + page.length;
+    return {
+      items,
+      totalCount: resolved.length,
+      returnedCount: items.length,
+      offset,
+      nextOffset: nextOffset < resolved.length ? nextOffset : undefined,
+    };
+  }
+
   async listItemsByFilters(params: {
     libraryID: number;
     filters?: AgentLibraryFilters;
@@ -1735,10 +1963,13 @@ export class ZoteroGateway {
         totalCount: items.length,
       };
     } catch (error) {
-      // A genuine fallback: the in-memory path applies the same filters and
-      // returns correct results, so this stays a fallback rather than a
-      // rethrow. It is logged because it silently masked the `year` operator
-      // bug for as long as that bug existed.
+      // The in-memory path reads the live library, so it cannot answer a
+      // trash query. Falling back would quietly return the user's ordinary
+      // items when they asked what was in the trash.
+      if (params.filters?.deleted) throw error;
+      // Otherwise a genuine fallback: the in-memory path applies the same
+      // filters and returns correct results. It is logged because silence is
+      // what masked the `year` operator bug for as long as it existed.
       Zotero.debug(
         `[agent] Zotero.Search listing failed, falling back to in-memory filtering: ${
           error instanceof Error ? error.message : String(error)
