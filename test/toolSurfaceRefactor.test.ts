@@ -117,6 +117,7 @@ describe("semantic tool surface", function () {
       "library_update",
       "literature_search",
       "note_write",
+      "note_write_batch",
       "paper_read",
       "revert_changes",
       "run_command",

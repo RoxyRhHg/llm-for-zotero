@@ -215,6 +215,7 @@ export function createLibraryBatchTool(deps: {
       });
 
       const progress: string[] = [];
+      let pagesDone = 0;
       const actionContext = buildActionExecutionContext({
         context,
         registry: deps.toolRegistry,
@@ -229,6 +230,30 @@ export function createLibraryBatchTool(deps: {
         onProgress: (event) => {
           if (event.type === "step_done" && event.summary) {
             progress.push(event.summary);
+            // Checkpoint per page, not once at the end. `advanceBatchJob`
+            // used to fire a single time after the whole run, so the cursor
+            // read 0 until completion and a quit mid-run left no record of
+            // how far the job had got -- the row said "running" from zero
+            // while the library was already half-changed.
+            //
+            // The cursor is written AFTER the page's writes land: a cursor
+            // ahead of the library skips work on resume, which is worse than
+            // repeating a page.
+            pagesDone += 1;
+            void advanceBatchJob({
+              jobId,
+              cursor: pagesDone,
+              appliedCount: progress.length,
+              now: now(),
+            }).catch(() => {
+              // A checkpoint failure must not abort the run; the worst case
+              // is a resume that repeats one page.
+            });
+          }
+          // "status" events were dropped silently, so a job that spent
+          // minutes between pages looked stalled.
+          if (event.type === "status" && event.message) {
+            progress.push(event.message);
           }
         },
       });

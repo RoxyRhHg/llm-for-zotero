@@ -67,6 +67,27 @@ export type MoveToCollectionOperation = {
  * would unfile the item from the destination and never put back the
  * collections the move took it out of.
  */
+/**
+ * Writes a note onto each of many items in one approved operation.
+ *
+ * `save_note` takes a single `targetItemId`, so "write a summary note on each
+ * of my 50 most recent papers" was 50 tool calls and — because every
+ * `note_write mode:'create'` returns its own review card — 50 human
+ * approvals. That, not the round budget, is what made the request
+ * impractical.
+ */
+export type SaveNotesBatchOperation = {
+  id?: string;
+  type: "save_notes_batch";
+  notes: Array<{
+    targetItemId: number;
+    content: string;
+    collections?: number[];
+  }>;
+  target?: "item" | "standalone";
+  modelName?: string;
+};
+
 export type CreateItemsOperation = {
   id?: string;
   type: "create_items";
@@ -225,6 +246,7 @@ export type LibraryMutationOperation =
   | RemoveFromCollectionOperation
   | CreateCollectionOperation
   | SetItemCollectionsOperation
+  | SaveNotesBatchOperation
   | CreateItemsOperation
   | ReparentItemsOperation
   | RelateItemsOperation
@@ -711,6 +733,83 @@ export class LibraryMutationService {
                       collectionId: item.targetCollectionId as number,
                     })),
                 ),
+        };
+      }
+      case "save_notes_batch": {
+        const rows: Array<{
+          targetItemId: number;
+          noteId?: number;
+          title: string;
+          status: "created" | "error";
+          reason?: string;
+        }> = [];
+        const createdNoteIds: number[] = [];
+        for (const entry of operation.notes) {
+          const target = this.zoteroGateway.getItem(entry.targetItemId);
+          const title = target
+            ? String(target.getDisplayTitle?.() || `Item ${entry.targetItemId}`)
+            : `Item ${entry.targetItemId}`;
+          if (!target) {
+            rows.push({
+              targetItemId: entry.targetItemId,
+              title,
+              status: "error",
+              reason: `No item with ID ${entry.targetItemId} exists in this library`,
+            });
+            continue;
+          }
+          try {
+            const saved = await this.zoteroGateway.saveAnswerToNote({
+              item: target,
+              libraryID: context.request.libraryID,
+              content: entry.content,
+              modelName: operation.modelName || context.modelName,
+              target: operation.target || "item",
+              collections: entry.collections,
+            });
+            if (saved.noteId) createdNoteIds.push(saved.noteId);
+            rows.push({
+              targetItemId: entry.targetItemId,
+              noteId: saved.noteId,
+              title,
+              status: "created",
+            });
+          } catch (error) {
+            // One bad target must not lose the other forty-nine notes.
+            rows.push({
+              targetItemId: entry.targetItemId,
+              title,
+              status: "error",
+              reason: error instanceof Error ? error.message : String(error),
+            });
+          }
+        }
+        return {
+          result: {
+            operation: operation.type,
+            operationId: operation.id,
+            result: {
+              createdCount: createdNoteIds.length,
+              failedCount: rows.length - createdNoteIds.length,
+              notes: rows,
+            },
+          },
+          undo: createdNoteIds.length
+            ? {
+                toolName: "library_mutation",
+                inverseOperations: [
+                  { type: "trash_items", itemIds: createdNoteIds },
+                ],
+                description: `Trash ${createdNoteIds.length} note${
+                  createdNoteIds.length === 1 ? "" : "s"
+                } that were just written`,
+                revert: async () => {
+                  await this.zoteroGateway.trashItems({
+                    itemIds: createdNoteIds,
+                  });
+                },
+              }
+            : null,
         };
       }
       case "create_items": {

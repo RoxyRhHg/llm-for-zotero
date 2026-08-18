@@ -56,9 +56,7 @@ function hasDb(): boolean {
 }
 
 function normalizeStatus(value: unknown): BatchJobStatus {
-  return value === "completed" ||
-    value === "cancelled" ||
-    value === "failed"
+  return value === "completed" || value === "cancelled" || value === "failed"
     ? value
     : "running";
 }
@@ -193,6 +191,50 @@ export async function listResumableBatchJobs(
      WHERE conversation_key = ? AND status = 'running'
      ORDER BY updated_at DESC`,
     [conversationKey],
+  )) as unknown as JobRow[] | null;
+  return Array.isArray(rows) ? rows.map(toRecord) : [];
+}
+
+/**
+ * Marks jobs abandoned by a crash or a quit.
+ *
+ * Nothing ever ran at startup, so a job interrupted mid-run stayed
+ * `status:'running'` for ever: `listResumableBatchJobs` would keep offering
+ * it, and the row implied work was still in progress when no process was
+ * doing it. Sweeping at startup is what makes "running" mean running.
+ *
+ * The rows are kept, not deleted -- the cursor is the only record of how far
+ * the job got, and the user may want to resume from it.
+ */
+export async function sweepInterruptedBatchJobs(params: {
+  now: number;
+}): Promise<{ sweptCount: number; jobs: BatchJobRecord[] }> {
+  if (!hasDb()) return { sweptCount: 0, jobs: [] };
+  const rows = (await Zotero.DB.queryAsync(
+    `SELECT * FROM ${BATCH_JOBS_TABLE} WHERE status = 'running'`,
+  )) as unknown as JobRow[] | null;
+  const jobs = Array.isArray(rows) ? rows.map(toRecord) : [];
+  if (!jobs.length) return { sweptCount: 0, jobs: [] };
+  await Zotero.DB.queryAsync(
+    `UPDATE ${BATCH_JOBS_TABLE} SET status = 'failed', updated_at = ? WHERE status = 'running'`,
+    [params.now],
+  );
+  return { sweptCount: jobs.length, jobs };
+}
+
+/**
+ * Jobs that stopped part-way and still have work left.
+ *
+ * Used to tell the user what an interrupted run had already applied, so they
+ * can decide whether to resume rather than re-running from zero over a
+ * library that is already half-changed.
+ */
+export async function listInterruptedBatchJobs(): Promise<BatchJobRecord[]> {
+  if (!hasDb()) return [];
+  const rows = (await Zotero.DB.queryAsync(
+    `SELECT * FROM ${BATCH_JOBS_TABLE}
+     WHERE status = 'failed' AND (total_count IS NULL OR cursor < total_count)
+     ORDER BY updated_at DESC`,
   )) as unknown as JobRow[] | null;
   return Array.isArray(rows) ? rows.map(toRecord) : [];
 }

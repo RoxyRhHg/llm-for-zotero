@@ -27,6 +27,7 @@ import { createManageCollectionsTool } from "./write/manageCollections";
 import { createImportIdentifiersTool } from "./write/importIdentifiers";
 import { createTrashItemsTool } from "./write/trashItems";
 import { createRestoreFromTrashTool } from "./write/restoreFromTrash";
+import { createWriteNotesBatchTool } from "./write/writeNotesBatch";
 import {
   createCreateItemsTool,
   createRelateItemsTool,
@@ -500,6 +501,7 @@ export function createBuiltInToolRegistry(
   const createItems = createCreateItemsTool(deps.zoteroGateway);
   const reparentItems = createReparentItemsTool(deps.zoteroGateway);
   const relateItems = createRelateItemsTool(deps.zoteroGateway);
+  const writeNotesBatch = createWriteNotesBatchTool(deps.zoteroGateway);
   const mergeItems = createMergeItemsTool(deps.zoteroGateway);
   const manageAttachments = createManageAttachmentsTool(deps.zoteroGateway);
   const editCurrentNote = createEditCurrentNoteTool(deps.zoteroGateway);
@@ -571,8 +573,17 @@ export function createBuiltInToolRegistry(
       name: "note_write",
       label: "Write Note",
       description:
-        "Create, append to, or edit Zotero notes. Use this for note writing instead of returning note-ready text in chat.",
+        "Create, append to, or edit a single Zotero note. Use this for note writing instead of returning note-ready text in chat. To write a note onto many items, use note_write_batch instead — one card for the whole set, rather than one approval per paper.",
       guidance: NOTE_WRITE_GUIDANCE,
+    }),
+  );
+  registry.register(
+    createRenamedTool({
+      tool: writeNotesBatch,
+      name: "note_write_batch",
+      label: "Write Notes",
+      description:
+        "Write a note onto each of many items in one approved operation. Use this whenever the user asks for a note on several papers — calling note_write once per paper means one confirmation dialog per paper.",
     }),
   );
   registry.register(
@@ -620,6 +631,7 @@ export function createBuiltInToolRegistry(
     createItems,
     reparentItems,
     relateItems,
+    writeNotesBatch,
     mergeItems,
     manageAttachments,
     editCurrentNote,
