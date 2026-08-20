@@ -171,6 +171,38 @@ describe("modelProviders", function () {
     assert.equal(entries[0].providerProtocol, "responses_api");
   });
 
+  it("round-trips explicit max-token provenance through provider storage", function () {
+    setModelProviderGroups([
+      {
+        id: "ollama",
+        apiBase: "http://127.0.0.1:11434",
+        apiKey: "",
+        authMode: "api_key",
+        providerProtocol: "ollama_native",
+        models: [
+          {
+            id: "explicit",
+            model: "qwen3:8b",
+            temperature: 0.3,
+            maxTokens: 4096,
+            maxTokensExplicit: true,
+          },
+          {
+            id: "default",
+            model: "gemma3:4b",
+            temperature: 0.3,
+            maxTokens: 4096,
+          },
+        ],
+      },
+    ]);
+
+    const entries = getRuntimeModelEntries();
+
+    assert.isTrue(entries[0].advanced.maxTokensExplicit);
+    assert.isUndefined(entries[1].advanced.maxTokensExplicit);
+  });
+
   it("infers Anthropic protocol for customized providers with default chat protocol", function () {
     const groups: ModelProviderGroup[] = [
       {

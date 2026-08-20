@@ -35,6 +35,8 @@ type AutoTagInput = PaperScopedActionInput &
   PagedActionInput & {
     userQuery?: string;
     tagsPerPaper?: number;
+    /** Internal durable-batch target set. Never accepted from model input. */
+    _batchItemIds?: number[];
   };
 
 type AutoTagOutput = {
@@ -185,16 +187,39 @@ export const autoTagAction: AgentAction<AutoTagInput, AutoTagOutput> = {
           : targetPapers.length;
       return Math.max(0, end - start);
     };
+    const remainingTargetIds = (nextOffset: number): number[] => {
+      const end =
+        windowEndOffset !== undefined
+          ? Math.min(windowEndOffset, targetPapers.length)
+          : targetPapers.length;
+      return targetPapers
+        .slice(Math.max(initialStartOffset, nextOffset), end)
+        .map((paper) => paper.itemId);
+    };
     const reloadTargets = async (): Promise<void> => {
       ctx.zoteroGateway.invalidateLibrarySearchCache?.(ctx.libraryID);
-      targetPapers = (await resolveTargetPapers(input, ctx)).sort(
-        compareTargetPaperDateAddedDesc,
-      );
+      const resolved = await resolveTargetPapers(input, ctx);
+      // A resumed batch carries the exact remaining IDs in their frozen
+      // order. Re-sorting would change the meaning of its durable cursor.
+      targetPapers = Array.isArray(input._batchItemIds)
+        ? resolved
+        : resolved.sort(compareTargetPaperDateAddedDesc);
       pages = getPagedActionPages(targetPapers, options);
       pagedTargetCount = countTargetWindow();
       existingTags = await fetchExistingLibraryTags(ctx);
     };
     await reloadTargets();
+
+    await ctx.checkpoint?.({
+      cursor: 0,
+      appliedCount: 0,
+      totalCount: pagedTargetCount,
+      plan: {
+        remainingItemIds: remainingTargetIds(initialStartOffset),
+        pageSize: options.pageSize,
+        tagsPerPaper,
+      },
+    });
 
     ctx.onProgress({
       type: "step_done",
@@ -274,6 +299,18 @@ export const autoTagAction: AgentAction<AutoTagInput, AutoTagOutput> = {
           type: "step_done",
           step: `${pageLabel}: Suggesting tags`,
           summary: "No confident tag suggestions for this page",
+        });
+        await ctx.checkpoint?.({
+          cursor: page.offset + page.items.length,
+          appliedCount: tagged,
+          totalCount: pagedTargetCount,
+          plan: {
+            remainingItemIds: remainingTargetIds(
+              page.offset + page.items.length,
+            ),
+            pageSize: options.pageSize,
+            tagsPerPaper,
+          },
         });
         pageCursor += 1;
         continue;
@@ -371,6 +408,18 @@ export const autoTagAction: AgentAction<AutoTagInput, AutoTagOutput> = {
           step: `${pageLabel}: Reviewing tag suggestions`,
           summary: `Tagged ${taggedCount} item${taggedCount === 1 ? "" : "s"}`,
         });
+        await ctx.checkpoint?.({
+          cursor: page.offset + page.items.length,
+          appliedCount: tagged,
+          totalCount: pagedTargetCount,
+          plan: {
+            remainingItemIds: remainingTargetIds(
+              page.offset + page.items.length,
+            ),
+            pageSize: options.pageSize,
+            tagsPerPaper,
+          },
+        });
         if (confirmationActionId === "confirm") {
           if (pageCursor >= pages.length - 1) {
             confirmed = true;
@@ -431,6 +480,15 @@ async function resolveTargetPapers(
   input: AutoTagInput,
   ctx: ActionExecutionContext,
 ): Promise<TargetPaper[]> {
+  if (Array.isArray(input._batchItemIds)) {
+    if (!input._batchItemIds.length) return [];
+    const targets = await resolvePaperScopedActionTargets(
+      { itemIds: input._batchItemIds },
+      ctx,
+      autoTagPaperScopeProfile,
+    );
+    return hydratePaperTargets(targets, ctx);
+  }
   const explicitTarget =
     input.itemId ||
     input.itemIds?.length ||

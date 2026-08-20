@@ -70,6 +70,9 @@ describe("delete_collection reversibility", function () {
       context,
     );
     assert.exists(outcome.undo, "a delete must record an inverse");
+    assert.deepEqual(outcome.undo?.inverseOperations, [
+      { type: "restore_from_trash", collectionIds: [42] },
+    ]);
 
     await outcome.undo?.revert();
 
@@ -118,6 +121,13 @@ describe("delete_collection reversibility", function () {
       { type: "delete_collection", collectionId: 42, deleteItems: true },
       context,
     );
+    assert.deepEqual(outcome.undo?.inverseOperations, [
+      {
+        type: "restore_from_trash",
+        collectionIds: [42],
+        itemIds: [11, 12],
+      },
+    ]);
     await outcome.undo?.revert();
 
     assert.deepEqual(calls.restoredCollections, [{ collectionIds: [42] }]);

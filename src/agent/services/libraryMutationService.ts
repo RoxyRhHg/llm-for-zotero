@@ -358,6 +358,13 @@ function buildMetadataUndo(
   return {
     toolName: "library_mutation",
     description: `Undo metadata edit for "${title}"`,
+    inverseOperations: [
+      {
+        type: "update_metadata",
+        itemId,
+        metadata: { ...fields, creators },
+      },
+    ],
     revert: async () => {
       const item = zoteroGateway.getItem(itemId);
       if (!item) return;
@@ -514,7 +521,11 @@ function buildCreateCollectionUndo(
   return {
     toolName: "library_mutation",
     inverseOperations: [
-      { type: "delete_collection", collectionId: collection.collectionId },
+      {
+        type: "delete_collection",
+        collectionId: collection.collectionId,
+        permanent: true,
+      },
     ],
     description: `Undo creation of collection "${collection.name}"`,
     revert: async () => {
@@ -567,6 +578,15 @@ function buildDeleteCollectionUndo(
     description: `Restore collection "${snapshot.name}"${
       parts.length ? ` with its ${parts.join(" and ")}` : ""
     }`,
+    inverseOperations: [
+      {
+        type: "restore_from_trash",
+        collectionIds: [snapshot.collectionId],
+        ...(snapshot.deleteItems && snapshot.itemIds.length
+          ? { itemIds: snapshot.itemIds }
+          : {}),
+      },
+    ],
     revert: async () => {
       await zoteroGateway.restoreCollections({
         collectionIds: [snapshot.collectionId],
@@ -856,6 +876,12 @@ export class LibraryMutationService {
             result.status === "trashed"
               ? {
                   toolName: "library_mutation",
+                  inverseOperations: [
+                    {
+                      type: "restore_from_trash" as const,
+                      savedSearchIds: [operation.savedSearchId],
+                    },
+                  ],
                   description: `Restore the saved search from the trash`,
                   revert: async () => {
                     await this.zoteroGateway.restoreSavedSearches({
@@ -922,12 +948,12 @@ export class LibraryMutationService {
             operationId: operation.id,
             result,
           },
-          // A rename is reversible by renaming back. A library-wide delete is
-          // not: which items carried the tag is gone with it, so it says so
-          // rather than offering an undo that would restore nothing.
+          // Only a rename is reversible by renaming back. A merge destroys
+          // the source/destination distinction, while a delete destroys the
+          // membership set; neither may advertise a lossy "undo".
           undo:
             result.status === "applied" &&
-            (operation.action === "rename" || operation.action === "merge") &&
+            operation.action === "rename" &&
             result.newTag
               ? {
                   toolName: "library_mutation",
@@ -950,14 +976,24 @@ export class LibraryMutationService {
                     });
                   },
                 }
-              : result.status === "applied" && operation.action === "delete"
+              : result.status === "applied" &&
+                  (operation.action === "delete" ||
+                    operation.action === "merge")
                 ? {
                     toolName: "library_mutation",
-                    irreversibleReason: `Deleting the tag "${operation.tag}" library-wide also discards which items carried it, so it cannot be restored.`,
-                    description: `Delete tag "${operation.tag}"`,
+                    irreversibleReason:
+                      operation.action === "delete"
+                        ? `Deleting the tag "${operation.tag}" library-wide also discards which items carried it, so it cannot be restored.`
+                        : `Merging the tag "${operation.tag}" into "${operation.newTag || "another tag"}" destroys which items originally carried each tag, so it cannot be separated safely.`,
+                    description:
+                      operation.action === "delete"
+                        ? `Delete tag "${operation.tag}"`
+                        : `Merge tag "${operation.tag}"`,
                     revert: async () => {
                       throw new Error(
-                        `Deleting a tag library-wide cannot be undone: which items carried "${operation.tag}" is not recorded anywhere.`,
+                        operation.action === "delete"
+                          ? `Deleting a tag library-wide cannot be undone: which items carried "${operation.tag}" is not recorded anywhere.`
+                          : `Merging tags cannot be undone safely because their original membership sets are no longer distinguishable.`,
                       );
                     },
                   }
@@ -1383,6 +1419,9 @@ export class LibraryMutationService {
           undo: importedIds.length
             ? {
                 toolName: "library_mutation",
+                inverseOperations: [
+                  { type: "trash_items" as const, itemIds: importedIds },
+                ],
                 description: `Trash the ${importedIds.length} imported item${
                   importedIds.length === 1 ? "" : "s"
                 }`,
@@ -1407,6 +1446,14 @@ export class LibraryMutationService {
             result.trashedCount > 0
               ? {
                   toolName: "library_mutation",
+                  inverseOperations: [
+                    {
+                      type: "restore_from_trash" as const,
+                      itemIds: result.items
+                        .filter((item) => item.status === "trashed")
+                        .map((item) => item.itemId),
+                    },
+                  ],
                   description: `Restore ${result.trashedCount} trashed item${
                     result.trashedCount === 1 ? "" : "s"
                   }`,
@@ -1454,6 +1501,24 @@ export class LibraryMutationService {
           undo: total
             ? {
                 toolName: "library_mutation",
+                inverseOperations: [
+                  ...(restoredItems.itemIds.length
+                    ? [
+                        {
+                          type: "trash_items" as const,
+                          itemIds: restoredItems.itemIds,
+                        },
+                      ]
+                    : []),
+                  ...collectionIds.map((collectionId) => ({
+                    type: "delete_collection" as const,
+                    collectionId,
+                  })),
+                  ...savedSearchIds.map((savedSearchId) => ({
+                    type: "delete_saved_search" as const,
+                    savedSearchId,
+                  })),
+                ],
                 description: `Move ${total} restored object${total === 1 ? "" : "s"} back to the trash`,
                 revert: async () => {
                   if (restoredItems.itemIds.length) {
@@ -1516,6 +1581,12 @@ export class LibraryMutationService {
             result.status === "deleted"
               ? {
                   toolName: "manage_attachments",
+                  inverseOperations: [
+                    {
+                      type: "restore_from_trash" as const,
+                      itemIds: [operation.attachmentId],
+                    },
+                  ],
                   description: `Restore deleted attachment: ${result.title}`,
                   revert: async () => {
                     await this.zoteroGateway.restoreItems({
@@ -1544,6 +1615,13 @@ export class LibraryMutationService {
             result.status === "renamed" && result.previousName
               ? {
                   toolName: "library_mutation",
+                  inverseOperations: [
+                    {
+                      type: "rename_attachment" as const,
+                      attachmentId: operation.attachmentId,
+                      newName: result.previousName,
+                    },
+                  ],
                   description: `Rename attachment back to "${result.previousName}"`,
                   revert: async () => {
                     await this.zoteroGateway.renameAttachment({
@@ -1573,6 +1651,13 @@ export class LibraryMutationService {
             result.status === "relinked" && result.previousPath
               ? {
                   toolName: "library_mutation",
+                  inverseOperations: [
+                    {
+                      type: "relink_attachment" as const,
+                      attachmentId: operation.attachmentId,
+                      newPath: result.previousPath,
+                    },
+                  ],
                   description: `Re-link attachment back to ${result.previousPath}`,
                   revert: async () => {
                     await this.zoteroGateway.relinkAttachment({
@@ -1602,6 +1687,16 @@ export class LibraryMutationService {
             result.succeeded > 0
               ? {
                   toolName: "import_local_files",
+                  inverseOperations: [
+                    {
+                      type: "trash_items" as const,
+                      itemIds: result.items
+                        .filter(
+                          (item) => item.status === "imported" && item.itemId,
+                        )
+                        .map((item) => item.itemId as number),
+                    },
+                  ],
                   description: `Trash ${result.succeeded} imported item${
                     result.succeeded === 1 ? "" : "s"
                   }`,

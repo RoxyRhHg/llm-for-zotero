@@ -57,6 +57,16 @@ export type ActionProgressEvent =
     }
   | { type: "status"; message: string };
 
+export type ActionCheckpoint = {
+  /** Absolute next item offset, not a page/event count. */
+  cursor: number;
+  /** Number of library objects actually changed so far. */
+  appliedCount: number;
+  totalCount?: number;
+  /** Stable action decisions needed to resume with the same behavior. */
+  plan?: Record<string, unknown>;
+};
+
 export type ActionServices = {
   queryService: LibraryQueryService;
   readService: LibraryReadService;
@@ -97,6 +107,8 @@ export type ActionExecutionContext = {
   libraryID: number;
   confirmationMode: ActionConfirmationMode;
   onProgress: (event: ActionProgressEvent) => void;
+  /** Awaited after a page has fully landed, before the next page starts. */
+  checkpoint?: (checkpoint: ActionCheckpoint) => Promise<void>;
   /**
    * Request confirmation from the user.  Called by ActionExecutor when a tool
    * requires HITL and confirmationMode is `"native_ui"` or `"mcp_response"`.

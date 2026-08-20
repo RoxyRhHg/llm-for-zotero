@@ -3771,7 +3771,9 @@ describe("primitive agent tools", function () {
       debug: () => undefined,
     };
     const registry = new AgentToolRegistry();
-    registry.register(createZoteroScriptTool());
+    registry.register(
+      createZoteroScriptTool({ allowUnsandboxedTestExecution: true }),
+    );
 
     const prepared = await registry.prepareExecution(
       {
@@ -3874,7 +3876,9 @@ env.log('updated');
       },
       debug: () => undefined,
     };
-    const scriptTool = createZoteroScriptTool();
+    const scriptTool = createZoteroScriptTool({
+      allowUnsandboxedTestExecution: true,
+    });
     const validated = scriptTool.validate({
       mode: "write",
       description: "Update then undo one fake item",
@@ -3905,7 +3909,9 @@ await item.saveTx();
   });
 
   it("zotero_script rejects write scripts without undo instrumentation", function () {
-    const tool = createZoteroScriptTool();
+    const tool = createZoteroScriptTool({
+      allowUnsandboxedTestExecution: true,
+    });
     const validation = tool.validate({
       mode: "write",
       description: "Unsafe direct write",
@@ -3917,7 +3923,9 @@ await item.saveTx();
   });
 
   it("zotero_script rejects write scripts that bypass note_write", function () {
-    const tool = createZoteroScriptTool();
+    const tool = createZoteroScriptTool({
+      allowUnsandboxedTestExecution: true,
+    });
     const validation = tool.validate({
       mode: "write",
       description: "Create a child note directly",

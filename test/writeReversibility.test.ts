@@ -61,6 +61,42 @@ describe("write reversibility policy", function () {
       // Zotero moves children onto the survivor and dedupes attachments by
       // hash, so the originals no longer exist to give back.
       assert.isTrue(isIrreversibleWrite("library_delete", { mode: "merge" }));
+      assert.isTrue(isIrreversibleWrite("tag_update", { action: "merge" }));
+    });
+
+    it("asks when no durable pre-image is guaranteed", function () {
+      assert.isTrue(
+        isIrreversibleWrite("saved_search_update", {
+          operation: { type: "save_saved_search", savedSearchId: 7 },
+        }),
+      );
+      assert.isTrue(
+        isIrreversibleWrite("attachment_update", { action: "relink" }),
+      );
+      assert.isTrue(isIrreversibleWrite("tag_update", { action: "setColor" }));
+      assert.isTrue(isIrreversibleWrite("annotate_pdf", {}));
+    });
+
+    it("sees irreversible operations behind a delegating facade", function () {
+      assert.isTrue(
+        isIrreversibleWrite("library_update", {
+          delegateName: "tag_update",
+          delegateInput: {
+            operation: { type: "update_library_tag", action: "merge" },
+          },
+        }),
+      );
+      assert.isTrue(
+        isIrreversibleWrite("library_delete", {
+          delegateName: "merge_items",
+          delegateInput: { operation: { type: "merge_items" } },
+        }),
+      );
+      assert.isTrue(
+        isIrreversibleWrite("attachment_update", {
+          operation: { type: "relink_attachment" },
+        }),
+      );
     });
 
     it("asks before a script or a shell command", function () {
@@ -89,7 +125,6 @@ describe("write reversibility policy", function () {
       ["library_delete", { mode: "restore" }],
       ["attachment_update", { action: "rename" }],
       ["saved_search_update", { action: "save" }],
-      ["annotate_pdf", {}],
     ];
 
     for (const [toolName, input] of reversible) {
@@ -161,6 +196,16 @@ describe("write reversibility policy", function () {
     it("yolo asks about nothing, including the irreversible", function () {
       assert.isFalse(writeNeedsConfirmation({ mode: "yolo", ...call }));
       assert.isFalse(writeNeedsConfirmation({ mode: "yolo", ...erase }));
+    });
+
+    it("always asks before resuming an interrupted batch", function () {
+      assert.isTrue(
+        writeNeedsConfirmation({
+          mode: "yolo",
+          toolName: "library_batch",
+          input: { kind: "resume", resumeJobId: "batch-auto_tag-1" },
+        }),
+      );
     });
   });
 

@@ -174,6 +174,13 @@ describe("attachment rename and relink", function () {
       );
 
       assert.exists(outcome.undo, "renaming recorded no inverse at all");
+      assert.deepEqual(outcome.undo?.inverseOperations, [
+        {
+          type: "rename_attachment",
+          attachmentId: 55,
+          newName: "old.pdf",
+        },
+      ]);
       await outcome.undo?.revert();
       assert.equal(att.renameCalls.at(-1)?.newName, "old.pdf");
     });
@@ -235,6 +242,13 @@ describe("attachment rename and relink", function () {
         { request: { conversationKey: 1, libraryID: 1 } } as never,
       );
       assert.exists(outcome.undo);
+      assert.deepEqual(outcome.undo?.inverseOperations, [
+        {
+          type: "relink_attachment",
+          attachmentId: 55,
+          newPath: "/Zotero/storage/ABCD/old.pdf",
+        },
+      ]);
       await outcome.undo?.revert();
       assert.equal(withFile.relinkCalls.at(-1), "/Zotero/storage/ABCD/old.pdf");
 

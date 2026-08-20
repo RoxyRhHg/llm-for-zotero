@@ -655,5 +655,57 @@ describe("model profile override", function () {
         ["ok"],
       );
     });
+
+    it("drops request-envelope keys from imported reasoning controls", function () {
+      const normalized = normalizeProfileOverride({
+        forModel: "local-model",
+        reasoning: {
+          kind: "select",
+          options: [
+            {
+              id: "high",
+              label: "High",
+              controls: {
+                body: {
+                  messages: [{ role: "user", content: "replace me" }],
+                  tools: [],
+                  stream: false,
+                  top_k: 40,
+                },
+              },
+            },
+          ],
+        },
+      });
+      assert.deepEqual(normalized?.reasoning?.options[0].controls?.body, {
+        top_k: 40,
+      });
+
+      const payload = buildReasoningPayload(
+        { provider: "local", level: "high" },
+        false,
+        "local-model",
+        "http://127.0.0.1:1234/v1",
+        "openai_chat_compat",
+        { profileOverride: normalized },
+      );
+      assert.deepEqual(payload.extra, { top_k: 40 });
+    });
+
+    it("drops imported reasoning ids that the preference store cannot retain", function () {
+      const normalized = normalizeProfileOverride({
+        reasoning: {
+          kind: "select",
+          options: [
+            { id: "valid", label: "Valid" },
+            { id: "INVALID VALUE", label: "Invalid" },
+          ],
+        },
+      });
+      assert.deepEqual(
+        normalized?.reasoning?.options.map((option) => option.id),
+        ["valid"],
+      );
+    });
   });
 });

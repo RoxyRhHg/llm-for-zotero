@@ -17,7 +17,10 @@ import {
   type ActionServices,
 } from "./actions";
 import { createLibraryBatchTool } from "./tools/write/libraryBatch";
-import { initAgentBatchJobStore } from "./store/batchJobStore";
+import {
+  initAgentBatchJobStore,
+  sweepInterruptedBatchJobs,
+} from "./store/batchJobStore";
 import { initAgentChangeJournal } from "./store/changeJournal";
 import { registerMcpServer, unregisterMcpServer } from "./mcp/server";
 import type {
@@ -112,6 +115,9 @@ async function createAgentSubsystemRuntime(
     }),
   );
   await initAgentBatchJobStore();
+  // Claim abandoned rows before the runtime is published. A deferred sweep
+  // can race with a newly started job and misclassify live work as failed.
+  await sweepInterruptedBatchJobs({ now: Date.now() });
   await initAgentChangeJournal();
 
   assertAgentInitCurrent(generation);

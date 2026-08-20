@@ -25,6 +25,7 @@ import { isLocalModelApiBase } from "../utils/providerPresets";
 import {
   normalizeProfileOverride,
   profileOverrideAppliesTo,
+  sanitizeUserRequestBody,
 } from "./profileOverride";
 import {
   applyControlPatch,
@@ -700,8 +701,12 @@ export function compileReasoningControls(
   ) {
     return null;
   }
-  const extra = applyControlPatch({}, controls);
-  removeControlRoots(extra, controls);
+  const patched = applyControlPatch({}, controls);
+  removeControlRoots(patched, controls);
+  // Capability data can come from persisted preferences as well as the
+  // bundled/remote registry. Keep the request envelope authoritative even if
+  // an older or hand-edited preference bypassed normalization.
+  const extra = sanitizeUserRequestBody(patched) || {};
   return {
     extra,
     omitTemperature: Boolean(controls.omitTemperature),

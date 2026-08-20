@@ -7760,6 +7760,8 @@ export async function retryLatestAssistantResponse(
       reasoning: effectiveRequestConfig.reasoning,
       temperature: effectiveRequestConfig.advanced?.temperature,
       maxTokens: effectiveRequestConfig.advanced?.maxTokens,
+      maxTokensExplicit:
+        effectiveRequestConfig.advanced?.maxTokensExplicit === true,
       inputTokenCap: effectiveRequestConfig.advanced?.inputTokenCap,
       profileOverride: effectiveRequestConfig.advanced?.profileOverride,
       inputMode: effectiveRequestConfig.advanced?.inputMode,
@@ -10311,6 +10313,8 @@ export async function sendQuestion(
       reasoning: effectiveRequestConfig.reasoning,
       temperature: effectiveRequestConfig.advanced?.temperature,
       maxTokens: effectiveRequestConfig.advanced?.maxTokens,
+      maxTokensExplicit:
+        effectiveRequestConfig.advanced?.maxTokensExplicit === true,
       inputTokenCap: effectiveRequestConfig.advanced?.inputTokenCap,
       profileOverride: effectiveRequestConfig.advanced?.profileOverride,
       inputMode: effectiveRequestConfig.advanced?.inputMode,

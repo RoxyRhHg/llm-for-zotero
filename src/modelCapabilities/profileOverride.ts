@@ -264,7 +264,7 @@ export function parseJsonObjectField(raw: string): {
       error: `${reserved.join(", ")} cannot be set here — the request builds these`,
     };
   }
-  return { value: sanitizeBody(parsed) || {} };
+  return { value: sanitizeUserRequestBody(parsed) || {} };
 }
 
 /** Render a parameter object back into the editor's JSON field. */
@@ -323,18 +323,22 @@ export function profileOverrideAppliesTo(
  * round-trip, this preserves the user's structure exactly: a literal `"a.b"`
  * key stays `"a.b"` rather than being rewritten into nesting.
  */
-function sanitizeBody(value: unknown): Record<string, unknown> | undefined {
+export function sanitizeUserRequestBody(
+  value: unknown,
+): Record<string, unknown> | undefined {
   if (!isRecord(value)) return undefined;
-  const cleaned = sanitizeRecord(value);
+  const cleaned = sanitizeRecord(value, true);
   return Object.keys(cleaned).length ? cleaned : undefined;
 }
 
 function sanitizeRecord(
   value: Record<string, unknown>,
+  stripReservedRoots = false,
 ): Record<string, unknown> {
   const out: Record<string, unknown> = {};
   for (const [key, entry] of Object.entries(value)) {
     if (isForbiddenPathSegment(key)) continue;
+    if (stripReservedRoots && isReservedRequestKey(key)) continue;
     out[key] = sanitizeValue(entry);
   }
   return out;
@@ -392,17 +396,18 @@ export function normalizeProfileOverride(
     const options = value.reasoning.options
       .filter(isRecord)
       .map((option) => {
-        const body = sanitizeBody(
+        const id = String(option.id || "").trim();
+        const body = sanitizeUserRequestBody(
           isRecord(option.controls) ? option.controls.body : undefined,
         );
         return {
-          id: String(option.id || "").trim(),
+          id,
           label: String(option.label || option.id || "").trim(),
           enabled: option.enabled !== false,
           ...(body ? { controls: { body } } : {}),
         };
       })
-      .filter((option) => Boolean(option.id));
+      .filter((option) => isValidReasoningLevelId(option.id));
     if (options.length) {
       result.reasoning = {
         kind: "select",
@@ -416,7 +421,7 @@ export function normalizeProfileOverride(
     }
   }
 
-  const extraBody = sanitizeBody(value.extraBody);
+  const extraBody = sanitizeUserRequestBody(value.extraBody);
   if (extraBody) result.extraBody = extraBody;
 
   return pruneProfileOverride(result);

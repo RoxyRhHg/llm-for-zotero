@@ -3,6 +3,7 @@ import type { AgentToolRegistry } from "../tools/registry";
 import type { ZoteroGateway } from "../services/zoteroGateway";
 import type {
   ActionConfirmationMode,
+  ActionCheckpoint,
   ActionExecutionContext,
   ActionProgressEvent,
   ActionServices,
@@ -27,6 +28,7 @@ export function buildActionExecutionContext(params: {
   confirmationMode: ActionConfirmationMode;
   runId?: string;
   onProgress?: (event: ActionProgressEvent) => void;
+  checkpoint?: (checkpoint: ActionCheckpoint) => Promise<void>;
   requestConfirmation?: ActionExecutionContext["requestConfirmation"];
 }): ActionExecutionContext {
   const { context } = params;
@@ -52,6 +54,7 @@ export function buildActionExecutionContext(params: {
      * collected by the caller (or dropped) rather than streamed.
      */
     onProgress: params.onProgress ?? (() => undefined),
+    checkpoint: params.checkpoint,
     /**
      * Actions ported to the paged tool never call this — the runtime owns
      * confirmation now. It throws rather than silently auto-approving,

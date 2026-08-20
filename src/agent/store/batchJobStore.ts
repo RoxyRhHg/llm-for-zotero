@@ -142,15 +142,51 @@ export async function advanceBatchJob(params: {
   jobId: string;
   cursor: number;
   appliedCount: number;
+  plan?: unknown;
+  totalCount?: number;
   now: number;
 }): Promise<void> {
   if (!hasDb()) return;
   await Zotero.DB.queryAsync(
     `UPDATE ${BATCH_JOBS_TABLE}
-     SET cursor = ?, applied_count = ?, updated_at = ?
+     SET cursor = ?, applied_count = ?,
+         plan_json = COALESCE(?, plan_json),
+         total_count = COALESCE(?, total_count),
+         updated_at = ?
      WHERE job_id = ?`,
-    [params.cursor, params.appliedCount, params.now, params.jobId],
+    [
+      params.cursor,
+      params.appliedCount,
+      params.plan === undefined ? null : JSON.stringify(params.plan),
+      params.totalCount ?? null,
+      params.now,
+      params.jobId,
+    ],
   );
+}
+
+/** Reopens an interrupted row only after an explicit resume confirmation. */
+export async function markBatchJobRunning(params: {
+  jobId: string;
+  now: number;
+}): Promise<boolean> {
+  if (!hasDb()) return true;
+  let claimed = false;
+  await Zotero.DB.executeTransaction(async () => {
+    const rows = (await Zotero.DB.queryAsync(
+      `SELECT status FROM ${BATCH_JOBS_TABLE} WHERE job_id = ?`,
+      [params.jobId],
+    )) as unknown as Array<{ status?: unknown }> | null;
+    if (!Array.isArray(rows) || rows[0]?.status !== "failed") return;
+    await Zotero.DB.queryAsync(
+      `UPDATE ${BATCH_JOBS_TABLE}
+       SET status = 'running', updated_at = ?
+       WHERE job_id = ? AND status = 'failed'`,
+      [params.now, params.jobId],
+    );
+    claimed = true;
+  });
+  return claimed;
 }
 
 export async function finishBatchJob(params: {
@@ -223,18 +259,25 @@ export async function sweepInterruptedBatchJobs(params: {
 }
 
 /**
- * Jobs that stopped part-way and still have work left.
+ * Jobs that stopped before the action reached its terminal commit.
  *
- * Used to tell the user what an interrupted run had already applied, so they
- * can decide whether to resume rather than re-running from zero over a
- * library that is already half-changed.
+ * Used to tell the user what an interrupted run had already applied. This
+ * includes a row whose cursor equals total_count: the process may have exited
+ * after the final page checkpoint but before the completed status was
+ * committed.
  */
-export async function listInterruptedBatchJobs(): Promise<BatchJobRecord[]> {
+export async function listInterruptedBatchJobs(
+  conversationKey?: number,
+): Promise<BatchJobRecord[]> {
   if (!hasDb()) return [];
+  const scoped =
+    Number.isFinite(conversationKey) && Number(conversationKey) > 0;
   const rows = (await Zotero.DB.queryAsync(
     `SELECT * FROM ${BATCH_JOBS_TABLE}
-     WHERE status = 'failed' AND (total_count IS NULL OR cursor < total_count)
+     WHERE status = 'failed'
+       ${scoped ? "AND conversation_key = ?" : ""}
      ORDER BY updated_at DESC`,
+    scoped ? [Math.floor(Number(conversationKey))] : [],
   )) as unknown as JobRow[] | null;
   return Array.isArray(rows) ? rows.map(toRecord) : [];
 }

@@ -88,6 +88,9 @@ describe("restore_from_trash", function () {
       { type: "restore_from_trash", itemIds: [11, 999] },
       context,
     );
+    assert.deepEqual(outcome.undo?.inverseOperations, [
+      { type: "trash_items", itemIds: [11] },
+    ]);
     await outcome.undo?.revert();
 
     assert.deepEqual(calls.trashed, [{ itemIds: [11] }]);

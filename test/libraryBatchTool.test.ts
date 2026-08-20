@@ -1,7 +1,9 @@
 import { assert } from "chai";
 import { createLibraryBatchTool } from "../src/agent/tools/write/libraryBatch";
+import type { LibraryBatchJobStore } from "../src/agent/tools/write/libraryBatch";
 import { ActionRegistry } from "../src/agent/actions/registry";
 import type { AgentToolContext } from "../src/agent/types";
+import type { BatchJobRecord } from "../src/agent/store/batchJobStore";
 
 /**
  * The batch engine was a complete propose/paginate/apply system that the
@@ -67,6 +69,30 @@ describe("library_batch", function () {
       services: {} as never,
       now: () => 1000,
     });
+  }
+
+  function makeJobStore(params?: {
+    record?: BatchJobRecord | null;
+    interrupted?: BatchJobRecord[];
+    onAdvance?: (
+      value: Parameters<LibraryBatchJobStore["advanceBatchJob"]>[0],
+    ) => void;
+    onMarkRunning?: (jobId: string) => void;
+    claim?: boolean;
+  }): LibraryBatchJobStore {
+    return {
+      createBatchJob: async () => undefined,
+      advanceBatchJob: async (value) => {
+        params?.onAdvance?.(value);
+      },
+      finishBatchJob: async () => undefined,
+      getBatchJob: async () => params?.record ?? null,
+      listInterruptedBatchJobs: async () => params?.interrupted ?? [],
+      markBatchJobRunning: async ({ jobId }) => {
+        params?.onMarkRunning?.(jobId);
+        return params?.claim ?? true;
+      },
+    };
   }
 
   it("lists the available jobs when the name is unknown", function () {
@@ -176,6 +202,228 @@ describe("library_batch", function () {
     assert.include(message, "model unreachable");
   });
 
+  it("awaits exact action checkpoints instead of guessing from progress events", async function () {
+    installMode("yolo");
+    const advances: Array<
+      Parameters<LibraryBatchJobStore["advanceBatchJob"]>[0]
+    > = [];
+    const actionRegistry = new ActionRegistry();
+    actionRegistry.register({
+      name: "auto_tag",
+      description: "Tag papers",
+      inputSchema: { type: "object" },
+      execute: async (_input: unknown, ctx: unknown) => {
+        const actionCtx = ctx as {
+          checkpoint: (value: unknown) => Promise<void>;
+          onProgress: (value: unknown) => void;
+        };
+        actionCtx.onProgress({
+          type: "step_done",
+          step: "LLM",
+          summary: "suggestions generated",
+        });
+        await actionCtx.checkpoint({
+          cursor: 20,
+          appliedCount: 17,
+          totalCount: 42,
+          plan: { remainingItemIds: [101, 102] },
+        });
+        return { ok: true, output: { tagged: 17, processed: 20 } };
+      },
+    } as never);
+    const tool = createLibraryBatchTool({
+      actionRegistry,
+      toolRegistry: {} as never,
+      zoteroGateway: {} as never,
+      services: {} as never,
+      now: () => 1000,
+      batchJobStore: makeJobStore({
+        onAdvance: (value) => advances.push(value),
+      }),
+    });
+    const validated = tool.validate({ job: "auto_tag", jobArgs: {} });
+    assert.isTrue(validated.ok);
+    if (!validated.ok) return;
+
+    await tool.execute(validated.value, context);
+
+    assert.lengthOf(advances, 1, "progress prose must not become a cursor");
+    assert.include(advances[0], {
+      cursor: 20,
+      appliedCount: 17,
+      totalCount: 42,
+    });
+    assert.deepEqual(advances[0].plan, { remainingItemIds: [101, 102] });
+  });
+
+  it("lists interrupted jobs without requiring yolo or confirmation", async function () {
+    installMode("safe");
+    const interrupted: BatchJobRecord = {
+      jobId: "batch-auto_tag-1",
+      conversationKey: 9,
+      action: "auto_tag",
+      inputJson: "{}",
+      planJson: JSON.stringify({ remainingItemIds: [3] }),
+      cursor: 2,
+      appliedCount: 1,
+      totalCount: 3,
+      status: "failed",
+      createdAt: 10,
+      updatedAt: 20,
+    };
+    const actionRegistry = new ActionRegistry();
+    const tool = createLibraryBatchTool({
+      actionRegistry,
+      toolRegistry: {} as never,
+      zoteroGateway: {} as never,
+      services: {} as never,
+      batchJobStore: makeJobStore({ interrupted: [interrupted] }),
+    });
+    const validated = tool.validate({ listInterrupted: true });
+    assert.isTrue(validated.ok);
+    if (!validated.ok) return;
+
+    assert.isFalse(
+      await tool.shouldRequireConfirmation?.(validated.value, context),
+    );
+    const result = (await tool.execute(validated.value, context)) as {
+      interruptedJobs: Array<Record<string, unknown>>;
+    };
+    assert.deepInclude(result.interruptedJobs[0], {
+      jobId: interrupted.jobId,
+      cursor: 2,
+      appliedCount: 1,
+    });
+  });
+
+  it("resumes only the frozen remaining item IDs and preserves cumulative progress", async function () {
+    installMode("yolo");
+    const record: BatchJobRecord = {
+      jobId: "batch-auto_tag-1",
+      conversationKey: 9,
+      action: "auto_tag",
+      inputJson: JSON.stringify({ scope: "all", pageSize: 20 }),
+      planJson: JSON.stringify({
+        remainingItemIds: [31, 32],
+        pageSize: 10,
+        tagsPerPaper: 4,
+      }),
+      cursor: 20,
+      appliedCount: 17,
+      totalCount: 22,
+      status: "failed",
+      createdAt: 10,
+      updatedAt: 20,
+    };
+    let resumedInput: Record<string, unknown> = {};
+    let marked = "";
+    const advances: Array<
+      Parameters<LibraryBatchJobStore["advanceBatchJob"]>[0]
+    > = [];
+    const actionRegistry = new ActionRegistry();
+    actionRegistry.register({
+      name: "auto_tag",
+      description: "Tag papers",
+      inputSchema: { type: "object" },
+      execute: async (input: unknown, ctx: unknown) => {
+        resumedInput = input as Record<string, unknown>;
+        await (
+          ctx as { checkpoint: (value: unknown) => Promise<void> }
+        ).checkpoint({
+          cursor: 2,
+          appliedCount: 2,
+          totalCount: 2,
+          plan: { remainingItemIds: [] },
+        });
+        return { ok: true, output: { tagged: 2, processed: 2 } };
+      },
+    } as never);
+    const tool = createLibraryBatchTool({
+      actionRegistry,
+      toolRegistry: {} as never,
+      zoteroGateway: {} as never,
+      services: {} as never,
+      now: () => 1000,
+      batchJobStore: makeJobStore({
+        record,
+        onAdvance: (value) => advances.push(value),
+        onMarkRunning: (jobId) => {
+          marked = jobId;
+        },
+      }),
+    });
+    const validated = tool.validate({ resumeJobId: record.jobId });
+    assert.isTrue(validated.ok);
+    if (!validated.ok) return;
+
+    const output = (await tool.execute(validated.value, context)) as Record<
+      string,
+      unknown
+    >;
+
+    assert.equal(marked, record.jobId);
+    assert.deepEqual(resumedInput._batchItemIds, [31, 32]);
+    assert.equal(resumedInput.startOffset, 0);
+    assert.equal(resumedInput.pageSize, 10);
+    assert.equal(resumedInput.tagsPerPaper, 4);
+    assert.include(advances[0], {
+      cursor: 22,
+      appliedCount: 19,
+      totalCount: 22,
+    });
+    assert.equal(output.appliedCount, 19);
+    assert.equal(output.cursor, 22);
+    assert.isTrue(output.resumed);
+  });
+
+  it("does not run a second concurrent resume after the durable claim is lost", async function () {
+    installMode("yolo");
+    const record: BatchJobRecord = {
+      jobId: "batch-auto_tag-claimed",
+      conversationKey: 9,
+      action: "auto_tag",
+      inputJson: "{}",
+      planJson: JSON.stringify({ remainingItemIds: [31] }),
+      cursor: 2,
+      appliedCount: 1,
+      totalCount: 3,
+      status: "failed",
+      createdAt: 10,
+      updatedAt: 20,
+    };
+    let executed = false;
+    const actionRegistry = new ActionRegistry();
+    actionRegistry.register({
+      name: "auto_tag",
+      description: "Tag papers",
+      inputSchema: { type: "object" },
+      execute: async () => {
+        executed = true;
+        return { ok: true, output: {} };
+      },
+    } as never);
+    const tool = createLibraryBatchTool({
+      actionRegistry,
+      toolRegistry: {} as never,
+      zoteroGateway: {} as never,
+      services: {} as never,
+      batchJobStore: makeJobStore({ record, claim: false }),
+    });
+    const validated = tool.validate({ resumeJobId: record.jobId });
+    assert.isTrue(validated.ok);
+    if (!validated.ok) return;
+
+    let message = "";
+    try {
+      await tool.execute(validated.value, context);
+    } catch (error) {
+      message = error instanceof Error ? error.message : String(error);
+    }
+
+    assert.isFalse(executed);
+    assert.include(message, "already running or was resumed elsewhere");
+  });
+
   /**
    * `discover_related` calls ctx.requestConfirmation directly — it is an
    * interactive review workflow, not a batch pass — so running it through a
@@ -231,5 +479,30 @@ describe("library_batch", function () {
     if (result.ok) return;
     assert.include(result.error, "auto_tag");
     assert.notInclude(result.error, "discover_related");
+  });
+
+  it("refuses audit-note creation outside the durable batch boundary", function () {
+    const actionRegistry = new ActionRegistry();
+    actionRegistry.register({
+      name: "audit_library",
+      description: "Audit metadata",
+      inputSchema: { type: "object" },
+      execute: async () => ({ ok: true, output: {} }),
+    } as never);
+    const tool = createLibraryBatchTool({
+      actionRegistry,
+      toolRegistry: {} as never,
+      zoteroGateway: {} as never,
+      services: {} as never,
+    });
+
+    const result = tool.validate({
+      job: "audit_library",
+      jobArgs: { scope: "all", saveNote: true },
+    });
+
+    assert.isFalse(result.ok);
+    if (result.ok) return;
+    assert.include(result.error, "not part of the durable batch transaction");
   });
 });

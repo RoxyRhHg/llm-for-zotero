@@ -39,7 +39,9 @@ describe("zotero_script cooperative cancellation", function () {
       Libraries: { userLibraryID: 1 },
       debug: () => undefined,
     };
-    const tool = createZoteroScriptTool();
+    const tool = createZoteroScriptTool({
+      allowUnsandboxedTestExecution: true,
+    });
     const validated = tool.validate({
       mode: "read",
       script,
@@ -74,9 +76,10 @@ describe("zotero_script cooperative cancellation", function () {
     assert.isBelow(value.after, value.before);
   });
 
-  it("admits the script may still be running after a timeout", async function () {
+  it("waits for an over-deadline script to settle before returning", async function () {
     this.timeout(10000);
     // timeoutMs clamps to a 1000ms floor, so the script must outlast that.
+    const startedAt = Date.now();
     const result = await run(
       "await new Promise((r) => setTimeout(r, 2500)); return 'done';",
       1000,
@@ -84,13 +87,17 @@ describe("zotero_script cooperative cancellation", function () {
 
     assert.include(String(result.error), "timed out");
     const output = String(result.output);
-    // "[Script timed out]" alone implied the script had stopped, so a user
-    // reading it had no reason to expect further changes to their library.
-    assert.include(output, "may still be running");
+    assert.isAtLeast(
+      Date.now() - startedAt,
+      2400,
+      "the tool must retain ownership until the script has finished",
+    );
+    assert.include(output, "allowed to settle");
     assert.include(output, "env.shouldStop()");
+    assert.equal(result.returnValue, "done");
   });
 
-  it("freezes the recorded undo state at the moment it gives up", async function () {
+  it("includes post-deadline snapshots in the recorded undo", async function () {
     this.timeout(10000);
     const items = new Map<number, unknown>();
     const snapshotted: number[] = [];
@@ -126,7 +133,9 @@ describe("zotero_script cooperative cancellation", function () {
       debug: () => undefined,
     };
 
-    const tool = createZoteroScriptTool();
+    const tool = createZoteroScriptTool({
+      allowUnsandboxedTestExecution: true,
+    });
     const validated = tool.validate({
       mode: "write",
       description: "snapshot, overrun, keep snapshotting",
@@ -150,25 +159,20 @@ describe("zotero_script cooperative cancellation", function () {
 
     assert.include(String(result.error), "timed out");
 
-    // The undo entry closes over the snapshot Map. If that Map is the live
-    // one, the abandoned script keeps adding to it, and reverting later would
-    // touch items the tool never reported and the user never approved.
     const entry = peekUndoEntry(context.request.conversationKey);
     assert.exists(entry, "a timed-out write script must still record an undo");
 
-    // Let the abandoned script run its post-timeout snapshots.
-    await new Promise((r) => setTimeout(r, 2000));
     assert.deepEqual(
       snapshotted,
       [1, 2, 3],
-      "the script really does keep running after the timeout",
+      "the tool must not return before later snapshots are recorded",
     );
 
     await entry?.revert();
     assert.deepEqual(
       restored.sort(),
-      [1],
-      "only the item snapshotted before the timeout may be reverted",
+      [1, 2, 3],
+      "every recorded mutation remains undoable when the tool returns",
     );
     clearUndoStack(context.request.conversationKey);
   });

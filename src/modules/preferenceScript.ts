@@ -1796,6 +1796,7 @@ export async function registerPrefsScripts(_window: Window | undefined | null) {
                   ? {
                       temperature: existing.temperature,
                       maxTokens: existing.maxTokens,
+                      maxTokensExplicit: existing.maxTokensExplicit,
                       inputTokenCap: existing.inputTokenCap,
                       inputMode: existing.inputMode,
                     }
@@ -2228,12 +2229,13 @@ export async function registerPrefsScripts(_window: Window | undefined | null) {
           profileEditor.refresh(resolveDetectedProfile());
         }
 
-        const commitAdvanced = () => {
+        const commitAdvanced = (maxTokensEdited = false) => {
           modelEntry.temperature = normalizeTemperature(tempField.input.value);
           modelEntry.maxTokens = normalizeMaxTokensForModel(
             maxTokField.input.value,
             modelEntry.model,
           );
+          if (maxTokensEdited) modelEntry.maxTokensExplicit = true;
           modelEntry.inputTokenCap = normalizeOptionalInputTokenCap(
             inputCapField.input.value,
           );
@@ -2269,12 +2271,16 @@ export async function registerPrefsScripts(_window: Window | undefined | null) {
           }
           persistGroups(groups);
         };
-        for (const f of [tempField, maxTokField, inputCapField]) {
-          f.input.addEventListener("change", commitAdvanced);
-          f.input.addEventListener("blur", commitAdvanced);
+        for (const f of [tempField, inputCapField]) {
+          f.input.addEventListener("change", () => commitAdvanced());
+          f.input.addEventListener("blur", () => commitAdvanced());
         }
-        inputModeSelect?.addEventListener("change", commitAdvanced);
-        protocolFieldSelect.addEventListener("change", commitAdvanced);
+        maxTokField.input.addEventListener("change", () =>
+          commitAdvanced(true),
+        );
+        maxTokField.input.addEventListener("blur", () => commitAdvanced(true));
+        inputModeSelect?.addEventListener("change", () => commitAdvanced());
+        protocolFieldSelect.addEventListener("change", () => commitAdvanced());
 
         const syncAdvAvailability = () => {
           const hasModel = Boolean(modelEntry.model.trim());

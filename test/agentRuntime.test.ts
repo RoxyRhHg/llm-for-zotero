@@ -886,6 +886,157 @@ describe("AgentRuntime", function () {
     }
   });
 
+  it("continues beyond one round segment while tools make new progress", async function () {
+    const restoreDb = installMockDb();
+    try {
+      const registry = new AgentToolRegistry();
+      registry.register({
+        spec: {
+          name: "read_chunk",
+          description: "read one distinct chunk",
+          inputSchema: { type: "object" },
+          mutability: "read",
+          requiresConfirmation: false,
+        },
+        validate: (args) => ({ ok: true, value: args }),
+        execute: async (input) => ({ chunk: input }),
+      });
+      const toolSteps: AgentModelStep[] = Array.from(
+        { length: MAX_AGENT_ROUNDS + 1 },
+        (_, index) => {
+          const call = {
+            id: `chunk-${index + 1}`,
+            name: "read_chunk",
+            arguments: { index: index + 1 },
+          };
+          return {
+            kind: "tool_calls" as const,
+            calls: [call],
+            assistantMessage: {
+              role: "assistant" as const,
+              content: "",
+              tool_calls: [call],
+            },
+          };
+        },
+      );
+      const runtime = new AgentRuntime({
+        registry,
+        adapterFactory: () =>
+          new MockAdapter(
+            toolSteps.concat({
+              kind: "final",
+              text: "All chunks synthesized.",
+              assistantMessage: {
+                role: "assistant",
+                content: "All chunks synthesized.",
+              },
+            }),
+            {
+              streaming: false,
+              toolCalls: true,
+              multimodal: false,
+            },
+          ),
+      });
+      const events: AgentEvent[] = [];
+
+      const outcome = await runtime.runTurn({
+        request: {
+          conversationKey: 171,
+          mode: "agent",
+          userText: "read every distinct chunk and synthesize",
+          model: "gpt-5.4",
+          apiBase: "",
+          apiKey: "test",
+        },
+        onEvent: (event) => {
+          events.push(event);
+        },
+      });
+
+      assert.equal(outcome.kind, "completed");
+      if (outcome.kind !== "completed") return;
+      assert.equal(outcome.text, "All chunks synthesized.");
+      assert.equal(
+        events.filter((event) => event.type === "tool_result").length,
+        MAX_AGENT_ROUNDS + 1,
+      );
+      assert.isTrue(
+        events.some(
+          (event) =>
+            event.type === "status" &&
+            event.text === "Checkpointed agent segment 1; continuing",
+        ),
+      );
+    } finally {
+      restoreDb();
+    }
+  });
+
+  it("stops segmented continuation when a full segment only repeats prior work", async function () {
+    const restoreDb = installMockDb();
+    try {
+      const registry = new AgentToolRegistry();
+      registry.register({
+        spec: {
+          name: "read_same_chunk",
+          description: "read a chunk",
+          inputSchema: { type: "object" },
+          mutability: "read",
+          requiresConfirmation: false,
+        },
+        validate: () => ({ ok: true, value: { index: 1 } }),
+        execute: async () => ({ chunk: "unchanged" }),
+      });
+      const repeatedSteps: AgentModelStep[] = Array.from(
+        { length: MAX_AGENT_ROUNDS * 2 },
+        (_, index) => {
+          const call = {
+            id: `repeat-${index + 1}`,
+            name: "read_same_chunk",
+            arguments: { index: 1 },
+          };
+          return {
+            kind: "tool_calls" as const,
+            calls: [call],
+            assistantMessage: {
+              role: "assistant" as const,
+              content: "",
+              tool_calls: [call],
+            },
+          };
+        },
+      );
+      const runtime = new AgentRuntime({
+        registry,
+        adapterFactory: () =>
+          new MockAdapter(repeatedSteps, {
+            streaming: false,
+            toolCalls: true,
+            multimodal: false,
+          }),
+      });
+
+      const outcome = await runtime.runTurn({
+        request: {
+          conversationKey: 172,
+          mode: "agent",
+          userText: "keep reading until done",
+          model: "gpt-5.4",
+          apiBase: "",
+          apiKey: "test",
+        },
+      });
+
+      assert.equal(outcome.kind, "completed");
+      if (outcome.kind !== "completed") return;
+      assert.include(outcome.text, "no new successful tool result");
+    } finally {
+      restoreDb();
+    }
+  });
+
   it("keeps assistant tool calls aligned with executed tool outputs when capped", async function () {
     const restoreDb = installMockDb();
     try {

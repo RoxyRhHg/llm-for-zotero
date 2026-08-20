@@ -3,9 +3,9 @@
  * privileged Gecko runtime. This is the "ultimate generalization" — the agent
  * can perform any operation the Zotero API supports.
  *
- * Two modes:
- * - "read": gather data across many items, no confirmation needed
- * - "write": executes directly with undo instrumentation required
+ * Both modes execute privileged code and therefore require source review.
+ * "read" means that no undo instrumentation is expected; it is not an
+ * authorization boundary and must never bypass confirmation.
  */
 import type { AgentToolDefinition, AgentToolContext } from "../../types";
 import { ok, fail, validateObject } from "../shared";
@@ -18,6 +18,11 @@ type ZoteroScriptInput = {
   script: string;
   description: string;
   timeoutMs: number;
+};
+
+type ZoteroScriptRuntimeOptions = {
+  /** Explicit unit-test seam. Production execution must fail closed. */
+  allowUnsandboxedTestExecution?: boolean;
 };
 
 type ItemSnapshot = {
@@ -106,14 +111,14 @@ const SNAPSHOT_FIELDS = [
  * declaration rather than a boundary — a read script could write freely.
  *
  * A `Cu.Sandbox` with an explicit global set is the fix, and Zotero's own
- * plugin loader uses exactly this recipe. Where the sandbox is unavailable
- * (older builds, the test harness) this falls back to the previous
- * behaviour rather than refusing to run at all — the read-mode guarantee is
- * then advertised as best-effort, which is what `sandboxAvailable` reports.
+ * plugin loader uses exactly this recipe. Production execution fails closed
+ * when that boundary is unavailable; unit tests use an explicit seam instead
+ * of silently weakening shipped behavior.
  */
 function compileScript(
   source: string,
   isWrite: boolean,
+  options: ZoteroScriptRuntimeOptions,
 ): (zotero: unknown, env: unknown) => Promise<unknown> {
   const cu = getComponentsUtils();
   const sandbox = createScriptSandbox(isWrite);
@@ -127,17 +132,22 @@ function compileScript(
       ) as (zotero: unknown, env: unknown) => Promise<unknown>;
       if (typeof factory === "function") return factory;
     } catch (error) {
-      // Loud, not silent: a sandbox that fails to compile means the mode
-      // boundary is not being enforced, and that should be discoverable.
+      // Loud, not silent: a sandbox that fails to compile means privileged
+      // source is no longer isolated from the plugin realm.
       Zotero.debug?.(
-        `[llm-for-zotero] zotero_script sandbox compile failed, falling back to the plugin realm: ${
+        `[llm-for-zotero] zotero_script sandbox compile failed: ${
           error instanceof Error ? error.message : String(error)
         }`,
       );
     }
   } else {
     Zotero.debug?.(
-      "[llm-for-zotero] zotero_script sandbox unavailable; running in the plugin realm. Zotero.DB is still withheld from write mode.",
+      "[llm-for-zotero] zotero_script sandbox unavailable; refusing privileged execution.",
+    );
+  }
+  if (!options.allowUnsandboxedTestExecution) {
+    throw new Error(
+      "Zotero script sandbox is unavailable. The script was not executed.",
     );
   }
   const AsyncFunction = Object.getPrototypeOf(async function () {}).constructor;
@@ -198,8 +208,6 @@ function createScriptSandbox(isWrite: boolean): unknown | null {
     });
     Object.assign(sandbox, {
       Zotero: buildScriptZotero(isWrite),
-      IOUtils: (globalThis as any).IOUtils,
-      PathUtils: (globalThis as any).PathUtils,
       setTimeout: (globalThis as any).setTimeout,
       clearTimeout: (globalThis as any).clearTimeout,
       console: (globalThis as any).console,
@@ -452,6 +460,7 @@ async function executeScript(params: {
   mode: "read" | "write";
   timeoutMs: number;
   libraryID: number;
+  runtimeOptions: ZoteroScriptRuntimeOptions;
 }): Promise<ScriptResult> {
   const logBuffer: string[] = [];
   const snapshots = new Map<number, ItemSnapshot>();
@@ -468,11 +477,10 @@ async function executeScript(params: {
     /**
      * True once the script has run past its time budget.
      *
-     * The timeout is a race, not a kill: JavaScript cannot interrupt a
-     * running function, so when the budget expires the tool reports failure
-     * while the script keeps going and keeps mutating the library. A loop
-     * that checks this can stop at a clean boundary and return what it
-     * finished, instead of being abandoned mid-way.
+     * JavaScript cannot interrupt a running function that owns live Zotero
+     * objects. When the budget expires the tool keeps waiting for the script
+     * to settle before returning. A loop that checks this can stop at a clean
+     * boundary promptly instead of holding the request open indefinitely.
      */
     shouldStop: () => Date.now() >= deadline,
     /** Milliseconds left before `shouldStop()` starts returning true. */
@@ -501,7 +509,7 @@ async function executeScript(params: {
   };
 
   try {
-    const fn = compileScript(params.script, isWrite);
+    const fn = compileScript(params.script, isWrite, params.runtimeOptions);
 
     let timeoutHandle: ReturnType<typeof setTimeout> | undefined;
     const timeoutPromise = new Promise<"timeout">((resolve) => {
@@ -520,19 +528,31 @@ async function executeScript(params: {
       if (timeoutHandle !== undefined) clearTimeout(timeoutHandle);
     }
     if (raceResult === "timeout") {
-      // The script is still running -- nothing here can stop it. Freeze what
-      // has been recorded so far, because the live Map and array keep being
-      // written by the abandoned script, and the undo entry closes over
-      // them: without a copy, what "undo" does would depend on when the user
-      // happened to click it.
-      const frozenSnapshots = new Map(snapshots);
-      const frozenUndoSteps = [...undoSteps];
+      // JavaScript cannot be force-interrupted safely while it owns live
+      // Zotero objects. Keep ownership of this frame until it settles so the
+      // tool never returns while writes continue behind the user's back and
+      // so every recorded undo step is included.
+      let settledValue: unknown;
+      try {
+        settledValue = await resultPromise;
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        return {
+          output:
+            logBuffer.join("\n") +
+            `\n[Script exceeded its ${params.timeoutMs}ms deadline and then failed: ${message}]`,
+          snapshots,
+          undoSteps,
+          error: message,
+        };
+      }
       return {
         output:
           logBuffer.join("\n") +
-          "\n[Script timed out. It may still be running and still changing the library; only the changes recorded before the timeout can be undone. Check env.shouldStop() inside long loops and return early so this cannot happen.]",
-        snapshots: frozenSnapshots,
-        undoSteps: frozenUndoSteps,
+          `\n[Script exceeded its ${params.timeoutMs}ms deadline but was allowed to settle before this result was returned. Check env.shouldStop() inside long loops and return early.]`,
+        returnValue: settledValue,
+        snapshots,
+        undoSteps,
         error: `Script timed out after ${params.timeoutMs}ms`,
       };
     }
@@ -676,19 +696,19 @@ several areas have no typed tool at all — reach for them directly:
 
 // ── Tool definition ─────────────────────────────────────────────────────────
 
-export function createZoteroScriptTool(): AgentToolDefinition<
-  ZoteroScriptInput,
-  unknown
-> {
+export function createZoteroScriptTool(
+  runtimeOptions: ZoteroScriptRuntimeOptions = {},
+): AgentToolDefinition<ZoteroScriptInput, unknown> {
   return {
     spec: {
       name: "zotero_script",
       description:
         "Execute a JavaScript script inside Zotero's runtime with full API access. " +
-        "Two modes: mode:'read' for gathering data across many items (no confirmation); " +
+        "All scripts require source review because the Zotero API is privileged. " +
+        "Two modes: mode:'read' for gathering data without undo instrumentation; " +
         "mode:'write' for mutations (runs directly with undo support; env.snapshot(item) or env.addUndoStep(fn) is required). " +
         "The script receives the global Zotero object and an env helper (env.log, env.snapshot, env.addUndoStep, env.libraryID, env.shouldStop, env.remainingMs). " +
-        "Long loops must check env.shouldStop() and return early: the timeout stops waiting for the script but cannot stop the script itself. " +
+        "Long loops must check env.shouldStop() and return early; an over-deadline script is allowed to settle before the tool returns. " +
         "Not for ordinary Zotero paper/library reading when semantic Zotero tools can answer.",
       inputSchema: {
         type: "object",
@@ -719,7 +739,7 @@ export function createZoteroScriptTool(): AgentToolDefinition<
         },
       },
       mutability: "write",
-      requiresConfirmation: false,
+      requiresConfirmation: true,
     },
 
     guidance: {
@@ -813,12 +833,12 @@ export function createZoteroScriptTool(): AgentToolDefinition<
     /**
      * Write-mode scripts mutate the live library through privileged JS, so the
      * source is the only meaningful thing to approve — a model-authored
-     * one-line description is not consent. Read mode stays frictionless; the
-     * fact that a read-mode script *can* still write is not fixed by a card,
-     * it is fixed by sandboxing the evaluator.
+     * one-line description is not consent. Read mode only relaxes undo
+     * instrumentation; it does not make the full Zotero API structurally
+     * immutable, so its source must be reviewed too.
      */
-    shouldRequireConfirmation(input) {
-      return input.mode === "write";
+    shouldRequireConfirmation() {
+      return true;
     },
 
     createPendingAction(input) {
@@ -860,6 +880,7 @@ export function createZoteroScriptTool(): AgentToolDefinition<
         mode: input.mode,
         timeoutMs: input.timeoutMs,
         libraryID,
+        runtimeOptions,
       });
 
       // Register undo for write mode

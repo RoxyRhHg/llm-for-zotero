@@ -614,6 +614,41 @@ function isSuccessfulFileIoWrite(record: {
   );
 }
 
+function stabilizeProgressValue(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(stabilizeProgressValue);
+  if (!value || typeof value !== "object") return value;
+  const record = value as Record<string, unknown>;
+  const stable: Record<string, unknown> = {};
+  for (const key of Object.keys(record).sort()) {
+    if (record[key] !== undefined) {
+      stable[key] = stabilizeProgressValue(record[key]);
+    }
+  }
+  return stable;
+}
+
+function buildToolProgressFingerprint(record: {
+  name: string;
+  effect?: AgentToolEffect;
+  input?: unknown;
+  content?: unknown;
+}): string {
+  try {
+    return JSON.stringify(
+      stabilizeProgressValue({
+        name: record.name,
+        effect: record.effect,
+        input: record.input,
+        content: record.content,
+      }),
+    );
+  } catch {
+    return `${record.name}:${String(record.effect || "read")}:${String(
+      record.input,
+    )}:${String(record.content)}`;
+  }
+}
+
 export class AgentRuntime {
   private readonly registry: AgentToolRegistry;
   private readonly adapterFactory: AgentRuntimeDeps["adapterFactory"];
@@ -805,6 +840,7 @@ export class AgentRuntime {
       const toolExecutionRecords: Array<{
         name: string;
         ok: boolean;
+        mutability?: "read" | "write";
         effect?: AgentToolEffect;
         input?: unknown;
         content?: unknown;
@@ -1030,6 +1066,23 @@ export class AgentRuntime {
           ? []
           : [currentUserTranscriptMessage]),
       ];
+      let persistedTranscriptMessageCount = 0;
+      const persistTranscriptCheckpoint = async (): Promise<void> => {
+        const pending = newTranscriptMessages.slice(
+          persistedTranscriptMessageCount,
+        );
+        if (!pending.length) return;
+        await persistIfLive(() =>
+          appendAgentTranscriptMessages({
+            conversationKey: request.conversationKey,
+            compatibilityKey: transcriptCompatibilityKey,
+            messages: turnPathRedactor.redactTerminalValue(pending),
+          }),
+        );
+        if (writeAllowed()) {
+          persistedTranscriptMessageCount = newTranscriptMessages.length;
+        }
+      };
 
       for (const skillId of matchedSkills) {
         await emit({ type: "status", text: `Skill activated: ${skillId}` });
@@ -1104,15 +1157,7 @@ export class AgentRuntime {
               activities: pendingReadActivities,
             }),
           );
-          await persistIfLive(() =>
-            appendAgentTranscriptMessages({
-              conversationKey: request.conversationKey,
-              compatibilityKey: transcriptCompatibilityKey,
-              messages: turnPathRedactor.redactTerminalValue(
-                newTranscriptMessages,
-              ),
-            }),
-          );
+          await persistTranscriptCheckpoint();
           if (status === "completed" && redactedFinalText) {
             await persistIfLive(() =>
               recordAgentTurn(
@@ -1523,6 +1568,7 @@ export class AgentRuntime {
         toolExecutionRecords.push({
           name: toolResult.name,
           ok: toolResult.ok,
+          mutability: executedCall.toolDefinition?.spec.mutability,
           effect: toolResult.effect,
           input: executedCall.input,
           content: toolResult.content,
@@ -1764,74 +1810,155 @@ export class AgentRuntime {
           text: stepStreamedText,
         });
       };
-      for (let round = 1; round <= maxRounds; round += 1) {
-        let stepResult: { step: AgentModelStep; stepStreamedText: string };
-        try {
-          stepResult = await runModelStep(
-            round,
-            round === 1
-              ? "Running agent"
-              : `Continuing agent (${round}/${maxRounds})`,
-          );
-        } catch (err) {
-          if (err instanceof AgentPromptBudgetError) {
-            return completeRun(err.message, "failed");
-          }
-          throw err;
-        }
-        const { step, stepStreamedText } = stepResult;
-        if (step.kind === "final") {
-          if (
-            intent.requiresFullPaperRead &&
-            hasPaperReadScope &&
-            !hasFullReadAttempt()
-          ) {
-            await rollbackCommittedStreamedText(stepStreamedText);
-            if (!fullReadCorrectionUsed) {
-              fullReadCorrectionUsed = true;
-              const assistantCorrectionMessage: AgentModelMessage =
-                step.assistantMessage ?? {
-                  role: "assistant",
-                  content: step.text || stepStreamedText,
-                };
-              const userCorrectionMessage: AgentModelMessage = {
-                role: "user",
-                content:
-                  "Correction for this turn: the user explicitly requested exhaustive full-text reading. Call `paper_read({ mode:'full' })` for the active or explicitly targeted paper now. Overview and targeted retrieval do not satisfy this request. Preserve the returned coverage receipt, and if it is partial or unreadable, state that limitation instead of claiming the whole text was read.",
-              };
-              messages.push(assistantCorrectionMessage, userCorrectionMessage);
-              newTranscriptMessages.push(
-                assistantCorrectionMessage,
-                userCorrectionMessage,
-              );
-              continue;
-            }
-            return completeRun(
-              "I could not complete the requested full-text read because the model did not call `paper_read({ mode:'full' })` after being corrected.",
-              "failed",
+      let round = 0;
+      let segment = 1;
+      const seenProgressFingerprints = new Set<string>();
+      while (true) {
+        const segmentRecordStart = toolExecutionRecords.length;
+        for (
+          let segmentRound = 1;
+          segmentRound <= maxRounds;
+          segmentRound += 1
+        ) {
+          round += 1;
+          let stepResult: { step: AgentModelStep; stepStreamedText: string };
+          try {
+            stepResult = await runModelStep(
+              round,
+              round === 1
+                ? "Running agent"
+                : segment === 1
+                  ? `Continuing agent (${segmentRound}/${maxRounds})`
+                  : `Continuing agent (segment ${segment}, ${segmentRound}/${maxRounds})`,
             );
+          } catch (err) {
+            if (err instanceof AgentPromptBudgetError) {
+              return completeRun(err.message, "failed");
+            }
+            throw err;
           }
-          if (
-            requiresFileNoteWrite &&
-            !hasSuccessfulFileWrite() &&
-            isNotesDirectoryConfigured()
-          ) {
-            await rollbackCommittedStreamedText(stepStreamedText);
-            if (!noteWriteCorrectionUsed) {
-              noteWriteCorrectionUsed = true;
+          const { step, stepStreamedText } = stepResult;
+          if (step.kind === "final") {
+            if (
+              intent.requiresFullPaperRead &&
+              hasPaperReadScope &&
+              !hasFullReadAttempt()
+            ) {
+              await rollbackCommittedStreamedText(stepStreamedText);
+              if (!fullReadCorrectionUsed) {
+                fullReadCorrectionUsed = true;
+                const assistantCorrectionMessage: AgentModelMessage =
+                  step.assistantMessage ?? {
+                    role: "assistant",
+                    content: step.text || stepStreamedText,
+                  };
+                const userCorrectionMessage: AgentModelMessage = {
+                  role: "user",
+                  content:
+                    "Correction for this turn: the user explicitly requested exhaustive full-text reading. Call `paper_read({ mode:'full' })` for the active or explicitly targeted paper now. Overview and targeted retrieval do not satisfy this request. Preserve the returned coverage receipt, and if it is partial or unreadable, state that limitation instead of claiming the whole text was read.",
+                };
+                messages.push(
+                  assistantCorrectionMessage,
+                  userCorrectionMessage,
+                );
+                newTranscriptMessages.push(
+                  assistantCorrectionMessage,
+                  userCorrectionMessage,
+                );
+                continue;
+              }
+              return completeRun(
+                "I could not complete the requested full-text read because the model did not call `paper_read({ mode:'full' })` after being corrected.",
+                "failed",
+              );
+            }
+            if (
+              requiresFileNoteWrite &&
+              !hasSuccessfulFileWrite() &&
+              isNotesDirectoryConfigured()
+            ) {
+              await rollbackCommittedStreamedText(stepStreamedText);
+              if (!noteWriteCorrectionUsed) {
+                noteWriteCorrectionUsed = true;
+                const assistantCorrectionMessage: AgentModelMessage =
+                  step.assistantMessage ?? {
+                    role: "assistant",
+                    content: stepStreamedText,
+                  };
+                const userCorrectionMessage: AgentModelMessage = {
+                  role: "user",
+                  content:
+                    'Correction for this turn: the user\'s request requires writing a Markdown note to the configured notes directory. Call `file_io` with `action: "write"` now, using the configured notes directory/default target path and a clear `.md` filename.' +
+                    (noteWritePolicy
+                      ? ` Default target path: ${noteWritePolicy.defaultTargetPath}.`
+                      : "") +
+                    " Do not put the note body in chat. If a write is impossible, explain the setup problem briefly.",
+                };
+                messages.push(
+                  assistantCorrectionMessage,
+                  userCorrectionMessage,
+                );
+                newTranscriptMessages.push(
+                  assistantCorrectionMessage,
+                  userCorrectionMessage,
+                );
+                continue;
+              }
+              const nickname = getNotesDirectoryNickname().trim();
+              const targetLabel = nickname ? `${nickname} note` : "note";
+              return completeRun(
+                `I could not complete the ${targetLabel} write because the model did not call \`file_io({ action:'write', filePath, content })\` after being corrected.`,
+                "failed",
+              );
+            }
+            // Zotero-write guard. The turn already refuses to finalize on an
+            // unfulfilled file_io write or full-text read; a library mutation
+            // that reported `effect:"none"` had no such check, which is how a
+            // move of zero items could be summarized as done (issue #374).
+            //
+            // This corrects once and then accepts, rather than failing the run:
+            // a zero-effect write is frequently legitimate ("they were already
+            // in that collection"), and the goal is an accurate report, not a
+            // dead turn.
+            // Only writes that were NOT superseded by a later successful call
+            // of the same tool. `toolExecutionRecords` spans the whole turn, so
+            // filtering it naively meant a first attempt that failed and was
+            // then correctly retried still produced "ran but changed nothing"
+            // — and `library_update` covers tags, collections and metadata, so
+            // one legitimately no-op call beside an applied one hit it too.
+            const supersededTools = new Set(
+              toolExecutionRecords
+                .filter(
+                  (record) =>
+                    record.ok &&
+                    (record.effect === "applied" ||
+                      record.effect === "partial"),
+                )
+                .map((record) => record.name),
+            );
+            const zeroEffectWrites = toolExecutionRecords.filter(
+              (record) =>
+                record.ok &&
+                record.effect === "none" &&
+                !supersededTools.has(record.name),
+            );
+            if (zeroEffectWrites.length && !zeroEffectWriteCorrectionUsed) {
+              zeroEffectWriteCorrectionUsed = true;
+              await rollbackCommittedStreamedText(stepStreamedText);
               const assistantCorrectionMessage: AgentModelMessage =
                 step.assistantMessage ?? {
                   role: "assistant",
                   content: stepStreamedText,
                 };
+              const names = Array.from(
+                new Set(zeroEffectWrites.map((record) => record.name)),
+              ).join(", ");
               const userCorrectionMessage: AgentModelMessage = {
                 role: "user",
                 content:
-                  'Correction for this turn: the user\'s request requires writing a Markdown note to the configured notes directory. Call `file_io` with `action: "write"` now, using the configured notes directory/default target path and a clear `.md` filename.' +
-                  (noteWritePolicy
-                    ? ` Default target path: ${noteWritePolicy.defaultTargetPath}.`
-                    : "") +
-                  " Do not put the note body in chat. If a write is impossible, explain the setup problem briefly.",
+                  `Correction for this turn: ${names} ran but changed nothing in the library. ` +
+                  "Read the per-row `reason` values in that tool result. Either fix the cause and retry (for example resolve the correct collection ID, or target items of a type the operation accepts), or tell the user plainly that nothing changed and why. " +
+                  "Do not report the request as completed.",
               };
               messages.push(assistantCorrectionMessage, userCorrectionMessage);
               newTranscriptMessages.push(
@@ -1840,179 +1967,150 @@ export class AgentRuntime {
               );
               continue;
             }
-            const nickname = getNotesDirectoryNickname().trim();
-            const targetLabel = nickname ? `${nickname} note` : "note";
-            return completeRun(
-              `I could not complete the ${targetLabel} write because the model did not call \`file_io({ action:'write', filePath, content })\` after being corrected.`,
-              "failed",
+            // Shallow-answer guard: a collection/tag-scoped evidence question
+            // must not finalize without library evidence. One correction turn,
+            // then the next final is accepted unconditionally (no failure
+            // branch — unlike the full-read guard, a degraded answer with
+            // disclosed coverage beats an aborted run).
+            const libraryScoped = Boolean(
+              request.selectedCollectionContexts?.length ||
+              request.selectedTagContexts?.length,
             );
+            if (
+              libraryScoped &&
+              !shallowLibraryCorrectionUsed &&
+              // On the last round a correction could never be acted on — the
+              // loop would exit into the round-exhaustion failure, discarding
+              // a usable streamed answer.
+              segmentRound < maxRounds &&
+              isEvidenceSeekingTurn(request) &&
+              // Follow-up turns legitimately answer from evidence gathered in
+              // earlier turns; do not roll those back.
+              !transcriptShowsEvidenceReads(transcriptMessagesForPrompt)
+            ) {
+              const shallowSignal =
+                findLibraryRetrieveShallowSignal(toolExecutionRecords);
+              const classifiedRetrieval =
+                request.classifiedIntent?.retrievalIntent;
+              const answeredShallow =
+                !shallowSignal.ranRetrieveFamily ||
+                (shallowSignal.lastRetrieveShallow &&
+                  (classifiedRetrieval === "summarize" ||
+                    classifiedRetrieval === "verify"));
+              if (answeredShallow) {
+                shallowLibraryCorrectionUsed = true;
+                await rollbackCommittedStreamedText(stepStreamedText);
+                const assistantCorrectionMessage: AgentModelMessage =
+                  step.assistantMessage ?? {
+                    role: "assistant",
+                    content: step.text || stepStreamedText,
+                  };
+                const userCorrectionMessage: AgentModelMessage = {
+                  role: "user",
+                  content:
+                    "Correction for this turn: the question targets the selected collection/tag scope and needs library evidence. Call `library_retrieve` scoped to the selected collections/tags now (intent:'summarize' for synthesis or theme questions, 'enumerate' for which-papers questions; depth:'evidence'), then answer from the returned evidence. Include the coverage line (papers planned / body evidence read / metadata-only) in the final answer; if coverage is partial, name what is missing instead of generalizing.",
+                };
+                messages.push(
+                  assistantCorrectionMessage,
+                  userCorrectionMessage,
+                );
+                newTranscriptMessages.push(
+                  assistantCorrectionMessage,
+                  userCorrectionMessage,
+                );
+                continue;
+              }
+            }
+            return emitFinalStep(step, stepStreamedText);
           }
-          // Zotero-write guard. The turn already refuses to finalize on an
-          // unfulfilled file_io write or full-text read; a library mutation
-          // that reported `effect:"none"` had no such check, which is how a
-          // move of zero items could be summarized as done (issue #374).
-          //
-          // This corrects once and then accepts, rather than failing the run:
-          // a zero-effect write is frequently legitimate ("they were already
-          // in that collection"), and the goal is an accurate report, not a
-          // dead turn.
-          // Only writes that were NOT superseded by a later successful call
-          // of the same tool. `toolExecutionRecords` spans the whole turn, so
-          // filtering it naively meant a first attempt that failed and was
-          // then correctly retried still produced "ran but changed nothing"
-          // — and `library_update` covers tags, collections and metadata, so
-          // one legitimately no-op call beside an applied one hit it too.
-          const supersededTools = new Set(
-            toolExecutionRecords
-              .filter(
-                (record) =>
-                  record.ok &&
-                  (record.effect === "applied" || record.effect === "partial"),
-              )
-              .map((record) => record.name),
-          );
-          const zeroEffectWrites = toolExecutionRecords.filter(
+
+          // The step returned tool_calls, not a final answer.  Any text the
+          // model streamed during this step is intermediate "thinking" text
+          // (e.g. "Let me read more of the paper...") that should appear in
+          // the agent trace but NOT in the final chat answer.  Roll it back.
+          await rollbackCommittedStreamedText(stepStreamedText);
+
+          const calls = step.calls.slice(0, maxToolCallsPerRound);
+          const assistantToolMessage: AgentModelMessage = {
+            ...step.assistantMessage,
+            tool_calls: Array.isArray(step.assistantMessage.tool_calls)
+              ? step.assistantMessage.tool_calls.slice(0, maxToolCallsPerRound)
+              : step.assistantMessage.tool_calls,
+          };
+          messages.push(assistantToolMessage);
+          newTranscriptMessages.push(assistantToolMessage);
+          if (!calls.length) break;
+          for (const call of calls) {
+            const outcome = await executeToolWorkflow(call, round, {
+              modelCallId: call.id,
+            });
+            if (outcome.delivery) {
+              const toolMessage: AgentModelMessage = {
+                role: "tool",
+                tool_call_id: outcome.delivery.callId,
+                name: outcome.delivery.name,
+                content: JSON.stringify(
+                  outcome.delivery.content ?? {},
+                  null,
+                  2,
+                ),
+              };
+              messages.push(toolMessage);
+              newTranscriptMessages.push(toolMessage);
+              for (const followupMessage of outcome.delivery.followupMessages) {
+                messages.push(followupMessage);
+                newTranscriptMessages.push(followupMessage);
+              }
+            }
+            if (outcome.stopRun) {
+              const stopFinalText = outcome.finalText || currentAnswerText;
+              if (stopFinalText) {
+                newTranscriptMessages.push({
+                  role: "assistant",
+                  content: stopFinalText,
+                });
+              }
+              return completeRun(stopFinalText, "completed");
+            }
+            if (consecutiveToolErrors >= 3) {
+              const finalText =
+                currentAnswerText ||
+                "Agent stopped after repeated tool errors. Please adjust the request and try again.";
+              return completeRun(finalText, "failed");
+            }
+          }
+        }
+
+        const newFingerprints = toolExecutionRecords
+          .slice(segmentRecordStart)
+          .filter(
             (record) =>
               record.ok &&
-              record.effect === "none" &&
-              !supersededTools.has(record.name),
-          );
-          if (zeroEffectWrites.length && !zeroEffectWriteCorrectionUsed) {
-            zeroEffectWriteCorrectionUsed = true;
-            await rollbackCommittedStreamedText(stepStreamedText);
-            const assistantCorrectionMessage: AgentModelMessage =
-              step.assistantMessage ?? {
-                role: "assistant",
-                content: stepStreamedText,
-              };
-            const names = Array.from(
-              new Set(zeroEffectWrites.map((record) => record.name)),
-            ).join(", ");
-            const userCorrectionMessage: AgentModelMessage = {
-              role: "user",
-              content:
-                `Correction for this turn: ${names} ran but changed nothing in the library. ` +
-                "Read the per-row `reason` values in that tool result. Either fix the cause and retry (for example resolve the correct collection ID, or target items of a type the operation accepts), or tell the user plainly that nothing changed and why. " +
-                "Do not report the request as completed.",
-            };
-            messages.push(assistantCorrectionMessage, userCorrectionMessage);
-            newTranscriptMessages.push(
-              assistantCorrectionMessage,
-              userCorrectionMessage,
-            );
-            continue;
-          }
-          // Shallow-answer guard: a collection/tag-scoped evidence question
-          // must not finalize without library evidence. One correction turn,
-          // then the next final is accepted unconditionally (no failure
-          // branch — unlike the full-read guard, a degraded answer with
-          // disclosed coverage beats an aborted run).
-          const libraryScoped = Boolean(
-            request.selectedCollectionContexts?.length ||
-            request.selectedTagContexts?.length,
-          );
-          if (
-            libraryScoped &&
-            !shallowLibraryCorrectionUsed &&
-            // On the last round a correction could never be acted on — the
-            // loop would exit into the round-exhaustion failure, discarding
-            // a usable streamed answer.
-            round < maxRounds &&
-            isEvidenceSeekingTurn(request) &&
-            // Follow-up turns legitimately answer from evidence gathered in
-            // earlier turns; do not roll those back.
-            !transcriptShowsEvidenceReads(transcriptMessagesForPrompt)
-          ) {
-            const shallowSignal =
-              findLibraryRetrieveShallowSignal(toolExecutionRecords);
-            const classifiedRetrieval =
-              request.classifiedIntent?.retrievalIntent;
-            const answeredShallow =
-              !shallowSignal.ranRetrieveFamily ||
-              (shallowSignal.lastRetrieveShallow &&
-                (classifiedRetrieval === "summarize" ||
-                  classifiedRetrieval === "verify"));
-            if (answeredShallow) {
-              shallowLibraryCorrectionUsed = true;
-              await rollbackCommittedStreamedText(stepStreamedText);
-              const assistantCorrectionMessage: AgentModelMessage =
-                step.assistantMessage ?? {
-                  role: "assistant",
-                  content: step.text || stepStreamedText,
-                };
-              const userCorrectionMessage: AgentModelMessage = {
-                role: "user",
-                content:
-                  "Correction for this turn: the question targets the selected collection/tag scope and needs library evidence. Call `library_retrieve` scoped to the selected collections/tags now (intent:'summarize' for synthesis or theme questions, 'enumerate' for which-papers questions; depth:'evidence'), then answer from the returned evidence. Include the coverage line (papers planned / body evidence read / metadata-only) in the final answer; if coverage is partial, name what is missing instead of generalizing.",
-              };
-              messages.push(assistantCorrectionMessage, userCorrectionMessage);
-              newTranscriptMessages.push(
-                assistantCorrectionMessage,
-                userCorrectionMessage,
-              );
-              continue;
-            }
-          }
-          return emitFinalStep(step, stepStreamedText);
+              (record.mutability !== "write" ||
+                record.effect === "applied" ||
+                record.effect === "partial"),
+          )
+          .map(buildToolProgressFingerprint)
+          .filter((fingerprint) => !seenProgressFingerprints.has(fingerprint));
+        if (!newFingerprints.length) {
+          const finalText =
+            currentAnswerText ||
+            `Agent stopped after segment ${segment} produced no new successful tool result. The completed transcript was saved; narrow or redirect the request before continuing.`;
+          return completeRun(finalText, "failed");
         }
-
-        // The step returned tool_calls, not a final answer.  Any text the
-        // model streamed during this step is intermediate "thinking" text
-        // (e.g. "Let me read more of the paper...") that should appear in
-        // the agent trace but NOT in the final chat answer.  Roll it back.
-        await rollbackCommittedStreamedText(stepStreamedText);
-
-        const calls = step.calls.slice(0, maxToolCallsPerRound);
-        const assistantToolMessage: AgentModelMessage = {
-          ...step.assistantMessage,
-          tool_calls: Array.isArray(step.assistantMessage.tool_calls)
-            ? step.assistantMessage.tool_calls.slice(0, maxToolCallsPerRound)
-            : step.assistantMessage.tool_calls,
-        };
-        messages.push(assistantToolMessage);
-        newTranscriptMessages.push(assistantToolMessage);
-        if (!calls.length) break;
-        for (const call of calls) {
-          const outcome = await executeToolWorkflow(call, round, {
-            modelCallId: call.id,
-          });
-          if (outcome.delivery) {
-            const toolMessage: AgentModelMessage = {
-              role: "tool",
-              tool_call_id: outcome.delivery.callId,
-              name: outcome.delivery.name,
-              content: JSON.stringify(outcome.delivery.content ?? {}, null, 2),
-            };
-            messages.push(toolMessage);
-            newTranscriptMessages.push(toolMessage);
-            for (const followupMessage of outcome.delivery.followupMessages) {
-              messages.push(followupMessage);
-              newTranscriptMessages.push(followupMessage);
-            }
-          }
-          if (outcome.stopRun) {
-            const stopFinalText = outcome.finalText || currentAnswerText;
-            if (stopFinalText) {
-              newTranscriptMessages.push({
-                role: "assistant",
-                content: stopFinalText,
-              });
-            }
-            return completeRun(stopFinalText, "completed");
-          }
-          if (consecutiveToolErrors >= 3) {
-            const finalText =
-              currentAnswerText ||
-              "Agent stopped after repeated tool errors. Please adjust the request and try again.";
-            return completeRun(finalText, "failed");
-          }
+        for (const fingerprint of newFingerprints) {
+          seenProgressFingerprints.add(fingerprint);
         }
+        // This is the durable continuation boundary. If Zotero or the model
+        // process exits later, the next turn can continue from the complete
+        // tool-call/result pairs checkpointed here instead of starting blind.
+        await persistTranscriptCheckpoint();
+        await emit({
+          type: "status",
+          text: `Checkpointed agent segment ${segment}; continuing`,
+        });
+        segment += 1;
       }
-
-      const finalText =
-        currentAnswerText ||
-        "Agent stopped before reaching a final answer. Try narrowing the request.";
-      return completeRun(finalText, "failed");
     } finally {
       pathLease.release();
     }

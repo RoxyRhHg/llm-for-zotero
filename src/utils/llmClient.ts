@@ -148,6 +148,8 @@ export type ChatParams = {
   temperature?: number;
   /** Optional custom token budget for completion/output */
   maxTokens?: number;
+  /** Whether maxTokens was deliberately set rather than inherited as a default. */
+  maxTokensExplicit?: boolean;
   /** Optional override for input token cap. */
   inputTokenCap?: number;
   /** Optional per-model input capability override. Missing means auto. */
@@ -3076,8 +3078,13 @@ export function buildOllamaChatPayload(params: {
  * "unset" and let the server decide; any other value is the user's explicit
  * choice and is honoured.
  */
-export function resolveOllamaNumPredict(effectiveMaxTokens: number): number {
-  return effectiveMaxTokens === DEFAULT_MAX_TOKENS ? -1 : effectiveMaxTokens;
+export function resolveOllamaNumPredict(
+  effectiveMaxTokens: number,
+  maxTokensExplicit = false,
+): number {
+  return !maxTokensExplicit && effectiveMaxTokens === DEFAULT_MAX_TOKENS
+    ? -1
+    : effectiveMaxTokens;
 }
 
 /**
@@ -3775,6 +3782,7 @@ async function callNativeProtocol(params: {
   model: string;
   messages: ChatMessage[];
   effectiveMaxTokens: number;
+  maxTokensExplicit?: boolean;
   /** Raw request temperature; protocol-specific defaults are applied here. */
   rawTemperature?: number | string;
   signal?: AbortSignal;
@@ -3837,7 +3845,10 @@ async function callNativeProtocol(params: {
           messages,
           stream: isStreaming,
           temperature: normalizeTemperature(rawTemperature),
-          numPredict: resolveOllamaNumPredict(effectiveMaxTokens),
+          numPredict: resolveOllamaNumPredict(
+            effectiveMaxTokens,
+            params.maxTokensExplicit,
+          ),
           numCtx: params.numCtx,
           reasoningExtra: buildReasoningPayload(
             reasoningOverride,
@@ -3966,6 +3977,7 @@ export async function callLLM(params: ChatParams): Promise<string> {
         authMode,
         profileOverride: params.profileOverride,
       }),
+      maxTokensExplicit: params.maxTokensExplicit === true,
       rawTemperature: params.temperature,
       signal: params.signal,
       attachments: params.attachments,
@@ -4117,6 +4129,7 @@ export async function callLLMStream(
         authMode,
         profileOverride: params.profileOverride,
       }),
+      maxTokensExplicit: params.maxTokensExplicit === true,
       rawTemperature: params.temperature,
       signal: params.signal,
       onDelta,

@@ -625,8 +625,14 @@ async function journalMutation(params: {
       itemCount: countAffected(operation),
       now: Date.now(),
     });
-  } catch {
-    // A journal write must never fail the mutation that already landed.
+  } catch (error) {
+    // The mutation has already landed, so this is a partial-success error,
+    // not permission to continue making unjournalled changes.
+    throw new Error(
+      `${operation.type} was applied, but its durable undo record could not be saved: ${
+        error instanceof Error ? error.message : String(error)
+      }`,
+    );
   }
 }
 
@@ -653,26 +659,16 @@ export async function executeAndRecordUndoBatch(
   facadeToolName: string,
 ): Promise<{ appliedCount: number; results: unknown[] }> {
   const results: unknown[] = [];
-  const undoEntries: LibraryMutationUndo[] = [];
-  for (const operation of operations) {
-    const executed = await mutationService.executeOperation(operation, context);
-    results.push(executed.result);
-    if (executed.undo) {
-      undoEntries.push(executed.undo);
-    }
-  }
-  // Journal each operation individually so a batch is as revertible as a
-  // single write. This helper journalled nothing at all, so update_metadata
-  // over several items -- its only caller -- left no history.
-  for (let index = 0; index < operations.length; index += 1) {
-    await journalMutation({
-      context,
-      operation: operations[index],
-      facadeToolName,
-      undo: undoEntries[index] ?? null,
-    });
-  }
-  if (undoEntries.length) {
+  const completed: Array<{
+    operation: LibraryMutationOperation;
+    undo: LibraryMutationUndo | null;
+  }> = [];
+
+  const registerSessionUndo = (): void => {
+    const undoEntries = completed
+      .map((entry) => entry.undo)
+      .filter((undo): undo is LibraryMutationUndo => Boolean(undo));
+    if (!undoEntries.length) return;
     pushUndoEntry(context.request.conversationKey, {
       id: `undo-${facadeToolName}-batch-${Date.now()}`,
       toolName: facadeToolName,
@@ -685,7 +681,37 @@ export async function executeAndRecordUndoBatch(
         }
       },
     });
+  };
+
+  try {
+    for (const operation of operations) {
+      const executed = await mutationService.executeOperation(
+        operation,
+        context,
+      );
+      results.push(executed.result);
+      const undo = executed.undo ?? null;
+      completed.push({ operation, undo });
+      // Persist each successful mutation before attempting the next one. A
+      // later failure must not erase the only durable recovery path for the
+      // successful prefix.
+      await journalMutation({
+        context,
+        operation,
+        facadeToolName,
+        undo,
+      });
+    }
+  } catch (error) {
+    registerSessionUndo();
+    const message = error instanceof Error ? error.message : String(error);
+    throw new Error(
+      `${message} (${completed.length} operation${
+        completed.length === 1 ? " was" : "s were"
+      } applied; available inverses were retained for in-session undo.)`,
+    );
   }
+  registerSessionUndo();
   return { appliedCount: results.length, results };
 }
 

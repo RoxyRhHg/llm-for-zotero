@@ -426,11 +426,49 @@ describe("ollama native protocol", function () {
           apiBase: "http://localhost:11434",
           providerProtocol: "ollama_native",
           maxTokens: 512,
+          maxTokensExplicit: true,
         },
         () => undefined,
       );
 
       assert.equal((body.options as Record<string, unknown>)?.num_predict, 512);
+    });
+
+    it("preserves an explicit 4096-token choice", async function () {
+      let body: Record<string, unknown> = {};
+      mockFetch(async (_url, init) => {
+        body = JSON.parse(String(init?.body || "{}")) as Record<
+          string,
+          unknown
+        >;
+        return {
+          ok: true,
+          status: 200,
+          statusText: "OK",
+          body: makeNdjsonStream([
+            '{"message":{"content":"ok"},"done":true}\n',
+          ]),
+          json: async () => ({}),
+          text: async () => "",
+        };
+      });
+
+      await callLLMStream(
+        {
+          prompt: "hi",
+          model: "gemma3",
+          apiBase: "http://localhost:11434",
+          providerProtocol: "ollama_native",
+          maxTokens: 4096,
+          maxTokensExplicit: true,
+        },
+        () => undefined,
+      );
+
+      assert.equal(
+        (body.options as Record<string, unknown>)?.num_predict,
+        4096,
+      );
     });
   });
 

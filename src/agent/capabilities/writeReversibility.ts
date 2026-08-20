@@ -17,7 +17,8 @@
  */
 
 /**
- * Tools whose every outcome is journalled with an inverse.
+ * Tools whose ordinary validated outcomes are journalled with a serialized
+ * inverse that survives restart. Input-specific exceptions are handled below.
  *
  * Some of these can still be irreversible for particular inputs — a
  * collection delete with `permanent: true`, a library-wide tag delete — which
@@ -36,11 +37,10 @@ const REVERSIBLE_TOOLS = new Set([
   "update_metadata",
   "apply_tags",
   "set_item_tags",
-  // Renaming, merging and colouring a tag are reversible; deleting one
-  // library-wide is not, and is caught per input below.
+  // Renaming a tag is reversible. Merge/delete/colour exceptions are caught
+  // from the validated operation below.
   "tag_update",
   // Notes
-  "edit_current_note",
   "note_write",
   "note_write_batch",
   "write_notes_batch",
@@ -59,8 +59,6 @@ const REVERSIBLE_TOOLS = new Set([
   "library_import",
   // Saved searches trash rather than erase
   "saved_search_update",
-  // Annotations are written through the journalled path
-  "annotate_pdf",
   // Undo/revert are themselves the recovery mechanism
   "undo_last_action",
   "revert_changes",
@@ -81,13 +79,28 @@ const REVERSIBLE_TOOLS = new Set([
  */
 function candidateRecords(input: unknown): Array<Record<string, unknown>> {
   const records: Array<Record<string, unknown>> = [];
-  let current = input;
-  for (let depth = 0; depth < 3; depth += 1) {
-    if (!current || typeof current !== "object" || Array.isArray(current))
-      break;
-    const record = current as Record<string, unknown>;
+  const pending: Array<{ value: unknown; depth: number }> = [
+    { value: input, depth: 0 },
+  ];
+  const seen = new Set<object>();
+  while (pending.length) {
+    const { value, depth } = pending.shift()!;
+    if (
+      depth > 4 ||
+      !value ||
+      typeof value !== "object" ||
+      Array.isArray(value) ||
+      seen.has(value)
+    ) {
+      continue;
+    }
+    seen.add(value);
+    const record = value as Record<string, unknown>;
     records.push(record);
-    current = record.operation;
+    pending.push(
+      { value: record.delegateInput, depth: depth + 1 },
+      { value: record.operation, depth: depth + 1 },
+    );
   }
   return records;
 }
@@ -128,14 +141,47 @@ export function isIrreversibleWrite(toolName: string, input: unknown): boolean {
   const action = readString(input, "action");
   const kind = readString(input, "kind");
   const mode = readString(input, "mode");
+  const operationType = readString(input, "type");
 
   // The tag *object*, not tags on items: library_update kind:'tag' delete.
-  if (kind === "tag" && action === "delete") return true;
+  if (
+    kind === "tag" &&
+    (action === "delete" || action === "merge" || action === "setColor")
+  ) {
+    return true;
+  }
   // The dedicated tag tool, same operation.
-  if (toolName === "tag_update" && action === "delete") return true;
+  if (
+    (toolName === "tag_update" || operationType === "update_library_tag") &&
+    (action === "merge" || action === "setColor")
+  ) {
+    return true;
+  }
+  if (
+    (toolName === "tag_update" || operationType === "update_library_tag") &&
+    action === "delete"
+  ) {
+    return true;
+  }
+  // Replacing a saved search discards its previous condition set. Creating a
+  // new one and trashing one both have durable inverses.
+  if (
+    toolName === "saved_search_update" &&
+    operationType === "save_saved_search" &&
+    candidateRecords(input).some((record) => Number(record.savedSearchId) > 0)
+  ) {
+    return true;
+  }
+  // A missing linked file has no previous path to restore after relinking.
+  if (
+    (toolName === "attachment_update" && action === "relink") ||
+    operationType === "relink_attachment"
+  ) {
+    return true;
+  }
   // Merging is not fully reversible; restoring the duplicates returns records
   // stripped of their attachments, notes and tags.
-  if (mode === "merge") return true;
+  if (mode === "merge" || operationType === "merge_items") return true;
 
   return false;
 }
@@ -148,6 +194,19 @@ export function writeNeedsConfirmation(params: {
   toolName: string;
   input: unknown;
 }): boolean {
+  // Restart recovery is intentionally user-steered even in yolo mode. A
+  // checkpoint proves where execution stopped, not that replaying the
+  // remaining external/model work is still what the user wants.
+  if (
+    params.toolName === "library_batch" &&
+    candidateRecords(params.input).some(
+      (record) =>
+        record.kind === "resume" ||
+        (typeof record.resumeJobId === "string" && record.resumeJobId.trim()),
+    )
+  ) {
+    return true;
+  }
   if (params.mode === "safe") return true;
   if (params.mode === "yolo") return false;
   return isIrreversibleWrite(params.toolName, params.input);

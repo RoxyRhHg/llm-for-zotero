@@ -272,7 +272,10 @@ export class OllamaNativeAgentAdapter implements AgentModelAdapter {
                   request.advanced?.temperature,
                 ),
               }),
-          numPredict: resolveOllamaNumPredict(effectiveMaxTokens),
+          numPredict: resolveOllamaNumPredict(
+            effectiveMaxTokens,
+            request.advanced?.maxTokensExplicit === true,
+          ),
           numCtx,
           tools,
           reasoningExtra: reasoningPayload.extra,

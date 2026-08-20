@@ -1,5 +1,6 @@
 import { assert } from "chai";
 import { revertEntries } from "../src/agent/services/changeReverter";
+import { LibraryMutationService } from "../src/agent/services/libraryMutationService";
 import type { ChangeJournalEntry } from "../src/agent/store/changeJournal";
 import type { AgentToolContext } from "../src/agent/types";
 
@@ -83,6 +84,61 @@ describe("change journal revert", function () {
     assert.deepEqual(removed, [
       { itemId: 1, collectionId: 88 },
       { itemId: 2, collectionId: 88 },
+    ]);
+  });
+
+  it("serializes a real metadata pre-image and replays it with a fresh service", async function () {
+    (globalThis as typeof globalThis & { Zotero?: unknown }).Zotero = {
+      debug: () => undefined,
+    };
+    const item = { id: 7, libraryID: 1 };
+    const makeMetadataGateway = (writes: unknown[]) =>
+      ({
+        resolveMetadataItem: () => item,
+        getEditableArticleMetadata: () => ({
+          itemId: 7,
+          title: "Before",
+          fields: { title: "Before", date: "2020" },
+          creators: [{ firstName: "Ada", lastName: "Lovelace" }],
+        }),
+        getItem: () => item,
+        updateArticleMetadata: async ({ metadata }: { metadata: unknown }) => {
+          writes.push(metadata);
+          return { status: "updated" };
+        },
+      }) as never;
+    const forwardWrites: unknown[] = [];
+    const service = new LibraryMutationService(
+      makeMetadataGateway(forwardWrites),
+    );
+    const executed = await service.executeOperation(
+      {
+        type: "update_metadata",
+        itemId: 7,
+        metadata: { title: "After" },
+      },
+      context,
+    );
+    assert.exists(executed.undo?.inverseOperations);
+
+    // JSON is the process boundary: no closure from `service` is retained.
+    const persistedInverse = JSON.stringify(executed.undo?.inverseOperations);
+    const replayWrites: unknown[] = [];
+    const outcome = await revertEntries({
+      entries: [
+        entry({ operation: "update_metadata", inverseJson: persistedInverse }),
+      ],
+      zoteroGateway: makeMetadataGateway(replayWrites),
+      context,
+    });
+
+    assert.equal(outcome.reverted, 1);
+    assert.deepEqual(replayWrites, [
+      {
+        title: "Before",
+        date: "2020",
+        creators: [{ firstName: "Ada", lastName: "Lovelace" }],
+      },
     ]);
   });
 

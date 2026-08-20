@@ -24,7 +24,7 @@ describe("zotero_script confirmation", function () {
     modelName: "test-model",
   };
 
-  const tool = createZoteroScriptTool();
+  const tool = createZoteroScriptTool({ allowUnsandboxedTestExecution: true });
 
   function validated(mode: "read" | "write", script: string) {
     const result = tool.validate({
@@ -66,12 +66,12 @@ describe("zotero_script confirmation", function () {
     );
   });
 
-  it("does not require confirmation for a read-mode script", async function () {
+  it("requires confirmation for a read-mode script", async function () {
     const input = validated("read", "return Zotero.Items.getAll(1).length;");
     const required = await tool.shouldRequireConfirmation?.(input, context);
-    assert.isNotTrue(
+    assert.isTrue(
       required,
-      "read scripts stay frictionless; real read-mode enforcement is the sandbox, not a card",
+      "read mode relaxes undo instrumentation but still exposes privileged APIs",
     );
   });
 });
@@ -87,7 +87,7 @@ describe("zotero_script confirmation", function () {
  * legitimate read script while preventing no write at all.
  */
 describe("zotero_script mode guards", function () {
-  const tool = createZoteroScriptTool();
+  const tool = createZoteroScriptTool({ allowUnsandboxedTestExecution: true });
   const NOTE_WRITE_SCRIPT =
     "const n = new Zotero.Item('note'); n.setNote('<p>hi</p>'); await n.saveTx();";
 

@@ -30,6 +30,8 @@ import type {
 
 type OrganizeUnfiledInput = PagedActionInput & {
   userQuery?: string;
+  /** Internal durable-batch target set. Never accepted from model input. */
+  _batchItemIds?: number[];
 };
 
 type OrganizeUnfiledOutput = {
@@ -104,6 +106,7 @@ export const organizeUnfiledAction: AgentAction<
     ctx: ActionExecutionContext,
   ): Promise<ActionResult<OrganizeUnfiledOutput>> {
     let options = getPagedActionOptions(input);
+    const initialStartOffset = options.startOffset;
     const windowEndOffset =
       options.limit !== undefined
         ? options.startOffset + options.limit
@@ -120,8 +123,26 @@ export const organizeUnfiledAction: AgentAction<
     let pages = getPagedActionPages<UnfiledItem>([], options);
     const reloadUnfiledPages = async (): Promise<void> => {
       invalidateLibraryCaches(ctx);
-      unfiledItems = await loadFreshUnfiledItems(ctx);
+      unfiledItems = Array.isArray(input._batchItemIds)
+        ? loadUnfiledItemsByIds(input._batchItemIds, ctx)
+        : await loadFreshUnfiledItems(ctx);
       pages = getPagedActionPages(unfiledItems, options);
+    };
+    const targetWindowCount = (): number => {
+      const end =
+        windowEndOffset !== undefined
+          ? Math.min(windowEndOffset, unfiledItems.length)
+          : unfiledItems.length;
+      return Math.max(0, end - Math.min(initialStartOffset, end));
+    };
+    const remainingTargetIds = (nextOffset: number): number[] => {
+      const end =
+        windowEndOffset !== undefined
+          ? Math.min(windowEndOffset, unfiledItems.length)
+          : unfiledItems.length;
+      return unfiledItems
+        .slice(Math.max(initialStartOffset, nextOffset), end)
+        .map((item) => item.itemId);
     };
     try {
       await reloadUnfiledPages();
@@ -134,6 +155,16 @@ export const organizeUnfiledAction: AgentAction<
             : "Failed to load unfiled items",
       };
     }
+
+    await ctx.checkpoint?.({
+      cursor: 0,
+      appliedCount: 0,
+      totalCount: targetWindowCount(),
+      plan: {
+        remainingItemIds: remainingTargetIds(initialStartOffset),
+        pageSize: options.pageSize,
+      },
+    });
 
     ctx.onProgress({
       type: "step_done",
@@ -244,6 +275,17 @@ export const organizeUnfiledAction: AgentAction<
           step: `${pageLabel}: Assigning items to collections`,
           summary: "No confident collection assignments for this page",
         });
+        await ctx.checkpoint?.({
+          cursor: page.offset + page.items.length,
+          appliedCount: moved,
+          totalCount: targetWindowCount(),
+          plan: {
+            remainingItemIds: remainingTargetIds(
+              page.offset + page.items.length,
+            ),
+            pageSize: options.pageSize,
+          },
+        });
         pageCursor += 1;
         continue;
       }
@@ -325,6 +367,17 @@ export const organizeUnfiledAction: AgentAction<
           type: "step_done",
           step: `${pageLabel}: Assigning items to collections`,
           summary: `Moved ${movedCount} item${movedCount === 1 ? "" : "s"}`,
+        });
+        await ctx.checkpoint?.({
+          cursor: page.offset + page.items.length,
+          appliedCount: moved,
+          totalCount: targetWindowCount(),
+          plan: {
+            remainingItemIds: remainingTargetIds(
+              page.offset + page.items.length,
+            ),
+            pageSize: options.pageSize,
+          },
         });
         if (confirmationActionId === "confirm") {
           if (pageCursor >= pages.length - 1) {
@@ -418,6 +471,15 @@ async function loadFreshUnfiledItems(
     ? queryContent.results
     : [];
   return normalizeUnfiledItems(unfiledRaw);
+}
+
+function loadUnfiledItemsByIds(
+  itemIds: number[],
+  ctx: ActionExecutionContext,
+): UnfiledItem[] {
+  return ctx.zoteroGateway
+    .getBibliographicItemTargetsByItemIds(itemIds)
+    .map((item) => normalizeUnfiledTarget(item, ctx));
 }
 
 async function loadFreshCollections(

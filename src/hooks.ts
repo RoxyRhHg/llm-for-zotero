@@ -247,26 +247,6 @@ function scheduleWebChatRelayRegistration(): void {
   });
 }
 
-/**
- * Marks batch jobs that a crash or a quit left mid-run.
- *
- * Nothing swept these, so an interrupted job stayed `status:'running'` for
- * ever -- the row claimed work was in progress when no process was doing it,
- * and the resume list kept offering a job that could never finish on its own.
- */
-function scheduleBatchJobSweep(): void {
-  runDeferredStartupTask("agent batch job sweep", async () => {
-    const { sweepInterruptedBatchJobs } =
-      await import("./agent/store/batchJobStore");
-    const { sweptCount } = await sweepInterruptedBatchJobs({ now: Date.now() });
-    if (sweptCount > 0) {
-      Zotero.debug(
-        `[llm-for-zotero] marked ${sweptCount} interrupted agent batch job(s) as failed at startup`,
-      );
-    }
-  });
-}
-
 function scheduleMineruAutoWatchRegistration(): void {
   runDeferredStartupTask("MinerU auto-watch", async () => {
     const { startAutoWatch } = await import("./modules/mineruAutoWatch");
@@ -308,7 +288,6 @@ function scheduleDeferredStartupWork(
   scheduleUserSkillsLoad();
   scheduleAttachmentMaintenance();
   scheduleWebChatRelayRegistration();
-  scheduleBatchJobSweep();
   scheduleMineruAutoWatchRegistration();
   scheduleModelCapabilityRefresh();
 }

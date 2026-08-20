@@ -201,6 +201,25 @@ describe("collections, tags and saved searches as objects", function () {
       );
     });
 
+    it("does not advertise a lossy tag merge as reversible", async function () {
+      const service = new LibraryMutationService(gateway());
+      const outcome = await service.executeOperation(
+        {
+          type: "update_library_tag",
+          action: "merge",
+          tag: "ML",
+          newTag: "machine learning",
+        },
+        { request: { conversationKey: 1, libraryID: 1 } } as never,
+      );
+
+      assert.notExists(outcome.undo?.inverseOperations);
+      assert.include(
+        outcome.undo?.irreversibleReason || "",
+        "cannot be separated",
+      );
+    });
+
     it("renames back on undo", async function () {
       const service = new LibraryMutationService(gateway());
       const outcome = await service.executeOperation(

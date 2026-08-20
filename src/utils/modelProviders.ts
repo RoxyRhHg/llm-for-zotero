@@ -34,6 +34,8 @@ export type LegacyModelSlotKey =
 export type AdvancedModelConfig = {
   temperature: number;
   maxTokens: number;
+  /** Distinguishes an untouched default from an explicit equal-valued choice. */
+  maxTokensExplicit?: boolean;
   inputTokenCap?: number;
   inputMode?: ModelInputMode;
   /**
@@ -98,6 +100,7 @@ export type LegacyMigrationResult = {
 type AdvancedModelConfigInput = {
   temperature?: number | string | null;
   maxTokens?: number | string | null;
+  maxTokensExplicit?: boolean;
   inputTokenCap?: number | string | null;
   inputMode?: unknown;
   profileOverride?: unknown;
@@ -193,6 +196,7 @@ function normalizeAdvancedModelConfig(
         ? { ...capabilityIdentity, profileOverride }
         : undefined,
     ),
+    ...(value?.maxTokensExplicit === true ? { maxTokensExplicit: true } : {}),
     inputTokenCap: normalizeOptionalInputTokenCap(value?.inputTokenCap),
     ...(inputMode ? { inputMode } : {}),
     ...(profileOverride ? { profileOverride } : {}),
@@ -321,6 +325,7 @@ function normalizeGroupModel(
     model?: unknown;
     temperature?: unknown;
     maxTokens?: unknown;
+    maxTokensExplicit?: unknown;
     inputTokenCap?: unknown;
     inputMode?: unknown;
     providerProtocol?: unknown;
@@ -331,6 +336,7 @@ function normalizeGroupModel(
     {
       temperature: Number(rawModel.temperature),
       maxTokens: Number(rawModel.maxTokens),
+      maxTokensExplicit: rawModel.maxTokensExplicit === true,
       inputTokenCap: rawModel.inputTokenCap as number | string | undefined,
       inputMode: rawModel.inputMode,
       profileOverride: rawModel.profileOverride,

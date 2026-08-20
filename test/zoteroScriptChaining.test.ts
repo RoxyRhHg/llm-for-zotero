@@ -36,7 +36,9 @@ describe("zotero_script chaining", function () {
       Items: { get: () => null },
       debug: () => undefined,
     };
-    const tool = createZoteroScriptTool();
+    const tool = createZoteroScriptTool({
+      allowUnsandboxedTestExecution: true,
+    });
     const validated = tool.validate({
       mode: "read",
       script,
@@ -146,7 +148,9 @@ describe("zotero_script write-mode snapshotting", function () {
 
   it("snapshots a regular item without throwing on getNote", async function () {
     installItem({});
-    const tool = createZoteroScriptTool();
+    const tool = createZoteroScriptTool({
+      allowUnsandboxedTestExecution: true,
+    });
     const validated = tool.validate({
       mode: "write",
       script:
@@ -174,7 +178,9 @@ describe("zotero_script write-mode snapshotting", function () {
       isNote: () => true,
       getNote: () => "<p>body</p>",
     });
-    const tool = createZoteroScriptTool();
+    const tool = createZoteroScriptTool({
+      allowUnsandboxedTestExecution: true,
+    });
     const validated = tool.validate({
       mode: "write",
       script:
@@ -225,7 +231,9 @@ describe("zotero_script scope control", function () {
       Items: { get: () => null },
       debug: () => undefined,
     };
-    const tool = createZoteroScriptTool();
+    const tool = createZoteroScriptTool({
+      allowUnsandboxedTestExecution: true,
+    });
     const validated = tool.validate({
       mode: "write",
       script:
@@ -249,7 +257,9 @@ describe("zotero_script scope control", function () {
       Items: { get: () => null },
       debug: () => undefined,
     };
-    const tool = createZoteroScriptTool();
+    const tool = createZoteroScriptTool({
+      allowUnsandboxedTestExecution: true,
+    });
     const validated = tool.validate({
       mode: "read",
       script:
@@ -323,7 +333,9 @@ describe("zotero_script sandbox engagement", function () {
       },
     };
 
-    const tool = createZoteroScriptTool();
+    const tool = createZoteroScriptTool({
+      allowUnsandboxedTestExecution: true,
+    });
     const validated = tool.validate({
       mode: "read",
       script: "return 7;",
@@ -342,7 +354,7 @@ describe("zotero_script sandbox engagement", function () {
     assert.equal(result.returnValue, 7);
   });
 
-  it("still runs when no sandbox is available, keeping the DB guard", async function () {
+  it("fails closed when no sandbox is available", async function () {
     const g = globalThis as typeof globalThis & Record<string, unknown>;
     g.Components = undefined;
     g.Services = undefined;
@@ -365,10 +377,6 @@ describe("zotero_script sandbox engagement", function () {
       string,
       unknown
     >;
-    assert.include(
-      String(result.error),
-      "Zotero.DB",
-      "the guard must hold on the fallback path too",
-    );
+    assert.include(String(result.error), "sandbox is unavailable");
   });
 });

@@ -136,6 +136,80 @@ function registerReviewApplyTagsTool(
 }
 
 describe("autoTag action", function () {
+  it("uses a frozen durable-batch target order and checkpoints exact remaining IDs", async function () {
+    const registry = new AgentToolRegistry();
+    const applied: number[] = [];
+    const checkpoints: Array<{
+      cursor: number;
+      plan?: Record<string, unknown>;
+    }> = [];
+    registry.register(
+      createStubTool(
+        {
+          name: "apply_tags",
+          description: "apply tags",
+          inputSchema: { type: "object" },
+          mutability: "write",
+          requiresConfirmation: false,
+        },
+        (args) => ok(args as Record<string, unknown>),
+        async (input) => {
+          const assignments = (
+            input as {
+              assignments: Array<{ itemId: number }>;
+            }
+          ).assignments;
+          applied.push(...assignments.map((entry) => entry.itemId));
+          return { result: { updatedCount: assignments.length } };
+        },
+      ),
+    );
+    const { ctx } = createActionContext(registry, {
+      confirmationMode: "auto_approve",
+      checkpoint: async (checkpoint) => {
+        checkpoints.push(checkpoint);
+      },
+      zoteroGateway: {
+        getBibliographicItemTargetsByItemIds: (itemIds: number[]) =>
+          itemIds.map((itemId) =>
+            makeBibliographicTarget(itemId, `Frozen Paper ${itemId}`),
+          ),
+        listBibliographicItemTargets: async () => {
+          throw new Error("resume must not re-query the dynamic scope");
+        },
+        getEditableArticleMetadata: () => ({
+          fields: { abstractNote: "stable batch abstract" },
+        }),
+        getItem: (itemId: number) => ({ id: itemId }),
+      } as never,
+    });
+
+    const result = await autoTagAction.execute(
+      {
+        _batchItemIds: [19, 18, 17, 16, 15, 14, 13, 12, 11, 10, 9],
+        pageSize: 10,
+      },
+      ctx,
+    );
+
+    assert.isTrue(result.ok);
+    assert.deepEqual(applied, [19, 18, 17, 16, 15, 14, 13, 12, 11, 10, 9]);
+    assert.deepEqual(
+      checkpoints.map((checkpoint) => ({
+        cursor: checkpoint.cursor,
+        remainingItemIds: checkpoint.plan?.remainingItemIds,
+      })),
+      [
+        {
+          cursor: 0,
+          remainingItemIds: [19, 18, 17, 16, 15, 14, 13, 12, 11, 10, 9],
+        },
+        { cursor: 10, remainingItemIds: [9] },
+        { cursor: 11, remainingItemIds: [] },
+      ],
+    );
+  });
+
   it("targets explicit paper itemIds, filters non-papers, and includes already-tagged papers", async function () {
     const registry = new AgentToolRegistry();
     let applyArgs: Record<string, unknown> | null = null;
