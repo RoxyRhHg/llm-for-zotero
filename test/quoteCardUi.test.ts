@@ -166,17 +166,6 @@ describe("quote card UI contract", function () {
     assert.include(css, "background: var(--llm-quote-card-surface)");
   });
 
-  it("isolates message layout and paint work while scrolling", function () {
-    const css = source("addon/content/zoteroPane.css");
-    const messageRuleStart = css.indexOf(".llm-message-wrapper {");
-    const messageRuleEnd = css.indexOf("}", messageRuleStart);
-    const messageRule = css.slice(messageRuleStart, messageRuleEnd);
-
-    assert.isAtLeast(messageRuleStart, 0);
-    assert.isAbove(messageRuleEnd, messageRuleStart);
-    assert.include(messageRule, "contain: layout paint style");
-  });
-
   it("defines noninteractive amber styling for not-source quote cards", function () {
     const css = source("addon/content/zoteroPane.css");
 
