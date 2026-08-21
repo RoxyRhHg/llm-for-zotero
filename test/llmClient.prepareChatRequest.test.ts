@@ -247,20 +247,18 @@ describe("llmClient prepareChatRequest", function () {
     assert.equal(prepared.authMode, "codex_auth");
   });
 
-  it("strips image content from DeepSeek V4 chat requests", function () {
+  it("keeps image content for DeepSeek vision models in automatic mode", function () {
     const prepared = prepareChatRequest({
       prompt: "Describe this image.",
       images: ["data:image/png;base64,AAAA"],
-      model: "deepseek-v4-pro",
+      model: "deepseek-v4-flash-vision-exp",
       apiBase: "https://api.deepseek.com/v1",
     });
 
     const lastMessage = prepared.messages[prepared.messages.length - 1];
     assert.equal(lastMessage.role, "user");
-    assert.isString(lastMessage.content);
-    assert.include(String(lastMessage.content), "Describe this image.");
-    assert.include(String(lastMessage.content), "image input");
-    assert.notInclude(JSON.stringify(prepared.messages), "image_url");
+    assert.isArray(lastMessage.content);
+    assert.include(JSON.stringify(prepared.messages), "image_url");
   });
 
   it("strips image content from explicit text-only chat requests", function () {

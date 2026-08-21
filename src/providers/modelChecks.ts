@@ -16,13 +16,6 @@ function isDeepseekModel(candidate: string): boolean {
   return /^deepseek(?:$|[-.])/.test(candidate);
 }
 
-function isKnownDeepseekTextOnlyModel(candidate: string): boolean {
-  return (
-    /^deepseek-(?:chat|reasoner)(?:[.-]|$)/.test(candidate) ||
-    /^deepseek-v4-(?:flash|pro)(?:[.-]|$)/.test(candidate)
-  );
-}
-
 function isExplicitTextOnlyModel(candidate: string): boolean {
   return /text-only|embedding/.test(candidate);
 }
@@ -31,11 +24,10 @@ export function isTextOnlyModel(model: string): boolean {
   const candidates = getModelNameCandidates(model);
   const deepseekCandidates = candidates.filter(isDeepseekModel);
   if (deepseekCandidates.length) {
-    return deepseekCandidates.some(
-      (candidate) =>
-        isKnownDeepseekTextOnlyModel(candidate) ||
-        isExplicitTextOnlyModel(candidate),
-    );
+    // DeepSeek model families can contain both text-only and vision variants,
+    // so model-name prefixes are not a safe capability boundary. Users can
+    // still select the explicit text-only input mode for models that need it.
+    return deepseekCandidates.some(isExplicitTextOnlyModel);
   }
   return candidates.some(
     (candidate) =>

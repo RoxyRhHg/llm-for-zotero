@@ -163,15 +163,16 @@ describe("provider capabilities", function () {
     }
   });
 
-  it("keeps known DeepSeek API models image-disabled", function () {
+  it("does not hard-disable image input for DeepSeek model families", function () {
     for (const model of [
       "deepseek-chat",
       "deepseek-reasoner",
       "deepseek-v4-flash",
       "deepseek-v4-pro",
+      "deepseek-v4-flash-vision-exp",
       "deepseek/deepseek-v4-pro",
     ]) {
-      assert.isTrue(isTextOnlyModel(model), model);
+      assert.isFalse(isTextOnlyModel(model), model);
       assert.deepInclude(
         resolveProviderCapabilities({
           model,
@@ -180,8 +181,8 @@ describe("provider capabilities", function () {
         }),
         {
           pdf: "none",
-          images: false,
-          multimodal: false,
+          images: true,
+          multimodal: true,
         },
       );
     }
@@ -228,8 +229,8 @@ describe("provider capabilities", function () {
       }),
       {
         pdf: "none",
-        images: false,
-        multimodal: false,
+        images: true,
+        multimodal: true,
       },
     );
     assert.deepInclude(
@@ -241,8 +242,8 @@ describe("provider capabilities", function () {
       }),
       {
         pdf: "none",
-        images: false,
-        multimodal: false,
+        images: true,
+        multimodal: true,
       },
     );
   });

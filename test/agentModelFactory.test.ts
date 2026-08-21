@@ -155,7 +155,7 @@ describe("agent model factory", function () {
     });
     assert.isFalse(anthropicCapabilities.fileInputs);
     assert.deepEqual(chatCompatCapabilities.contentInputs, {
-      images: false,
+      images: true,
       pdfDocuments: false,
       nativeFiles: false,
     });

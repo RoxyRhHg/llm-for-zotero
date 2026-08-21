@@ -815,7 +815,7 @@ describe("AnthropicMessagesAgentAdapter", function () {
     assert.equal(requestBodies[2]?.temperature, 0.4);
   });
 
-  it("omits image blocks and PDF documents for DeepSeek Anthropic-compatible models", async function () {
+  it("keeps images but omits PDF documents for DeepSeek Anthropic-compatible models", async function () {
     const adapter = new AnthropicMessagesAgentAdapter();
     let capturedBody: Record<string, unknown> | null = null;
     const restoreIOUtils = (
@@ -868,7 +868,7 @@ describe("AnthropicMessagesAgentAdapter", function () {
     try {
       await adapter.runStep({
         request: makeRequest({
-          model: "deepseek-v4-flash",
+          model: "deepseek-v4-flash-vision-exp",
           apiBase: "https://api.deepseek.com/anthropic",
         }),
         messages: [
@@ -896,26 +896,23 @@ describe("AnthropicMessagesAgentAdapter", function () {
 
       const capabilities = adapter.getCapabilities(
         makeRequest({
-          model: "deepseek-v4-flash",
+          model: "deepseek-v4-flash-vision-exp",
           apiBase: "https://api.deepseek.com/anthropic",
         }),
       );
       const serialized = JSON.stringify(capturedBody);
       assert.isFalse(capabilities.fileInputs);
       assert.deepEqual(capabilities.contentInputs, {
-        images: false,
+        images: true,
         pdfDocuments: false,
         nativeFiles: false,
       });
-      assert.notInclude(serialized, '"type":"image"');
-      assert.notInclude(serialized, '"media_type":"image/png"');
+      assert.include(serialized, '"type":"image"');
+      assert.include(serialized, '"media_type":"image/png"');
       assert.notInclude(serialized, '"type":"document"');
       assert.notInclude(serialized, '"media_type":"application/pdf"');
       assert.include(serialized, "Inspect the image and PDF.");
-      assert.include(
-        serialized,
-        "does not support image input or PDF/document input",
-      );
+      assert.include(serialized, "does not support PDF/document input");
     } finally {
       rmSync(tempDir, { recursive: true, force: true });
       (
