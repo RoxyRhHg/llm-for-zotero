@@ -389,7 +389,7 @@ export function createLibraryBatchTool(deps: {
         try {
           await prepareJournalAction({
             actionId: journalActionId,
-            runId: prepared.jobId,
+            runId: context.runId || prepared.jobId,
             conversationKey: context.request.conversationKey,
             toolName: context.journalToolName || "library_batch",
             description: `${prepared.resumed ? "Resume" : "Run"} ${prepared.job} batch job`,

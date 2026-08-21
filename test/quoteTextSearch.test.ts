@@ -12,6 +12,18 @@ import {
 } from "../src/modules/contextPanel/quoteTextSearch";
 
 describe("quoteTextSearch", function () {
+  it("keeps exact repetitive quotes searchable above the fragment state ceiling", function () {
+    const quote = Array.from({ length: 500 }, () => "repeat").join(" ");
+    const match = findLargestUniqueQuoteTextAnchorMatch(
+      [{ id: "repetitive-page", text: quote }],
+      quote,
+    );
+
+    assert.isNotNull(match);
+    assert.equal(match?.entryId, "repetitive-page");
+    assert.equal(match?.totalOccurrences, 1);
+  });
+
   it("splits quotes at internal ellipsis and keeps meaningful segments", function () {
     const result = splitQuoteAtEllipsis(
       "...Preparatory activity is thought to provide top-down signals that enable rapid processing... The neural basis of this preparatory state involves distributed cortical networks...",

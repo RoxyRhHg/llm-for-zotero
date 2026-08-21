@@ -585,6 +585,8 @@ export type QuoteTextAlignmentRun = {
   sourceEnd: number;
 };
 
+const MAX_QUOTE_ALIGNMENT_STATES = 200_000;
+
 type AttachedCitationToken = {
   sourceWord: string;
   lastCitationTokenIndex: number;
@@ -795,21 +797,127 @@ export function collectQuoteTextAlignmentRunsAllowingLayoutFragments(
   queryIndex: QuoteTextIndex,
 ): QuoteTextAlignmentRun[] {
   if (!sourceIndex.tokens.length || !queryIndex.tokens.length) return [];
+  const sourceTokenCount = sourceIndex.tokens.length;
+  const queryTokenCount = queryIndex.tokens.length;
+  if (
+    sourceTokenCount > Math.floor(MAX_QUOTE_ALIGNMENT_STATES / queryTokenCount)
+  ) {
+    return [];
+  }
+
+  type AlignmentSuffix = {
+    sourceTokenEnd: number;
+    queryTokenEnd: number;
+    lastMatchedSourceIndex: number | null;
+  };
+  type AlignmentTransition = {
+    stateKey: number;
+    lastMatchedSourceIndex: number | null;
+  };
+
+  const sourceLayoutTokens = sourceIndex.tokens.map((_token, tokenIndex) =>
+    isLikelyLayoutNumberToken(sourceIndex, tokenIndex),
+  );
+  const queryLayoutTokens = queryIndex.tokens.map((_token, tokenIndex) =>
+    isLikelyLayoutNumberToken(queryIndex, tokenIndex),
+  );
+  const suffixes = new Map<number, AlignmentSuffix>();
+  const continuationStates = new Set<number>();
+  const stateKeyFor = (sourceTokenIndex: number, queryTokenIndex: number) =>
+    sourceTokenIndex * queryTokenCount + queryTokenIndex;
+
+  const resolveSuffix = (
+    sourceTokenStart: number,
+    queryTokenStart: number,
+  ): AlignmentSuffix => {
+    let sourceCursor = sourceTokenStart;
+    let queryCursor = queryTokenStart;
+    const path: AlignmentTransition[] = [];
+    let suffix: AlignmentSuffix | undefined;
+
+    while (sourceCursor < sourceTokenCount && queryCursor < queryTokenCount) {
+      const stateKey = stateKeyFor(sourceCursor, queryCursor);
+      if (path.length) continuationStates.add(stateKey);
+      const cached = suffixes.get(stateKey);
+      if (cached) {
+        suffix = cached;
+        break;
+      }
+
+      if (
+        queryLayoutTokens[queryCursor] &&
+        queryIndex.tokens[queryCursor]?.text !==
+          sourceIndex.tokens[sourceCursor]?.text
+      ) {
+        path.push({ stateKey, lastMatchedSourceIndex: null });
+        queryCursor += 1;
+        continue;
+      }
+      if (
+        sourceLayoutTokens[sourceCursor] &&
+        sourceIndex.tokens[sourceCursor]?.text !==
+          queryIndex.tokens[queryCursor]?.text
+      ) {
+        path.push({ stateKey, lastMatchedSourceIndex: null });
+        sourceCursor += 1;
+        continue;
+      }
+
+      const step = matchTokenAlignmentStep({
+        sourceIndex,
+        queryIndex,
+        sourceTokenIndex: sourceCursor,
+        queryTokenIndex: queryCursor,
+      });
+      if (!step) {
+        suffix = {
+          sourceTokenEnd: sourceCursor,
+          queryTokenEnd: queryCursor,
+          lastMatchedSourceIndex: null,
+        };
+        suffixes.set(stateKey, suffix);
+        break;
+      }
+      path.push({
+        stateKey,
+        lastMatchedSourceIndex: step.lastMatchedSourceIndex,
+      });
+      sourceCursor = step.nextSourceIndex;
+      queryCursor = step.nextQueryIndex;
+    }
+
+    suffix ||= {
+      sourceTokenEnd: sourceCursor,
+      queryTokenEnd: queryCursor,
+      lastMatchedSourceIndex: null,
+    };
+    for (let index = path.length - 1; index >= 0; index -= 1) {
+      const transition = path[index];
+      suffix = {
+        ...suffix,
+        lastMatchedSourceIndex:
+          suffix.lastMatchedSourceIndex ?? transition.lastMatchedSourceIndex,
+      };
+      suffixes.set(transition.stateKey, suffix);
+    }
+    return suffix;
+  };
 
   const candidates: QuoteTextAlignmentRun[] = [];
-  const seen = new Set<string>();
   for (
     let sourceTokenStart = 0;
-    sourceTokenStart < sourceIndex.tokens.length;
+    sourceTokenStart < sourceTokenCount;
     sourceTokenStart += 1
   ) {
-    if (isLikelyLayoutNumberToken(sourceIndex, sourceTokenStart)) continue;
+    if (sourceLayoutTokens[sourceTokenStart]) continue;
     for (
       let queryTokenStart = 0;
-      queryTokenStart < queryIndex.tokens.length;
+      queryTokenStart < queryTokenCount;
       queryTokenStart += 1
     ) {
-      if (isLikelyLayoutNumberToken(queryIndex, queryTokenStart)) continue;
+      if (queryLayoutTokens[queryTokenStart]) continue;
+      const stateKey = stateKeyFor(sourceTokenStart, queryTokenStart);
+      if (continuationStates.has(stateKey)) continue;
       if (
         !tokensCanStartAlignmentRun(
           sourceIndex.tokens[sourceTokenStart],
@@ -818,78 +926,27 @@ export function collectQuoteTextAlignmentRunsAllowingLayoutFragments(
       ) {
         continue;
       }
-
-      let sourceCursor = sourceTokenStart;
-      let queryCursor = queryTokenStart;
-      let lastMatchedSourceIndex = sourceTokenStart - 1;
-      while (
-        sourceCursor < sourceIndex.tokens.length &&
-        queryCursor < queryIndex.tokens.length
-      ) {
-        if (
-          isLikelyLayoutNumberToken(queryIndex, queryCursor) &&
-          queryIndex.tokens[queryCursor]?.text !==
-            sourceIndex.tokens[sourceCursor]?.text
-        ) {
-          queryCursor += 1;
-          continue;
-        }
-        if (
-          isLikelyLayoutNumberToken(sourceIndex, sourceCursor) &&
-          sourceIndex.tokens[sourceCursor]?.text !==
-            queryIndex.tokens[queryCursor]?.text
-        ) {
-          sourceCursor += 1;
-          continue;
-        }
-        const step = matchTokenAlignmentStep({
-          sourceIndex,
-          queryIndex,
-          sourceTokenIndex: sourceCursor,
-          queryTokenIndex: queryCursor,
-        });
-        if (!step) break;
-        sourceCursor = step.nextSourceIndex;
-        queryCursor = step.nextQueryIndex;
-        lastMatchedSourceIndex = step.lastMatchedSourceIndex;
-      }
+      const suffix = resolveSuffix(sourceTokenStart, queryTokenStart);
       if (
-        queryCursor <= queryTokenStart ||
-        lastMatchedSourceIndex < sourceTokenStart
+        suffix.queryTokenEnd <= queryTokenStart ||
+        suffix.lastMatchedSourceIndex === null
       ) {
         continue;
       }
       const firstSourceToken = sourceIndex.tokens[sourceTokenStart];
-      const lastSourceToken = sourceIndex.tokens[lastMatchedSourceIndex];
-      const key = `${sourceTokenStart}:${sourceCursor}:${queryTokenStart}:${queryCursor}`;
-      if (seen.has(key)) continue;
-      seen.add(key);
+      const lastSourceToken = sourceIndex.tokens[suffix.lastMatchedSourceIndex];
       candidates.push({
         sourceTokenStart,
-        sourceTokenEnd: sourceCursor,
+        sourceTokenEnd: suffix.sourceTokenEnd,
         queryTokenStart,
-        queryTokenEnd: queryCursor,
+        queryTokenEnd: suffix.queryTokenEnd,
         sourceStart: firstSourceToken.sourceStart,
         sourceEnd: lastSourceToken.sourceEnd,
       });
     }
   }
 
-  return candidates.filter(
-    (candidate, index) =>
-      !candidates.some(
-        (other, otherIndex) =>
-          otherIndex !== index &&
-          other.sourceTokenStart <= candidate.sourceTokenStart &&
-          other.sourceTokenEnd >= candidate.sourceTokenEnd &&
-          other.queryTokenStart <= candidate.queryTokenStart &&
-          other.queryTokenEnd >= candidate.queryTokenEnd &&
-          (other.sourceTokenStart < candidate.sourceTokenStart ||
-            other.sourceTokenEnd > candidate.sourceTokenEnd ||
-            other.queryTokenStart < candidate.queryTokenStart ||
-            other.queryTokenEnd > candidate.queryTokenEnd),
-      ),
-  );
+  return candidates;
 }
 
 /**

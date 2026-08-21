@@ -5,7 +5,10 @@ import { ActionRegistry } from "../src/agent/actions/registry";
 import { callTool } from "../src/agent/actions/executor";
 import { AgentToolRegistry } from "../src/agent/tools/registry";
 import { executeLibraryMutationAction } from "../src/agent/services/mutationCoordinator";
-import { initAgentChangeJournal } from "../src/agent/store/changeJournal";
+import {
+  initAgentChangeJournal,
+  listJournalActions,
+} from "../src/agent/store/changeJournal";
 import type { AgentToolContext } from "../src/agent/types";
 import type { BatchJobRecord } from "../src/agent/store/batchJobStore";
 import { ChangeJournalTestDb } from "./helpers/changeJournalTestDb";
@@ -277,18 +280,29 @@ describe("library_batch", function () {
     assert.isTrue(validated.ok);
     if (!validated.ok) return;
 
-    const execution = await tool.execute(validated.value, context);
+    const execution = await tool.execute(validated.value, {
+      ...context,
+      runId: "agent-run-9",
+    });
 
     assert.equal(execution.effect, "applied");
     assert.equal(db.actions.size, 1);
     assert.equal(db.steps.size, 2);
     const action = [...db.actions.values()][0];
+    assert.equal(action.run_id, "agent-run-9");
     assert.equal(action.tool_name, "library_batch");
     assert.equal(action.status, "applied");
     assert.equal(action.affected_count, 2);
     assert.deepEqual(
       [...db.steps.values()].map((step) => step.sequence_no),
       [1, 2],
+    );
+    assert.deepEqual(
+      (await listJournalActions({ runId: "agent-run-9" })).map(
+        (journalAction) => journalAction.actionId,
+      ),
+      [action.action_id],
+      "interrupted-run recovery must find the batch through its agent run",
     );
   });
 

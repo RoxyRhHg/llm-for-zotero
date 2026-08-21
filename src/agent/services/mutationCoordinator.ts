@@ -342,8 +342,11 @@ export async function executeLibraryMutationAction(params: {
   const ownsAction = Boolean(actionId && !parentScope);
 
   const results: LibraryMutationExecutionResult[] = [];
-  const finalReversibilities: JournalReversibility[] = [];
-  const effects: AgentToolEffect[] = [];
+  const completedOutcomes: Array<{
+    effect: AgentToolEffect;
+    reversibility: JournalReversibility;
+    affectedCount: number;
+  }> = [];
   let affectedCount = 0;
   try {
     for (let index = 0; index < operations.length; index += 1) {
@@ -373,21 +376,34 @@ export async function executeLibraryMutationAction(params: {
             : undefined,
       });
       results.push(executed.result);
-      finalReversibilities.push(executed.reversibility);
-      effects.push(executed.effect);
+      completedOutcomes.push({
+        effect: executed.effect,
+        reversibility: executed.reversibility,
+        affectedCount: executed.affectedCount,
+      });
       if (executed.effect !== "none") {
         affectedCount += executed.affectedCount;
       }
     }
-    const effect = combineEffects(effects);
+    const effect = combineEffects(
+      completedOutcomes.map((outcome) => outcome.effect),
+    );
     if (actionId && ownsAction) {
-      const reversibility = combineReversibility(finalReversibilities);
+      const changedOutcomes = completedOutcomes.filter(
+        (outcome) => outcome.effect !== "none",
+      );
+      const changedEffect = combineEffects(
+        changedOutcomes.map((outcome) => outcome.effect),
+      );
+      const reversibility = combineReversibility(
+        changedOutcomes.map((outcome) => outcome.reversibility),
+      );
       await updateJournalAction({
         actionId,
         status:
           effect === "none"
             ? "no_effect"
-            : effect === "partial"
+            : changedEffect === "partial"
               ? "partially_applied"
               : reversibility === "none"
                 ? "irreversible"
@@ -403,32 +419,41 @@ export async function executeLibraryMutationAction(params: {
       results,
     };
   } catch (error) {
+    const changedOutcomes = completedOutcomes.filter(
+      (outcome) => outcome.effect !== "none",
+    );
+    const uncertain = error instanceof MutationMayHaveAppliedError;
+    const recovery = changedOutcomes.length
+      ? `${changedOutcomes.length} prior operation${
+          changedOutcomes.length === 1 ? "" : "s"
+        } changed the library; durable recovery steps were retained.`
+      : uncertain
+        ? "The current operation may have applied; inspect journal state before retrying."
+        : undefined;
     if (actionId && ownsAction) {
-      const failureReversibilities =
-        error instanceof MutationMayHaveAppliedError
-          ? [...finalReversibilities, error.reversibility]
-          : finalReversibilities;
+      const failureReversibilities = uncertain
+        ? [
+            ...changedOutcomes.map((outcome) => outcome.reversibility),
+            error.reversibility,
+          ]
+        : changedOutcomes.map((outcome) => outcome.reversibility);
       await updateJournalAction({
         actionId,
-        status: results.length
+        status: changedOutcomes.length
           ? "partially_applied"
-          : error instanceof MutationMayHaveAppliedError
+          : uncertain
             ? "uncertain"
             : "failed",
         reversibility: combineReversibility(failureReversibilities),
         affectedCount,
         error: error instanceof Error ? error.message : String(error),
-        recovery:
-          "Inspect the uncertain step before retrying; previously applied steps retain their durable inverses.",
+        recovery,
       }).catch(() => undefined);
     }
     const message = error instanceof Error ? error.message : String(error);
-    if (!results.length) throw error;
-    throw new Error(
-      `${message} (${results.length} operation${
-        results.length === 1 ? " was" : "s were"
-      } applied; durable recovery steps were retained.)`,
-    );
+    if (changedOutcomes.length) throw new Error(`${message} (${recovery})`);
+    if (uncertain) throw new Error(`${message} (${recovery})`);
+    throw error;
   }
 }
 

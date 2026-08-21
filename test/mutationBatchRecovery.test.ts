@@ -131,7 +131,7 @@ describe("multi-operation durable mutation recovery", function () {
       message = error instanceof Error ? error.message : String(error);
     }
 
-    assert.include(message, "1 operation was applied");
+    assert.include(message, "1 prior operation changed the library");
     assert.equal(db.actions.size, 1, "the batch is one user-visible action");
     assert.equal(db.steps.size, 2, "each attempted operation is one step");
     const action = [...db.actions.values()][0];
@@ -250,7 +250,7 @@ describe("multi-operation durable mutation recovery", function () {
 
     assert.equal(calls, 1, "no unjournalled second write may start");
     assert.include(message, "database is read-only");
-    assert.include(message, "1 operation was applied");
+    assert.include(message, "1 prior operation changed the library");
   });
 
   it("promotes a finalized deferred creation to fully reversible", async function () {
@@ -350,6 +350,174 @@ describe("multi-operation durable mutation recovery", function () {
     assert.equal([...db.actions.values()][0].status, "no_effect");
     assert.equal([...db.actions.values()][0].affected_count, 0);
     assert.equal([...db.steps.values()][0].status, "no_effect");
+  });
+
+  it("does not report a prior no-op as applied when the next write is uncertain", async function () {
+    const db = await installJournal();
+    let calls = 0;
+    const mutationService = {
+      planOperation: async (operation: { itemId: number }) => ({
+        effect: "write" as const,
+        reversibility: "full" as const,
+        description: `update ${operation.itemId}`,
+        inverseOperations: [inverseFor(operation.itemId)],
+      }),
+      executeOperation: async (operation: { itemId: number }) => {
+        calls += 1;
+        if (calls === 2) throw new Error("the second write may have committed");
+        return {
+          result: {
+            operation: "update_metadata",
+            result: { status: "unchanged", itemId: operation.itemId },
+          },
+          inverse: null,
+          effect: "none" as const,
+          affectedCount: 0,
+        };
+      },
+      captureOperationState: async () => ({
+        version: 1,
+        operation: "update_metadata",
+      }),
+    };
+
+    let message = "";
+    try {
+      await executeLibraryMutationAction({
+        service: mutationService as never,
+        operations: [
+          { type: "update_metadata", itemId: 1, metadata: { title: "same" } },
+          { type: "update_metadata", itemId: 2, metadata: { title: "new" } },
+        ],
+        context,
+        facadeToolName: "update_metadata",
+      });
+      assert.fail("expected the second operation to be uncertain");
+    } catch (error) {
+      message = error instanceof Error ? error.message : String(error);
+    }
+
+    const action = [...db.actions.values()][0];
+    assert.equal(action.status, "uncertain");
+    assert.equal(action.affected_count, 0);
+    assert.equal(action.reversibility, "full");
+    assert.include(message, "The current operation may have applied");
+    assert.notInclude(message, "operation was applied");
+    assert.deepEqual(
+      [...db.steps.values()]
+        .sort(
+          (left, right) => Number(left.sequence_no) - Number(right.sequence_no),
+        )
+        .map((step) => step.status),
+      ["no_effect", "uncertain"],
+    );
+  });
+
+  it("reports failure when only no-ops precede a pre-write error", async function () {
+    const db = await installJournal();
+    const preWriteError = new Error("the second operation is invalid");
+    const mutationService = {
+      planOperation: async (operation: { itemId: number }) => {
+        if (operation.itemId === 2) throw preWriteError;
+        return {
+          effect: "write" as const,
+          reversibility: "full" as const,
+          description: `update ${operation.itemId}`,
+          inverseOperations: [inverseFor(operation.itemId)],
+        };
+      },
+      executeOperation: async (operation: { itemId: number }) => ({
+        result: {
+          operation: "update_metadata",
+          result: { status: "unchanged", itemId: operation.itemId },
+        },
+        inverse: null,
+        effect: "none" as const,
+        affectedCount: 0,
+      }),
+      captureOperationState: async () => ({
+        version: 1,
+        operation: "update_metadata",
+      }),
+    };
+
+    let thrown: unknown;
+    try {
+      await executeLibraryMutationAction({
+        service: mutationService as never,
+        operations: [
+          { type: "update_metadata", itemId: 1, metadata: { title: "same" } },
+          { type: "update_metadata", itemId: 2, metadata: { title: "new" } },
+        ],
+        context,
+        facadeToolName: "update_metadata",
+      });
+    } catch (error) {
+      thrown = error;
+    }
+
+    assert.strictEqual(thrown, preWriteError);
+    const action = [...db.actions.values()][0];
+    assert.equal(action.status, "failed");
+    assert.equal(action.affected_count, 0);
+    assert.equal(action.reversibility, "full");
+  });
+
+  it("ignores no-op reversibility when a later change is irreversible", async function () {
+    const db = await installJournal();
+    const mutationService = {
+      planOperation: async (operation: { itemId: number }) => ({
+        effect: "write" as const,
+        reversibility:
+          operation.itemId === 1 ? ("full" as const) : ("none" as const),
+        description: `update ${operation.itemId}`,
+        inverseOperations:
+          operation.itemId === 1 ? [inverseFor(operation.itemId)] : undefined,
+        reason:
+          operation.itemId === 2 ? "No declarative inverse exists." : undefined,
+      }),
+      executeOperation: async (operation: { itemId: number }) => ({
+        result: {
+          operation: "update_metadata",
+          result: {
+            status: operation.itemId === 1 ? "unchanged" : "updated",
+            itemId: operation.itemId,
+          },
+        },
+        inverse: null,
+        effect:
+          operation.itemId === 1 ? ("none" as const) : ("applied" as const),
+        affectedCount: operation.itemId === 1 ? 0 : 1,
+      }),
+      captureOperationState: async () => ({
+        version: 1,
+        operation: "update_metadata",
+      }),
+    };
+
+    const outcome = await executeLibraryMutationAction({
+      service: mutationService as never,
+      operations: [
+        { type: "update_metadata", itemId: 1, metadata: { title: "same" } },
+        { type: "update_metadata", itemId: 2, metadata: { title: "new" } },
+      ],
+      context,
+      facadeToolName: "update_metadata",
+    });
+
+    assert.equal(outcome.effect, "partial");
+    assert.equal(outcome.affectedCount, 1);
+    const action = [...db.actions.values()][0];
+    assert.equal(action.status, "irreversible");
+    assert.equal(action.reversibility, "none");
+    assert.deepEqual(
+      [...db.steps.values()]
+        .sort(
+          (left, right) => Number(left.sequence_no) - Number(right.sequence_no),
+        )
+        .map((step) => step.status),
+      ["no_effect", "irreversible"],
+    );
   });
 
   it("keeps partial effects and affected counts aligned across tool and journal output", async function () {

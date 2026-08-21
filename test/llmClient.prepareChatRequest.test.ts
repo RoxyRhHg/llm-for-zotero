@@ -261,6 +261,22 @@ describe("llmClient prepareChatRequest", function () {
     assert.include(JSON.stringify(prepared.messages), "image_url");
   });
 
+  it("strips image content from known DeepSeek text models in automatic mode", function () {
+    for (const model of ["deepseek-chat", "deepseek-reasoner"]) {
+      const prepared = prepareChatRequest({
+        prompt: "Describe this image.",
+        images: ["data:image/png;base64,AAAA"],
+        model,
+        apiBase: "https://api.deepseek.com/v1",
+      });
+
+      const lastMessage = prepared.messages[prepared.messages.length - 1];
+      assert.equal(lastMessage.role, "user");
+      assert.isString(lastMessage.content, model);
+      assert.notInclude(JSON.stringify(prepared.messages), "image_url", model);
+    }
+  });
+
   it("strips image content from explicit text-only chat requests", function () {
     const prepared = prepareChatRequest({
       prompt: "Describe this image.",
@@ -281,9 +297,8 @@ describe("llmClient prepareChatRequest", function () {
     const prepared = prepareChatRequest({
       prompt: "Describe this image.",
       images: ["data:image/png;base64,AAAA"],
-      model: "gpt-5.5",
-      apiBase: "https://api.openai.com/v1/responses",
-      providerProtocol: "responses_api",
+      model: "deepseek-vl2",
+      apiBase: "https://api.deepseek.com/v1",
       inputMode: "text_only",
     });
 
@@ -299,8 +314,8 @@ describe("llmClient prepareChatRequest", function () {
     const prepared = prepareChatRequest({
       prompt: "Describe this image.",
       images: ["data:image/png;base64,AAAA"],
-      model: "local-text-only",
-      apiBase: "https://api.example.test/v1",
+      model: "deepseek-chat",
+      apiBase: "https://api.deepseek.com/v1",
       inputMode: "vision_allowed",
     });
 
