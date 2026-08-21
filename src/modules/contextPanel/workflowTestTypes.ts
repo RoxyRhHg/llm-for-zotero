@@ -152,6 +152,7 @@ export type WorkflowTestDiagnostics = {
   runtimeSystemToggles: WorkflowTestRuntimeSystemToggle[];
   inputValue?: string;
   statusText?: string;
+  tokenUsageText?: string;
   messageText?: string;
   lastSend: SendQuestionOptions | null;
   lastFinalRequest: WorkflowTestFinalRequestSnapshot | null;
@@ -486,4 +487,17 @@ export type WorkflowTestApi = {
     panelId: string,
     text: string,
   ) => Promise<WorkflowTestFinalRequestSnapshot>;
+  simulateProviderContextUsage: (
+    panelId: string,
+    usage: {
+      contextTokens: number;
+      contextWindow?: number;
+      contextWindowIsAuthoritative?: boolean;
+    },
+  ) => Promise<WorkflowTestDiagnostics>;
+  setWorkflowModelInputCap: (
+    panelId: string,
+    entryId: string,
+    inputTokenCap: number,
+  ) => Promise<WorkflowTestDiagnostics>;
 };

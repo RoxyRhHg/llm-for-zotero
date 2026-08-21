@@ -400,7 +400,7 @@ describe("ollama native protocol", function () {
       assert.isNumber(options.temperature);
     });
 
-    it("honours an explicitly configured max-tokens value", async function () {
+    it("allocates Ollama num_ctx from the explicit qwen3.8-max input cap", async function () {
       let body: Record<string, unknown> = {};
       mockFetch(async (_url, init) => {
         body = JSON.parse(String(init?.body || "{}")) as Record<
@@ -422,16 +422,59 @@ describe("ollama native protocol", function () {
       await callLLMStream(
         {
           prompt: "hi",
-          model: "gemma3",
+          model: "qwen3.8-max",
           apiBase: "http://localhost:11434",
           providerProtocol: "ollama_native",
-          maxTokens: 512,
-          maxTokensExplicit: true,
+          inputTokenCap: 1_000_000,
         },
         () => undefined,
       );
 
-      assert.equal((body.options as Record<string, unknown>)?.num_predict, 512);
+      assert.equal(
+        (body.options as Record<string, unknown>)?.num_ctx,
+        1_000_000,
+      );
+    });
+
+    it("preserves explicit output above detected limits", async function () {
+      let body: Record<string, unknown> = {};
+      mockFetch(async (_url, init) => {
+        body = JSON.parse(String(init?.body || "{}")) as Record<
+          string,
+          unknown
+        >;
+        return {
+          ok: true,
+          status: 200,
+          statusText: "OK",
+          body: makeNdjsonStream([
+            '{"message":{"content":"ok"},"done":true}\n',
+          ]),
+          json: async () => ({}),
+          text: async () => "",
+        };
+      });
+
+      await callLLMStream(
+        {
+          prompt: "hi",
+          model: "qwen3.8-max",
+          apiBase: "http://localhost:11434",
+          providerProtocol: "ollama_native",
+          maxTokens: 200_000,
+          maxTokensExplicit: true,
+          profileOverride: {
+            forModel: "qwen3.8-max",
+            limits: { outputTokens: 64_000 },
+          },
+        },
+        () => undefined,
+      );
+
+      assert.equal(
+        (body.options as Record<string, unknown>)?.num_predict,
+        200_000,
+      );
     });
 
     it("preserves an explicit 4096-token choice", async function () {

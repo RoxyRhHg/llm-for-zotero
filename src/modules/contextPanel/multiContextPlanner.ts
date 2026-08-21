@@ -1634,6 +1634,7 @@ export async function resolveMultiContextPlan(params: {
     image: params.image,
     reasoning: params.reasoning,
     maxTokens: params.advanced?.maxTokens,
+    maxTokensExplicit: params.advanced?.maxTokensExplicit,
     inputTokenCap: params.advanced?.inputTokenCap,
     systemPrompt: params.systemPrompt,
     apiBase: params.apiBase,

@@ -1,6 +1,8 @@
 import { assert } from "chai";
 import {
   estimateAvailableContextBudget,
+  normalizeMaxTokensForRequest,
+  prepareChatRequest,
   type ChatMessage,
 } from "../src/utils/llmClient";
 
@@ -55,5 +57,53 @@ describe("llmClient context budget", function () {
     assert.equal(plan.modelLimitTokens, 20_000);
     assert.equal(plan.limitTokens, 20_000);
     assert.equal(plan.outputReserveTokens, 4_000);
+  });
+
+  it("uses one qwen3.8-max cap in planning and final preparation", function () {
+    const previousZotero = globalThis.Zotero;
+    (globalThis as typeof globalThis & { Zotero: typeof Zotero }).Zotero = {
+      Prefs: { get: () => "" },
+    } as typeof Zotero;
+    try {
+      const plan = estimateAvailableContextBudget({
+        model: "qwen3.8-max",
+        prompt: "Summarize the paper.",
+        inputTokenCap: 1_000_000,
+      });
+      const prepared = prepareChatRequest({
+        model: "qwen3.8-max",
+        prompt: "Summarize the paper.",
+        inputTokenCap: 1_000_000,
+        apiBase: "https://dashscope.aliyuncs.com/compatible-mode/v1",
+        apiKey: "test",
+        authMode: "api_key",
+        providerProtocol: "openai_chat_compat",
+      });
+
+      assert.equal(plan.limitTokens, 1_000_000);
+      assert.equal(prepared.inputCap.limitTokens, 1_000_000);
+      assert.equal(prepared.inputCap.limitSource, "advanced");
+    } finally {
+      (globalThis as typeof globalThis & { Zotero?: typeof Zotero }).Zotero =
+        previousZotero;
+    }
+  });
+
+  it("keeps explicit output values while bounding untouched defaults", function () {
+    assert.equal(
+      normalizeMaxTokensForRequest({
+        value: 200_000,
+        maxTokensExplicit: true,
+        model: "claude-haiku-4-5",
+      }),
+      200_000,
+    );
+    assert.equal(
+      normalizeMaxTokensForRequest({
+        value: 200_000,
+        model: "claude-haiku-4-5",
+      }),
+      64_000,
+    );
   });
 });

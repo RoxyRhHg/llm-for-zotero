@@ -56,6 +56,7 @@ import {
   ensureConversationLoaded,
   getConversationKey,
   refreshChat,
+  updateContextUsageSnapshotFromProvider,
 } from "./chat";
 import {
   applySelectedTextPreview,
@@ -89,6 +90,10 @@ import {
   type ReaderSelectionTrackingReader,
 } from "./readerSelectionTracking";
 import { config } from "./constants";
+import {
+  getModelProviderGroups,
+  setModelProviderGroups,
+} from "../../utils/modelProviders";
 import type { RuntimeConversationSystem } from "./runtimeSystemControls";
 import { collectReaderSelectionDocuments } from "./readerSelection";
 import { getReaderContextPanelForTab } from "./readerPopupPanelRouting";
@@ -2289,6 +2294,10 @@ async function getDiagnostics(
     statusText:
       (body?.querySelector("#llm-status") as HTMLElement | null)?.textContent ||
       undefined,
+    tokenUsageText:
+      (
+        body?.querySelector("#llm-token-usage") as HTMLElement | null
+      )?.textContent?.trim() || undefined,
     messageText: chatBox?.textContent?.trim() || undefined,
     lastSend,
     lastFinalRequest,
@@ -3347,6 +3356,54 @@ async function askCapturingFinalRequest(
   }
 }
 
+async function simulateProviderContextUsage(
+  panelId: string,
+  usage: {
+    contextTokens: number;
+    contextWindow?: number;
+    contextWindowIsAuthoritative?: boolean;
+  },
+): Promise<WorkflowTestDiagnostics> {
+  assertWorkflowTestEnabled();
+  const panel = getPanel(panelId);
+  const inputCap = lastFinalRequest?.inputCap;
+  if (!inputCap) {
+    throw new Error("No captured final request input cap is available");
+  }
+  const item = activeContextPanels.get(panel.body)?.() || panel.item;
+  updateContextUsageSnapshotFromProvider({
+    conversationKey: getConversationKey(item),
+    usage: {
+      promptTokens: usage.contextTokens,
+      completionTokens: 0,
+      totalTokens: usage.contextTokens,
+      ...usage,
+    },
+    fallbackContextWindow: inputCap.limitTokens,
+    fallbackInputLimitSource: inputCap.limitSource,
+  });
+  refreshChat(panel.body, item);
+  return getDiagnostics(panelId);
+}
+
+async function setWorkflowModelInputCap(
+  panelId: string,
+  entryId: string,
+  inputTokenCap: number,
+): Promise<WorkflowTestDiagnostics> {
+  assertWorkflowTestEnabled();
+  getPanel(panelId);
+  const groups = getModelProviderGroups();
+  const model = groups
+    .flatMap((group) => group.models)
+    .find((entry) => entry.id === entryId);
+  if (!model) throw new Error(`Unknown workflow model entry ${entryId}`);
+  model.inputTokenCap = inputTokenCap;
+  setModelProviderGroups(groups);
+  await Zotero.Promise.delay(25);
+  return getDiagnostics(panelId);
+}
+
 async function cleanupFixture(
   fixture:
     | WorkflowTestFixture
@@ -3448,5 +3505,7 @@ export function installWorkflowTestHarness(targetAddon: {
     searchPanelHistory,
     failNextPendingTurnFinalizes,
     askCapturingFinalRequest,
+    simulateProviderContextUsage,
+    setWorkflowModelInputCap,
   };
 }

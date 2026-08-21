@@ -1,7 +1,7 @@
 import { config } from "../../package.json";
 import { DEFAULT_MAX_TOKENS, DEFAULT_TEMPERATURE } from "./llmDefaults";
 import {
-  normalizeMaxTokensForModel,
+  normalizeMaxTokens,
   normalizeOptionalInputTokenCap,
   normalizeTemperature,
 } from "./normalization";
@@ -20,7 +20,6 @@ import {
 } from "../modelCapabilities";
 import { normalizeProfileOverride } from "../modelCapabilities";
 import type {
-  ModelCapabilityIdentity,
   ModelCatalogIdentity,
   ModelProfileOverride,
 } from "../modelCapabilities";
@@ -117,6 +116,7 @@ const MODEL_PROVIDER_GROUPS_MIGRATION_VERSION_PREF_KEY =
 const LAST_USED_MODEL_ENTRY_ID_PREF_KEY = "lastUsedModelEntryId";
 const LEGACY_LAST_MODEL_PROFILE_PREF_KEY = "lastUsedModelProfile";
 const MODEL_PROVIDER_GROUPS_MIGRATION_VERSION = 3;
+const modelProviderGroupListeners = new Set<() => void>();
 
 function getZoteroPrefs(): ZoteroPrefsAPI | null {
   return (
@@ -169,9 +169,7 @@ function normalizeProviderAuthMode(value: unknown): ModelProviderAuthMode {
 
 function normalizeAdvancedModelConfig(
   value?: AdvancedModelConfigInput | null,
-  modelName?: string,
   runtimeMode?: unknown,
-  capabilityIdentity?: Omit<ModelCapabilityIdentity, "model">,
 ): AdvancedModelConfig {
   const inputMode = normalizeModelInputModeForRuntime(
     value?.inputMode,
@@ -183,20 +181,21 @@ function normalizeAdvancedModelConfig(
   // enforced where the override is consumed — `applyProfileOverride` for
   // capabilities, `resolveUserExtraBody` for request parameters.
   const profileOverride = normalizeProfileOverride(value?.profileOverride);
+  const maxTokens = normalizeMaxTokens(
+    `${value?.maxTokens ?? DEFAULT_MAX_TOKENS}`,
+  );
+  const maxTokensExplicit =
+    value?.maxTokensExplicit === true ||
+    (value?.maxTokensExplicit === undefined &&
+      value?.maxTokens !== undefined &&
+      value?.maxTokens !== null &&
+      maxTokens !== DEFAULT_MAX_TOKENS);
   return {
     temperature: normalizeTemperature(
       `${value?.temperature ?? DEFAULT_TEMPERATURE}`,
     ),
-    maxTokens: normalizeMaxTokensForModel(
-      `${value?.maxTokens ?? DEFAULT_MAX_TOKENS}`,
-      modelName,
-      // The override can raise or lower the output limit, so it has to be part
-      // of the identity used to clamp maxTokens.
-      capabilityIdentity
-        ? { ...capabilityIdentity, profileOverride }
-        : undefined,
-    ),
-    ...(value?.maxTokensExplicit === true ? { maxTokensExplicit: true } : {}),
+    maxTokens,
+    ...(maxTokensExplicit ? { maxTokensExplicit: true } : {}),
     inputTokenCap: normalizeOptionalInputTokenCap(value?.inputTokenCap),
     ...(inputMode ? { inputMode } : {}),
     ...(profileOverride ? { profileOverride } : {}),
@@ -336,12 +335,14 @@ function normalizeGroupModel(
     {
       temperature: Number(rawModel.temperature),
       maxTokens: Number(rawModel.maxTokens),
-      maxTokensExplicit: rawModel.maxTokensExplicit === true,
+      maxTokensExplicit:
+        typeof rawModel.maxTokensExplicit === "boolean"
+          ? rawModel.maxTokensExplicit
+          : undefined,
       inputTokenCap: rawModel.inputTokenCap as number | string | undefined,
       inputMode: rawModel.inputMode,
       profileOverride: rawModel.profileOverride,
     },
-    modelName,
     authMode,
   );
   const modelProtocol = isProviderProtocol(rawModel.providerProtocol)
@@ -472,9 +473,9 @@ function resolveLegacyModelSlot(
   const temperature = normalizeTemperature(
     getStringPref(`temperature${suffix}`) || `${DEFAULT_TEMPERATURE}`,
   );
-  const maxTokens = normalizeMaxTokensForModel(
-    getStringPref(`maxTokens${suffix}`) || `${DEFAULT_MAX_TOKENS}`,
-    modelName,
+  const storedMaxTokens = getStringPref(`maxTokens${suffix}`);
+  const maxTokens = normalizeMaxTokens(
+    storedMaxTokens || `${DEFAULT_MAX_TOKENS}`,
   );
   const inputTokenCap = normalizeOptionalInputTokenCap(
     getStringPref(`inputTokenCap${suffix}`),
@@ -489,6 +490,9 @@ function resolveLegacyModelSlot(
     model: modelName,
     temperature,
     maxTokens,
+    ...(storedMaxTokens && maxTokens !== DEFAULT_MAX_TOKENS
+      ? { maxTokensExplicit: true }
+      : {}),
     inputTokenCap,
   };
 }
@@ -534,7 +538,7 @@ export function buildModelProviderGroupsFromLegacySlots(
     const entry: ModelProviderModel = {
       id: createId("model"),
       model: slot.model.trim(),
-      ...normalizeAdvancedModelConfig(slot, slot.model),
+      ...normalizeAdvancedModelConfig(slot),
     };
     group.models.push(entry);
     legacyToEntryId[slot.key] = entry.id;
@@ -592,6 +596,12 @@ export function getModelProviderGroups(): ModelProviderGroup[] {
 
 export function setModelProviderGroups(groups: ModelProviderGroup[]): void {
   storeModelProviderGroups(normalizeModelProviderGroups(groups));
+  for (const listener of modelProviderGroupListeners) listener();
+}
+
+export function subscribeModelProviderGroups(listener: () => void): () => void {
+  modelProviderGroupListeners.add(listener);
+  return () => modelProviderGroupListeners.delete(listener);
 }
 
 // The `apiBase` field is repurposed as a local "Codex CLI Path" under
@@ -642,7 +652,7 @@ export function createProviderModelEntry(
   return {
     id: createId("model"),
     model: model.trim(),
-    ...normalizeAdvancedModelConfig(advanced, model),
+    ...normalizeAdvancedModelConfig(advanced),
     ...(providerProtocol ? { providerProtocol } : {}),
   };
 }
@@ -704,19 +714,7 @@ export function getRuntimeModelEntries(): RuntimeModelEntry[] {
           duplicateCount > 1
             ? `${baseModelLabel} #${duplicateCount}`
             : baseModelLabel,
-        advanced: normalizeAdvancedModelConfig(
-          modelEntry,
-          modelName,
-          undefined,
-          {
-            provider: resolveStoredPresetId(group),
-            apiBase: group.apiBase,
-            protocol: providerProtocol,
-            authMode,
-            scope: group.id,
-            profileOverride: modelEntry.profileOverride,
-          },
-        ),
+        advanced: normalizeAdvancedModelConfig(modelEntry),
       });
     }
 

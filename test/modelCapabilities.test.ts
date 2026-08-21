@@ -220,7 +220,7 @@ describe("model capability service", function () {
           return new Response(
             JSON.stringify({
               schemaVersion: 1,
-              revision: 3,
+              revision: 4,
               models: [
                 {
                   match: { provider: "kimi", exact: "kimi-v4" },
@@ -287,7 +287,7 @@ describe("model capability service", function () {
           text: async () =>
             JSON.stringify({
               schemaVersion: 1,
-              revision: 3,
+              revision: 4,
               models: [
                 {
                   match: { provider: "kimi", exact: "kimi-v4" },
@@ -339,7 +339,7 @@ describe("model capability service", function () {
     assert.isFalse(accepted);
   });
 
-  it("keeps user caps below discovered hard limits", function () {
+  it("keeps explicit user caps above discovered model limits", function () {
     assert.equal(
       getModelInputTokenLimit("kimi-k3", {
         provider: "kimi",
@@ -352,7 +352,53 @@ describe("model capability service", function () {
         provider: "kimi",
         apiBase: "https://api.moonshot.ai/v1",
       }),
-      1048576,
+      2_000_000,
+    );
+  });
+
+  it("ships qwen3.8-max context and output metadata", function () {
+    const capabilities = getModelCapabilities({
+      model: "openrouter/qwen3.8-max",
+      apiBase: "https://proxy.example/v1",
+    });
+
+    assert.equal(capabilities.limits.contextWindowTokens, 1_000_000);
+    assert.isUndefined(capabilities.limits.inputTokens);
+    assert.equal(capabilities.limits.outputTokens, 131_072);
+  });
+
+  it("preserves arbitrary future model IDs and user reasoning levels", function () {
+    const model = "relay/vendor-model-2031-alpha";
+    const capabilities = getModelCapabilities({
+      provider: "customized",
+      model,
+      profileOverride: {
+        forModel: model,
+        reasoning: {
+          kind: "select",
+          defaultOptionId: "quantum",
+          options: [
+            {
+              id: "quantum",
+              label: "Quantum",
+              controls: { body: { reasoning_effort: "quantum" } },
+            },
+          ],
+        },
+      },
+    });
+
+    assert.equal(capabilities.model, model);
+    assert.deepEqual(
+      capabilities.reasoning.options.map((option) => option.id),
+      ["quantum"],
+    );
+    assert.deepEqual(
+      compileReasoningControls(capabilities, { level: "quantum" }),
+      {
+        extra: { reasoning_effort: "quantum" },
+        omitTemperature: false,
+      },
     );
   });
 

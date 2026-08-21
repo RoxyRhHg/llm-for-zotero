@@ -85,42 +85,6 @@ const catalogRefreshTasks = new Map<string, Promise<DiscoveredModel[]>>();
 const catalogSnapshots = new Map<string, CatalogSnapshot>();
 const capabilityListeners = new Set<() => void>();
 
-const LEGACY_INPUT_LIMIT_RULES: Array<[RegExp, number]> = [
-  [/^qwen-long(?:[.-]|$)/, 10_000_000],
-  [/^qwen-turbo(?:[.-]|$)/, 1_000_000],
-  [/^qwen-max(?:-latest)?(?:[.-]|$)/, 129_024],
-  [/^gemini-2[.-]?5(?:[.-]|$)/, 1_048_576],
-  [/^gemini-3(?:[.-]|$)/, 1_000_000],
-  [/^gemini-1[.-]?5(?:[.-]|$)/, 1_000_000],
-  [/^gpt-4[.-]?1(?:[.-]|$)/, 1_047_576],
-  [/^gpt-5\.4(?:[.-]|$)/, 1_050_000],
-  [/^gpt-5(?:[.-]|$)/, 400_000],
-  [/^o(?:3|1(?:-pro)?)(?:[.-]|$)/, 200_000],
-  [/^gpt-4o(?:[.-]|$)/, 128_000],
-  [/^claude(?:[.-]|$)/, 200_000],
-  [/^grok-(?:4[.-]?1-fast|4-fast)(?:[.-]|$)/, 2_000_000],
-  [/^grok-code-fast-1(?:[.-]|$)/, 256_000],
-  [/^grok-4(?:[.-]|$)/, 256_000],
-  [/^grok-3(?:[.-]|$)/, 131_072],
-  [/^command-a(?:-reasoning)?(?:[.-]|$)/, 256_000],
-  [/^command-r(?:\+|-plus)?(?:[.-]|$)/, 128_000],
-  [/^mistral-large-3(?:[.-]|$)/, 256_000],
-  [/^ministral-3(?:-14b)?(?:[.-]|$)/, 256_000],
-  [/^mistral-medium-3(?:[.-]|$)/, 128_000],
-  [/^mistral-small-3(?:[.-]|$)/, 128_000],
-  [/^codestral(?:[.-]|$)/, 128_000],
-  [/^deepseek-v4-(?:flash|pro)(?:[.-]|$)/, 1_000_000],
-  [/^deepseek-(?:chat|reasoner)(?:[.-]|$)/, 1_000_000],
-  [/^deepseek(?:[.-]|$)/, 128_000],
-];
-
-const LEGACY_OUTPUT_LIMIT_RULES: Array<[RegExp, number]> = [
-  [/(^|[/:.])claude-(?:opus-4-7|opus-4-6)(?:[.-]|$)/, 128_000],
-  [/(^|[/:.])claude-(?:sonnet-4-6|haiku-4-5)(?:[.-]|$)/, 64_000],
-  [/^deepseek-v4-(?:flash|pro)(?:[.-]|$)/, 384_000],
-  [/^deepseek-(?:chat|reasoner)(?:[.-]|$)/, 384_000],
-];
-
 function now(): number {
   return runtime.now?.() || Date.now();
 }
@@ -213,24 +177,6 @@ function legacyReasoningProvider(
     return provider;
   }
   return null;
-}
-
-function legacyInputLimit(model: string): number | undefined {
-  const normalized = normalize(model);
-  const candidates = [normalized, normalized.split("/").pop() || normalized];
-  for (const [pattern, limit] of LEGACY_INPUT_LIMIT_RULES) {
-    if (candidates.some((candidate) => pattern.test(candidate))) return limit;
-  }
-  return undefined;
-}
-
-function legacyOutputLimit(model: string): number | undefined {
-  const normalized = normalize(model);
-  const candidates = [normalized, normalized.split("/").pop() || normalized];
-  for (const [pattern, limit] of LEGACY_OUTPUT_LIMIT_RULES) {
-    if (candidates.some((candidate) => pattern.test(candidate))) return limit;
-  }
-  return undefined;
 }
 
 function legacyReasoning(
@@ -326,16 +272,12 @@ function getLiveModel(
 }
 
 function mergeLimits(
-  legacy: number | undefined,
-  legacyOutput: number | undefined,
   entry: RegistryModelEntry | null,
   live: DiscoveredModel | undefined,
-): { limits: ModelCapabilityLimits; source: CapabilitySource } {
+): { limits: ModelCapabilityLimits; source?: CapabilitySource } {
   const entryLimits = entry?.limits;
   const liveLimits = live?.limits;
   const limits: ModelCapabilityLimits = {
-    ...(legacy ? { contextWindowTokens: legacy, inputTokens: legacy } : {}),
-    ...(legacyOutput ? { outputTokens: legacyOutput } : {}),
     ...(entryLimits || {}),
     ...(liveLimits || {}),
   };
@@ -344,11 +286,11 @@ function mergeLimits(
     // rules when the provider does not expose a separate input limit.
     limits.inputTokens = liveLimits.contextWindowTokens;
   }
-  const source: CapabilitySource = liveLimits
+  const source: CapabilitySource | undefined = liveLimits
     ? "live"
     : entryLimits
       ? activeRegistrySource
-      : "legacy";
+      : undefined;
   return { limits, source };
 }
 
@@ -565,12 +507,7 @@ export function getModelCapabilities(
   const model = identity.model.trim();
   const entry = findRegistryEntry(activeRegistry, provider, model);
   const live = getLiveModel(identity);
-  const mergedLimits = mergeLimits(
-    legacyInputLimit(model),
-    legacyOutputLimit(model),
-    entry,
-    live,
-  );
+  const mergedLimits = mergeLimits(entry, live);
   const mergedReasoning = mergeReasoning(
     provider,
     model,
@@ -610,7 +547,7 @@ export function getModelCapabilities(
     stale: Boolean(getCatalogSnapshot(identity)?.stale),
     resolvedAt: now(),
     provenance: {
-      limits: mergedLimits.source,
+      ...(mergedLimits.source ? { limits: mergedLimits.source } : {}),
       reasoning: mergedReasoning.source,
       ...(entry?.sampling ? { sampling: activeRegistrySource } : {}),
       ...(entry?.inputs || live?.inputs

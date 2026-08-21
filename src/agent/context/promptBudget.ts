@@ -10,8 +10,9 @@ import {
 import {
   estimateContextMessagesTokens,
   estimateTextTokens,
-  resolveContextWindowTokens,
+  resolveModelInputTokenLimit,
   sliceTextToTokenBudget,
+  type ModelInputTokenLimitSource,
 } from "../../utils/modelInputCap";
 import type { ModelProfileOverride } from "../../modelCapabilities";
 
@@ -38,6 +39,7 @@ export class AgentPromptBudgetError extends Error {
 
 export type AgentPromptBudgetLimits = {
   contextWindow: number;
+  inputLimitSource: ModelInputTokenLimitSource;
   softLimitTokens: number;
 };
 
@@ -57,6 +59,7 @@ export type AgentPromptBudgetResult = {
   messages: AgentModelMessage[];
   changed: boolean;
   contextWindow: number;
+  inputLimitSource: ModelInputTokenLimitSource;
   softLimitTokens: number;
   estimatedBeforeTokens: number;
   estimatedAfterTokens: number;
@@ -72,7 +75,7 @@ export function resolveAgentPromptBudgetLimits(params: {
   authMode?: string;
   profileOverride?: ModelProfileOverride;
 }): AgentPromptBudgetLimits {
-  const contextWindow = resolveContextWindowTokens(
+  const resolvedLimit = resolveModelInputTokenLimit(
     params.model || "",
     params.inputTokenCap,
     {
@@ -83,10 +86,11 @@ export function resolveAgentPromptBudgetLimits(params: {
     },
   );
   return {
-    contextWindow,
+    contextWindow: resolvedLimit.limitTokens,
+    inputLimitSource: resolvedLimit.source,
     softLimitTokens: Math.max(
       1,
-      Math.floor(contextWindow * AGENT_PROMPT_SOFT_LIMIT_RATIO),
+      Math.floor(resolvedLimit.limitTokens * AGENT_PROMPT_SOFT_LIMIT_RATIO),
     ),
   };
 }
@@ -1058,6 +1062,7 @@ export function enforceAgentPromptBudget(params: {
       messages,
       changed,
       contextWindow: limits.contextWindow,
+      inputLimitSource: limits.inputLimitSource,
       softLimitTokens: limits.softLimitTokens,
       estimatedBeforeTokens,
       estimatedAfterTokens: estimatedBeforeTokens,
@@ -1161,6 +1166,7 @@ export function enforceAgentPromptBudget(params: {
     messages,
     changed,
     contextWindow: limits.contextWindow,
+    inputLimitSource: limits.inputLimitSource,
     softLimitTokens: limits.softLimitTokens,
     estimatedBeforeTokens,
     estimatedAfterTokens,

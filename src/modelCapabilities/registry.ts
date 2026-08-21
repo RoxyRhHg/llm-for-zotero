@@ -290,7 +290,16 @@ export function findRegistryEntry(
 ): RegistryModelEntry | null {
   const providerName = normalized(provider);
   const modelName = normalized(model);
-  const modelTail = modelName.split("/").pop() || modelName;
+  const modelCandidates = [modelName];
+  for (let index = 0; index < modelName.length - 1; index += 1) {
+    if (
+      modelName[index] === "/" ||
+      modelName[index] === ":" ||
+      modelName[index] === "."
+    ) {
+      modelCandidates.push(modelName.slice(index + 1));
+    }
+  }
   let best: { entry: RegistryModelEntry; score: number } | null = null;
   for (const entry of registry.models) {
     const matchProvider = normalized(entry.match.provider);
@@ -299,11 +308,11 @@ export function findRegistryEntry(
     const exact = normalized(entry.match.exact);
     const prefix = normalized(entry.match.prefix);
     let score = -1;
-    if (exact && (exact === modelName || exact === modelTail)) {
+    if (exact && modelCandidates.includes(exact)) {
       score = providerSpecificity + 100000 + exact.length;
     } else if (
       prefix &&
-      (matchesPrefix(modelName, prefix) || matchesPrefix(modelTail, prefix))
+      modelCandidates.some((candidate) => matchesPrefix(candidate, prefix))
     ) {
       score = providerSpecificity + 1000 + prefix.length;
     }

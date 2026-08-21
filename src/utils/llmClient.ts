@@ -61,9 +61,9 @@ import {
 import { getLocalParentPath, joinLocalPath, pathToFileUrl } from "./localPath";
 import { fingerprintSecret } from "./secretFingerprint";
 import {
+  normalizeMaxTokens,
   normalizeTemperature,
   normalizeMaxTokensForModel,
-  normalizeInputTokenCap,
   resolveGeminiTemperature,
 } from "./normalization";
 import {
@@ -95,7 +95,7 @@ import { buildMultipartRequest } from "./multipart";
 import {
   applyModelInputTokenCap,
   estimateConversationTokens,
-  getModelInputTokenLimit,
+  resolveModelInputTokenLimit,
   type InputCapResult,
 } from "./modelInputCap";
 import { resolveProviderCapabilities } from "../providers";
@@ -1446,7 +1446,7 @@ export function prepareChatRequest(params: ChatParams): PreparedChatRequest {
   };
 }
 
-async function preflightRequestModelCapabilities(
+export async function preflightRequestModelCapabilities(
   params: ChatParams,
 ): Promise<void> {
   try {
@@ -1504,6 +1504,7 @@ export function estimateAvailableContextBudget(params: {
   model: string;
   reasoning?: ReasoningConfig;
   maxTokens?: number;
+  maxTokensExplicit?: boolean;
   inputTokenCap?: number;
   systemPrompt?: string;
   apiBase?: string;
@@ -1513,22 +1514,25 @@ export function estimateAvailableContextBudget(params: {
 }): ContextBudgetPlan {
   const normalizedModel =
     (params.model || DEFAULT_MODEL).trim() || DEFAULT_MODEL;
-  const modelLimitTokens = getModelInputTokenLimit(normalizedModel, {
-    provider: params.apiBase
-      ? detectProviderPreset(params.apiBase).toString()
-      : undefined,
-    apiBase: params.apiBase,
-    protocol: params.providerProtocol,
-    authMode: params.authMode,
-    profileOverride: params.profileOverride,
-  });
-  const limitTokens = normalizeInputTokenCap(
+  const resolvedInputLimit = resolveModelInputTokenLimit(
+    normalizedModel,
     params.inputTokenCap,
-    modelLimitTokens,
+    {
+      provider: params.apiBase
+        ? detectProviderPreset(params.apiBase).toString()
+        : undefined,
+      apiBase: params.apiBase,
+      protocol: params.providerProtocol,
+      authMode: params.authMode,
+      profileOverride: params.profileOverride,
+    },
   );
+  const limitTokens = resolvedInputLimit.limitTokens;
+  const modelLimitTokens = limitTokens;
   const softLimitTokens = Math.max(1, Math.floor(limitTokens * 0.9));
   const outputReserveTokens = normalizeMaxTokensForRequest({
     value: params.maxTokens,
+    maxTokensExplicit: params.maxTokensExplicit,
     model: normalizedModel,
     apiBase: params.apiBase,
     protocol: params.providerProtocol,
@@ -1789,12 +1793,14 @@ function buildResponsesTokenParam(maxTokens: number) {
 
 export function normalizeMaxTokensForRequest(params: {
   value?: number;
+  maxTokensExplicit?: boolean;
   model: string;
   apiBase?: string;
   protocol?: ProviderProtocol;
   authMode?: ModelProviderAuthMode;
   profileOverride?: ModelProfileOverride;
 }): number {
+  if (params.maxTokensExplicit) return normalizeMaxTokens(params.value);
   const normalized = normalizeMaxTokensForModel(params.value, params.model, {
     provider: params.apiBase
       ? detectProviderPreset(params.apiBase).toString()
@@ -1804,17 +1810,7 @@ export function normalizeMaxTokensForRequest(params: {
     authMode: params.authMode,
     profileOverride: params.profileOverride,
   });
-  const discovered = getModelCapabilities({
-    provider: params.apiBase
-      ? detectProviderPreset(params.apiBase).toString()
-      : undefined,
-    model: params.model,
-    apiBase: params.apiBase,
-    protocol: params.protocol,
-    authMode: params.authMode,
-    profileOverride: params.profileOverride,
-  }).limits.outputTokens;
-  return discovered ? Math.min(normalized, discovered) : normalized;
+  return normalized;
 }
 
 const OPENAI_EFFORT_ORDER: OpenAIReasoningEffort[] = [
@@ -3971,6 +3967,7 @@ export async function callLLM(params: ChatParams): Promise<string> {
       messages,
       effectiveMaxTokens: normalizeMaxTokensForRequest({
         value: params.maxTokens,
+        maxTokensExplicit: params.maxTokensExplicit,
         model,
         apiBase,
         protocol: providerProtocol,
@@ -4033,6 +4030,7 @@ export async function callLLM(params: ChatParams): Promise<string> {
   const effectiveTemperature = normalizeTemperature(params.temperature);
   const effectiveMaxTokens = normalizeMaxTokensForRequest({
     value: params.maxTokens,
+    maxTokensExplicit: params.maxTokensExplicit,
     model,
     apiBase,
     protocol: providerProtocol,
@@ -4123,6 +4121,7 @@ export async function callLLMStream(
       messages,
       effectiveMaxTokens: normalizeMaxTokensForRequest({
         value: params.maxTokens,
+        maxTokensExplicit: params.maxTokensExplicit,
         model,
         apiBase,
         protocol: providerProtocol,
@@ -4185,6 +4184,7 @@ export async function callLLMStream(
   const effectiveTemperature = normalizeTemperature(params.temperature);
   const effectiveMaxTokens = normalizeMaxTokensForRequest({
     value: params.maxTokens,
+    maxTokensExplicit: params.maxTokensExplicit,
     model,
     apiBase,
     protocol: providerProtocol,

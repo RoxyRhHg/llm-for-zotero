@@ -1299,6 +1299,9 @@ export class AgentRuntime {
         setToolResultReadAvailability(request, stepToolResultReadAvailable);
         const stepToolSpecs = this.registry.listToolsForRequest(request);
         const stepContextWindow = preflight.contextWindow;
+        const stepInputLimitIsUserAuthoritative =
+          preflight.inputLimitSource === "advanced" ||
+          preflight.inputLimitSource === "user";
         const stepContextTokens = preflight.estimatedAfterTokens;
         if (stepContextTokens > 0 && stepContextWindow > 0) {
           await emit({
@@ -1345,14 +1348,19 @@ export class AgentRuntime {
               Number.isFinite(usageRecord.contextTokens)
                 ? Math.max(0, usageRecord.contextTokens)
                 : undefined;
-            const contextWindow =
+            const providerContextWindow =
               typeof usageRecord.contextWindow === "number" &&
               Number.isFinite(usageRecord.contextWindow)
                 ? Math.max(0, usageRecord.contextWindow)
-                : typeof contextTokens === "number" && contextTokens > 0
+                : undefined;
+            const contextWindow = stepInputLimitIsUserAuthoritative
+              ? stepContextWindow
+              : providerContextWindow ||
+                (typeof contextTokens === "number" && contextTokens > 0
                   ? stepContextWindow
-                  : undefined;
+                  : undefined);
             const contextWindowIsAuthoritative =
+              !stepInputLimitIsUserAuthoritative &&
               usageRecord.contextWindowIsAuthoritative === true;
             const percentage =
               typeof usageRecord.percentage === "number" &&

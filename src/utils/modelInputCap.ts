@@ -7,9 +7,15 @@
  */
 
 import { DEFAULT_INPUT_TOKEN_CAP } from "./llmDefaults";
-import { normalizeInputTokenCap } from "./normalization";
+import {
+  normalizeInputTokenCap,
+  normalizeOptionalInputTokenCap,
+} from "./normalization";
 import {
   getModelCapabilities,
+  normalizeProfileOverride,
+  profileOverrideAppliesTo,
+  type CapabilitySource,
   type ModelCapabilityIdentity,
 } from "../modelCapabilities";
 
@@ -381,12 +387,71 @@ export function getModelInputTokenLimit(
   modelName: string,
   identity?: Omit<ModelCapabilityIdentity, "model">,
 ): number {
-  const limits = getModelCapabilities({ model: modelName, ...identity }).limits;
-  return (
-    limits.inputTokens ||
-    limits.contextWindowTokens ||
-    DEFAULT_MODEL_INPUT_TOKEN_LIMIT
+  return resolveModelInputTokenLimit(modelName, undefined, identity)
+    .limitTokens;
+}
+
+export type ModelInputTokenLimitSource =
+  | "advanced"
+  | CapabilitySource
+  | "default";
+
+export type ResolvedModelInputTokenLimit = {
+  limitTokens: number;
+  source: ModelInputTokenLimitSource;
+  detectedLimitTokens?: number;
+};
+
+/**
+ * Resolve the effective input budget without allowing discovered model
+ * metadata to constrain an explicit advanced setting.
+ */
+export function resolveModelInputTokenLimit(
+  modelName: string,
+  inputTokenCapOverride?: number,
+  identity?: Omit<ModelCapabilityIdentity, "model">,
+): ResolvedModelInputTokenLimit {
+  const capabilities = getModelCapabilities({
+    model: modelName,
+    ...identity,
+    profileOverride: undefined,
+  });
+  const detectedLimitTokens =
+    capabilities.limits.inputTokens || capabilities.limits.contextWindowTokens;
+  const explicitLimitTokens = normalizeOptionalInputTokenCap(
+    inputTokenCapOverride,
   );
+  if (explicitLimitTokens !== undefined) {
+    return {
+      limitTokens: explicitLimitTokens,
+      source: "advanced",
+      ...(detectedLimitTokens ? { detectedLimitTokens } : {}),
+    };
+  }
+  const profileOverride = normalizeProfileOverride(identity?.profileOverride);
+  const profileLimitTokens =
+    profileOverride && profileOverrideAppliesTo(profileOverride, modelName)
+      ? profileOverride.limits?.inputTokens ||
+        profileOverride.limits?.contextWindowTokens
+      : undefined;
+  if (profileLimitTokens) {
+    return {
+      limitTokens: normalizeInputTokenCap(profileLimitTokens),
+      source: "user",
+      ...(detectedLimitTokens ? { detectedLimitTokens } : {}),
+    };
+  }
+  if (detectedLimitTokens) {
+    return {
+      limitTokens: normalizeInputTokenCap(detectedLimitTokens),
+      source: capabilities.provenance.limits || capabilities.source,
+      detectedLimitTokens,
+    };
+  }
+  return {
+    limitTokens: DEFAULT_MODEL_INPUT_TOKEN_LIMIT,
+    source: "default",
+  };
 }
 
 export function resolveContextWindowTokens(
@@ -394,17 +459,15 @@ export function resolveContextWindowTokens(
   inputTokenCapOverride?: number,
   identity?: Omit<ModelCapabilityIdentity, "model">,
 ): number {
-  const modelLimit = getModelInputTokenLimit(modelName, identity);
-  return Math.min(
-    normalizeInputTokenCap(inputTokenCapOverride, modelLimit),
-    modelLimit,
-  );
+  return resolveModelInputTokenLimit(modelName, inputTokenCapOverride, identity)
+    .limitTokens;
 }
 
 export type InputCapResult = {
   messages: InputCapMessage[];
   capped: boolean;
   limitTokens: number;
+  limitSource: ModelInputTokenLimitSource;
   softLimitTokens: number;
   estimatedBeforeTokens: number;
   estimatedAfterTokens: number;
@@ -424,11 +487,12 @@ export function applyModelInputTokenCap(
   inputTokenCapOverride?: number,
   identity?: Omit<ModelCapabilityIdentity, "model">,
 ): InputCapResult {
-  const modelLimitTokens = getModelInputTokenLimit(modelName, identity);
-  const limitTokens = Math.min(
-    normalizeInputTokenCap(inputTokenCapOverride, modelLimitTokens),
-    modelLimitTokens,
+  const resolvedLimit = resolveModelInputTokenLimit(
+    modelName,
+    inputTokenCapOverride,
+    identity,
   );
+  const limitTokens = resolvedLimit.limitTokens;
   const softLimitTokens = Math.max(
     1,
     Math.floor(limitTokens * TOKEN_SAFETY_RATIO),
@@ -448,6 +512,7 @@ export function applyModelInputTokenCap(
       messages: working,
       capped: false,
       limitTokens,
+      limitSource: resolvedLimit.source,
       softLimitTokens,
       estimatedBeforeTokens,
       estimatedAfterTokens,
@@ -533,6 +598,7 @@ export function applyModelInputTokenCap(
     messages: working,
     capped: true,
     limitTokens,
+    limitSource: resolvedLimit.source,
     softLimitTokens,
     estimatedBeforeTokens,
     estimatedAfterTokens,

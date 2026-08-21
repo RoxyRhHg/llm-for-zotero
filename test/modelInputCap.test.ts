@@ -5,6 +5,7 @@ import {
   estimateConversationTokens,
   estimateTextTokens,
   getModelInputTokenLimit,
+  resolveModelInputTokenLimit,
   sliceTextToTokenBudget,
   resolveContextWindowTokens,
   type InputCapMessage,
@@ -31,7 +32,8 @@ describe("modelInputCap", function () {
       assert.equal(getModelInputTokenLimit("gemini-2.5-pro"), 1048576);
       assert.equal(getModelInputTokenLimit("gemini-3-pro"), 1000000);
       assert.equal(getModelInputTokenLimit("qwen-long-latest"), 10000000);
-      assert.equal(getModelInputTokenLimit("unknown-custom-model"), 128000);
+      assert.equal(getModelInputTokenLimit("qwen3.8-max"), 1000000);
+      assert.equal(getModelInputTokenLimit("unknown-custom-model"), 256000);
     });
   });
 
@@ -86,6 +88,27 @@ describe("modelInputCap", function () {
     it("resolves the active context window from model and override", function () {
       assert.equal(resolveContextWindowTokens("gpt-5.4"), 1050000);
       assert.equal(resolveContextWindowTokens("gpt-5.4", 64000), 64000);
+      assert.equal(resolveContextWindowTokens("gpt-4o", 1_000_000), 1_000_000);
+      assert.equal(
+        resolveContextWindowTokens("future-model-2030", 1_000_000),
+        1_000_000,
+      );
+      assert.deepInclude(
+        resolveModelInputTokenLimit("future-model-2030", 1_000_000),
+        { limitTokens: 1_000_000, source: "advanced" },
+      );
+    });
+
+    it("uses a matching profile override when the dedicated cap is blank", function () {
+      assert.deepInclude(
+        resolveModelInputTokenLimit("claude-haiku-4-5", undefined, {
+          profileOverride: {
+            forModel: "claude-haiku-4-5",
+            limits: { contextWindowTokens: 750_000 },
+          },
+        }),
+        { limitTokens: 750_000, source: "user" },
+      );
     });
   });
 

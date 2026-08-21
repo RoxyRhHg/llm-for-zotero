@@ -1043,4 +1043,55 @@ describe("GeminiNativeAgentAdapter", function () {
       "customizing the level must not silently cost the user the thought stream",
     );
   });
+
+  it("preserves explicit output above detected limits", async function () {
+    const adapter = new GeminiNativeAgentAdapter();
+    let capturedBody: Record<string, unknown> | null = null;
+    (
+      globalThis as typeof globalThis & {
+        ztoolkit: { getGlobal: (name: string) => unknown };
+      }
+    ).ztoolkit = {
+      getGlobal: (name: string) => {
+        if (name !== "fetch") return undefined;
+        return async (_url: string, init?: RequestInit) => {
+          capturedBody = JSON.parse(String(init?.body || "{}")) as Record<
+            string,
+            unknown
+          >;
+          return {
+            ok: true,
+            status: 200,
+            statusText: "OK",
+            body: undefined,
+            json: async () => ({
+              candidates: [{ content: { parts: [{ text: "done" }] } }],
+            }),
+            text: async () => "",
+          };
+        };
+      },
+    };
+
+    await adapter.runStep({
+      request: makeRequest({
+        advanced: {
+          maxTokens: 200_000,
+          maxTokensExplicit: true,
+          profileOverride: {
+            forModel: "gemini-2.5-pro",
+            limits: { outputTokens: 64_000 },
+          },
+        },
+      }),
+      messages: [{ role: "user", content: "Inspect this paper" }],
+      tools: [],
+    });
+
+    const generationConfig = capturedBody?.generationConfig as Record<
+      string,
+      unknown
+    >;
+    assert.equal(generationConfig.maxOutputTokens, 200_000);
+  });
 });

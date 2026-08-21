@@ -108,10 +108,11 @@ describe("agent adapters honour model profile overrides", function () {
     };
   }
 
-  function advancedWithRaisedOutputLimit() {
+  function advancedWithExplicitOutputLimit() {
     return {
       temperature: 0.3,
-      maxTokens: 80_000,
+      maxTokens: 200_000,
+      maxTokensExplicit: true,
       profileOverride: {
         forModel: "claude-haiku-4-5",
         limits: { outputTokens: 100_000 },
@@ -201,7 +202,7 @@ describe("agent adapters honour model profile overrides", function () {
     assert.equal(body.read().top_k, 40);
   });
 
-  it("openai_chat_compat clamps output using the matching raised profile limit", async function () {
+  it("openai_chat_compat preserves explicit output above detected limits", async function () {
     const body = captureBody({
       sse: [
         `data: ${JSON.stringify({ choices: [{ delta: { content: "hi" } }] })}\n\n`,
@@ -212,16 +213,16 @@ describe("agent adapters honour model profile overrides", function () {
     await new OpenAIChatCompatAgentAdapter().runStep({
       request: makeRequest({
         model: "claude-haiku-4-5",
-        advanced: advancedWithRaisedOutputLimit(),
+        advanced: advancedWithExplicitOutputLimit(),
       }),
       messages: [{ role: "user", content: "Summarize" }],
       tools,
     });
 
-    assert.equal(body.read().max_tokens, 80_000);
+    assert.equal(body.read().max_tokens, 200_000);
   });
 
-  it("responses_api clamps output using the matching raised profile limit", async function () {
+  it("responses_api preserves explicit output above detected limits", async function () {
     const body = captureBody({
       json: { output: [{ content: [{ type: "output_text", text: "hi" }] }] },
     });
@@ -231,16 +232,16 @@ describe("agent adapters honour model profile overrides", function () {
         model: "claude-haiku-4-5",
         apiBase: "https://api.openai.com/v1/responses",
         providerProtocol: "responses_api",
-        advanced: advancedWithRaisedOutputLimit(),
+        advanced: advancedWithExplicitOutputLimit(),
       }),
       messages: [{ role: "user", content: "Summarize" }],
       tools,
     });
 
-    assert.equal(body.read().max_output_tokens, 80_000);
+    assert.equal(body.read().max_output_tokens, 200_000);
   });
 
-  it("anthropic_messages clamps output using the matching raised profile limit", async function () {
+  it("anthropic_messages preserves explicit output above detected limits", async function () {
     const body = captureBody({
       json: {
         content: [{ type: "text", text: "hi" }],
@@ -253,13 +254,13 @@ describe("agent adapters honour model profile overrides", function () {
         model: "claude-haiku-4-5",
         apiBase: "https://api.anthropic.com/v1",
         providerProtocol: "anthropic_messages",
-        advanced: advancedWithRaisedOutputLimit(),
+        advanced: advancedWithExplicitOutputLimit(),
       }),
       messages: [{ role: "user", content: "Summarize" }],
       tools,
     });
 
-    assert.equal(body.read().max_tokens, 80_000);
+    assert.equal(body.read().max_tokens, 200_000);
   });
 
   it("ollama_native sends the user's extra parameters", async function () {

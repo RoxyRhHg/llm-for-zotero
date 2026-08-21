@@ -1,5 +1,6 @@
 import type { SendQuestionOptions } from "./types";
 import type { InputCapEffects } from "../../utils/modelInputCap";
+import type { ModelInputTokenLimitSource } from "../../utils/modelInputCap";
 import type { ContextAssemblyStrategy, MultiContextPlan } from "./types";
 
 export type WorkflowTestSendInterceptor = (
@@ -12,6 +13,11 @@ export type WorkflowTestFinalRequestSnapshot = {
   combinedContext: string;
   strategy: ContextAssemblyStrategy;
   systemMessages: string[];
+  inputCap: {
+    limitTokens: number;
+    limitSource: ModelInputTokenLimitSource;
+    estimatedAfterTokens: number;
+  };
   inputCapEffects: InputCapEffects;
   readStrategy?: MultiContextPlan["readStrategy"];
   coverageReceipt?: MultiContextPlan["coverageReceipt"];

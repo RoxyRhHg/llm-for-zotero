@@ -9,7 +9,7 @@ import {
 import { HTML_NS, el, iconBtn } from "../utils/domHelpers";
 import { registerAddonDialog } from "../utils/dialogRegistry";
 import {
-  normalizeMaxTokensForModel,
+  normalizeMaxTokens,
   normalizeOptionalInputTokenCap,
   normalizeTemperature,
 } from "../utils/normalization";
@@ -2147,8 +2147,8 @@ export async function registerPrefsScripts(_window: Window | undefined | null) {
         if (inputModeFieldWrap) advFields.append(inputModeFieldWrap);
         advFields.append(protocolFieldWrap);
         const inputModeHelpText = inputModeFieldWrap
-          ? "Temperature: randomness (0–2)  ·  Max tokens: output limit  ·  Input cap: context limit  ·  Input mode: auto/text-only/vision"
-          : "Temperature: randomness (0–2)  ·  Max tokens: output limit  ·  Input cap: context limit (optional)";
+          ? "Temperature: randomness (0–2)  ·  Edited Max tokens and set Input cap override detected/default limits  ·  Input mode: auto/text-only/vision"
+          : "Temperature: randomness (0–2)  ·  Edited Max tokens and set Input cap override detected/default limits";
         advRow.append(
           advFields,
           el(
@@ -2231,10 +2231,7 @@ export async function registerPrefsScripts(_window: Window | undefined | null) {
 
         const commitAdvanced = (maxTokensEdited = false) => {
           modelEntry.temperature = normalizeTemperature(tempField.input.value);
-          modelEntry.maxTokens = normalizeMaxTokensForModel(
-            maxTokField.input.value,
-            modelEntry.model,
-          );
+          modelEntry.maxTokens = normalizeMaxTokens(maxTokField.input.value);
           if (maxTokensEdited) modelEntry.maxTokensExplicit = true;
           modelEntry.inputTokenCap = normalizeOptionalInputTokenCap(
             inputCapField.input.value,
@@ -2278,7 +2275,7 @@ export async function registerPrefsScripts(_window: Window | undefined | null) {
         maxTokField.input.addEventListener("change", () =>
           commitAdvanced(true),
         );
-        maxTokField.input.addEventListener("blur", () => commitAdvanced(true));
+        maxTokField.input.addEventListener("blur", () => commitAdvanced());
         inputModeSelect?.addEventListener("change", () => commitAdvanced());
         protocolFieldSelect.addEventListener("change", () => commitAdvanced());
 

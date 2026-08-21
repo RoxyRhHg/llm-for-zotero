@@ -8,10 +8,8 @@ import {
   normalizeProfileOverride,
   getModelCapabilities,
 } from "../../modelCapabilities";
-import {
-  normalizeMaxTokensForModel,
-  resolveGeminiTemperature,
-} from "../../utils/normalization";
+import { resolveGeminiTemperature } from "../../utils/normalization";
+import { normalizeMaxTokensForRequest } from "../../utils/llmClient";
 import { withGeminiThoughtSummaries } from "../../utils/reasoningProfiles";
 import {
   buildProviderTransportHeaders,
@@ -851,16 +849,15 @@ export class GeminiNativeAgentAdapter implements AgentModelAdapter {
           );
           return temperature !== undefined ? { temperature } : {};
         })(),
-        maxOutputTokens: normalizeMaxTokensForModel(
-          request.advanced?.maxTokens,
-          request.model,
-          {
-            apiBase: request.apiBase,
-            protocol: "gemini_native",
-            authMode: request.authMode,
-            profileOverride: request.advanced?.profileOverride,
-          },
-        ),
+        maxOutputTokens: normalizeMaxTokensForRequest({
+          value: request.advanced?.maxTokens,
+          maxTokensExplicit: request.advanced?.maxTokensExplicit,
+          model: request.model || "",
+          apiBase: request.apiBase,
+          protocol: "gemini_native",
+          authMode: request.authMode,
+          profileOverride: request.advanced?.profileOverride,
+        }),
         ...(resolveGeminiReasoningConfig(request)
           ? { thinkingConfig: resolveGeminiReasoningConfig(request) }
           : {}),

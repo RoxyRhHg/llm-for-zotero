@@ -386,6 +386,7 @@ export class OpenAIChatCompatAgentAdapter implements AgentModelAdapter {
             ? {
                 max_completion_tokens: normalizeMaxTokensForRequest({
                   value: request.advanced?.maxTokens,
+                  maxTokensExplicit: request.advanced?.maxTokensExplicit,
                   model: request.model || "",
                   apiBase: request.apiBase,
                   protocol: "openai_chat_compat",
@@ -396,6 +397,7 @@ export class OpenAIChatCompatAgentAdapter implements AgentModelAdapter {
             : {
                 max_tokens: normalizeMaxTokensForRequest({
                   value: request.advanced?.maxTokens,
+                  maxTokensExplicit: request.advanced?.maxTokensExplicit,
                   model: request.model || "",
                   apiBase: request.apiBase,
                   protocol: "openai_chat_compat",

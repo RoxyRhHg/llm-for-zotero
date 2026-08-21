@@ -95,6 +95,7 @@ describe("agent prompt budget", function () {
       inputTokenCap: 12_000,
     });
     assert.equal(limits.contextWindow, 12_000);
+    assert.equal(limits.inputLimitSource, "advanced");
     assert.equal(limits.softLimitTokens, 10_800);
     assert.notProperty(limits, "toolResultMaxTokens");
   });
@@ -109,6 +110,7 @@ describe("agent prompt budget", function () {
     });
 
     assert.equal(limits.contextWindow, 18_000);
+    assert.equal(limits.inputLimitSource, "user");
     assert.equal(limits.softLimitTokens, 16_200);
   });
 

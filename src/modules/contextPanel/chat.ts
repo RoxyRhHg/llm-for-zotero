@@ -85,6 +85,7 @@ import {
   ChatFileAttachment,
   ChatMessage,
   prepareChatRequest,
+  preflightRequestModelCapabilities,
   type PreparedChatRequest,
   ReasoningConfig as LLMReasoningConfig,
   ReasoningEvent,
@@ -98,7 +99,11 @@ import {
   getRuntimeReasoningOptions as getCatalogReasoningOptions,
   inferProviderFromModelName,
 } from "../../modelCapabilities";
-import { applyModelInputTokenCap } from "../../utils/modelInputCap";
+import {
+  applyModelInputTokenCap,
+  type ModelInputTokenLimitSource,
+} from "../../utils/modelInputCap";
+import { subscribeModelProviderGroups } from "../../utils/modelProviders";
 import { formatDisplayModelName } from "../../utils/modelDisplayLabel";
 import type { ProviderProtocol } from "../../utils/providerProtocol";
 import { inferLegacyProviderProtocol } from "../../utils/providerProtocol";
@@ -1380,9 +1385,10 @@ const followBottomStabilizers = new Map<
 
 /** Legacy cumulative API token usage per conversation key for this UI session. */
 const sessionTokenTotals = new Map<number, number>();
-type ContextUsageSnapshot = {
+export type ContextUsageSnapshot = {
   contextTokens: number;
   contextWindow?: number;
+  inputLimitSource?: ModelInputTokenLimitSource;
   contextWindowIsAuthoritative?: boolean;
   cacheReadTokens?: number;
   cacheWriteTokens?: number;
@@ -1404,6 +1410,7 @@ function setContextUsageSnapshot(
       Number(snapshot.contextWindow) > 0
         ? Math.floor(Number(snapshot.contextWindow))
         : undefined,
+    inputLimitSource: snapshot.inputLimitSource,
     contextWindowIsAuthoritative:
       snapshot.contextWindowIsAuthoritative === true,
     cacheReadTokens:
@@ -1482,10 +1489,19 @@ function estimateHistoryContextUsageSnapshot(
   return {
     contextTokens: inputCap.estimatedAfterTokens,
     contextWindow: inputCap.limitTokens,
+    inputLimitSource: inputCap.limitSource,
     estimated: true,
     source: "estimated",
   };
 }
+
+subscribeModelProviderGroups(() => {
+  for (const [body, getItem] of activeContextPanels) {
+    if (!(body as Element).isConnected) continue;
+    const item = getItem();
+    if (item) refreshChat(body, item);
+  }
+});
 
 function accumulateSessionTokens(
   conversationKey: number,
@@ -2991,6 +3007,70 @@ function createStreamReasoningHandler(params: {
   };
 }
 
+export function resolveUsageContextWindow(params: {
+  providerContextWindow?: number;
+  providerContextWindowIsAuthoritative?: boolean;
+  fallbackContextWindow: number;
+  fallbackInputLimitSource: ModelInputTokenLimitSource;
+}): {
+  contextWindow: number;
+  inputLimitSource: ModelInputTokenLimitSource;
+  contextWindowIsAuthoritative: boolean;
+} {
+  const fallbackIsUserAuthoritative =
+    params.fallbackInputLimitSource === "advanced" ||
+    params.fallbackInputLimitSource === "user";
+  if (fallbackIsUserAuthoritative || !params.providerContextWindow) {
+    return {
+      contextWindow: params.fallbackContextWindow,
+      inputLimitSource: params.fallbackInputLimitSource,
+      contextWindowIsAuthoritative: false,
+    };
+  }
+  return {
+    contextWindow: params.providerContextWindow,
+    inputLimitSource: "live",
+    contextWindowIsAuthoritative:
+      params.providerContextWindowIsAuthoritative === true,
+  };
+}
+
+export function updateContextUsageSnapshotFromProvider(params: {
+  conversationKey: number;
+  usage: UsageStats;
+  fallbackContextWindow: number;
+  fallbackInputLimitSource: ModelInputTokenLimitSource;
+}): ContextUsageSnapshot | undefined {
+  const contextTokens =
+    typeof params.usage.contextTokens === "number" &&
+    params.usage.contextTokens > 0
+      ? params.usage.contextTokens
+      : 0;
+  if (contextTokens <= 0) return undefined;
+  const resolvedWindow = resolveUsageContextWindow({
+    providerContextWindow: params.usage.contextWindow,
+    providerContextWindowIsAuthoritative:
+      params.usage.contextWindowIsAuthoritative,
+    fallbackContextWindow: params.fallbackContextWindow,
+    fallbackInputLimitSource: params.fallbackInputLimitSource,
+  });
+  return setContextUsageSnapshot(params.conversationKey, {
+    contextTokens,
+    contextWindow: resolvedWindow.contextWindow,
+    inputLimitSource: resolvedWindow.inputLimitSource,
+    estimated: !resolvedWindow.contextWindowIsAuthoritative,
+    source: resolvedWindow.contextWindowIsAuthoritative
+      ? "provider"
+      : "estimated",
+    contextWindowIsAuthoritative: resolvedWindow.contextWindowIsAuthoritative,
+    cacheReadTokens: params.usage.cacheReadTokens,
+    cacheWriteTokens: params.usage.cacheWriteTokens,
+    cacheMissTokens: params.usage.cacheMissTokens,
+    cacheHitRatio: params.usage.cacheHitRatio,
+    cacheProvider: params.usage.cacheProvider,
+  });
+}
+
 function createStreamUsageHandler(params: {
   body: Element;
   tokenUsageEl: HTMLElement | null;
@@ -2998,6 +3078,7 @@ function createStreamUsageHandler(params: {
   conversationGeneration?: number;
   contextCache: Parameters<typeof recordContextCacheTelemetry>[0];
   fallbackContextWindow: number;
+  fallbackInputLimitSource: ModelInputTokenLimitSource;
 }): (usage: UsageStats) => void {
   return (usage) => {
     if (
@@ -3011,24 +3092,13 @@ function createStreamUsageHandler(params: {
       return;
     }
     recordContextCacheTelemetry(params.contextCache, usage);
-    const contextTokens =
-      typeof usage.contextTokens === "number" && usage.contextTokens > 0
-        ? usage.contextTokens
-        : 0;
-    if (contextTokens <= 0) return;
-    const snapshot = setContextUsageSnapshot(params.conversationKey, {
-      contextTokens,
-      contextWindow: usage.contextWindow || params.fallbackContextWindow,
-      estimated: usage.contextWindowIsAuthoritative !== true,
-      source:
-        usage.contextWindowIsAuthoritative === true ? "provider" : "estimated",
-      contextWindowIsAuthoritative: usage.contextWindowIsAuthoritative,
-      cacheReadTokens: usage.cacheReadTokens,
-      cacheWriteTokens: usage.cacheWriteTokens,
-      cacheMissTokens: usage.cacheMissTokens,
-      cacheHitRatio: usage.cacheHitRatio,
-      cacheProvider: usage.cacheProvider,
+    const snapshot = updateContextUsageSnapshotFromProvider({
+      conversationKey: params.conversationKey,
+      usage,
+      fallbackContextWindow: params.fallbackContextWindow,
+      fallbackInputLimitSource: params.fallbackInputLimitSource,
     });
+    if (!snapshot) return;
     renderContextUsageSnapshot(params.body, params.tokenUsageEl, snapshot);
   };
 }
@@ -3642,6 +3712,11 @@ async function prepareFinalContextPlanChatRequest(params: {
         combinedContext: params.combinedContext,
         strategy: params.contextPlan.strategy,
         systemMessages,
+        inputCap: {
+          limitTokens: finalPrepared.inputCap.limitTokens,
+          limitSource: finalPrepared.inputCap.limitSource,
+          estimatedAfterTokens: finalPrepared.inputCap.estimatedAfterTokens,
+        },
         inputCapEffects: preview.inputCap.effects,
         readStrategy: params.contextPlan.readStrategy,
         coverageReceipt: params.contextPlan.coverageReceipt,
@@ -7667,6 +7742,18 @@ export async function retryLatestAssistantResponse(
       AbortControllerCtor ? new AbortControllerCtor() : null,
     );
 
+    if (effectiveConversationSystem === "upstream") {
+      await preflightRequestModelCapabilities({
+        prompt: question,
+        model: effectiveRequestConfig.model,
+        apiBase: effectiveRequestConfig.apiBase,
+        apiKey: effectiveRequestConfig.apiKey,
+        authMode: effectiveRequestConfig.authMode,
+        providerProtocol: effectiveRequestConfig.providerProtocol,
+        profileOverride: effectiveRequestConfig.advanced?.profileOverride,
+      });
+    }
+
     const contextPlan = shouldUseCodexNativeLightContext({ isCodexNativeTurn })
       ? buildLightCodexNativeMcpContextPlan({
           paperContexts: retryPaperContexts,
@@ -7783,6 +7870,7 @@ export async function retryLatestAssistantResponse(
     const estimatedContextSnapshot = setContextUsageSnapshot(conversationKey, {
       contextTokens: finalPrepared.inputCap.estimatedAfterTokens,
       contextWindow: finalPrepared.inputCap.limitTokens,
+      inputLimitSource: finalPrepared.inputCap.limitSource,
       estimated: true,
       source: "estimated",
     });
@@ -7815,6 +7903,7 @@ export async function retryLatestAssistantResponse(
       conversationGeneration,
       contextCache: contextPlan.contextCache,
       fallbackContextWindow: finalPrepared.inputCap.limitTokens,
+      fallbackInputLimitSource: finalPrepared.inputCap.limitSource,
     });
     const answer = isCodexNativeTurn
       ? (
@@ -10191,6 +10280,18 @@ export async function sendQuestion(
       AbortControllerCtor ? new AbortControllerCtor() : null,
     );
 
+    if (effectiveConversationSystem === "upstream") {
+      await preflightRequestModelCapabilities({
+        prompt: question,
+        model: effectiveRequestConfig.model,
+        apiBase: effectiveRequestConfig.apiBase,
+        apiKey: effectiveRequestConfig.apiKey,
+        authMode: effectiveRequestConfig.authMode,
+        providerProtocol: effectiveRequestConfig.providerProtocol,
+        profileOverride: effectiveRequestConfig.advanced?.profileOverride,
+      });
+    }
+
     const contextPlan = shouldUseCodexNativeLightContext({ isCodexNativeTurn })
       ? buildLightCodexNativeMcpContextPlan({
           paperContexts: paperContextsForMessage,
@@ -10336,6 +10437,7 @@ export async function sendQuestion(
     const estimatedContextSnapshot = setContextUsageSnapshot(conversationKey, {
       contextTokens: finalPrepared.inputCap.estimatedAfterTokens,
       contextWindow: finalPrepared.inputCap.limitTokens,
+      inputLimitSource: finalPrepared.inputCap.limitSource,
       estimated: true,
       source: "estimated",
     });
@@ -10358,6 +10460,7 @@ export async function sendQuestion(
       conversationGeneration,
       contextCache: contextPlan.contextCache,
       fallbackContextWindow: finalPrepared.inputCap.limitTokens,
+      fallbackInputLimitSource: finalPrepared.inputCap.limitSource,
     });
     const answer = isCodexNativeTurn
       ? (
@@ -10803,15 +10906,30 @@ export function refreshChat(
   const forkLink = conversationForkLinks.get(conversationKey) || null;
   if (tokenUsageEl && !useTargetedRerender) {
     const snapshot = contextUsageSnapshots.get(conversationKey);
-    const liveSnapshot =
-      snapshot && snapshot.source !== "persisted" ? snapshot : undefined;
-    const recomputedSnapshot = liveSnapshot
-      ? undefined
-      : estimateHistoryContextUsageSnapshot(item, history);
+    const recomputedSnapshot = estimateHistoryContextUsageSnapshot(
+      item,
+      history,
+    );
+    const configuredLimitIsUserAuthoritative =
+      recomputedSnapshot?.inputLimitSource === "advanced" ||
+      recomputedSnapshot?.inputLimitSource === "user";
+    const providerWindowRemainsEligible =
+      snapshot?.source === "provider" && !configuredLimitIsUserAuthoritative;
+    const reconciledSnapshot =
+      snapshot && recomputedSnapshot && !providerWindowRemainsEligible
+        ? setContextUsageSnapshot(conversationKey, {
+            ...snapshot,
+            contextWindow: recomputedSnapshot.contextWindow,
+            inputLimitSource: recomputedSnapshot.inputLimitSource,
+            contextWindowIsAuthoritative: false,
+            estimated: true,
+            source: "estimated",
+          })
+        : snapshot;
     renderContextUsageSnapshot(
       body,
       tokenUsageEl,
-      liveSnapshot || recomputedSnapshot || snapshot,
+      reconciledSnapshot || recomputedSnapshot,
     );
   } else if (tokenUsageEl) {
     // Targeted streaming refreshes reach every panel showing the conversation,

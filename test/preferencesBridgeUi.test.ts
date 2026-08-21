@@ -54,15 +54,15 @@ describe("bridge settings UI behavior", function () {
       assert.equal(t("Vision allowed"), "允许视觉");
       assert.equal(
         t(
-          "Temperature: randomness (0–2)  ·  Max tokens: output limit  ·  Input cap: context limit  ·  Input mode: auto/text-only/vision",
+          "Temperature: randomness (0–2)  ·  Edited Max tokens and set Input cap override detected/default limits  ·  Input mode: auto/text-only/vision",
         ),
-        "温度：随机性 (0–2)  ·  最大 Token 数：输出限制  ·  输入上限：上下文限制  ·  输入模式：自动/仅文本/视觉",
+        "温度：随机性 (0–2)  ·  编辑后的最大 Token 数和已设置的输入上限会覆盖检测值/默认值  ·  输入模式：自动/仅文本/视觉",
       );
       assert.equal(
         t(
-          "Temperature: randomness (0–2)  ·  Max tokens: output limit  ·  Input cap: context limit (optional)",
+          "Temperature: randomness (0–2)  ·  Edited Max tokens and set Input cap override detected/default limits",
         ),
-        "温度：随机性 (0–2)  ·  最大 Token 数：输出限制  ·  输入上限：上下文限制（可选）",
+        "温度：随机性 (0–2)  ·  编辑后的最大 Token 数和已设置的输入上限会覆盖检测值/默认值",
       );
     } finally {
       if (previousZotero) {

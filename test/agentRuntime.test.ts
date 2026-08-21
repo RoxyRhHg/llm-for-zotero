@@ -2250,6 +2250,65 @@ describe("AgentRuntime", function () {
     }
   });
 
+  it("keeps the explicit agent context denominator after provider usage", async function () {
+    const restoreDb = installMockDb();
+    try {
+      const runtime = new AgentRuntime({
+        registry: new AgentToolRegistry(),
+        adapterFactory: () => ({
+          getCapabilities: () => ({
+            streaming: true,
+            toolCalls: true,
+            multimodal: false,
+            fileInputs: false,
+            reasoning: true,
+          }),
+          supportsTools: () => true,
+          async runStep(params: AgentStepParams): Promise<AgentModelStep> {
+            await params.onUsage?.({
+              promptTokens: 10,
+              completionTokens: 4,
+              totalTokens: 14,
+              contextTokens: 10,
+              contextWindow: 128_000,
+              contextWindowIsAuthoritative: true,
+            });
+            return {
+              kind: "final",
+              text: "Done.",
+              assistantMessage: { role: "assistant", content: "Done." },
+            };
+          },
+        }),
+      });
+      const events: AgentEvent[] = [];
+
+      await runtime.runTurn({
+        request: {
+          conversationKey: 1,
+          mode: "agent",
+          userText: "count tokens",
+          model: "qwen3.8-max",
+          apiBase: "https://dashscope.aliyuncs.com/compatible-mode/v1",
+          apiKey: "test",
+          advanced: { inputTokenCap: 1_000_000 },
+        },
+        onEvent: async (event) => events.push(event),
+      });
+
+      const providerUsage = events.find(
+        (event) => event.type === "usage" && event.totalTokens === 14,
+      );
+      assert.equal(providerUsage?.type, "usage");
+      if (providerUsage?.type === "usage") {
+        assert.equal(providerUsage.contextWindow, 1_000_000);
+        assert.isNotTrue(providerUsage.contextWindowIsAuthoritative);
+      }
+    } finally {
+      restoreDb();
+    }
+  });
+
   it("emits current context events and renders context on repeated turns", async function () {
     const restoreDb = installMockDb();
     try {

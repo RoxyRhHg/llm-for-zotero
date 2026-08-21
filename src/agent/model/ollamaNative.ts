@@ -227,6 +227,7 @@ export class OllamaNativeAgentAdapter implements AgentModelAdapter {
     // cannot burn the whole budget on thought.
     const effectiveMaxTokens = normalizeMaxTokensForRequest({
       value: request.advanced?.maxTokens,
+      maxTokensExplicit: request.advanced?.maxTokensExplicit,
       model: request.model || "",
       apiBase: request.apiBase,
       protocol: "ollama_native",

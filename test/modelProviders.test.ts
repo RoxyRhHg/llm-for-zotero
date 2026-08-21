@@ -8,6 +8,7 @@ import {
   migrateApiBaseForAuthModeChange,
   refreshConfiguredProviderModelCatalogs,
   setModelProviderGroups,
+  subscribeModelProviderGroups,
   type LegacyModelSlot,
   type ModelProviderGroup,
 } from "../src/utils/modelProviders";
@@ -193,6 +194,19 @@ describe("modelProviders", function () {
             temperature: 0.3,
             maxTokens: 4096,
           },
+          {
+            id: "legacy-custom",
+            model: "future-model",
+            temperature: 0.3,
+            maxTokens: 250000,
+          },
+          {
+            id: "known-high-explicit",
+            model: "claude-haiku-4-5",
+            temperature: 0.3,
+            maxTokens: 200000,
+            maxTokensExplicit: true,
+          },
         ],
       },
     ]);
@@ -201,6 +215,23 @@ describe("modelProviders", function () {
 
     assert.isTrue(entries[0].advanced.maxTokensExplicit);
     assert.isUndefined(entries[1].advanced.maxTokensExplicit);
+    assert.equal(entries[2].advanced.maxTokens, 250000);
+    assert.isTrue(entries[2].advanced.maxTokensExplicit);
+    assert.equal(entries[3].advanced.maxTokens, 200000);
+    assert.isTrue(entries[3].advanced.maxTokensExplicit);
+  });
+
+  it("notifies open consumers after provider settings change", function () {
+    let notifications = 0;
+    const unsubscribe = subscribeModelProviderGroups(() => {
+      notifications += 1;
+    });
+
+    setModelProviderGroups([]);
+    unsubscribe();
+    setModelProviderGroups([]);
+
+    assert.equal(notifications, 1);
   });
 
   it("infers Anthropic protocol for customized providers with default chat protocol", function () {
