@@ -16,6 +16,7 @@ import {
   resolvePageNativeFindControllerQuery,
   scrollToExactQuoteInReader,
   scrollToSelectedTextInReader,
+  verifyCompleteQuoteInLivePdfJs,
   verifyQuoteLocationForAttachment,
   warmPageTextCacheForAttachment,
   warmQuoteLocationCacheForAttachment,
@@ -461,6 +462,125 @@ describe("livePdfSelectionLocator", function () {
       assert.equal(result.confidence, "none");
       assert.isNull(result.computedPageIndex);
       assert.include(result.reason || "", "cached result is not conclusive");
+    } finally {
+      restore();
+    }
+  });
+
+  it("strictly verifies a unique complete quote in page-native PDF.js text", async function () {
+    clearPageTextCache();
+    const restore = installPdfWorkerStub(async () => null);
+    const quote =
+      "The paper explains why these are intuitive concepts commonly used in the field.";
+    const reader = {
+      _item: { id: 6123 },
+      itemID: 6123,
+      _window: {
+        PDFViewerApplication: {
+          pdfDocument: {
+            numPages: 2,
+            fingerprints: ["strict-verification-pdf"],
+            getPage: async (pageNumber: number) => ({
+              getTextContent: async () => ({
+                items:
+                  pageNumber === 2
+                    ? [
+                        { str: "The paper explains why these are " },
+                        { str: "i" },
+                        { str: "ntuitive" },
+                        { str: " concepts commonly used in the field." },
+                      ]
+                    : [{ str: "Unrelated searchable first page." }],
+              }),
+            }),
+          },
+        },
+      },
+    };
+
+    try {
+      const result = await verifyCompleteQuoteInLivePdfJs(reader, 6123, quote);
+
+      assert.equal(result.status, "matched");
+      if (result.status !== "matched") return;
+      assert.equal(
+        result.certificate.documentFingerprint,
+        "strict-verification-pdf",
+      );
+      assert.equal(result.certificate.pageIndex, 1);
+      assert.equal(result.certificate.sourceMatchPageOccurrence, 0);
+      assert.equal(result.certificate.sourceMatchText, quote);
+    } finally {
+      restore();
+    }
+  });
+
+  it("returns absent when complete PDF.js text rejects a strong fabricated quote", async function () {
+    clearPageTextCache();
+    const restore = installPdfWorkerStub(async () => null);
+    const reader = {
+      _item: { id: 6124 },
+      itemID: 6124,
+      _window: {
+        PDFViewerApplication: {
+          pdfDocument: {
+            numPages: 1,
+            fingerprints: ["strict-negative-pdf"],
+            getPage: async () => ({
+              getTextContent: async () => ({
+                items: [
+                  {
+                    str: "The measured population response remained stable across every repeated recording session.",
+                  },
+                ],
+              }),
+            }),
+          },
+        },
+      },
+    };
+
+    try {
+      const result = await verifyCompleteQuoteInLivePdfJs(
+        reader,
+        6124,
+        "The measured population response remained stable across every fabricated recording session.",
+      );
+
+      assert.equal(result.status, "absent");
+    } finally {
+      restore();
+    }
+  });
+
+  it("defers when the complete PDF.js quote occurs more than once", async function () {
+    clearPageTextCache();
+    const restore = installPdfWorkerStub(async () => null);
+    const quote =
+      "A repeated complete sentence cannot identify one visual source location.";
+    const reader = {
+      _item: { id: 6125 },
+      itemID: 6125,
+      _window: {
+        PDFViewerApplication: {
+          pdfDocument: {
+            numPages: 2,
+            fingerprints: ["strict-ambiguous-pdf"],
+            getPage: async () => ({
+              getTextContent: async () => ({ items: [{ str: quote }] }),
+            }),
+          },
+        },
+      },
+    };
+
+    try {
+      const result = await verifyCompleteQuoteInLivePdfJs(reader, 6125, quote);
+
+      assert.equal(result.status, "defer");
+      if (result.status === "defer") {
+        assert.include(result.reason, "more than once");
+      }
     } finally {
       restore();
     }
@@ -1493,6 +1613,59 @@ describe("page-native scrollToExactQuoteInReader", function () {
     assert.include(resolved?.query || "", " 141 ");
   });
 
+  it("uses a PDF.js certificate to highlight the complete native visual span", async function () {
+    clearPageTextCache();
+    const restore = installPdfWorkerStub(async () => null);
+    const quote =
+      "Consistently, pattern identity remained perfectly decodable from population activity throughout the drift period. Together, these results show that local predictive plasticity generates drifting but organized assemblies.";
+    const fixture = createExactFindControllerReader({
+      pageItems: [
+        [
+          {
+            str: "Consistently, pattern identity remained perfectly decodable\n139 from population activity throughout the drift period.\n140 Together, these results show that local predictive plasticity\n141 generates drifting but organized assemblies.",
+          },
+        ],
+      ],
+      targetPageIndex: 0,
+      fingerprint: "visual-certificate-pdf",
+    });
+    fixture.reader._item = { id: 6126 };
+    fixture.reader.itemID = 6126;
+
+    try {
+      const verification = await verifyCompleteQuoteInLivePdfJs(
+        fixture.reader,
+        6126,
+        quote,
+      );
+      assert.equal(
+        verification.status,
+        "matched",
+        JSON.stringify(verification),
+      );
+      if (verification.status !== "matched") return;
+      assert.include(verification.certificate.sourceMatchText, "139");
+
+      const jump = await scrollToExactQuoteInReader(
+        fixture.reader,
+        verification.certificate.sourceMatchText,
+        {
+          expectedPageIndex: verification.certificate.pageIndex,
+          sourceFingerprint: `pdfjs:${verification.certificate.documentFingerprint}`,
+          sourceMatchPageOccurrence:
+            verification.certificate.sourceMatchPageOccurrence,
+          verifiedFullSpan: true,
+        },
+      );
+
+      assert.isTrue(jump.matched, JSON.stringify(jump));
+      assert.include(jump.queryUsed || "", "139");
+      assert.equal(jump.highlightCoverage, 1);
+    } finally {
+      restore();
+    }
+  });
+
   it("reconstructs the row-604 query with FindController EOL spacing and its complete source suffix", function () {
     const boundary = "\u0003";
     const quote =
@@ -1788,6 +1961,30 @@ describe("page-native scrollToExactQuoteInReader", function () {
     assert.equal(result.queries[0]?.query, quote);
     assert.equal(result.queries[0]?.totalMatches, 0);
     assert.equal(result.queries[1]?.query, result.queryUsed);
+  });
+
+  it("does not partially highlight a PDF.js-certified complete quote", async function () {
+    const quote =
+      "The prediction index is the change in spread, χpred = S(t+1) − S(t), with positive values indicating that SC at day t predicts a more ordered NC structure at day t + 1.";
+    const fixture = createExactFindControllerReader({
+      pageItems: [[{ str: quote }]],
+      targetPageIndex: 0,
+      matchesQuery: (query) =>
+        query.startsWith(
+          "with positive values indicating that SC at day t predicts",
+        ),
+    });
+
+    const result = await scrollToExactQuoteInReader(fixture.reader, quote, {
+      expectedPageIndex: 0,
+      verifiedFullSpan: true,
+    });
+
+    assert.isFalse(result.matched);
+    assert.isTrue(
+      fixture.dispatched.every((entry) => entry.query === quote),
+      JSON.stringify(fixture.dispatched),
+    );
   });
 
   it("prefers the unwrapped PDF.js application when Xray hides getPage", async function () {

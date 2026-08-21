@@ -8,6 +8,7 @@ import {
   findUniqueQuoteTextSearchMatch,
   normalizeLocatorText,
   splitQuoteAtEllipsis,
+  summarizeQuoteTextSupport,
 } from "../src/modules/contextPanel/quoteTextSearch";
 
 describe("quoteTextSearch", function () {
@@ -384,5 +385,20 @@ describe("quoteTextSearch", function () {
     assert.include(match?.query || "", "痛觉感觉成分加工");
     assert.notInclude(match?.query || "", "另一栏");
     assert.isAtLeast(match?.matchedTokenCount || 0, 12);
+  });
+
+  it("credits recoverable PDF layout fragments after one corrupted token pair", function () {
+    const quote =
+      "The paper defines low dimensional representations of neural activity using definitions of line and ring attractors which are intuitive concepts commonly applied in computational neuroscience models of memory dynamics";
+    const pdfWorkerText =
+      "The paper defines low dimensional representations o f neural activity using definitions o f l ine a nd r ing a ttractors w hich a re i ntuiticveoncepts commonly applied in computational neuroscience models of memory dynamics";
+    const support = summarizeQuoteTextSupport(
+      [{ id: "corrupted-page", text: pdfWorkerText }],
+      quote,
+    );
+
+    assert.equal(support.quoteTokenCount, 29);
+    assert.equal(support.supportedQuoteTokenCount, 27);
+    assert.closeTo(support.coverage, 27 / 29, 0.000001);
   });
 });

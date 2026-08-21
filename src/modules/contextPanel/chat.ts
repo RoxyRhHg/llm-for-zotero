@@ -337,6 +337,7 @@ import {
 import {
   getCachedPageTextForAttachment,
   hasCompleteSearchablePageTextForAttachment,
+  verifyCompleteQuoteInLivePdfJs,
   warmPageTextCacheForAttachment,
 } from "./livePdfSelectionLocator";
 import {
@@ -346,10 +347,12 @@ import {
 import {
   buildQuoteSourceIndex,
   buildSelectedTextQuoteCitations,
+  collectDisplayedQuoteVerificationRequests,
   extractQuoteCitationsFromToolContent,
   finalizeAssistantQuoteCitations,
   finalizeAssistantQuoteCitationsCooperatively,
   mergeQuoteCitations,
+  type QuoteSecondaryEvidence,
   type QuoteSourceText,
 } from "./quoteCitations";
 import {
@@ -4352,7 +4355,7 @@ const MAX_QUOTE_VALIDATION_DECISION_ENTRIES = 1000;
 const MAX_QUOTE_VALIDATION_DECISION_BYTES = 4 * 1024 * 1024;
 const MAX_QUOTE_SOURCE_INDEX_ENTRIES = 64;
 const MAX_QUOTE_SOURCE_INDEX_BYTES = 2 * 1024 * 1024;
-const QUOTE_VALIDATION_POLICY_VERSION = 5;
+const QUOTE_VALIDATION_POLICY_VERSION = 6;
 type QuoteValidationDecision = ReturnType<
   typeof finalizeAssistantQuoteCitations
 >;
@@ -4620,6 +4623,7 @@ async function applyAssistantMessageQuoteGate(
   evidence: QuoteSourceEvidence,
   options: AssistantQuoteFinalizationOptions,
   preparedSourceIndex?: ReturnType<typeof buildQuoteSourceIndex>,
+  secondaryEvidence: readonly QuoteSecondaryEvidence[] = [],
   cooperativeOptions?: {
     yieldToMain: () => Promise<void>;
     shouldContinue?: () => boolean;
@@ -4650,6 +4654,23 @@ async function applyAssistantMessageQuoteGate(
             citation.contextItemId || "",
             citation.sourceFingerprint || "",
             citation.quoteText,
+          ].join("\u241f"),
+        ),
+        ...secondaryEvidence.map((entry) =>
+          [
+            "secondary",
+            entry.quoteKey,
+            entry.contextItemId,
+            entry.status,
+            entry.status === "matched"
+              ? entry.certificate.documentFingerprint
+              : entry.status === "absent"
+                ? entry.documentFingerprint
+                : entry.reason,
+            entry.status === "matched" ? entry.certificate.pageIndex : "",
+            entry.status === "matched"
+              ? entry.certificate.sourceMatchPageOccurrence
+              : "",
           ].join("\u241f"),
         ),
       ].join("\u241e")
@@ -4685,6 +4706,7 @@ async function applyAssistantMessageQuoteGate(
             quoteSourceReview: {
               sourceEvidenceComplete,
             },
+            secondaryEvidence,
           },
           cooperativeOptions,
         )
@@ -4696,6 +4718,7 @@ async function applyAssistantMessageQuoteGate(
           quoteSourceReview: {
             sourceEvidenceComplete,
           },
+          secondaryEvidence,
         });
     if (!finalized) return false;
     if (cacheKey && validationSignature) {
@@ -4718,6 +4741,59 @@ async function applyAssistantMessageQuoteGate(
   );
   assistantMessage.quoteDisplayOverride = nextOverride;
   return changed;
+}
+
+async function collectLivePdfQuoteSecondaryEvidence(params: {
+  markdown: string;
+  sourceIndex: ReturnType<typeof buildQuoteSourceIndex>;
+  yieldToMain: () => Promise<void>;
+  shouldContinue: () => boolean;
+}): Promise<QuoteSecondaryEvidence[]> {
+  const reader = getActiveReaderForSelectedTab();
+  const readerItemId = Math.floor(
+    Number(reader?._item?.id || reader?.itemID || 0),
+  );
+  if (!reader || !readerItemId) return [];
+  const requests = collectDisplayedQuoteVerificationRequests({
+    markdown: params.markdown,
+    sourceIndex: params.sourceIndex,
+  }).filter((request) => request.contextItemId === readerItemId);
+  const out: QuoteSecondaryEvidence[] = [];
+  for (const request of requests) {
+    if (!params.shouldContinue()) break;
+    const verification = await verifyCompleteQuoteInLivePdfJs(
+      reader,
+      request.contextItemId,
+      request.quoteText,
+      {
+        yieldToMain: params.yieldToMain,
+        shouldContinue: params.shouldContinue,
+      },
+    );
+    if (verification.status === "matched") {
+      out.push({
+        quoteKey: request.quoteKey,
+        contextItemId: request.contextItemId,
+        status: "matched",
+        certificate: verification.certificate,
+      });
+    } else if (verification.status === "absent") {
+      out.push({
+        quoteKey: request.quoteKey,
+        contextItemId: request.contextItemId,
+        status: "absent",
+        documentFingerprint: verification.documentFingerprint,
+      });
+    } else {
+      out.push({
+        quoteKey: request.quoteKey,
+        contextItemId: request.contextItemId,
+        status: "defer",
+        reason: verification.reason,
+      });
+    }
+  }
+  return out;
 }
 
 const quoteValidationSignatures = new WeakMap<Message, string>();
@@ -4945,6 +5021,21 @@ function startConversationQuoteValidation(conversationKey: number): void {
                 evidence.sourceTexts,
               )
             : undefined;
+          const yieldQuoteValidation = async () => {
+            await waitForQuoteValidationIdle(conversationKey, () =>
+              isPendingQuoteValidationCurrent(conversationKey, request),
+            );
+          };
+          const shouldContinueQuoteValidation = () =>
+            isPendingQuoteValidationCurrent(conversationKey, request);
+          const secondaryEvidence = sourceIndex
+            ? await collectLivePdfQuoteSecondaryEvidence({
+                markdown: rawMarkdown,
+                sourceIndex,
+                yieldToMain: yieldQuoteValidation,
+                shouldContinue: shouldContinueQuoteValidation,
+              })
+            : [];
           const changed = await applyAssistantMessageQuoteGate(
             assistantMessage,
             rawMarkdown,
@@ -4952,14 +5043,10 @@ function startConversationQuoteValidation(conversationKey: number): void {
             evidence,
             options,
             sourceIndex,
+            secondaryEvidence,
             {
-              yieldToMain: async () => {
-                await waitForQuoteValidationIdle(conversationKey, () =>
-                  isPendingQuoteValidationCurrent(conversationKey, request),
-                );
-              },
-              shouldContinue: () =>
-                isPendingQuoteValidationCurrent(conversationKey, request),
+              yieldToMain: yieldQuoteValidation,
+              shouldContinue: shouldContinueQuoteValidation,
             },
           );
           if (changed) {

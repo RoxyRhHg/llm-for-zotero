@@ -107,6 +107,7 @@ type QuoteNavigationProvenance = {
   sourceMatchPageOccurrence?: number;
   preferredFullQuoteText?: string;
   verifiedSourceMatchText?: string;
+  verifiedFullSpan?: boolean;
 };
 
 type CitationCandidateProvenance =
@@ -1686,6 +1687,7 @@ async function attemptCitationParagraphJump(params: {
   sourceMatchPageOccurrence?: number;
   preferredFullQuoteText?: string;
   verifiedSourceMatchText?: string;
+  verifiedFullSpan?: boolean;
 }): Promise<ExactQuoteJumpResult> {
   const quoteTexts = Array.from(
     new Set(
@@ -1707,6 +1709,7 @@ async function attemptCitationParagraphJump(params: {
       sourceFingerprint: params.sourceFingerprint,
       sourceMatchPageOccurrence: params.sourceMatchPageOccurrence,
       fallbackQuoteTexts: quoteTexts.slice(1),
+      verifiedFullSpan: params.verifiedFullSpan,
     },
   );
   if (!paragraphJump.matched) {
@@ -1789,6 +1792,7 @@ async function navigateToHiddenQuoteLocation(params: {
   sourceMatchPageOccurrence?: number;
   preferredFullQuoteText?: string;
   verifiedSourceMatchText?: string;
+  verifiedFullSpan?: boolean;
 }): Promise<CitationParagraphJumpNavigation | null> {
   const targetPageIndex = Math.floor(params.pageIndex);
   if (!Number.isFinite(targetPageIndex) || targetPageIndex < 0) return null;
@@ -1813,6 +1817,7 @@ async function navigateToHiddenQuoteLocation(params: {
     sourceMatchPageOccurrence: params.sourceMatchPageOccurrence,
     preferredFullQuoteText: params.preferredFullQuoteText,
     verifiedSourceMatchText: params.verifiedSourceMatchText,
+    verifiedFullSpan: params.verifiedFullSpan,
   });
   return {
     reader,
@@ -1832,6 +1837,7 @@ async function navigateToStoredQuotePageHint(params: {
   sourceFingerprint?: string;
   sourceMatchPageOccurrence?: number;
   preferredFullQuoteText?: string;
+  verifiedFullSpan?: boolean;
   onReaderOpened?: () => void;
 }): Promise<CitationParagraphJumpNavigation | null> {
   const hintedPageIndex =
@@ -1881,6 +1887,7 @@ async function navigateToStoredQuotePageHint(params: {
     sourceFingerprint: params.sourceFingerprint,
     sourceMatchPageOccurrence: params.sourceMatchPageOccurrence,
     preferredFullQuoteText: params.preferredFullQuoteText,
+    verifiedFullSpan: params.verifiedFullSpan,
   });
   return {
     reader,
@@ -3265,6 +3272,10 @@ async function resolveAndNavigateAssistantCitation(params: {
         ? params.candidates
         : [];
     const quoteCitation = citationButtonQuoteCitationCache.get(params.button);
+    const verifiedFullSpan = Boolean(
+      quoteCitation?.sourceMatchKind === "exact" &&
+      quoteCitation.sourceFingerprint?.startsWith("pdfjs:"),
+    );
     const navigationMode = getCitationNavigationMode(
       params.button,
       Boolean(normalizedQuoteText),
@@ -3379,6 +3390,7 @@ async function resolveAndNavigateAssistantCitation(params: {
           sourceFingerprint: quoteCitation?.sourceFingerprint,
           sourceMatchPageOccurrence: quoteCitation?.sourceMatchPageOccurrence,
           preferredFullQuoteText,
+          verifiedFullSpan,
         },
       );
       if (cached) {
@@ -3464,6 +3476,7 @@ async function resolveAndNavigateAssistantCitation(params: {
           hiddenLocation.sourceMatchPageOccurrence,
         preferredFullQuoteText,
         verifiedSourceMatchText: hiddenLocation.sourceMatchText,
+        verifiedFullSpan,
       });
       if (!cached) continue;
       markCitationNavigationTiming(timing, "cache lookup", {
@@ -3541,6 +3554,7 @@ async function resolveAndNavigateAssistantCitation(params: {
         sourceFingerprint: quoteCitation?.sourceFingerprint,
         sourceMatchPageOccurrence: quoteCitation?.sourceMatchPageOccurrence,
         preferredFullQuoteText,
+        verifiedFullSpan,
         onReaderOpened: () => {
           markCitationNavigationTiming(timing, "hint open", {
             contextItemId: hintedCandidate.contextItemId,
@@ -3633,6 +3647,7 @@ async function resolveAndNavigateAssistantCitation(params: {
               sourceMatchPageOccurrence:
                 quoteCitation?.sourceMatchPageOccurrence,
               preferredFullQuoteText,
+              verifiedFullSpan,
             });
             const jumpedLabel = resolveJumpedPageLabel(
               target,
@@ -3712,6 +3727,7 @@ async function resolveAndNavigateAssistantCitation(params: {
               result.sourceMatchPageOccurrence,
             preferredFullQuoteText,
             verifiedSourceMatchText: result.sourceMatchText,
+            verifiedFullSpan,
           });
           markCitationNavigationTiming(timing, "paragraph jump", {
             source: "full-quote-locate-active-reader",
@@ -3808,6 +3824,7 @@ async function resolveAndNavigateAssistantCitation(params: {
             result.sourceMatchPageOccurrence,
           preferredFullQuoteText,
           verifiedSourceMatchText: result.sourceMatchText,
+          verifiedFullSpan,
         });
         markCitationNavigationTiming(timing, "paragraph jump", {
           source: "full-quote-locate-candidate",

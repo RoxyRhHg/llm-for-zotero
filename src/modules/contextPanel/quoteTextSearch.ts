@@ -1,5 +1,6 @@
 import {
   buildQuoteTextIndex,
+  collectQuoteTextAlignmentRunsAllowingLayoutFragments,
   countCanonicalTextMatches,
   extractQuoteTextTokens,
   findQuoteSourceSpansAllowingLayoutArtifacts,
@@ -135,6 +136,10 @@ export type QuoteTextAnchorMatch = {
   quoteTokenSupportCoverage: number;
   quoteStartTokenSupported: boolean;
   quoteEndTokenSupported: boolean;
+  literalSupportedQuoteTokenCount: number;
+  literalQuoteTokenSupportCoverage: number;
+  literalQuoteStartTokenSupported: boolean;
+  literalQuoteEndTokenSupported: boolean;
   quoteTokenStart: number;
   quoteTokenEnd: number;
 };
@@ -685,6 +690,22 @@ function collectCommonQuoteTokenRuns(
   entry: NormalizedQuoteTextSearchEntry,
   quoteIndex: QuoteTextIndex,
 ): CommonQuoteTokenRun[] {
+  return collectQuoteTextAlignmentRunsAllowingLayoutFragments(
+    entry.textIndex,
+    quoteIndex,
+  ).map((run) => ({
+    entry,
+    quoteTokenStart: run.queryTokenStart,
+    quoteTokenEnd: run.queryTokenEnd,
+    sourceTokenStart: run.sourceTokenStart,
+    sourceTokenEnd: run.sourceTokenEnd,
+  }));
+}
+
+function collectLiteralCommonQuoteTokenRuns(
+  entry: NormalizedQuoteTextSearchEntry,
+  quoteIndex: QuoteTextIndex,
+): CommonQuoteTokenRun[] {
   const quotePositions = new Map<string, number[]>();
   for (let index = 0; index < quoteIndex.tokens.length; index += 1) {
     const token = quoteIndex.tokens[index];
@@ -692,7 +713,6 @@ function collectCommonQuoteTokenRuns(
     positions.push(index);
     quotePositions.set(token.text, positions);
   }
-
   const completed: CommonQuoteTokenRun[] = [];
   let active = new Map<number, CommonQuoteTokenRun>();
   for (
@@ -781,9 +801,13 @@ function collectQuoteTokenRunCandidates(
   normalizedEntries: NormalizedQuoteTextSearchEntry[],
   quoteIndex: QuoteTextIndex,
   options: { minQueryLength: number; rejectWeakQueries: boolean },
+  collectRuns: (
+    entry: NormalizedQuoteTextSearchEntry,
+    quoteIndex: QuoteTextIndex,
+  ) => CommonQuoteTokenRun[] = collectCommonQuoteTokenRuns,
 ): QuoteTokenRunCandidate[] {
   return normalizedEntries
-    .flatMap((entry) => collectCommonQuoteTokenRuns(entry, quoteIndex))
+    .flatMap((entry) => collectRuns(entry, quoteIndex))
     .map((run) => {
       const query = sourceTextForTokenRun(run, quoteIndex.tokens.length);
       const normalizedQuery = normalizeLocatorText(query);
@@ -945,6 +969,10 @@ function buildQuoteTextAnchorMatches(
         quoteTokenSupportCoverage: 1,
         quoteStartTokenSupported: true,
         quoteEndTokenSupported: true,
+        literalSupportedQuoteTokenCount: quoteIndex.tokens.length,
+        literalQuoteTokenSupportCoverage: 1,
+        literalQuoteStartTokenSupported: true,
+        literalQuoteEndTokenSupported: true,
         quoteTokenStart: 0,
         quoteTokenEnd: quoteIndex.tokens.length,
       },
@@ -965,6 +993,29 @@ function buildQuoteTextAnchorMatches(
     if (!supported) {
       supported = new Set();
       supportedQuoteTokensByEntry.set(candidate.run.entry.id, supported);
+    }
+    for (
+      let tokenIndex = candidate.run.quoteTokenStart;
+      tokenIndex < candidate.run.quoteTokenEnd;
+      tokenIndex += 1
+    ) {
+      supported.add(tokenIndex);
+    }
+  }
+  const literalSupportedQuoteTokensByEntry = new Map<string, Set<number>>();
+  for (const candidate of collectQuoteTokenRunCandidates(
+    normalizedEntries,
+    quoteIndex,
+    { minQueryLength, rejectWeakQueries },
+    collectLiteralCommonQuoteTokenRuns,
+  )) {
+    if (!runCountsAsQuoteSupport(candidate)) continue;
+    let supported = literalSupportedQuoteTokensByEntry.get(
+      candidate.run.entry.id,
+    );
+    if (!supported) {
+      supported = new Set();
+      literalSupportedQuoteTokensByEntry.set(candidate.run.entry.id, supported);
     }
     for (
       let tokenIndex = candidate.run.quoteTokenStart;
@@ -1010,6 +1061,11 @@ function buildQuoteTextAnchorMatches(
     const supportedQuoteTokens = supportedQuoteTokensByEntry.get(
       candidate.run.entry.id,
     );
+    const literalSupportedQuoteTokens = literalSupportedQuoteTokensByEntry.get(
+      candidate.run.entry.id,
+    );
+    const literalSupportedQuoteTokenCount =
+      literalSupportedQuoteTokens?.size || 0;
     out.push({
       entryId: candidate.run.entry.id,
       query: candidate.query,
@@ -1040,6 +1096,17 @@ function buildQuoteTextAnchorMatches(
       quoteStartTokenSupported: Boolean(supportedQuoteTokens?.has(0)),
       quoteEndTokenSupported: Boolean(
         supportedQuoteTokens?.has(quoteIndex.tokens.length - 1),
+      ),
+      literalSupportedQuoteTokenCount,
+      literalQuoteTokenSupportCoverage: Math.min(
+        1,
+        literalSupportedQuoteTokenCount / quoteIndex.tokens.length,
+      ),
+      literalQuoteStartTokenSupported: Boolean(
+        literalSupportedQuoteTokens?.has(0),
+      ),
+      literalQuoteEndTokenSupported: Boolean(
+        literalSupportedQuoteTokens?.has(quoteIndex.tokens.length - 1),
       ),
       quoteTokenStart: candidate.run.quoteTokenStart,
       quoteTokenEnd: candidate.run.quoteTokenEnd,

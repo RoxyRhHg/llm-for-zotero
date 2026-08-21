@@ -576,6 +576,15 @@ type TokenAlignmentStep = {
   lastMatchedSourceIndex: number;
 };
 
+export type QuoteTextAlignmentRun = {
+  sourceTokenStart: number;
+  sourceTokenEnd: number;
+  queryTokenStart: number;
+  queryTokenEnd: number;
+  sourceStart: number;
+  sourceEnd: number;
+};
+
 type AttachedCitationToken = {
   sourceWord: string;
   lastCitationTokenIndex: number;
@@ -761,6 +770,126 @@ function matchTokenAlignmentStep(params: {
   }
 
   return null;
+}
+
+function tokensCanStartAlignmentRun(
+  sourceToken: QuoteTextToken | undefined,
+  queryToken: QuoteTextToken | undefined,
+): boolean {
+  if (!sourceToken || !queryToken) return false;
+  return (
+    sourceToken.text === queryToken.text ||
+    sourceToken.text.startsWith(queryToken.text) ||
+    queryToken.text.startsWith(sourceToken.text)
+  );
+}
+
+/**
+ * Collect maximal ordered runs that use the same character-preserving layout
+ * fragment rules as complete quote matching. A semantic mismatch ends a run;
+ * callers may combine the resulting query-token ranges as partial support,
+ * but no mismatch is ever treated as a match.
+ */
+export function collectQuoteTextAlignmentRunsAllowingLayoutFragments(
+  sourceIndex: QuoteTextIndex,
+  queryIndex: QuoteTextIndex,
+): QuoteTextAlignmentRun[] {
+  if (!sourceIndex.tokens.length || !queryIndex.tokens.length) return [];
+
+  const candidates: QuoteTextAlignmentRun[] = [];
+  const seen = new Set<string>();
+  for (
+    let sourceTokenStart = 0;
+    sourceTokenStart < sourceIndex.tokens.length;
+    sourceTokenStart += 1
+  ) {
+    if (isLikelyLayoutNumberToken(sourceIndex, sourceTokenStart)) continue;
+    for (
+      let queryTokenStart = 0;
+      queryTokenStart < queryIndex.tokens.length;
+      queryTokenStart += 1
+    ) {
+      if (isLikelyLayoutNumberToken(queryIndex, queryTokenStart)) continue;
+      if (
+        !tokensCanStartAlignmentRun(
+          sourceIndex.tokens[sourceTokenStart],
+          queryIndex.tokens[queryTokenStart],
+        )
+      ) {
+        continue;
+      }
+
+      let sourceCursor = sourceTokenStart;
+      let queryCursor = queryTokenStart;
+      let lastMatchedSourceIndex = sourceTokenStart - 1;
+      while (
+        sourceCursor < sourceIndex.tokens.length &&
+        queryCursor < queryIndex.tokens.length
+      ) {
+        if (
+          isLikelyLayoutNumberToken(queryIndex, queryCursor) &&
+          queryIndex.tokens[queryCursor]?.text !==
+            sourceIndex.tokens[sourceCursor]?.text
+        ) {
+          queryCursor += 1;
+          continue;
+        }
+        if (
+          isLikelyLayoutNumberToken(sourceIndex, sourceCursor) &&
+          sourceIndex.tokens[sourceCursor]?.text !==
+            queryIndex.tokens[queryCursor]?.text
+        ) {
+          sourceCursor += 1;
+          continue;
+        }
+        const step = matchTokenAlignmentStep({
+          sourceIndex,
+          queryIndex,
+          sourceTokenIndex: sourceCursor,
+          queryTokenIndex: queryCursor,
+        });
+        if (!step) break;
+        sourceCursor = step.nextSourceIndex;
+        queryCursor = step.nextQueryIndex;
+        lastMatchedSourceIndex = step.lastMatchedSourceIndex;
+      }
+      if (
+        queryCursor <= queryTokenStart ||
+        lastMatchedSourceIndex < sourceTokenStart
+      ) {
+        continue;
+      }
+      const firstSourceToken = sourceIndex.tokens[sourceTokenStart];
+      const lastSourceToken = sourceIndex.tokens[lastMatchedSourceIndex];
+      const key = `${sourceTokenStart}:${sourceCursor}:${queryTokenStart}:${queryCursor}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      candidates.push({
+        sourceTokenStart,
+        sourceTokenEnd: sourceCursor,
+        queryTokenStart,
+        queryTokenEnd: queryCursor,
+        sourceStart: firstSourceToken.sourceStart,
+        sourceEnd: lastSourceToken.sourceEnd,
+      });
+    }
+  }
+
+  return candidates.filter(
+    (candidate, index) =>
+      !candidates.some(
+        (other, otherIndex) =>
+          otherIndex !== index &&
+          other.sourceTokenStart <= candidate.sourceTokenStart &&
+          other.sourceTokenEnd >= candidate.sourceTokenEnd &&
+          other.queryTokenStart <= candidate.queryTokenStart &&
+          other.queryTokenEnd >= candidate.queryTokenEnd &&
+          (other.sourceTokenStart < candidate.sourceTokenStart ||
+            other.sourceTokenEnd > candidate.sourceTokenEnd ||
+            other.queryTokenStart < candidate.queryTokenStart ||
+            other.queryTokenEnd > candidate.queryTokenEnd),
+      ),
+  );
 }
 
 /**

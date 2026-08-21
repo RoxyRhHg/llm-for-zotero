@@ -4,6 +4,7 @@ import {
   __getDisplayedQuoteAnchorMatchCacheStatsForTest,
   buildQuoteAnchorPromptBlock,
   buildQuoteCitation,
+  buildQuoteSecondaryEvidenceKey,
   buildQuoteSourceIndex,
   buildSelectedTextQuoteCitations,
   extractQuoteCitationsFromToolContent,
@@ -78,6 +79,10 @@ describe("quoteCitations", function () {
       quoteTokenSupportCoverage: 1,
       quoteStartTokenSupported: true,
       quoteEndTokenSupported: true,
+      literalSupportedQuoteTokenCount: 1,
+      literalQuoteTokenSupportCoverage: 1,
+      literalQuoteStartTokenSupported: true,
+      literalQuoteEndTokenSupported: true,
       quoteTokenStart: 0,
       quoteTokenEnd: 1,
     });
@@ -2773,6 +2778,121 @@ describe("quoteCitations", function () {
 
     assert.equal(finalized.markdown, markdown);
     assert.notInclude(finalized.markdown, "Not a source quote");
+    assert.isEmpty(finalized.quoteCitations);
+  });
+
+  it("upgrades strong artifact-aware support with a unique PDF.js certificate", function () {
+    const quote =
+      "The paper defines low dimensional representations of neural activity using definitions of line and ring attractors which are intuitive concepts commonly applied in computational neuroscience models of memory dynamics";
+    const pdfWorkerText =
+      "The paper defines low dimensional representations o f neural activity using definitions o f l ine a nd r ing a ttractors w hich a re i ntuiticveoncepts commonly applied in computational neuroscience models of memory dynamics";
+    const finalized = finalizeAssistantQuoteCitations({
+      markdown: `> ${quote}`,
+      sourceIndex: buildQuoteSourceIndex({
+        sourceTexts: [
+          {
+            sourceText: pdfWorkerText,
+            sourceLabel: "(Example et al., 2026)",
+            sourceMatchSource: "pdf-page-text",
+            sourceFingerprint: "pdfworker:worker-cache",
+            contextItemId: 81,
+            itemId: 80,
+            pageHintIndex: 2,
+          },
+        ],
+      }),
+      secondaryEvidence: [
+        {
+          quoteKey: buildQuoteSecondaryEvidenceKey(quote),
+          contextItemId: 81,
+          status: "matched",
+          certificate: {
+            documentFingerprint: "viewer-document",
+            pageIndex: 2,
+            pageLabel: "3",
+            sourceMatchText: quote,
+            sourceMatchPageOccurrence: 0,
+          },
+        },
+      ],
+      quoteSourceReview: { sourceEvidenceComplete: true },
+    });
+
+    assert.match(finalized.markdown, /\[\[quote:Q_[a-z0-9]+\]\]/);
+    assert.lengthOf(finalized.quoteCitations, 1);
+    assert.equal(
+      finalized.quoteCitations[0]?.sourceFingerprint,
+      "pdfjs:viewer-document",
+    );
+    assert.equal(finalized.quoteCitations[0]?.sourceMatchText, quote);
+    assert.equal(finalized.quoteCitations[0]?.pageHintIndex, 2);
+  });
+
+  it("rejects a strong Worker partial after complete PDF.js text confirms absence", function () {
+    const source =
+      "The population response remained stable across every repeated recording session despite substantial changes in individual neuronal tuning patterns.";
+    const quote = source.replace("patterns", "preferences");
+    const finalized = finalizeAssistantQuoteCitations({
+      markdown: `> ${quote}`,
+      sourceIndex: buildQuoteSourceIndex({
+        sourceTexts: [
+          {
+            sourceText: source,
+            sourceLabel: "(Example et al., 2026)",
+            sourceMatchSource: "pdf-page-text",
+            contextItemId: 81,
+            itemId: 80,
+            pageHintIndex: 2,
+          },
+        ],
+      }),
+      secondaryEvidence: [
+        {
+          quoteKey: buildQuoteSecondaryEvidenceKey(quote),
+          contextItemId: 81,
+          status: "absent",
+          documentFingerprint: "viewer-document",
+        },
+      ],
+      quoteSourceReview: { sourceEvidenceComplete: true },
+    });
+
+    assert.equal(finalized.markdown, `> ${quote}\n>\n> Not a source quote`);
+    assert.isEmpty(finalized.quoteCitations);
+  });
+
+  it("defers when independent PDF.js certificates match more than one paper", function () {
+    const source =
+      "The population response remained stable across every repeated recording session despite substantial changes in individual neuronal tuning patterns.";
+    const quote = source.replace("patterns", "preferences");
+    const quoteKey = buildQuoteSecondaryEvidenceKey(quote);
+    const finalized = finalizeAssistantQuoteCitations({
+      markdown: `> ${quote}`,
+      sourceIndex: buildQuoteSourceIndex({
+        sourceTexts: [81, 82].map((contextItemId) => ({
+          sourceText: source,
+          sourceLabel: `(Example ${contextItemId} et al., 2026)`,
+          sourceMatchSource: "pdf-page-text",
+          contextItemId,
+          itemId: contextItemId - 1,
+          pageHintIndex: 2,
+        })),
+      }),
+      secondaryEvidence: [81, 82].map((contextItemId) => ({
+        quoteKey,
+        contextItemId,
+        status: "matched" as const,
+        certificate: {
+          documentFingerprint: `viewer-document-${contextItemId}`,
+          pageIndex: 2,
+          sourceMatchText: quote,
+          sourceMatchPageOccurrence: 0,
+        },
+      })),
+      quoteSourceReview: { sourceEvidenceComplete: true },
+    });
+
+    assert.equal(finalized.markdown, `> ${quote}`);
     assert.isEmpty(finalized.quoteCitations);
   });
 

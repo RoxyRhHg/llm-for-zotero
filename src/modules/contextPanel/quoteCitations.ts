@@ -2206,9 +2206,9 @@ function hasCompleteDisplayedQuoteSupport(
   if (match.matchKind === "exact") return true;
   return (
     quoteContainsLayoutArtifactHazards(quoteText) &&
-    match.quoteStartTokenSupported &&
-    match.quoteEndTokenSupported &&
-    match.quoteTokenSupportCoverage >=
+    match.literalQuoteStartTokenSupported &&
+    match.literalQuoteEndTokenSupported &&
+    match.literalQuoteTokenSupportCoverage >=
       MIN_COMPLETE_LAYOUT_ARTIFACT_SUPPORT_COVERAGE
   );
 }
@@ -2645,6 +2645,118 @@ export type QuoteSourceResolution =
   | { kind: "absent" }
   | { kind: "defer" };
 
+export type QuoteSecondaryEvidence =
+  | {
+      quoteKey: string;
+      contextItemId: number;
+      status: "matched";
+      certificate: {
+        documentFingerprint: string;
+        pageIndex: number;
+        pageLabel?: string;
+        sourceMatchText: string;
+        sourceMatchPageOccurrence: number;
+      };
+    }
+  | {
+      quoteKey: string;
+      contextItemId: number;
+      status: "absent";
+      documentFingerprint: string;
+    }
+  | {
+      quoteKey: string;
+      contextItemId: number;
+      status: "defer";
+      reason: string;
+    };
+
+export function buildQuoteSecondaryEvidenceKey(value: string): string {
+  return normalizeQuoteTextCanonical(
+    stripOuterQuoteDelimiters(normalizeMultilineText(value)),
+  );
+}
+
+type StrongPartialQuoteSource = {
+  match: QuoteTextAnchorMatch;
+  source: QuoteSourceIndexEntry;
+};
+
+function isStrongPartialDisplayedQuoteMatch(
+  match: QuoteTextAnchorMatch,
+  quoteText: string,
+): boolean {
+  return (
+    match.matchKind !== "exact" &&
+    (hasNearCompleteDisplayedQuoteSupport(match, quoteText) ||
+      hasExtractionSensitiveDisplayedQuoteSupport(match, quoteText) ||
+      hasCjkInterleavedDisplayedQuoteSupport(match, quoteText))
+  );
+}
+
+function collectStrongPartialDisplayedQuoteSources(params: {
+  quoteText: string;
+  sourceIndex: QuoteSourceIndex;
+}): StrongPartialQuoteSource[] {
+  const sourceGroups = new Map<string, QuoteSourceIndexEntry[]>();
+  for (const source of params.sourceIndex.sources) {
+    const key = source.contextItemId
+      ? `context:${source.contextItemId}`
+      : source.sourceFingerprint
+        ? `fingerprint:${source.sourceFingerprint}`
+        : `source:${sourceGroups.size}`;
+    const group = sourceGroups.get(key) || [];
+    group.push(source);
+    sourceGroups.set(key, group);
+  }
+  const out: StrongPartialQuoteSource[] = [];
+  for (const sources of sourceGroups.values()) {
+    const resolved = findDisplayedQuoteAnchorMatch({
+      quoteText: params.quoteText,
+      sourceIndex: {
+        quoteCitations: params.sourceIndex.quoteCitations,
+        metadataTexts: params.sourceIndex.metadataTexts,
+        sources,
+      },
+      requireUnique: true,
+    });
+    if (
+      resolved &&
+      isStrongPartialDisplayedQuoteMatch(resolved.match, params.quoteText)
+    ) {
+      out.push(resolved);
+    }
+  }
+  return out;
+}
+
+function buildPdfJsVerifiedQuoteCitation(params: {
+  quoteText: string;
+  partial: StrongPartialQuoteSource;
+  evidence: Extract<QuoteSecondaryEvidence, { status: "matched" }>;
+}): QuoteCitation | undefined {
+  const fingerprint = params.evidence.certificate.documentFingerprint;
+  return buildQuoteCitation({
+    quoteText: params.quoteText,
+    citationLabel: params.partial.source.citationLabel,
+    sourceMatchText: params.evidence.certificate.sourceMatchText,
+    sourceMatchKind: "exact",
+    sourceMatchSource: "pdf-page-text",
+    sourceSectionLabel: params.partial.source.sectionLabel,
+    sourceChunkKind: params.partial.source.chunkKind,
+    contextItemId: params.partial.source.contextItemId,
+    itemId: params.partial.source.itemId,
+    sourceFingerprint: fingerprint.startsWith("pdfjs:")
+      ? fingerprint
+      : `pdfjs:${fingerprint}`,
+    sourceMatchPageOccurrence:
+      params.evidence.certificate.sourceMatchPageOccurrence,
+    pageHintIndex: params.evidence.certificate.pageIndex,
+    pageHintLabel: params.evidence.certificate.pageLabel,
+    allowShortQuoteText: true,
+  });
+}
+
 function resolveExactDisplayedQuoteCitationsWithLabelFallback(params: {
   quoteText: string;
   citationLabel?: string;
@@ -2700,6 +2812,7 @@ export function classifyDisplayedQuoteSource(params: {
   quoteText: string;
   sourceIndex: QuoteSourceIndex;
   sourceEvidenceComplete: boolean;
+  secondaryEvidence?: readonly QuoteSecondaryEvidence[];
 }): QuoteSourceResolution {
   const quoteText = normalizeMultilineText(params.quoteText);
   if (isKnownQuoteMetadataText(quoteText, params.sourceIndex.metadataTexts)) {
@@ -2711,6 +2824,52 @@ export function classifyDisplayedQuoteSource(params: {
   });
   if (quoteCitations.length) {
     return { kind: "matched", quoteCitations };
+  }
+  const strongPartials = collectStrongPartialDisplayedQuoteSources({
+    quoteText,
+    sourceIndex: params.sourceIndex,
+  });
+  if (strongPartials.length) {
+    const quoteKey = buildQuoteSecondaryEvidenceKey(quoteText);
+    const evidenceByContextItemId = new Map(
+      (params.secondaryEvidence || [])
+        .filter((entry) => entry.quoteKey === quoteKey)
+        .map((entry) => [entry.contextItemId, entry]),
+    );
+    const resolvedEvidence = strongPartials.map((partial) => ({
+      partial,
+      evidence: partial.source.contextItemId
+        ? evidenceByContextItemId.get(partial.source.contextItemId)
+        : undefined,
+    }));
+    if (
+      resolvedEvidence.some(
+        ({ evidence }) => !evidence || evidence.status === "defer",
+      )
+    ) {
+      return { kind: "defer" };
+    }
+    const matched = resolvedEvidence.filter(
+      (
+        entry,
+      ): entry is typeof entry & {
+        evidence: Extract<QuoteSecondaryEvidence, { status: "matched" }>;
+      } => entry.evidence?.status === "matched",
+    );
+    if (matched.length > 1) return { kind: "defer" };
+    if (matched.length === 1) {
+      const citation = buildPdfJsVerifiedQuoteCitation({
+        quoteText,
+        partial: matched[0].partial,
+        evidence: matched[0].evidence,
+      });
+      return citation
+        ? { kind: "matched", quoteCitations: [citation] }
+        : { kind: "defer" };
+    }
+    return params.sourceEvidenceComplete
+      ? { kind: "absent" }
+      : { kind: "defer" };
   }
   if (
     hasCompleteDisplayedQuoteSourceMatch({
@@ -2972,6 +3131,7 @@ function finalizeQuoteSourceCandidate(params: {
   citationRemainder?: string;
   sourceIndex: QuoteSourceIndex;
   sourceEvidenceComplete: boolean;
+  secondaryEvidence?: readonly QuoteSecondaryEvidence[];
 }): {
   kind: QuoteSourceResolution["kind"];
   markdown?: string;
@@ -2985,6 +3145,7 @@ function finalizeQuoteSourceCandidate(params: {
     quoteText,
     sourceIndex: params.sourceIndex,
     sourceEvidenceComplete: params.sourceEvidenceComplete,
+    secondaryEvidence: params.secondaryEvidence,
   });
   if (resolution.kind === "matched") {
     return {
@@ -3147,7 +3308,93 @@ export type AssistantQuoteCitationFinalizationParams = {
   quoteSourceReview?: {
     sourceEvidenceComplete: boolean;
   };
+  secondaryEvidence?: readonly QuoteSecondaryEvidence[];
 };
+
+export type DisplayedQuoteVerificationRequest = {
+  quoteKey: string;
+  quoteText: string;
+  contextItemId: number;
+};
+
+/**
+ * Collect quote/attachment pairs whose strong partial source support requires
+ * an independent full-span check. Parsing mirrors the finalizer's blockquote
+ * walk so fenced examples and structured quote anchors are treated identically.
+ */
+export function collectDisplayedQuoteVerificationRequests(params: {
+  markdown: string;
+  sourceIndex: QuoteSourceIndex;
+}): DisplayedQuoteVerificationRequest[] {
+  const markdown = stripMetadataQuoteCitationPlaceholders(
+    sanitizeInvalidStructuredSourceMarkers(params.markdown || ""),
+    new Set<string>(),
+  );
+  if (!markdown) return [];
+  const lines = markdown.split("\n");
+  const quoteTexts: string[] = [];
+  let inFence = false;
+  for (let index = 0; index < lines.length; index += 1) {
+    const line = lines[index];
+    if (FENCED_CODE_PATTERN.test(line)) {
+      inFence = !inFence;
+      continue;
+    }
+    if (inFence || !/^[ \t]*>/.test(line)) continue;
+    const quoteLines: string[] = [];
+    if (isBlockquoteWrappedQuoteCitationLine(line)) continue;
+    while (
+      index < lines.length &&
+      /^[ \t]*>/.test(lines[index]) &&
+      (!isBlockquoteWrappedQuoteCitationLine(lines[index]) ||
+        shouldIncludeStructuredAnchorInBlockquote({
+          lines,
+          index,
+          hasQuoteLines: quoteLines.length > 0,
+        }))
+    ) {
+      quoteLines.push(stripBlockquoteMarker(lines[index]));
+      index += 1;
+    }
+    const structuredBinding = parseStructuredBlockquoteQuoteBinding(quoteLines);
+    if (structuredBinding?.quoteText) {
+      quoteTexts.push(structuredBinding.quoteText);
+    } else {
+      const candidate = parseSourceBackedBlockquoteCandidate({
+        quoteLines,
+        markdownLines: lines,
+        followingLineStartIndex: index,
+      });
+      if (candidate.quoteText) quoteTexts.push(candidate.quoteText);
+      if (
+        candidate.trailingCitation?.quoteText &&
+        candidate.trailingCitation.quoteText !== candidate.quoteText
+      ) {
+        quoteTexts.push(candidate.trailingCitation.quoteText);
+      }
+    }
+    index -= 1;
+  }
+
+  const out: DisplayedQuoteVerificationRequest[] = [];
+  const seen = new Set<string>();
+  for (const quoteText of quoteTexts) {
+    const quoteKey = buildQuoteSecondaryEvidenceKey(quoteText);
+    if (!quoteKey) continue;
+    for (const partial of collectStrongPartialDisplayedQuoteSources({
+      quoteText,
+      sourceIndex: params.sourceIndex,
+    })) {
+      const contextItemId = normalizePositiveInt(partial.source.contextItemId);
+      if (!contextItemId) continue;
+      const key = `${quoteKey}\u241f${contextItemId}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      out.push({ quoteKey, quoteText, contextItemId });
+    }
+  }
+  return out;
+}
 
 export type AssistantQuoteCitationFinalizationResult = {
   markdown: string;
@@ -3361,6 +3608,7 @@ function* finalizeAssistantQuoteCitationSteps(
           sourceIndex: finalizedSourceIndex,
           sourceEvidenceComplete:
             params.quoteSourceReview.sourceEvidenceComplete,
+          secondaryEvidence: params.secondaryEvidence,
         });
         if (fullQuote.kind === "matched") {
           if (fullQuote.quoteCitations?.length) {
@@ -3385,6 +3633,7 @@ function* finalizeAssistantQuoteCitationSteps(
           sourceIndex: finalizedSourceIndex,
           sourceEvidenceComplete:
             params.quoteSourceReview.sourceEvidenceComplete,
+          secondaryEvidence: params.secondaryEvidence,
         });
         if (finalized.quoteCitations?.length) {
           quoteCitations = mergeQuoteCitations(
@@ -3442,6 +3691,7 @@ function* finalizeAssistantQuoteCitationSteps(
         quoteText,
         sourceIndex: finalizedSourceIndex,
         sourceEvidenceComplete: params.quoteSourceReview.sourceEvidenceComplete,
+        secondaryEvidence: params.secondaryEvidence,
       });
       if (finalized.quoteCitations?.length) {
         quoteCitations = mergeQuoteCitations(
