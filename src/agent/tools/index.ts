@@ -50,7 +50,6 @@ import { PdfPageService } from "../services/pdfPageService";
 import { PdfFigureExtractionService } from "../services/pdfFigureExtractionService";
 import type { AgentToolDefinition } from "../types";
 import { fail, ok, PAPER_CONTEXT_REF_SCHEMA, validateObject } from "./shared";
-import { summarizeMutationOutcome } from "./effect";
 
 type BuiltInAgentToolDeps = {
   zoteroGateway: ZoteroGateway;
@@ -296,11 +295,12 @@ function createLibraryUpdateTool(tools: {
       onPending: "Waiting for confirmation on library changes",
       onApproved: "Applying library changes",
       onDenied: "Library changes cancelled",
-      onSuccess: ({ content }) =>
-        summarizeMutationOutcome(content, {
-          applied: "Updated",
-          noun: "items",
-        }) || "Library updated",
+      onSuccess: ({ effect }) =>
+        effect === "none"
+          ? "No library items changed"
+          : effect === "partial"
+            ? "Some library items updated"
+            : "Library updated",
     },
     guidance: LIBRARY_UPDATE_GUIDANCE,
     chooseDelegate(args) {

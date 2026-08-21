@@ -374,6 +374,35 @@ export async function loadAgentTranscriptSegment(params: {
   );
 }
 
+export async function loadLatestAgentTranscriptSegment(
+  conversationKeyValue: number,
+): Promise<AgentTranscriptSegment | null> {
+  const conversationKey = normalizePositiveInt(conversationKeyValue);
+  if (!conversationKey) return null;
+  const dbReady = await ensureAgentTranscriptStore();
+  const db = getDb();
+  if (!dbReady || !db) return null;
+  try {
+    const rows = (await db.queryAsync(
+      `SELECT compatibility_key AS compatibilityKey
+       FROM ${TRANSCRIPT_TABLE}
+       WHERE conversation_key = ?
+       ORDER BY created_at DESC, rowid DESC
+       LIMIT 1`,
+      [conversationKey],
+    )) as Array<{ compatibilityKey?: unknown }> | undefined;
+    const compatibilityKey = rows?.[0]?.compatibilityKey;
+    if (typeof compatibilityKey !== "string" || !compatibilityKey) return null;
+    return loadAgentTranscriptSegment({ conversationKey, compatibilityKey });
+  } catch (error) {
+    logTranscriptStoreError(
+      "LLM Agent: Failed to load latest transcript segment",
+      error,
+    );
+    return null;
+  }
+}
+
 async function persistTranscriptSegment(
   segment: AgentTranscriptSegment,
 ): Promise<void> {

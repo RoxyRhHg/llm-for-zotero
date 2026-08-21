@@ -1,4 +1,8 @@
-import type { AgentToolContext } from "../types";
+import type {
+  AgentToolContext,
+  AgentToolEffect,
+  AgentWriteToolOutput,
+} from "../types";
 import {
   claimJournalAction,
   claimJournalStep,
@@ -23,7 +27,8 @@ import {
 
 export type CoordinatedMutationResult = {
   actionId?: string;
-  appliedCount: number;
+  effect: AgentToolEffect;
+  affectedCount: number;
   results: LibraryMutationExecutionResult[];
 };
 
@@ -48,9 +53,7 @@ export async function withActiveJournalAction<T>(
 }
 
 function runIdFor(context: AgentToolContext): string {
-  return (
-    context.request.agentRunId || `conv-${context.request.conversationKey}`
-  );
+  return context.runId || `conv-${context.request.conversationKey}`;
 }
 
 function inversePayload(operations: LibraryMutationOperation[] | undefined) {
@@ -67,6 +70,13 @@ function combineReversibility(
   }
   if (values.every((value) => value === "none")) return "none";
   return "partial";
+}
+
+function combineEffects(values: AgentToolEffect[]): AgentToolEffect {
+  if (!values.length || values.every((value) => value === "none")) {
+    return "none";
+  }
+  return values.every((value) => value === "applied") ? "applied" : "partial";
 }
 
 type MutationStepPlan = {
@@ -86,7 +96,7 @@ type MutationStepOutcome<T> = {
   expectedPostcondition?: unknown;
   reversibility?: JournalReversibility;
   affectedCount: number;
-  changed: boolean;
+  effect: AgentToolEffect;
   reason?: string;
 };
 
@@ -109,7 +119,7 @@ async function executeJournaledStep<T>(params: {
 }): Promise<{
   result: T;
   reversibility: JournalReversibility;
-  changed: boolean;
+  effect: AgentToolEffect;
   affectedCount: number;
 }> {
   const { context, actionId, sequence } = params;
@@ -184,7 +194,7 @@ async function executeJournaledStep<T>(params: {
 
     try {
       const outcome = await params.execute(plan);
-      const changed = outcome.changed;
+      const changed = outcome.effect !== "none";
       const finalInverse =
         outcome.inverse === undefined ? plan.inverse : outcome.inverse;
       const recoveryReason =
@@ -197,6 +207,14 @@ async function executeJournaledStep<T>(params: {
               : "full"
             : "none")
         : "full";
+      const status =
+        outcome.effect === "none"
+          ? "no_effect"
+          : outcome.effect === "partial"
+            ? "partially_applied"
+            : reversibility === "none"
+              ? "irreversible"
+              : "applied";
       if (actionId && stepId) {
         if (outcome.inverse !== undefined && outcome.inverse !== null) {
           await registerJournalRecoveryPayloads({
@@ -207,11 +225,7 @@ async function executeJournaledStep<T>(params: {
         }
         await updateJournalStep({
           stepId,
-          status: changed
-            ? reversibility === "none"
-              ? "irreversible"
-              : "applied"
-            : "no_effect",
+          status,
           inverse: finalInverse,
           expectedPostcondition: outcome.expectedPostcondition,
           result: outcome.result,
@@ -220,18 +234,15 @@ async function executeJournaledStep<T>(params: {
         });
       }
       parentScope?.recordStep({
-        status: changed
-          ? reversibility === "none"
-            ? "irreversible"
-            : "applied"
-          : "no_effect",
+        effect: outcome.effect,
+        status,
         reversibility,
         affectedCount: changed ? outcome.affectedCount : 0,
       });
       return {
         result: outcome.result,
         reversibility,
-        changed,
+        effect: outcome.effect,
         affectedCount: outcome.affectedCount,
       };
     } catch (error) {
@@ -247,6 +258,7 @@ async function executeJournaledStep<T>(params: {
         }).catch(() => undefined);
       }
       parentScope?.recordStep({
+        effect: "none",
         status: "uncertain",
         reversibility: plan.reversibility,
         affectedCount: 0,
@@ -295,7 +307,7 @@ async function executeOne(params: {
           executed.result,
         ),
         affectedCount: executed.affectedCount,
-        changed: executed.changed,
+        effect: executed.effect,
         reason: inverse?.irreversibleReason,
       };
     },
@@ -314,7 +326,7 @@ export async function executeLibraryMutationAction(params: {
   const { service, operations, context, facadeToolName } = params;
   const journalToolName = context.journalToolName || facadeToolName;
   if (!operations.length) {
-    return { appliedCount: 0, results: [] };
+    return { effect: "none", affectedCount: 0, results: [] };
   }
 
   const parentScope = context.journalActionScope;
@@ -331,6 +343,7 @@ export async function executeLibraryMutationAction(params: {
 
   const results: LibraryMutationExecutionResult[] = [];
   const finalReversibilities: JournalReversibility[] = [];
+  const effects: AgentToolEffect[] = [];
   let affectedCount = 0;
   try {
     for (let index = 0; index < operations.length; index += 1) {
@@ -361,27 +374,32 @@ export async function executeLibraryMutationAction(params: {
       });
       results.push(executed.result);
       finalReversibilities.push(executed.reversibility);
-      if (executed.changed) {
+      effects.push(executed.effect);
+      if (executed.effect !== "none") {
         affectedCount += executed.affectedCount;
       }
     }
+    const effect = combineEffects(effects);
     if (actionId && ownsAction) {
       const reversibility = combineReversibility(finalReversibilities);
       await updateJournalAction({
         actionId,
         status:
-          affectedCount === 0
+          effect === "none"
             ? "no_effect"
-            : reversibility === "none"
-              ? "irreversible"
-              : "applied",
+            : effect === "partial"
+              ? "partially_applied"
+              : reversibility === "none"
+                ? "irreversible"
+                : "applied",
         reversibility,
         affectedCount,
       });
     }
     return {
       actionId: actionId || undefined,
-      appliedCount: results.length,
+      effect,
+      affectedCount,
       results,
     };
   } catch (error) {
@@ -423,7 +441,7 @@ export async function executeExternalMutation<T>(params: {
   toolName: string;
   plan: ExternalMutationPlan | (() => Promise<ExternalMutationPlan>);
   execute: () => Promise<ExternalMutationOutcome<T>>;
-}): Promise<T> {
+}): Promise<AgentWriteToolOutput<T>> {
   const { context, toolName } = params;
   const parentScope = context.journalActionScope;
   const journalAvailable = isAgentChangeJournalAvailable();
@@ -457,16 +475,22 @@ export async function executeExternalMutation<T>(params: {
     if (actionId && ownsAction) {
       await updateJournalAction({
         actionId,
-        status: executed.changed
-          ? executed.reversibility === "none"
-            ? "irreversible"
-            : "applied"
-          : "no_effect",
+        status:
+          executed.effect === "none"
+            ? "no_effect"
+            : executed.effect === "partial"
+              ? "partially_applied"
+              : executed.reversibility === "none"
+                ? "irreversible"
+                : "applied",
         reversibility: executed.reversibility,
-        affectedCount: executed.changed ? executed.affectedCount : 0,
+        affectedCount: executed.effect !== "none" ? executed.affectedCount : 0,
       });
     }
-    return executed.result;
+    return {
+      content: executed.result,
+      effect: executed.effect,
+    };
   } catch (error) {
     if (actionId && ownsAction) {
       const uncertain = error instanceof MutationMayHaveAppliedError;

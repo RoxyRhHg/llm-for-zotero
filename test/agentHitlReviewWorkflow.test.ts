@@ -212,7 +212,10 @@ function createStubFacadeTool(
       approval.sourceToolName === "literature_search" &&
       acceptActionIds.includes(approval.sourceActionId),
     applyConfirmation: (input) => ({ ok: true, value: input }),
-    execute: async (input) => execute(input),
+    execute: async (input) => ({
+      content: await execute(input),
+      effect: "applied",
+    }),
   };
 }
 

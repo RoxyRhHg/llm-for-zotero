@@ -1,4 +1,4 @@
-import type { AgentToolDefinition } from "../../types";
+import type { AgentWriteToolDefinition } from "../../types";
 import {
   buildPagedReviewActionConfig,
   buildPageSizeSelectField,
@@ -18,7 +18,6 @@ import {
   normalizePositiveInt,
   normalizePositiveIntArray,
 } from "../shared";
-import { summarizeMutationOutcome } from "../effect";
 import {
   buildMoveAssignmentField,
   normalizeMoveAssignmentsFromResolution,
@@ -34,7 +33,7 @@ type MoveToCollectionInput = {
 
 export function createMoveToCollectionTool(
   zoteroGateway: ZoteroGateway,
-): AgentToolDefinition<MoveToCollectionInput, unknown> {
+): AgentWriteToolDefinition<MoveToCollectionInput, unknown> {
   const mutationService = new LibraryMutationService(zoteroGateway);
 
   return {
@@ -117,11 +116,12 @@ export function createMoveToCollectionTool(
         onPending: "Waiting for confirmation on collection changes",
         onApproved: "Applying collection changes",
         onDenied: "Collection changes cancelled",
-        onSuccess: ({ content }) =>
-          summarizeMutationOutcome(content, {
-            applied: "Filed",
-            noun: "papers",
-          }) || "Collection updated",
+        onSuccess: ({ effect }) =>
+          effect === "none"
+            ? "No papers changed"
+            : effect === "partial"
+              ? "Some papers filed"
+              : "Collection updated",
       },
     },
 

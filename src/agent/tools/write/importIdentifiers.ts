@@ -2,7 +2,7 @@
  * Focused facade tool for importing papers into Zotero by DOI, ISBN, arXiv ID, or URL.
  * Provides a self-describing schema for importing papers by identifier.
  */
-import type { AgentToolDefinition } from "../../types";
+import type { AgentWriteToolDefinition } from "../../types";
 import {
   LibraryMutationService,
   type ImportIdentifiersOperation,
@@ -29,7 +29,7 @@ type ImportIdentifiersInput = {
 
 export function createImportIdentifiersTool(
   zoteroGateway: ZoteroGateway,
-): AgentToolDefinition<ImportIdentifiersInput, unknown> {
+): AgentWriteToolDefinition<ImportIdentifiersInput, unknown> {
   const mutationService = new LibraryMutationService(zoteroGateway);
 
   return {

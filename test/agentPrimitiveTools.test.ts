@@ -965,6 +965,7 @@ describe("primitive agent tools", function () {
       assert.isFalse(
         await tool.shouldRequireConfirmation?.(read.value, context),
       );
+      assert.equal((await tool.execute(read.value, context)).effect, "none");
 
       const write = tool.validate({
         action: "write",
@@ -976,7 +977,8 @@ describe("primitive agent tools", function () {
       assert.isFalse(
         await tool.shouldRequireConfirmation?.(write.value, context),
       );
-      await tool.execute(write.value, context);
+      const writeOutput = await tool.execute(write.value, context);
+      assert.equal(writeOutput.effect, "applied");
       assert.equal(fileContent.get("/tmp/output.md"), "Saved note.");
 
       const overwrite = tool.validate({
@@ -990,7 +992,9 @@ describe("primitive agent tools", function () {
         await tool.shouldRequireConfirmation?.(overwrite.value, context),
       );
 
-      const deniedBypass = await tool.execute(overwrite.value, context);
+      const deniedOutput = await tool.execute(overwrite.value, context);
+      const deniedBypass = deniedOutput.content;
+      assert.equal(deniedOutput.effect, "none");
       assert.include(
         String((deniedBypass as { error?: unknown }).error || ""),
         "without confirmation",
@@ -1000,7 +1004,8 @@ describe("primitive agent tools", function () {
       const approved = tool.applyConfirmation?.(overwrite.value, {}, context);
       assert.isTrue(approved?.ok);
       if (!approved?.ok) return;
-      await tool.execute(approved.value, context);
+      const approvedOutput = await tool.execute(approved.value, context);
+      assert.equal(approvedOutput.effect, "applied");
       assert.equal(fileContent.get("/tmp/existing.md"), "Updated note.");
     } finally {
       (globalThis as { IOUtils?: unknown }).IOUtils = originalIOUtils;
@@ -1066,10 +1071,8 @@ describe("primitive agent tools", function () {
       assert.isTrue(write.ok);
       if (!write.ok) return;
 
-      const result = (await tool.execute(write.value, context)) as Record<
-        string,
-        unknown
-      >;
+      const result = (await tool.execute(write.value, context))
+        .content as Record<string, unknown>;
 
       assert.deepEqual(writes, [
         {
@@ -1130,10 +1133,8 @@ describe("primitive agent tools", function () {
       assert.isTrue(write.ok);
       if (!write.ok) return;
 
-      const result = (await tool.execute(write.value, context)) as Record<
-        string,
-        unknown
-      >;
+      const result = (await tool.execute(write.value, context))
+        .content as Record<string, unknown>;
 
       assert.deepInclude(result, {
         action: "write",
@@ -1230,10 +1231,8 @@ describe("primitive agent tools", function () {
       assert.isTrue(write.ok);
       if (!write.ok) return;
 
-      const result = (await tool.execute(write.value, context)) as Record<
-        string,
-        unknown
-      >;
+      const result = (await tool.execute(write.value, context))
+        .content as Record<string, unknown>;
 
       assert.deepInclude(result, {
         action: "write",
@@ -1325,10 +1324,8 @@ describe("primitive agent tools", function () {
       assert.isTrue(write.ok);
       if (!write.ok) return;
 
-      const result = (await tool.execute(write.value, context)) as Record<
-        string,
-        unknown
-      >;
+      const result = (await tool.execute(write.value, context))
+        .content as Record<string, unknown>;
 
       assert.notProperty(result, "error");
       assert.deepEqual(writes, [
@@ -1609,10 +1606,8 @@ describe("primitive agent tools", function () {
       assert.isTrue(write.ok);
       if (!write.ok) return;
 
-      const result = (await tool.execute(write.value, context)) as Record<
-        string,
-        unknown
-      >;
+      const result = (await tool.execute(write.value, context))
+        .content as Record<string, unknown>;
 
       assert.notProperty(result, "error");
       assert.equal(
@@ -1703,10 +1698,8 @@ describe("primitive agent tools", function () {
       assert.isTrue(write.ok);
       if (!write.ok) return;
 
-      const result = (await tool.execute(write.value, context)) as Record<
-        string,
-        unknown
-      >;
+      const result = (await tool.execute(write.value, context))
+        .content as Record<string, unknown>;
 
       assert.notProperty(result, "error");
       assert.equal(
@@ -1799,7 +1792,8 @@ describe("primitive agent tools", function () {
         await tool.shouldRequireConfirmation?.(overwrite.value, context),
       );
 
-      const deniedBypass = await tool.execute(overwrite.value, context);
+      const deniedBypass = (await tool.execute(overwrite.value, context))
+        .content;
       assert.deepInclude(deniedBypass as Record<string, unknown>, {
         action: "write",
         filePath: "/tmp/obsidian-vault/Papers/existing.md",
@@ -1984,7 +1978,8 @@ describe("primitive agent tools", function () {
       );
       assert.equal(newRedirectPlan?.effect, "write");
       assert.equal(newRedirectPlan?.reversibility, "partial");
-      await tool.execute(newRedirect.value, context);
+      const newRedirectOutput = await tool.execute(newRedirect.value, context);
+      assert.equal(newRedirectOutput.effect, "applied");
 
       const overwriteRedirect = tool.validate({
         command: 'printf "note" > "/tmp/existing.md"',
@@ -2013,10 +2008,9 @@ describe("primitive agent tools", function () {
       );
       assert.isTrue(approvedMkdir?.ok);
       if (!approvedMkdir?.ok) return;
-      const mkdirResult = (await tool.execute(
-        approvedMkdir.value,
-        context,
-      )) as { exitCode: number };
+      const mkdirOutput = await tool.execute(approvedMkdir.value, context);
+      const mkdirResult = mkdirOutput.content as { exitCode: number };
+      assert.equal(mkdirOutput.effect, "none");
       assert.equal(mkdirResult.exitCode, 0);
 
       const dateSet = tool.validate({ command: "date -s 2026-05-15" });
@@ -2174,10 +2168,9 @@ describe("primitive agent tools", function () {
           await tool.shouldRequireConfirmation?.(validated.value, context),
           command,
         );
-        const result = (await tool.execute(
-          { ...validated.value, allowUnsafe: true },
-          context,
-        )) as Record<string, unknown>;
+        const result = (
+          await tool.execute({ ...validated.value, allowUnsafe: true }, context)
+        ).content as Record<string, unknown>;
         assert.equal(result.exitCode, -1, command);
         assert.include(String(result.stderr || ""), "Refusing run_command");
         assert.include(String(result.stderr || ""), "file_io");
@@ -2590,10 +2583,12 @@ describe("primitive agent tools", function () {
     assert.isTrue(confirmed?.ok);
     if (!confirmed?.ok) return;
 
-    const result = await tool.execute(confirmed.value, {
-      ...baseContext,
-      request: noteRequest,
-    });
+    const result = (
+      await tool.execute(confirmed.value, {
+        ...baseContext,
+        request: noteRequest,
+      })
+    ).content;
     assert.deepEqual(result, {
       status: "updated",
       noteId: 55,
@@ -2739,10 +2734,8 @@ describe("primitive agent tools", function () {
       assert.isTrue(validated.ok);
       if (!validated.ok) return;
 
-      const result = (await tool.execute(validated.value, context)) as Record<
-        string,
-        unknown
-      >;
+      const result = (await tool.execute(validated.value, context))
+        .content as Record<string, unknown>;
 
       assert.deepInclude(result, {
         status: "updated",
@@ -2863,10 +2856,8 @@ describe("primitive agent tools", function () {
       assert.isTrue(validated.ok);
       if (!validated.ok) return;
 
-      const result = (await tool.execute(validated.value, context)) as Record<
-        string,
-        unknown
-      >;
+      const result = (await tool.execute(validated.value, context))
+        .content as Record<string, unknown>;
 
       assert.deepInclude(result, {
         status: "updated",
@@ -2995,10 +2986,8 @@ describe("primitive agent tools", function () {
       assert.isTrue(validated.ok);
       if (!validated.ok) return;
 
-      const result = (await tool.execute(validated.value, context)) as Record<
-        string,
-        unknown
-      >;
+      const result = (await tool.execute(validated.value, context))
+        .content as Record<string, unknown>;
 
       assert.deepInclude(result, {
         status: "updated",
@@ -3088,10 +3077,8 @@ describe("primitive agent tools", function () {
       assert.isTrue(validated.ok);
       if (!validated.ok) return;
 
-      const result = (await tool.execute(validated.value, context)) as Record<
-        string,
-        unknown
-      >;
+      const result = (await tool.execute(validated.value, context))
+        .content as Record<string, unknown>;
 
       assert.deepInclude(result, {
         status: "updated",
@@ -3190,10 +3177,8 @@ describe("primitive agent tools", function () {
       assert.isTrue(validated.ok);
       if (!validated.ok) return;
 
-      const result = (await tool.execute(validated.value, context)) as Record<
-        string,
-        unknown
-      >;
+      const result = (await tool.execute(validated.value, context))
+        .content as Record<string, unknown>;
 
       assert.deepInclude(result, {
         status: "updated",
@@ -3292,10 +3277,8 @@ describe("primitive agent tools", function () {
       assert.isTrue(validated.ok);
       if (!validated.ok) return;
 
-      const result = (await tool.execute(validated.value, context)) as Record<
-        string,
-        unknown
-      >;
+      const result = (await tool.execute(validated.value, context))
+        .content as Record<string, unknown>;
 
       assert.deepInclude(result, {
         status: "updated",
@@ -3406,10 +3389,8 @@ describe("primitive agent tools", function () {
       assert.isTrue(validated.ok);
       if (!validated.ok) return;
 
-      const result = (await tool.execute(validated.value, context)) as Record<
-        string,
-        unknown
-      >;
+      const result = (await tool.execute(validated.value, context))
+        .content as Record<string, unknown>;
 
       assert.deepInclude(result, {
         status: "updated",
@@ -3569,10 +3550,8 @@ describe("primitive agent tools", function () {
       assert.isTrue(validated.ok);
       if (!validated.ok) return;
 
-      const result = (await tool.execute(validated.value, context)) as Record<
-        string,
-        unknown
-      >;
+      const result = (await tool.execute(validated.value, context))
+        .content as Record<string, unknown>;
 
       assert.deepInclude(result, {
         status: "updated",
@@ -3717,10 +3696,8 @@ describe("primitive agent tools", function () {
       assert.isTrue(validated.ok);
       if (!validated.ok) return;
 
-      const result = (await tool.execute(validated.value, context)) as Record<
-        string,
-        unknown
-      >;
+      const result = (await tool.execute(validated.value, context))
+        .content as Record<string, unknown>;
 
       assert.deepInclude(result, {
         status: "updated",
@@ -3799,10 +3776,12 @@ describe("primitive agent tools", function () {
     if (!confirmed?.ok) return;
     assert.equal(confirmed.value.content, "Approved *note*");
 
-    const result = await tool.execute(confirmed.value, {
-      ...baseContext,
-      request: noteRequest,
-    });
+    const result = (
+      await tool.execute(confirmed.value, {
+        ...baseContext,
+        request: noteRequest,
+      })
+    ).content;
     assert.equal((result as { noteText: string }).noteText, "Approved *note*");
   });
 

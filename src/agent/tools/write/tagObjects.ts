@@ -8,7 +8,7 @@
  * library exactly these 20 tags" drifted: each batch added its own and
  * nothing removed a previous batch's choices.
  */
-import type { AgentToolDefinition } from "../../types";
+import type { AgentWriteToolDefinition } from "../../types";
 import {
   LibraryMutationService,
   type SetItemTagsOperation,
@@ -23,7 +23,7 @@ import {
 
 export function createUpdateLibraryTagTool(
   zoteroGateway: ZoteroGateway,
-): AgentToolDefinition<{ operation: UpdateLibraryTagOperation }, unknown> {
+): AgentWriteToolDefinition<{ operation: UpdateLibraryTagOperation }, unknown> {
   const mutationService = new LibraryMutationService(zoteroGateway);
 
   return {
@@ -168,7 +168,7 @@ export function createUpdateLibraryTagTool(
 
 export function createSetItemTagsTool(
   zoteroGateway: ZoteroGateway,
-): AgentToolDefinition<{ operation: SetItemTagsOperation }, unknown> {
+): AgentWriteToolDefinition<{ operation: SetItemTagsOperation }, unknown> {
   const mutationService = new LibraryMutationService(zoteroGateway);
 
   return {

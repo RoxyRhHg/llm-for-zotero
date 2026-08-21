@@ -1,11 +1,11 @@
 import type {
   AgentJournalActionScope,
   AgentJournalStepOutcome,
-  AgentToolDefinition,
+  AgentWriteToolDefinition,
 } from "../../types";
 import type { AgentToolRegistry } from "../registry";
 import type { ZoteroGateway } from "../../services/zoteroGateway";
-import type { ActionRegistry, ActionServices } from "../../actions";
+import type { ActionRegistry } from "../../actions";
 import type { ActionCheckpoint } from "../../actions/types";
 import { buildActionExecutionContext } from "../../actions/toolContextBridge";
 import { getAgentLibraryWriteMode } from "../../libraryWriteMode";
@@ -97,6 +97,16 @@ function batchAffectedCount(outcomes: AgentJournalStepOutcome[]): number {
   );
 }
 
+function batchEffect(outcomes: AgentJournalStepOutcome[]) {
+  const effects = outcomes.map((outcome) => outcome.effect);
+  if (!effects.length || effects.every((effect) => effect === "none")) {
+    return "none" as const;
+  }
+  return effects.every((effect) => effect === "applied")
+    ? ("applied" as const)
+    : ("partial" as const);
+}
+
 /**
  * Runs and resumes durable library-wide jobs.
  *
@@ -109,10 +119,9 @@ export function createLibraryBatchTool(deps: {
   actionRegistry: ActionRegistry;
   toolRegistry: AgentToolRegistry;
   zoteroGateway: ZoteroGateway;
-  services: ActionServices;
   now?: () => number;
   batchJobStore?: LibraryBatchJobStore;
-}): AgentToolDefinition<LibraryBatchInput, unknown> {
+}): AgentWriteToolDefinition<LibraryBatchInput, unknown> {
   const now = deps.now ?? (() => Date.now());
   const store = deps.batchJobStore ?? defaultBatchJobStore;
 
@@ -335,7 +344,10 @@ export function createLibraryBatchTool(deps: {
           context.request.conversationKey,
         );
         return {
-          interruptedJobs: jobs.map(summarizeInterruptedJob),
+          content: {
+            interruptedJobs: jobs.map(summarizeInterruptedJob),
+          },
+          effect: "none",
         };
       }
 
@@ -414,6 +426,7 @@ export function createLibraryBatchTool(deps: {
       ): Promise<void> => {
         if (!journalActionId || journalFinalized) return;
         const affectedCount = batchAffectedCount(journalOutcomes);
+        const effect = batchEffect(journalOutcomes);
         const reversibility = combineBatchReversibility(journalOutcomes);
         const uncertain = journalOutcomes.some(
           (outcome) => outcome.status === "uncertain",
@@ -426,11 +439,13 @@ export function createLibraryBatchTool(deps: {
               : uncertain
                 ? "uncertain"
                 : "failed"
-            : affectedCount === 0
+            : effect === "none"
               ? "no_effect"
-              : reversibility === "none"
-                ? "irreversible"
-                : "applied",
+              : effect === "partial"
+                ? "partially_applied"
+                : reversibility === "none"
+                  ? "irreversible"
+                  : "applied",
           reversibility,
           affectedCount,
           error:
@@ -471,7 +486,6 @@ export function createLibraryBatchTool(deps: {
         context,
         registry: deps.toolRegistry,
         zoteroGateway: deps.zoteroGateway,
-        services: deps.services,
         confirmationMode: "auto_approve",
         runId: prepared.jobId,
         journalActionScope,
@@ -529,14 +543,17 @@ export function createLibraryBatchTool(deps: {
         });
 
         return {
-          job: prepared.job,
-          jobId: prepared.jobId,
-          resumed: prepared.resumed || undefined,
-          cursor: lastCursor,
-          totalCount: lastTotalCount,
-          appliedCount: lastAppliedCount,
-          output,
-          progress: progress.slice(-20),
+          content: {
+            job: prepared.job,
+            jobId: prepared.jobId,
+            resumed: prepared.resumed || undefined,
+            cursor: lastCursor,
+            totalCount: lastTotalCount,
+            appliedCount: lastAppliedCount,
+            output,
+            progress: progress.slice(-20),
+          },
+          effect: batchEffect(journalOutcomes),
         };
       } catch (error) {
         await finalizeJournal(true, error).catch(() => undefined);

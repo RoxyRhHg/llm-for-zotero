@@ -29,7 +29,6 @@ function buildToolContext(
       // change under a conversation nothing queries, so neither undo path
       // could find them.
       conversationKey: ctx.conversationKey ?? 0,
-      agentRunId: ctx.runId,
       mode: "agent",
       userText: stepDescription,
       libraryID: ctx.libraryID,
@@ -40,6 +39,7 @@ function buildToolContext(
         ctx.requestContext?.selectedCollectionContexts,
       selectedTagContexts: ctx.requestContext?.selectedTagContexts,
     },
+    runId: ctx.runId,
     item: syntheticItem,
     currentAnswerText: "",
     modelName: "action",

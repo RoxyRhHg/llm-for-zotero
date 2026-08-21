@@ -1,6 +1,7 @@
 import { assert } from "chai";
 import { initAgentChangeJournal } from "../src/agent/store/changeJournal";
 import { executeLibraryMutationAction } from "../src/agent/services/mutationCoordinator";
+import { LibraryMutationService } from "../src/agent/services/libraryMutationService";
 import { executeAndRecordUndoBatch } from "../src/agent/tools/write/mutateLibraryShared";
 import type { AgentToolContext } from "../src/agent/types";
 import { ChangeJournalTestDb } from "./helpers/changeJournalTestDb";
@@ -39,6 +40,39 @@ describe("multi-operation durable mutation recovery", function () {
     };
   }
 
+  it("reports applied, partial, and zero effects from changed targets", async function () {
+    const assignments = [
+      { itemId: 1, tags: ["reviewed"] },
+      { itemId: 2, tags: ["reviewed"] },
+    ];
+    for (const [updatedCount, expectedEffect] of [
+      [2, "applied"],
+      [1, "partial"],
+      [0, "none"],
+    ] as const) {
+      const service = new LibraryMutationService({
+        applyTagAssignments: async () => ({
+          updatedCount,
+          skippedCount: assignments.length - updatedCount,
+          items: assignments.map((assignment, index) => ({
+            itemId: assignment.itemId,
+            status: index < updatedCount ? "updated" : "skipped",
+            addedTags: index < updatedCount ? assignment.tags : [],
+            skippedTags: index < updatedCount ? [] : assignment.tags,
+          })),
+        }),
+      } as never);
+
+      const execution = await service.executeOperation(
+        { type: "apply_tags", assignments },
+        context,
+      );
+
+      assert.equal(execution.effect, expectedEffect);
+      assert.equal(execution.affectedCount, updatedCount);
+    }
+  });
+
   it("persists one action and every prepared inverse before the write starts", async function () {
     const db = await installJournal();
     let calls = 0;
@@ -70,7 +104,7 @@ describe("multi-operation durable mutation recovery", function () {
             description: `restore item ${operation.itemId}`,
             inverseOperations: [inverseFor(operation.itemId)],
           },
-          changed: true,
+          effect: "applied" as const,
           affectedCount: 1,
         };
       },
@@ -183,7 +217,7 @@ describe("multi-operation durable mutation recovery", function () {
             description: `restore item ${operation.itemId}`,
             inverseOperations: [inverseFor(operation.itemId)],
           },
-          changed: true,
+          effect: "applied" as const,
           affectedCount: 1,
         };
       },
@@ -243,7 +277,7 @@ describe("multi-operation durable mutation recovery", function () {
           description: "delete collection 42",
           inverseOperations: [inverse],
         },
-        changed: true,
+        effect: "applied" as const,
         affectedCount: 1,
       }),
       captureOperationState: async () => ({
@@ -291,7 +325,7 @@ describe("multi-operation durable mutation recovery", function () {
           },
         },
         inverse: null,
-        changed: false,
+        effect: "none" as const,
         affectedCount: 0,
       }),
       captureOperationState: async () => ({
@@ -307,10 +341,60 @@ describe("multi-operation durable mutation recovery", function () {
       "update_metadata",
     );
 
-    assert.equal(outcome.appliedCount, 1, "the attempted step still returned");
+    assert.equal(
+      outcome.content.appliedCount,
+      0,
+      "appliedCount reports objects actually changed",
+    );
+    assert.equal(outcome.effect, "none");
     assert.equal([...db.actions.values()][0].status, "no_effect");
     assert.equal([...db.actions.values()][0].affected_count, 0);
     assert.equal([...db.steps.values()][0].status, "no_effect");
+  });
+
+  it("keeps partial effects and affected counts aligned across tool and journal output", async function () {
+    const db = await installJournal();
+    const mutationService = {
+      planOperation: async () => ({
+        effect: "write" as const,
+        reversibility: "full" as const,
+        description: "update two targets",
+        inverseOperations: [inverseFor(1)],
+      }),
+      executeOperation: async () => ({
+        result: {
+          operation: "update_metadata",
+          result: {
+            selectedCount: 2,
+            updatedCount: 1,
+            skippedCount: 1,
+          },
+        },
+        inverse: {
+          description: "restore item 1",
+          inverseOperations: [inverseFor(1)],
+        },
+        effect: "partial" as const,
+        affectedCount: 1,
+      }),
+      captureOperationState: async () => ({
+        version: 1,
+        operation: "update_metadata",
+      }),
+    };
+
+    const outcome = await executeAndRecordUndoBatch(
+      mutationService as never,
+      [{ type: "update_metadata", itemId: 1, metadata: { title: "new" } }],
+      context,
+      "update_metadata",
+    );
+
+    assert.equal(outcome.effect, "partial");
+    assert.equal(outcome.content.appliedCount, 1);
+    assert.equal([...db.actions.values()][0].status, "partially_applied");
+    assert.equal([...db.actions.values()][0].affected_count, 1);
+    assert.equal([...db.steps.values()][0].status, "partially_applied");
   });
 
   it("keeps a committed child-note row in durable history when its ID is unavailable", async function () {
@@ -332,7 +416,7 @@ describe("multi-operation durable mutation recovery", function () {
           },
         },
         inverse: null,
-        changed: true,
+        effect: "applied" as const,
         affectedCount: 1,
       }),
       captureOperationState: async () => ({
@@ -378,7 +462,7 @@ describe("multi-operation durable mutation recovery", function () {
           description: "restore item 1",
           inverseOperations: [inverseFor(1)],
         },
-        changed: true,
+        effect: "applied" as const,
         affectedCount: 1,
       }),
       captureOperationState: async () => ({
@@ -445,7 +529,7 @@ describe("multi-operation durable mutation recovery", function () {
             description: `restore ${itemId}`,
             inverseOperations: [inverseFor(itemId)],
           },
-          changed: true,
+          effect: "applied" as const,
           affectedCount: 1,
         };
       },
@@ -551,7 +635,7 @@ describe("multi-operation durable mutation recovery", function () {
             result: { status: "updated", itemId: operation.itemId },
           },
           inverse: null,
-          changed: true,
+          effect: "applied" as const,
           affectedCount: 1,
         };
       },

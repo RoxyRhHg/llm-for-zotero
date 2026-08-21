@@ -5,6 +5,7 @@ import { recordAgentTurn } from "./store/conversationMemory";
 import {
   appendAgentTranscriptMessages,
   buildAgentTranscriptCompatibilityKey,
+  loadLatestAgentTranscriptSegment,
   loadAgentTranscriptSegment,
   replaceAgentTranscriptSegment,
 } from "./store/transcriptStore";
@@ -25,6 +26,7 @@ import type {
   AgentToolContext,
   AgentToolResult,
   AgentToolEffect,
+  AgentRunRecord,
 } from "./types";
 import type { AgentModelAdapter } from "./model/adapter";
 import type {
@@ -86,7 +88,13 @@ import {
   createAgentRun,
   finishAgentRun,
   getAgentRunTrace,
+  getLatestAgentRunForConversation,
+  INTERRUPTED_AGENT_RUN_MARKER,
 } from "./store/traceStore";
+import {
+  listJournalActions,
+  type JournalActionWithSteps,
+} from "./store/changeJournal";
 import {
   hasAgentToolResultHandles,
   hydrateAgentToolResultHandles,
@@ -536,6 +544,55 @@ function isCurrentTurnUserTranscriptMessage(
   );
 }
 
+function readLatestTranscriptGoal(
+  messages: readonly AgentModelMessage[],
+): string | undefined {
+  for (let index = messages.length - 1; index >= 0; index -= 1) {
+    const message = messages[index];
+    if (message.role !== "user") continue;
+    const goal = normalizeTranscriptUserText(
+      transcriptContentToPlainText(message.content),
+    );
+    if (!goal) continue;
+    return goal.length > 600 ? `${goal.slice(0, 597)}...` : goal;
+  }
+  return undefined;
+}
+
+function buildInterruptedRunRecoveryMessage(params: {
+  run: AgentRunRecord;
+  actions: JournalActionWithSteps[];
+  priorGoal?: string;
+}): AgentModelMessage {
+  const actions = [...params.actions].sort(
+    (left, right) =>
+      left.createdAt - right.createdAt ||
+      left.actionId.localeCompare(right.actionId),
+  );
+  const lines = [
+    `Recovery note for interrupted run ${params.run.runId}.`,
+    "Do not automatically repeat any prior write.",
+  ];
+  if (params.priorGoal) lines.push(`Prior goal: ${params.priorGoal}`);
+  if (actions.length) {
+    lines.push("Recorded journal actions:");
+    for (const action of actions) {
+      lines.push(
+        `- actionId=${action.actionId}; status=${action.status}; affectedCount=${action.affectedCount}; reversibility=${action.reversibility}`,
+      );
+    }
+  } else {
+    lines.push("No journaled writes were recorded.");
+  }
+  lines.push(
+    "Any unfinished confirmation was discarded and must be proposed and approved again.",
+  );
+  return {
+    role: "user",
+    content: lines.join("\n"),
+  };
+}
+
 type ExecutedToolCall = {
   toolResult: AgentToolResult;
   toolDefinition?: import("./types").AgentToolDefinition<any, any>;
@@ -773,6 +830,14 @@ export class AgentRuntime {
       request.localDocuments,
     );
     try {
+      const latestPriorRun = await getLatestAgentRunForConversation(
+        request.conversationKey,
+      );
+      const interruptedPriorRun =
+        latestPriorRun?.status === "failed" &&
+        latestPriorRun.finalText === INTERRUPTED_AGENT_RUN_MARKER
+          ? latestPriorRun
+          : null;
       const runId = createRunId();
       const adapter = this.adapterFactory(request);
       const adapterCapabilities = adapter.getCapabilities(request);
@@ -830,6 +895,7 @@ export class AgentRuntime {
 
       const context: AgentToolContext = {
         request,
+        runId,
         item,
         currentAnswerText,
         modelName: request.model || "unknown",
@@ -874,9 +940,33 @@ export class AgentRuntime {
         conversationKey: request.conversationKey,
         compatibilityKey: transcriptCompatibilityKey,
       });
+      const hadCompatibleTranscript = transcriptSegment.messages.length > 0;
       let transcriptMessagesForPrompt = transcriptSegment.messages.length
         ? transcriptSegment.messages
         : normalizeHistoryMessages(request);
+      let recoveryMessage: AgentModelMessage | null = null;
+      if (interruptedPriorRun) {
+        const [actions, latestTranscriptSegment] = await Promise.all([
+          listJournalActions({
+            runId: interruptedPriorRun.runId,
+            limit: 50,
+          }),
+          loadLatestAgentTranscriptSegment(request.conversationKey),
+        ]);
+        const compatibilityMatches =
+          latestTranscriptSegment?.compatibilityKey ===
+          transcriptCompatibilityKey;
+        recoveryMessage = buildInterruptedRunRecoveryMessage({
+          run: interruptedPriorRun,
+          actions,
+          priorGoal: compatibilityMatches
+            ? undefined
+            : readLatestTranscriptGoal(latestTranscriptSegment?.messages || []),
+        });
+        transcriptMessagesForPrompt = compatibilityMatches
+          ? [...transcriptMessagesForPrompt, recoveryMessage]
+          : [recoveryMessage];
+      }
 
       if (isManualCompactRequest(request)) {
         const policy = resolveAgentContextBudgetPolicy();
@@ -926,6 +1016,34 @@ export class AgentRuntime {
           text,
           usedFallback: false,
         };
+      }
+
+      const currentUserTranscriptMessage = buildTranscriptUserMessage(request);
+      const turnStartTranscriptMessages: AgentModelMessage[] = transcriptSegment
+        .messages.length
+        ? recoveryMessage
+          ? [recoveryMessage]
+          : []
+        : [...transcriptMessagesForPrompt];
+      const transcriptTail =
+        turnStartTranscriptMessages[turnStartTranscriptMessages.length - 1] ||
+        transcriptSegment.messages[transcriptSegment.messages.length - 1];
+      if (
+        hadCompatibleTranscript ||
+        !isCurrentTurnUserTranscriptMessage(transcriptTail, request)
+      ) {
+        turnStartTranscriptMessages.push(currentUserTranscriptMessage);
+      }
+      if (turnStartTranscriptMessages.length) {
+        await persistIfLive(() =>
+          appendAgentTranscriptMessages({
+            conversationKey: request.conversationKey,
+            compatibilityKey: transcriptCompatibilityKey,
+            messages: turnPathRedactor.redactTerminalValue(
+              turnStartTranscriptMessages,
+            ),
+          }),
+        );
       }
 
       // Intent/skill selection runs ONCE per user turn, before the system
@@ -1020,12 +1138,19 @@ export class AgentRuntime {
           resourceSignature: resourceContextPlan.resourceSignature,
         });
         if (compacted.compacted) {
+          transcriptMessagesForPrompt = compacted.messages;
           transcriptSegment = {
             ...transcriptSegment,
-            messages: compacted.messages,
+            messages:
+              !hadCompatibleTranscript &&
+              isCurrentTurnUserTranscriptMessage(
+                compacted.messages[compacted.messages.length - 1],
+                request,
+              )
+                ? compacted.messages
+                : [...compacted.messages, currentUserTranscriptMessage],
             compactedAt: this.now(),
           };
-          transcriptMessagesForPrompt = transcriptSegment.messages;
           await persistIfLive(() =>
             upsertAgentToolResultHandles(compacted.handleRecords),
           );
@@ -1053,19 +1178,7 @@ export class AgentRuntime {
           );
         }
       }
-      const seedTranscriptMessages = transcriptSegment.messages.length
-        ? []
-        : transcriptMessagesForPrompt;
-      const currentUserTranscriptMessage = buildTranscriptUserMessage(request);
-      const newTranscriptMessages: AgentModelMessage[] = [
-        ...seedTranscriptMessages,
-        ...(isCurrentTurnUserTranscriptMessage(
-          seedTranscriptMessages[seedTranscriptMessages.length - 1],
-          request,
-        )
-          ? []
-          : [currentUserTranscriptMessage]),
-      ];
+      const newTranscriptMessages: AgentModelMessage[] = [];
       let persistedTranscriptMessageCount = 0;
       const persistTranscriptCheckpoint = async (): Promise<void> => {
         const pending = newTranscriptMessages.slice(
@@ -1466,6 +1579,7 @@ export class AgentRuntime {
                 content: outcome.finalText,
               });
             }
+            await persistTranscriptCheckpoint();
             return buildAdapterToolCallResult(outcome);
           },
         });
@@ -1622,6 +1736,7 @@ export class AgentRuntime {
           callId: toolResult.callId,
           name: toolResult.name,
           ok: toolResult.ok,
+          effect: toolResult.effect,
           content: toolResult.content,
           artifacts: toolResult.artifacts,
         });
@@ -2046,9 +2161,13 @@ export class AgentRuntime {
               : step.assistantMessage.tool_calls,
           };
           messages.push(assistantToolMessage);
-          newTranscriptMessages.push(assistantToolMessage);
           if (!calls.length) break;
           for (const call of calls) {
+            newTranscriptMessages.push({
+              role: "assistant",
+              content: "",
+              tool_calls: [call],
+            });
             const outcome = await executeToolWorkflow(call, round, {
               modelCallId: call.id,
             });
@@ -2078,8 +2197,10 @@ export class AgentRuntime {
                   content: stopFinalText,
                 });
               }
+              await persistTranscriptCheckpoint();
               return completeRun(stopFinalText, "completed");
             }
+            await persistTranscriptCheckpoint();
             if (consecutiveToolErrors >= 3) {
               const finalText =
                 currentAnswerText ||

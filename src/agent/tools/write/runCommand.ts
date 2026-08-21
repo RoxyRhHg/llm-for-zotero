@@ -5,7 +5,7 @@
  *
  * Uses Mozilla's Subprocess module (Gecko runtime).
  */
-import type { AgentToolContext, AgentToolDefinition } from "../../types";
+import type { AgentToolContext, AgentWriteToolDefinition } from "../../types";
 import { getRuntimePlatformInfo } from "../../../utils/runtimePlatform";
 import {
   isLocalPathInsideOrEqual,
@@ -600,7 +600,7 @@ async function getRunCommandConfirmationReason(
   return null;
 }
 
-export function createRunCommandTool(): AgentToolDefinition<
+export function createRunCommandTool(): AgentWriteToolDefinition<
   RunCommandInput,
   unknown
 > {
@@ -770,19 +770,25 @@ export function createRunCommandTool(): AgentToolDefinition<
       const noteWriteRefusal = getNoteWriteBypassRefusal(input, context);
       if (noteWriteRefusal) {
         return {
-          exitCode: -1,
-          stdout: "",
-          stderr: noteWriteRefusal,
-          command: input.command,
+          content: {
+            exitCode: -1,
+            stdout: "",
+            stderr: noteWriteRefusal,
+            command: input.command,
+          },
+          effect: "none",
         };
       }
       const confirmationReason = await getRunCommandConfirmationReason(input);
       if (confirmationReason && !input.allowUnsafe) {
         return {
-          exitCode: -1,
-          stdout: "",
-          stderr: confirmationReason,
-          command: input.command,
+          content: {
+            exitCode: -1,
+            stdout: "",
+            stderr: confirmationReason,
+            command: input.command,
+          },
+          effect: "none",
         };
       }
       let outputPath: string | undefined;
@@ -884,28 +890,32 @@ export function createRunCommandTool(): AgentToolDefinition<
                 ? ("partial" as const)
                 : ("none" as const),
             affectedCount: changed ? 1 : 0,
-            changed,
+            effect: changed ? "applied" : "none",
           };
         },
       });
+      const commandResult = result.content;
 
       const maxLen = 8000;
       const stdout =
-        result.stdout.length > maxLen
-          ? result.stdout.slice(0, maxLen) +
-            `\n... [truncated, ${result.stdout.length} chars total]`
-          : result.stdout;
+        commandResult.stdout.length > maxLen
+          ? commandResult.stdout.slice(0, maxLen) +
+            `\n... [truncated, ${commandResult.stdout.length} chars total]`
+          : commandResult.stdout;
       const stderr =
-        result.stderr.length > maxLen
-          ? result.stderr.slice(0, maxLen) +
-            `\n... [truncated, ${result.stderr.length} chars total]`
-          : result.stderr;
+        commandResult.stderr.length > maxLen
+          ? commandResult.stderr.slice(0, maxLen) +
+            `\n... [truncated, ${commandResult.stderr.length} chars total]`
+          : commandResult.stderr;
 
       return {
-        exitCode: result.exitCode,
-        stdout,
-        stderr,
-        command: input.command,
+        content: {
+          exitCode: commandResult.exitCode,
+          stdout,
+          stderr,
+          command: input.command,
+        },
+        effect: result.effect,
       };
     },
   };

@@ -43,7 +43,10 @@ describe("mutation-plan confirmation policy", function () {
         cancelLabel: "Cancel",
         fields: [],
       }),
-      execute: async () => ({ status: "ran" }),
+      execute: async () => ({
+        content: { status: "ran" },
+        effect: "applied",
+      }),
     };
   }
 

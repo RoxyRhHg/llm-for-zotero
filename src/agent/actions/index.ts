@@ -23,7 +23,6 @@ export type {
   ActionProgressEvent,
   ActionCheckpoint,
   ActionResult,
-  ActionServices,
   ActionLLMConfig,
   ActionRequestContext,
 } from "./types";

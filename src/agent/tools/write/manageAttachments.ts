@@ -1,7 +1,7 @@
 /**
  * Tool for managing Zotero attachments — delete, rename, or re-link.
  */
-import type { AgentToolDefinition } from "../../types";
+import type { AgentWriteToolDefinition } from "../../types";
 import {
   LibraryMutationService,
   type DeleteAttachmentOperation,
@@ -24,7 +24,7 @@ type ManageAttachmentsInput = {
 
 export function createManageAttachmentsTool(
   zoteroGateway: ZoteroGateway,
-): AgentToolDefinition<ManageAttachmentsInput, unknown> {
+): AgentWriteToolDefinition<ManageAttachmentsInput, unknown> {
   const mutationService = new LibraryMutationService(zoteroGateway);
 
   return {

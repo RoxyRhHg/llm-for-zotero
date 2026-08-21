@@ -2,7 +2,7 @@
  * Focused facade tool for adding and removing tags on Zotero papers.
  * Provides a self-describing schema for managing Zotero tags.
  */
-import type { AgentToolDefinition } from "../../types";
+import type { AgentWriteToolDefinition } from "../../types";
 import {
   buildPagedReviewActionConfig,
   buildPageSizeSelectField,
@@ -38,7 +38,7 @@ type ApplyTagsInput = {
 
 export function createApplyTagsTool(
   zoteroGateway: ZoteroGateway,
-): AgentToolDefinition<ApplyTagsInput, unknown> {
+): AgentWriteToolDefinition<ApplyTagsInput, unknown> {
   const mutationService = new LibraryMutationService(zoteroGateway);
 
   return {

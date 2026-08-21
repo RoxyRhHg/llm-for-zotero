@@ -2,7 +2,7 @@
  * Tool for reading and writing files on the local filesystem.
  * Enables the agent to read data files, write scripts, export results, etc.
  */
-import type { AgentToolContext, AgentToolDefinition } from "../../types";
+import type { AgentToolContext, AgentWriteToolDefinition } from "../../types";
 import type { PaperContextRef } from "../../../shared/types";
 import {
   formatPaperCitationLabel,
@@ -426,7 +426,10 @@ async function writeFile(
   throw new Error("File I/O is not available in this Zotero environment");
 }
 
-export function createFileIOTool(): AgentToolDefinition<FileIOInput, unknown> {
+export function createFileIOTool(): AgentWriteToolDefinition<
+  FileIOInput,
+  unknown
+> {
   return {
     spec: {
       name: "file_io",
@@ -717,6 +720,7 @@ export function createFileIOTool(): AgentToolDefinition<FileIOInput, unknown> {
                 filePath: input.filePath,
                 error: "Image file not found",
               },
+              effect: "none",
             };
           }
           if (isDisallowedMineruSourceImageCacheRead(input.filePath, context)) {
@@ -727,6 +731,7 @@ export function createFileIOTool(): AgentToolDefinition<FileIOInput, unknown> {
                 error:
                   "MinerU source image caches are not available. Use paper_read mode:'figures' to extract source-PDF figure crops under figure_crops/**.",
               },
+              effect: "none",
             };
           }
           return {
@@ -745,6 +750,7 @@ export function createFileIOTool(): AgentToolDefinition<FileIOInput, unknown> {
                 paperContext: paperSourceMetadata?.paperContext,
               },
             ],
+            effect: "none",
           };
         }
 
@@ -767,6 +773,7 @@ export function createFileIOTool(): AgentToolDefinition<FileIOInput, unknown> {
               ...(start > 0 ? { offset: start } : {}),
               ...(text.length < raw.length ? { totalLength: raw.length } : {}),
             },
+            effect: "none",
           };
         } catch (error) {
           return {
@@ -775,108 +782,115 @@ export function createFileIOTool(): AgentToolDefinition<FileIOInput, unknown> {
               filePath: input.filePath,
               error: error instanceof Error ? error.message : String(error),
             },
+            effect: "none",
           };
         }
       }
 
       // write
-      try {
-        const nextContent = input.content || "";
-        const nextBytes = new TextEncoder().encode(nextContent);
-        const nextChecksum = await sha256Bytes(nextBytes);
-        return await executeExternalMutation({
-          context,
-          toolName: "file_io",
-          plan: async () => {
-            const existedBeforeWrite = await fileExists(input.filePath);
-            if (existedBeforeWrite === true && !input.allowOverwrite) {
-              throw new Error(
-                "Refusing to overwrite an existing file without confirmation",
-              );
-            }
-            const previousBytes =
-              existedBeforeWrite === true
-                ? await readFileBytes(input.filePath)
-                : null;
-            const recovery =
-              previousBytes !== null
-                ? await storeRecoveryBytes(previousBytes)
-                : undefined;
-            const previousChecksum =
-              previousBytes === null ? null : await sha256Bytes(previousBytes);
-            return {
-              operation: "write_file",
-              description:
-                existedBeforeWrite === false
-                  ? `Create file: ${input.filePath}`
-                  : `Overwrite file: ${input.filePath}`,
-              forward: {
-                path: input.filePath,
-                encoding: input.encoding || "utf-8",
-                checksum: nextChecksum,
-              },
-              inverse:
-                existedBeforeWrite === false
+      const nextContent = input.content || "";
+      const nextBytes = new TextEncoder().encode(nextContent);
+      const nextChecksum = await sha256Bytes(nextBytes);
+      if (
+        (await fileExists(input.filePath)) === true &&
+        !input.allowOverwrite
+      ) {
+        return {
+          content: {
+            action: "write",
+            filePath: input.filePath,
+            error:
+              "Refusing to overwrite an existing file without confirmation",
+          },
+          effect: "none",
+        };
+      }
+      return executeExternalMutation({
+        context,
+        toolName: "file_io",
+        plan: async () => {
+          const existedBeforeWrite = await fileExists(input.filePath);
+          if (existedBeforeWrite === true && !input.allowOverwrite) {
+            throw new Error(
+              "Refusing to overwrite an existing file without confirmation",
+            );
+          }
+          const previousBytes =
+            existedBeforeWrite === true
+              ? await readFileBytes(input.filePath)
+              : null;
+          const recovery =
+            previousBytes !== null
+              ? await storeRecoveryBytes(previousBytes)
+              : undefined;
+          const previousChecksum =
+            previousBytes === null ? null : await sha256Bytes(previousBytes);
+          return {
+            operation: "write_file",
+            description:
+              existedBeforeWrite === false
+                ? `Create file: ${input.filePath}`
+                : `Overwrite file: ${input.filePath}`,
+            forward: {
+              path: input.filePath,
+              encoding: input.encoding || "utf-8",
+              checksum: nextChecksum,
+            },
+            inverse:
+              existedBeforeWrite === false
+                ? {
+                    version: 1,
+                    kind: "file",
+                    operation: "delete",
+                    path: input.filePath,
+                  }
+                : recovery
                   ? {
                       version: 1,
                       kind: "file",
-                      operation: "delete",
+                      operation: "restore",
                       path: input.filePath,
+                      encoding: input.encoding || "utf-8",
+                      payload: recovery,
                     }
-                  : recovery
-                    ? {
-                        version: 1,
-                        kind: "file",
-                        operation: "restore",
-                        path: input.filePath,
-                        encoding: input.encoding || "utf-8",
-                        payload: recovery,
-                      }
-                    : undefined,
-              precondition: {
-                kind: "file",
-                path: input.filePath,
-                exists: existedBeforeWrite === true,
-                checksum: previousChecksum,
-              },
-              reversibility:
-                existedBeforeWrite === false || recovery ? "full" : "none",
-              reason:
-                existedBeforeWrite === null
-                  ? "The prior file state could not be determined."
                   : undefined,
-            };
-          },
-          execute: async () => {
-            await writeFile(
-              input.filePath,
-              nextContent,
-              input.encoding || "utf-8",
-            );
-            return {
-              result: {
-                action: "write",
-                filePath: input.filePath,
-                bytesWritten: nextBytes.byteLength,
-              },
-              expectedPostcondition: {
-                kind: "file",
-                path: input.filePath,
-                exists: true,
-                checksum: nextChecksum,
-              },
-              affectedCount: 1,
-              changed: true,
-            };
-          },
-        });
-      } catch (error) {
-        return {
-          action: "write",
-          filePath: input.filePath,
-          error: error instanceof Error ? error.message : String(error),
-        };
-      }
+            precondition: {
+              kind: "file",
+              path: input.filePath,
+              exists: existedBeforeWrite === true,
+              checksum: previousChecksum,
+            },
+            reversibility:
+              existedBeforeWrite === false || recovery ? "full" : "none",
+            reason:
+              existedBeforeWrite === null
+                ? "The prior file state could not be determined."
+                : undefined,
+          };
+        },
+        execute: async () => {
+          await writeFile(
+            input.filePath,
+            nextContent,
+            input.encoding || "utf-8",
+          );
+          return {
+            result: {
+              action: "write",
+              filePath: input.filePath,
+              bytesWritten: nextBytes.byteLength,
+            },
+            expectedPostcondition: {
+              kind: "file",
+              path: input.filePath,
+              exists: true,
+              checksum: nextChecksum,
+            },
+            affectedCount: 1,
+            effect: "applied",
+          };
+        },
+      });
     },
   };
 }

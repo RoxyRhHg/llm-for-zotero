@@ -69,7 +69,7 @@ describe("library write mode gate", function () {
       }),
       async execute() {
         ran = true;
-        return { ok: true };
+        return { content: { ok: true }, effect: "applied" };
       },
     } as never);
     return { registry, didRun: () => ran };
@@ -147,7 +147,7 @@ describe("library write mode gate", function () {
       }),
       async execute() {
         ran = true;
-        return { ok: true };
+        return { content: { ok: true }, effect: "applied" };
       },
     } as never);
     const prepared = await registry.prepareExecution(

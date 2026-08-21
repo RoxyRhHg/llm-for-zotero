@@ -6,7 +6,7 @@
  * recent papers" meant 50 tool calls and 50 human approvals. The round budget
  * was never the binding constraint — consent was.
  */
-import type { AgentToolDefinition } from "../../types";
+import type { AgentWriteToolDefinition } from "../../types";
 import {
   LibraryMutationService,
   type SaveNotesBatchOperation,
@@ -25,7 +25,7 @@ type WriteNotesBatchInput = { operation: SaveNotesBatchOperation };
 
 export function createWriteNotesBatchTool(
   zoteroGateway: ZoteroGateway,
-): AgentToolDefinition<WriteNotesBatchInput, unknown> {
+): AgentWriteToolDefinition<WriteNotesBatchInput, unknown> {
   const mutationService = new LibraryMutationService(zoteroGateway);
 
   return {

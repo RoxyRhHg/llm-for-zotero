@@ -5,10 +5,6 @@ import type {
 } from "../types";
 import type { AgentToolRegistry } from "../tools/registry";
 import type { ZoteroGateway } from "../services/zoteroGateway";
-import type { LibraryQueryService } from "../services/libraryQueryService";
-import type { LibraryReadService } from "../services/libraryReadService";
-import type { LibraryMutationService } from "../services/libraryMutationService";
-import type { LiteratureSearchService } from "../services/literatureSearchService";
 import type { ModelProviderAuthMode } from "../../utils/modelProviders";
 import type { ProviderProtocol } from "../../utils/providerProtocol";
 import type {
@@ -71,13 +67,6 @@ export type ActionCheckpoint = {
   plan?: Record<string, unknown>;
 };
 
-export type ActionServices = {
-  queryService: LibraryQueryService;
-  readService: LibraryReadService;
-  mutationService: LibraryMutationService;
-  literatureSearchService: LiteratureSearchService;
-};
-
 export type ActionRequestContext = {
   mode?: "paper" | "library";
   activeItemId?: number;
@@ -110,7 +99,6 @@ export type ActionExecutionContext = {
   /** User-visible tool identity retained across internal action/tool bridges. */
   journalToolName?: string;
   zoteroGateway: ZoteroGateway;
-  services: ActionServices;
   /** The Zotero library ID to operate on. */
   libraryID: number;
   confirmationMode: ActionConfirmationMode;

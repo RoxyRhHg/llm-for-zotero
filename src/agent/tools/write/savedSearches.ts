@@ -6,7 +6,7 @@
  * search *is* a set of conditions, which is why this had to wait for the
  * condition vocabulary — before that there was nothing to save.
  */
-import type { AgentToolDefinition } from "../../types";
+import type { AgentWriteToolDefinition } from "../../types";
 import {
   LibraryMutationService,
   type DeleteSavedSearchOperation,
@@ -25,7 +25,7 @@ type SavedSearchInput = {
 
 export function createSavedSearchTool(
   zoteroGateway: ZoteroGateway,
-): AgentToolDefinition<SavedSearchInput, unknown> {
+): AgentWriteToolDefinition<SavedSearchInput, unknown> {
   const mutationService = new LibraryMutationService(zoteroGateway);
 
   return {

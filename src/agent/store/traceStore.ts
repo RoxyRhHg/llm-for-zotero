@@ -26,6 +26,19 @@ const AGENT_TRACE_FILE_CLEANUP_TABLE =
 const AGENT_RUN_EVENTS_INDEX = "llm_for_zotero_agent_run_events_run_idx";
 const AGENT_TRACE_EXPORT_DIR_NAME = "trace-debug";
 const AGENT_TRACE_EXPORT_PREF_KEY = `${config.prefsPrefix}.agentTraceExportEnabled`;
+export const INTERRUPTED_AGENT_RUN_MARKER =
+  "Agent run interrupted before completion.";
+
+type AgentRunRow = {
+  runId?: unknown;
+  conversationKey?: unknown;
+  mode?: unknown;
+  modelName?: unknown;
+  status?: unknown;
+  createdAt?: unknown;
+  completedAt?: unknown;
+  finalText?: unknown;
+};
 
 const traceExportTimers = new Map<string, number>();
 const traceExportInFlight = new Map<string, Promise<void>>();
@@ -245,6 +258,12 @@ export async function initAgentTraceStore(): Promise<void> {
       `CREATE INDEX IF NOT EXISTS ${AGENT_RUN_EVENTS_INDEX}
        ON ${AGENT_RUN_EVENTS_TABLE} (run_id, seq, id)`,
     );
+    await Zotero.DB.queryAsync(
+      `UPDATE ${AGENT_RUNS_TABLE}
+       SET status = ?, completed_at = ?, final_text = ?
+       WHERE status = 'running'`,
+      ["failed", Date.now(), INTERRUPTED_AGENT_RUN_MARKER],
+    );
     await installConversationKeyLedgerAgentTriggers();
   });
   await sweepOrphanedAgentTraceExports();
@@ -458,6 +477,50 @@ export async function finishAgentRun(
   scheduleAgentRunTraceExport(runId, 0);
 }
 
+function toAgentRunRecord(row: AgentRunRow | undefined): AgentRunRecord | null {
+  return row &&
+    typeof row.runId === "string" &&
+    typeof row.mode === "string" &&
+    typeof row.status === "string" &&
+    Number.isFinite(Number(row.conversationKey)) &&
+    Number.isFinite(Number(row.createdAt))
+    ? {
+        runId: row.runId,
+        conversationKey: Math.floor(Number(row.conversationKey)),
+        mode: "agent",
+        model: typeof row.modelName === "string" ? row.modelName : undefined,
+        status: row.status as AgentRunStatus,
+        createdAt: Math.floor(Number(row.createdAt)),
+        completedAt: Number.isFinite(Number(row.completedAt))
+          ? Math.floor(Number(row.completedAt))
+          : undefined,
+        finalText:
+          typeof row.finalText === "string" ? row.finalText : undefined,
+      }
+    : null;
+}
+
+export async function getLatestAgentRunForConversation(
+  conversationKey: number,
+): Promise<AgentRunRecord | null> {
+  const rows = (await Zotero.DB.queryAsync(
+    `SELECT run_id AS runId,
+            conversation_key AS conversationKey,
+            mode,
+            model_name AS modelName,
+            status,
+            created_at AS createdAt,
+            completed_at AS completedAt,
+            final_text AS finalText
+     FROM ${AGENT_RUNS_TABLE}
+     WHERE conversation_key = ?
+     ORDER BY created_at DESC, rowid DESC
+     LIMIT 1`,
+    [conversationKey],
+  )) as AgentRunRow[] | undefined;
+  return toAgentRunRecord(rows?.[0]);
+}
+
 export async function appendAgentRunEvent(
   runId: string,
   seq: number,
@@ -540,40 +603,8 @@ export async function getAgentRunTrace(runId: string): Promise<{
      WHERE run_id = ?
      LIMIT 1`,
     [runId],
-  )) as
-    | Array<{
-        runId?: unknown;
-        conversationKey?: unknown;
-        mode?: unknown;
-        modelName?: unknown;
-        status?: unknown;
-        createdAt?: unknown;
-        completedAt?: unknown;
-        finalText?: unknown;
-      }>
-    | undefined;
-  const row = rows?.[0];
-  const run =
-    row &&
-    typeof row.runId === "string" &&
-    typeof row.mode === "string" &&
-    typeof row.status === "string" &&
-    Number.isFinite(Number(row.conversationKey)) &&
-    Number.isFinite(Number(row.createdAt))
-      ? {
-          runId: row.runId,
-          conversationKey: Math.floor(Number(row.conversationKey)),
-          mode: "agent" as const,
-          model: typeof row.modelName === "string" ? row.modelName : undefined,
-          status: row.status as AgentRunStatus,
-          createdAt: Math.floor(Number(row.createdAt)),
-          completedAt: Number.isFinite(Number(row.completedAt))
-            ? Math.floor(Number(row.completedAt))
-            : undefined,
-          finalText:
-            typeof row.finalText === "string" ? row.finalText : undefined,
-        }
-      : null;
+  )) as AgentRunRow[] | undefined;
+  const run = toAgentRunRecord(rows?.[0]);
   return {
     run,
     events: await listAgentRunEvents(runId),

@@ -5,7 +5,7 @@ import {
   sha256Text,
   storeRecoveryText,
 } from "../../store/journalRecoveryBlobStore";
-import type { AgentToolContext, AgentToolDefinition } from "../../types";
+import type { AgentToolContext, AgentWriteToolDefinition } from "../../types";
 import {
   normalizeNoteSourceText,
   stripNoteHtml,
@@ -416,7 +416,7 @@ function resolveAppendNoteTarget(
 
 export function createEditCurrentNoteTool(
   zoteroGateway: ZoteroGateway,
-): AgentToolDefinition<EditCurrentNoteInput, unknown> {
+): AgentWriteToolDefinition<EditCurrentNoteInput, unknown> {
   const mutationService = new LibraryMutationService(zoteroGateway);
   return {
     spec: {
@@ -889,7 +889,7 @@ export function createEditCurrentNoteTool(
 
         if (!hasLocalImages && !input._isHtml) {
           // No images, no styled HTML — use the standard mutation service path
-          const { result } = await executeAndRecordUndo(
+          const execution = await executeAndRecordUndo(
             mutationService,
             {
               type: "save_note",
@@ -902,7 +902,10 @@ export function createEditCurrentNoteTool(
             context,
             "edit_current_note",
           );
-          return result;
+          return {
+            content: execution.content.result,
+            effect: execution.effect,
+          };
         }
 
         // Has local images — create note manually to get the note ID,
@@ -1042,7 +1045,7 @@ export function createEditCurrentNoteTool(
                 ? "The note itself is recoverable; embedded attachment creation is covered by Zotero's note trash cascade."
                 : undefined,
               affectedCount: 1,
-              changed: true,
+              effect: "applied",
             };
           },
         });
@@ -1143,7 +1146,7 @@ export function createEditCurrentNoteTool(
                 ? ("partial" as const)
                 : ("full" as const),
               affectedCount: 1,
-              changed: true,
+              effect: "applied",
             };
           },
         });
@@ -1241,7 +1244,7 @@ export function createEditCurrentNoteTool(
               ? ("partial" as const)
               : ("full" as const),
             affectedCount: 1,
-            changed: true,
+            effect: "applied",
           };
         },
       });

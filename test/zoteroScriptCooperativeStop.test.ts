@@ -58,9 +58,8 @@ describe("zotero_script cooperative cancellation", function () {
     });
     assert.isTrue(validated.ok, JSON.stringify(validated));
     if (!validated.ok) throw new Error("unreachable");
-    return tool.execute(validated.value, context) as Promise<
-      Record<string, unknown>
-    >;
+    const output = await tool.execute(validated.value, context);
+    return output.content as Record<string, unknown>;
   }
 
   it("gives the script a stop signal it can honour", async function () {
@@ -163,10 +162,8 @@ describe("zotero_script cooperative cancellation", function () {
     assert.isTrue(validated.ok, JSON.stringify(validated));
     if (!validated.ok) return;
 
-    const result = (await tool.execute(validated.value, context)) as Record<
-      string,
-      unknown
-    >;
+    const result = (await tool.execute(validated.value, context))
+      .content as Record<string, unknown>;
 
     assert.include(String(result.error), "timed out");
 

@@ -6,6 +6,7 @@ import type {
   AgentMutationPlan,
   AgentPendingField,
   AgentToolContext,
+  AgentWriteToolOutput,
 } from "../../types";
 import type {
   ApplyTagsOperation,
@@ -572,14 +573,17 @@ export async function executeAndRecordUndo(
   operation: LibraryMutationOperation,
   context: AgentToolContext,
   facadeToolName: string,
-): Promise<{ result: unknown }> {
+): Promise<AgentWriteToolOutput<{ result: unknown }>> {
   const coordinated = await executeLibraryMutationAction({
     service: mutationService,
     operations: [operation],
     context,
     facadeToolName,
   });
-  return { result: coordinated.results[0] };
+  return {
+    content: { result: coordinated.results[0] },
+    effect: coordinated.effect,
+  };
 }
 
 /**
@@ -592,7 +596,7 @@ export async function executeAndRecordUndoBatch(
   operations: LibraryMutationOperation[],
   context: AgentToolContext,
   facadeToolName: string,
-): Promise<{ appliedCount: number; results: unknown[] }> {
+): Promise<AgentWriteToolOutput<{ appliedCount: number; results: unknown[] }>> {
   const coordinated = await executeLibraryMutationAction({
     service: mutationService,
     operations,
@@ -600,8 +604,11 @@ export async function executeAndRecordUndoBatch(
     facadeToolName,
   });
   return {
-    appliedCount: coordinated.appliedCount,
-    results: coordinated.results,
+    content: {
+      appliedCount: coordinated.affectedCount,
+      results: coordinated.results,
+    },
+    effect: coordinated.effect,
   };
 }
 

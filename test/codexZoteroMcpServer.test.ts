@@ -45,7 +45,7 @@ function createWriteTool(name: string): AgentToolDefinition<unknown, unknown> {
       requiresConfirmation: true,
     },
     validate: (args) => ({ ok: true, value: args ?? {} }),
-    execute: async () => ({ ok: true }),
+    execute: async () => ({ content: { ok: true }, effect: "applied" }),
   };
 }
 
@@ -828,7 +828,7 @@ describe("Zotero MCP server", function () {
           validate: (args) => ({ ok: true, value: args ?? {} }),
           execute: async (input) => {
             executed.push({ name, input });
-            return { name, input };
+            return { content: { name, input }, effect: "applied" };
           },
         });
       }
@@ -952,7 +952,7 @@ describe("Zotero MCP server", function () {
         }),
         execute: async () => {
           executed.push(name);
-          return { name };
+          return { content: { name }, effect: "none" };
         },
       });
     }
@@ -1723,7 +1723,10 @@ describe("Zotero MCP server", function () {
       }),
       execute: async () => {
         writeExecuteCount += 1;
-        return { writeExecuteCount };
+        return {
+          content: { writeExecuteCount },
+          effect: "applied",
+        };
       },
     });
     registerMcpServer({
@@ -2135,7 +2138,7 @@ describe("Zotero MCP server", function () {
       }),
       execute: async () => {
         executeCount += 1;
-        return { applied: true };
+        return { content: { applied: true }, effect: "applied" };
       },
     });
     registerMcpServer({
@@ -2212,7 +2215,7 @@ describe("Zotero MCP server", function () {
         }),
         execute: async () => {
           executed.push(name);
-          return { direct: true, name };
+          return { content: { direct: true, name }, effect: "none" };
         },
       });
     }
@@ -2292,10 +2295,13 @@ describe("Zotero MCP server", function () {
         };
       },
       execute: async (input) => ({
-        status: "created",
-        noteId: 99,
-        target: (input as { target?: unknown }).target,
-        noteContent: (input as { content?: unknown }).content,
+        content: {
+          status: "created",
+          noteId: 99,
+          target: (input as { target?: unknown }).target,
+          noteContent: (input as { content?: unknown }).content,
+        },
+        effect: "applied",
       }),
     });
     registerMcpServer({
@@ -2411,8 +2417,11 @@ describe("Zotero MCP server", function () {
         };
       },
       execute: async (_input, context) => ({
-        status: "updated",
-        noteId: context.request.activeNoteContext?.noteId,
+        content: {
+          status: "updated",
+          noteId: context.request.activeNoteContext?.noteId,
+        },
+        effect: "applied",
       }),
     });
     registerMcpServer({
@@ -2637,11 +2646,14 @@ describe("Zotero MCP server", function () {
         };
       },
       execute: async (_input, context: AgentToolContext) => ({
-        request: {
-          conversationKey: context.request.conversationKey,
-          libraryID: context.request.libraryID,
-          activeItemId: context.request.activeItemId,
+        content: {
+          request: {
+            conversationKey: context.request.conversationKey,
+            libraryID: context.request.libraryID,
+            activeItemId: context.request.activeItemId,
+          },
         },
+        effect: "applied",
       }),
     });
     registerMcpServer({
@@ -2721,7 +2733,7 @@ describe("Zotero MCP server", function () {
       },
       execute: async () => {
         executed = true;
-        return { status: "ran" };
+        return { content: { status: "ran" }, effect: "applied" };
       },
     });
     registerMcpServer({

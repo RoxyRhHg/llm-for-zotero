@@ -474,13 +474,15 @@ describe("durable change journal v2", function () {
     } as never;
     const tool = createUndoLastActionTool(gateway);
 
-    const result = (await tool.execute!({}, context)) as {
+    const execution = await tool.execute!({}, context);
+    const result = execution.content as {
       status: string;
       reverted: number;
       partiallyReverted: number;
       residuals: Array<{ actionId: string; reason: string }>;
     };
 
+    assert.equal(execution.effect, "partial");
     assert.equal(value, "Before");
     assert.equal(result.status, "partially_undone");
     assert.equal(result.reverted, 0);
@@ -1578,9 +1580,15 @@ describe("durable change journal v2", function () {
     const revertPlan = await createRevertChangesTool(
       {} as never,
     ).planMutation?.({ count: 1, dryRun: false }, context);
-    const dryRunPlan = await createRevertChangesTool(
-      {} as never,
-    ).planMutation?.({ count: 1, dryRun: true }, context);
+    const revertTool = createRevertChangesTool({} as never);
+    const dryRunPlan = await revertTool.planMutation?.(
+      { count: 1, dryRun: true },
+      context,
+    );
+    const dryRunExecution = await revertTool.execute(
+      { count: 1, dryRun: true },
+      context,
+    );
 
     assert.deepInclude(undoPlan, {
       effect: "write",
@@ -1596,6 +1604,7 @@ describe("durable change journal v2", function () {
       effect: "none",
       reversibility: "full",
     });
+    assert.equal(dryRunExecution.effect, "none");
   });
 
   it("closes a pre-write journal failure without running the external write", async function () {
@@ -1776,7 +1785,7 @@ describe("durable change journal v2", function () {
       assert.isTrue(approved?.ok);
       if (!approved?.ok) return;
 
-      const result = (await tool.execute(approved.value, context)) as {
+      const result = (await tool.execute(approved.value, context)).content as {
         exitCode: number;
       };
       const [action] = await listJournalActions({
@@ -1839,7 +1848,7 @@ describe("durable change journal v2", function () {
       assert.isTrue(approved?.ok);
       if (!approved?.ok) return;
 
-      const result = (await tool.execute(approved.value, context)) as {
+      const result = (await tool.execute(approved.value, context)).content as {
         exitCode: number;
       };
       const [action] = await listJournalActions({

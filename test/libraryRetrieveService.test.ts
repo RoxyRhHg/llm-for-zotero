@@ -1661,7 +1661,7 @@ describe("LibraryRetrieveService", function () {
     );
   });
 
-  it("scans tag quicksearch matches when selected collection and tag scopes are mixed", async function () {
+  it("quicksearches a mixed collection/tag scope once per probe", async function () {
     const collectionOnly = makeItem(4, "Collection-only paper", "", {
       hasPdf: true,
       collectionIds: [4],
@@ -1718,10 +1718,9 @@ describe("LibraryRetrieveService", function () {
       },
     });
 
-    assert.lengthOf(quicksearchCalls, 2);
-    assert.equal(quicksearchCalls[0]?.filters?.collectionId, 4);
-    assert.deepEqual(quicksearchCalls[1]?.allowedItemIds, [7, 8]);
-    assert.isUndefined(quicksearchCalls[1]?.filters);
+    assert.lengthOf(quicksearchCalls, 1);
+    assert.deepEqual(quicksearchCalls[0]?.allowedItemIds, [4, 7, 8]);
+    assert.isUndefined(quicksearchCalls[0]?.filters);
     assert.equal(result.resourcePool.type, "mixed");
     assert.equal(result.resourcePool.queryCoverage.indexedTextMatched, 1);
     // With a single direct match the shortlist fallback widens candidates to
@@ -1836,8 +1835,8 @@ describe("LibraryRetrieveService", function () {
       },
     });
 
-    assert.deepEqual(quicksearchCalls[0]?.allowedItemIds, [8]);
-    assert.deepEqual(quicksearchCalls[1]?.allowedItemIds, [1]);
+    assert.lengthOf(quicksearchCalls, 1);
+    assert.deepEqual(quicksearchCalls[0]?.allowedItemIds, [1, 8]);
     assert.equal(result.resourcePool.type, "mixed");
     assert.equal(result.resourcePool.queryCoverage.indexedTextMatched, 1);
     assert.equal(result.candidates[0]?.itemId, "1");

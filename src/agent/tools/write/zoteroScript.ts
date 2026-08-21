@@ -7,7 +7,7 @@
  * "read" means that no undo instrumentation is expected; it is not an
  * authorization boundary and must never bypass confirmation.
  */
-import type { AgentToolDefinition, AgentToolContext } from "../../types";
+import type { AgentWriteToolDefinition, AgentToolContext } from "../../types";
 import { ok, fail, validateObject } from "../shared";
 import {
   currentMutationActionId,
@@ -746,7 +746,7 @@ several areas have no typed tool at all — reach for them directly:
 
 export function createZoteroScriptTool(
   runtimeOptions: ZoteroScriptRuntimeOptions = {},
-): AgentToolDefinition<ZoteroScriptInput, unknown> {
+): AgentWriteToolDefinition<ZoteroScriptInput, unknown> {
   return {
     spec: {
       name: "zotero_script",
@@ -985,7 +985,7 @@ export function createZoteroScriptTool(
               // not emit notifier events. Treating the invocation as no-effect
               // would recreate the exact unjournalled-write escape hatch this
               // coordinator is meant to close.
-              changed: true,
+              effect: "applied",
             };
           }
           const instrumentedIds = new Set([
@@ -1037,7 +1037,7 @@ export function createZoteroScriptTool(
             // A write-mode script is conservatively treated as an effect even
             // when it forgot to declare coverage. That truthfully records an
             // irreversible action instead of silently calling it a no-op.
-            changed: true,
+            effect: "applied",
           };
         },
       });

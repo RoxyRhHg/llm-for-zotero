@@ -1,4 +1,4 @@
-import type { AgentToolDefinition } from "../../types";
+import type { AgentWriteToolDefinition } from "../../types";
 import type { ZoteroGateway } from "../../services/zoteroGateway";
 import {
   buildAnnotationSortIndex,
@@ -41,7 +41,7 @@ type AnnotateInput = {
  */
 export function createAnnotatePdfTool(
   zoteroGateway: ZoteroGateway,
-): AgentToolDefinition<AnnotateInput, unknown> {
+): AgentWriteToolDefinition<AnnotateInput, unknown> {
   const mutationService = new LibraryMutationService(zoteroGateway);
   return {
     spec: {
@@ -297,7 +297,7 @@ export function createAnnotatePdfTool(
             expectedPostcondition,
             reversibility: annotationId ? ("full" as const) : ("none" as const),
             affectedCount: annotationId ? 1 : 0,
-            changed: annotationId > 0,
+            effect: annotationId > 0 ? "applied" : "none",
           };
         },
       });

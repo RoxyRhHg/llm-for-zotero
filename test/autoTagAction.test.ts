@@ -12,13 +12,21 @@ import { ChangeJournalTestDb } from "./helpers/changeJournalTestDb";
 function createStubTool<TInput extends Record<string, unknown>, TResult>(
   spec: AgentToolDefinition<TInput, TResult>["spec"],
   validate: AgentToolDefinition<TInput, TResult>["validate"],
-  execute: AgentToolDefinition<TInput, TResult>["execute"],
+  execute: (
+    input: TInput,
+    context: Parameters<AgentToolDefinition<TInput, TResult>["execute"]>[1],
+  ) => TResult | Promise<TResult>,
   extras: Partial<AgentToolDefinition<TInput, TResult>> = {},
 ): AgentToolDefinition<TInput, TResult> {
   return {
     spec,
     validate,
-    execute,
+    execute: async (input, context) => {
+      const content = await execute(input, context);
+      return spec.mutability === "write"
+        ? { content, effect: "applied" as const }
+        : content;
+    },
     ...(spec.mutability === "write"
       ? {
           planMutation: async () => ({
@@ -39,7 +47,6 @@ function createActionContext(
   const ctx: ActionExecutionContext = {
     registry,
     zoteroGateway: {} as never,
-    services: {} as never,
     libraryID: 1,
     confirmationMode: "native_ui",
     onProgress: (event) => {
@@ -141,9 +148,12 @@ function registerReviewApplyTagsTool(
     async execute(input) {
       onExecute(input);
       return {
-        result: {
-          updatedCount: input.assignments.length,
+        content: {
+          result: {
+            updatedCount: input.assignments.length,
+          },
         },
+        effect: "applied",
       };
     },
   });
@@ -633,11 +643,14 @@ describe("autoTag action", function () {
       },
       async execute(input) {
         return {
-          result: {
-            updatedCount: input.assignments.filter(
-              (entry) => entry.tags.length > 0,
-            ).length,
+          content: {
+            result: {
+              updatedCount: input.assignments.filter(
+                (entry) => entry.tags.length > 0,
+              ).length,
+            },
           },
+          effect: "applied",
         };
       },
     });
@@ -734,7 +747,10 @@ describe("autoTag action", function () {
         return ok(input);
       },
       async execute() {
-        return { result: { updatedCount: 0 } };
+        return {
+          content: { result: { updatedCount: 0 } },
+          effect: "none",
+        };
       },
     });
 

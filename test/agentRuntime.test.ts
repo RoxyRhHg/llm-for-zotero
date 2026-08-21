@@ -5,8 +5,16 @@ import { tmpdir } from "node:os";
 import { AgentRuntime } from "../src/agent/runtime";
 import { clearAgentReadLedger } from "../src/agent/context/resourceContextPlan";
 import { clearAgentCoverageLedger } from "../src/agent/context/coverageLedger";
-import { getAgentRunTrace } from "../src/agent/store/traceStore";
-import { initAgentChangeJournal } from "../src/agent/store/changeJournal";
+import {
+  getAgentRunTrace,
+  initAgentTraceStore,
+  INTERRUPTED_AGENT_RUN_MARKER,
+} from "../src/agent/store/traceStore";
+import {
+  initAgentChangeJournal,
+  prepareJournalAction,
+  updateJournalAction,
+} from "../src/agent/store/changeJournal";
 import { clearAgentTranscriptStore } from "../src/agent/store/transcriptStore";
 import {
   clearAgentToolResultHandleStore,
@@ -40,9 +48,17 @@ import { ChangeJournalTestDb } from "./helpers/changeJournalTestDb";
 
 type MockDbRow = Record<string, unknown>;
 
-function installMockDb() {
+type InstalledMockDb = (() => void) & {
+  runs: Map<string, MockDbRow>;
+  events: MockDbRow[];
+  transcripts: MockDbRow[];
+  journalDb: ChangeJournalTestDb;
+};
+
+function installMockDb(): InstalledMockDb {
   const runs = new Map<string, MockDbRow>();
   const events: MockDbRow[] = [];
+  const transcripts: MockDbRow[] = [];
   const prefs = new Map<string, unknown>();
   const journalDb = new ChangeJournalTestDb();
   const originalZotero = (
@@ -63,6 +79,18 @@ function installMockDb() {
             completedAt: params[6],
             finalText: params[7],
           });
+          return [];
+        }
+        if (
+          sql.includes("UPDATE llm_for_zotero_agent_runs") &&
+          sql.includes("WHERE status = 'running'")
+        ) {
+          for (const run of runs.values()) {
+            if (run.status !== "running") continue;
+            run.status = params[0];
+            run.completedAt = params[1];
+            run.finalText = params[2];
+          }
           return [];
         }
         if (sql.includes("UPDATE llm_for_zotero_agent_runs")) {
@@ -94,10 +122,74 @@ function installMockDb() {
         }
         if (
           sql.includes("SELECT run_id AS runId") &&
+          sql.includes("agent_runs") &&
+          sql.includes("WHERE conversation_key = ?")
+        ) {
+          return [...runs.values()]
+            .filter((run) => Number(run.conversationKey) === Number(params[0]))
+            .sort(
+              (left, right) => Number(right.createdAt) - Number(left.createdAt),
+            )
+            .slice(0, 1);
+        }
+        if (
+          sql.includes("SELECT run_id AS runId") &&
           sql.includes("agent_runs")
         ) {
           const run = runs.get(String(params[0]));
           return run ? [run] : [];
+        }
+        if (sql.includes("DELETE FROM llm_for_zotero_agent_transcript")) {
+          for (let index = transcripts.length - 1; index >= 0; index -= 1) {
+            if (
+              Number(transcripts[index].conversationKey) ===
+                Number(params[0]) &&
+              transcripts[index].compatibilityKey === params[1]
+            ) {
+              transcripts.splice(index, 1);
+            }
+          }
+          return [];
+        }
+        if (sql.includes("INSERT INTO llm_for_zotero_agent_transcript")) {
+          transcripts.push({
+            conversationKey: params[0],
+            compatibilityKey: params[1],
+            sequence: params[2],
+            messageJson: params[3],
+            compactedAt: params[4],
+            createdAt: params[5],
+          });
+          return [];
+        }
+        if (
+          sql.includes("FROM llm_for_zotero_agent_transcript") &&
+          sql.includes("ORDER BY created_at DESC")
+        ) {
+          return transcripts
+            .filter(
+              (row) =>
+                Number(row.conversationKey) === Number(params[0]) &&
+                typeof row.compatibilityKey === "string",
+            )
+            .sort(
+              (left, right) =>
+                Number(right.createdAt) - Number(left.createdAt) ||
+                transcripts.indexOf(right) - transcripts.indexOf(left),
+            )
+            .slice(0, 1)
+            .map((row) => ({ compatibilityKey: row.compatibilityKey }));
+        }
+        if (sql.includes("FROM llm_for_zotero_agent_transcript")) {
+          return transcripts
+            .filter(
+              (row) =>
+                Number(row.conversationKey) === Number(params[0]) &&
+                row.compatibilityKey === params[1],
+            )
+            .sort(
+              (left, right) => Number(left.sequence) - Number(right.sequence),
+            );
         }
         return journalDb.queryAsync(sql, params);
       },
@@ -109,10 +201,26 @@ function installMockDb() {
       },
     },
   };
-  return () => {
+  const restore = () => {
     (globalThis as typeof globalThis & { Zotero?: unknown }).Zotero =
       originalZotero;
   };
+  return Object.assign(restore, {
+    runs,
+    events,
+    transcripts,
+    journalDb,
+  });
+}
+
+function readPersistedTranscript(
+  installed: InstalledMockDb,
+  conversationKey: number,
+): AgentModelMessage[] {
+  return installed.transcripts
+    .filter((row) => Number(row.conversationKey) === Number(conversationKey))
+    .sort((left, right) => Number(left.sequence) - Number(right.sequence))
+    .map((row) => JSON.parse(String(row.messageJson)) as AgentModelMessage);
 }
 
 class MockAdapter implements AgentModelAdapter {
@@ -305,9 +413,12 @@ describe("AgentRuntime", function () {
           };
         },
         execute: async (input) => ({
-          status: "created",
-          saved: input.content,
-          target: input.target,
+          content: {
+            status: "created",
+            saved: input.content,
+            target: input.target,
+          },
+          effect: "applied",
         }),
       });
 
@@ -1523,7 +1634,7 @@ describe("AgentRuntime", function () {
         }),
         execute: async (input) => {
           writes.push(input);
-          return input;
+          return { content: input, effect: "applied" };
         },
       });
 
@@ -1794,7 +1905,7 @@ describe("AgentRuntime", function () {
         }),
         execute: async (input) => {
           noteWrites.push(input);
-          return { status: "saved" };
+          return { content: { status: "saved" }, effect: "applied" };
         },
       });
 
@@ -2680,6 +2791,207 @@ describe("AgentRuntime", function () {
     }
   });
 
+  it("persists the user goal and each complete tool pair before the next model request", async function () {
+    const installed = installMockDb();
+    try {
+      const conversationKey = 701;
+      const registry = new AgentToolRegistry();
+      registry.register({
+        spec: {
+          name: "checkpoint_read",
+          description: "read",
+          inputSchema: { type: "object" },
+          mutability: "read",
+          requiresConfirmation: false,
+        },
+        validate: () => ({ ok: true, value: {} }),
+        execute: async () => ({ value: "durable result" }),
+      });
+      let step = 0;
+      const runtime = new AgentRuntime({
+        registry,
+        adapterFactory: () => ({
+          getCapabilities: () => ({
+            streaming: false,
+            toolCalls: true,
+            multimodal: false,
+            fileInputs: false,
+            reasoning: true,
+          }),
+          supportsTools: () => true,
+          async runStep(): Promise<AgentModelStep> {
+            step += 1;
+            const persisted = readPersistedTranscript(
+              installed,
+              conversationKey,
+            );
+            if (step === 1) {
+              assert.include(
+                JSON.stringify(persisted),
+                "persist this before inference",
+              );
+              return {
+                kind: "tool_calls",
+                calls: [
+                  {
+                    id: "checkpoint-call",
+                    name: "checkpoint_read",
+                    arguments: {},
+                  },
+                ],
+                assistantMessage: {
+                  role: "assistant",
+                  content: "",
+                  tool_calls: [
+                    {
+                      id: "checkpoint-call",
+                      name: "checkpoint_read",
+                      arguments: {},
+                    },
+                  ],
+                },
+              };
+            }
+            const serialized = JSON.stringify(persisted);
+            assert.include(serialized, "checkpoint-call");
+            assert.include(serialized, "durable result");
+            throw new Error("simulated process interruption");
+          },
+        }),
+      });
+
+      let thrown: unknown;
+      try {
+        await runtime.runTurn({
+          request: {
+            conversationKey,
+            mode: "agent",
+            userText: "persist this before inference",
+            model: "gpt-4o-mini",
+            apiBase: "https://api.openai.com/v1/chat/completions",
+            apiKey: "test",
+          },
+        });
+      } catch (error) {
+        thrown = error;
+      }
+
+      assert.instanceOf(thrown, Error);
+      assert.equal((thrown as Error).message, "simulated process interruption");
+    } finally {
+      installed();
+    }
+  });
+
+  it("does not serialize a confirmation while it is still awaiting approval", async function () {
+    const installed = installMockDb();
+    try {
+      await initAgentChangeJournal();
+      const conversationKey = 704;
+      const registry = new AgentToolRegistry();
+      registry.register({
+        spec: {
+          name: "confirmation_write",
+          description: "write",
+          inputSchema: { type: "object" },
+          mutability: "write",
+          requiresConfirmation: true,
+        },
+        validate: () => ({ ok: true, value: {} }),
+        planMutation: () => ({
+          effect: "write",
+          reversibility: "full",
+          requiresConfirmation: true,
+        }),
+        createPendingAction: () => ({
+          toolName: "confirmation_write",
+          title: "Confirm write",
+          confirmLabel: "Apply",
+          cancelLabel: "Cancel",
+          fields: [],
+        }),
+        execute: async () => ({
+          content: { status: "saved" },
+          effect: "applied",
+        }),
+      });
+      const runtime = new AgentRuntime({
+        registry,
+        adapterFactory: () =>
+          new MockAdapter(
+            [
+              {
+                kind: "tool_calls",
+                calls: [
+                  {
+                    id: "pending-confirmation-call",
+                    name: "confirmation_write",
+                    arguments: {},
+                  },
+                ],
+                assistantMessage: {
+                  role: "assistant",
+                  content: "",
+                  tool_calls: [
+                    {
+                      id: "pending-confirmation-call",
+                      name: "confirmation_write",
+                      arguments: {},
+                    },
+                  ],
+                },
+              },
+              {
+                kind: "final",
+                text: "The write was cancelled.",
+                assistantMessage: {
+                  role: "assistant",
+                  content: "The write was cancelled.",
+                },
+              },
+            ],
+            {
+              streaming: false,
+              toolCalls: true,
+              multimodal: false,
+              fileInputs: false,
+              reasoning: true,
+            },
+          ),
+      });
+      let resolveConfirmationId: ((requestId: string) => void) | undefined;
+      const confirmationId = new Promise<string>((resolve) => {
+        resolveConfirmationId = resolve;
+      });
+      const run = runtime.runTurn({
+        request: {
+          conversationKey,
+          mode: "agent",
+          userText: "ask before changing anything",
+          model: "gpt-4o-mini",
+          apiBase: "https://api.openai.com/v1/chat/completions",
+          apiKey: "test",
+        },
+        onEvent: (event) => {
+          if (event.type === "confirmation_required") {
+            resolveConfirmationId?.(event.requestId);
+          }
+        },
+      });
+
+      const requestId = await confirmationId;
+      const pendingTranscript = JSON.stringify(
+        readPersistedTranscript(installed, conversationKey),
+      );
+      assert.include(pendingTranscript, "ask before changing anything");
+      assert.notInclude(pendingTranscript, "pending-confirmation-call");
+      assert.isTrue(runtime.resolveConfirmation(requestId, false));
+      await run;
+    } finally {
+      installed();
+    }
+  });
+
   it("reuses the local append-only transcript across agent turns", async function () {
     const restoreDb = installMockDb();
     try {
@@ -2787,6 +3099,330 @@ describe("AgentRuntime", function () {
       assert.include(secondToolNames, "tool_result_read");
     } finally {
       restoreDb();
+    }
+  });
+
+  it("continues an interrupted same-key run from durable pairs and journal facts without replaying writes", async function () {
+    const installed = installMockDb();
+    try {
+      await initAgentChangeJournal();
+      const conversationKey = 702;
+      const actionId = "recovery-action";
+      let writes = 0;
+      const registry = new AgentToolRegistry();
+      registry.register({
+        spec: {
+          name: "recovery_write",
+          description: "write",
+          inputSchema: { type: "object" },
+          mutability: "write",
+          requiresConfirmation: false,
+        },
+        validate: () => ({ ok: true, value: {} }),
+        planMutation: () => ({ effect: "write", reversibility: "full" }),
+        execute: async (_input, context) => {
+          writes += 1;
+          assert.isString(context.runId);
+          await prepareJournalAction({
+            actionId,
+            runId: context.runId!,
+            conversationKey,
+            toolName: "recovery_write",
+            description: "commit one recovery test write",
+            effect: "write",
+            reversibility: "full",
+          });
+          await updateJournalAction({
+            actionId,
+            status: "applied",
+            affectedCount: 2,
+          });
+          return {
+            content: { status: "saved" },
+            effect: "applied",
+          };
+        },
+      });
+      let firstStep = 0;
+      const firstRuntime = new AgentRuntime({
+        registry,
+        adapterFactory: () => ({
+          getCapabilities: () => ({
+            streaming: false,
+            toolCalls: true,
+            multimodal: false,
+            fileInputs: false,
+            reasoning: true,
+          }),
+          supportsTools: () => true,
+          async runStep(): Promise<AgentModelStep> {
+            firstStep += 1;
+            if (firstStep === 1) {
+              return {
+                kind: "tool_calls",
+                calls: [
+                  {
+                    id: "recovery-call",
+                    name: "recovery_write",
+                    arguments: {},
+                  },
+                ],
+                assistantMessage: {
+                  role: "assistant",
+                  content: "",
+                  tool_calls: [
+                    {
+                      id: "recovery-call",
+                      name: "recovery_write",
+                      arguments: {},
+                    },
+                  ],
+                },
+              };
+            }
+            throw new Error("simulated restart");
+          },
+        }),
+      });
+
+      try {
+        await firstRuntime.runTurn({
+          request: {
+            conversationKey,
+            mode: "agent",
+            userText: "save this once",
+            model: "gpt-4o-mini",
+            apiBase: "https://api.openai.com/v1/chat/completions",
+            apiKey: "test",
+          },
+        });
+        assert.fail("expected the first run to be interrupted");
+      } catch (error) {
+        assert.equal((error as Error).message, "simulated restart");
+      }
+
+      const priorRun = [...installed.runs.values()][0];
+      assert.equal(
+        installed.journalDb.actions.get(actionId)?.run_id,
+        priorRun.runId,
+      );
+      await initAgentTraceStore();
+      assert.equal(priorRun.status, "failed");
+      assert.equal(priorRun.finalText, INTERRUPTED_AGENT_RUN_MARKER);
+      clearAgentTranscriptStore();
+
+      let continuedMessages: AgentModelMessage[] = [];
+      const continuedRuntime = new AgentRuntime({
+        registry,
+        adapterFactory: () => ({
+          getCapabilities: () => ({
+            streaming: false,
+            toolCalls: true,
+            multimodal: false,
+            fileInputs: false,
+            reasoning: true,
+          }),
+          supportsTools: () => true,
+          async runStep(params): Promise<AgentModelStep> {
+            continuedMessages = params.messages;
+            return {
+              kind: "final",
+              text: "Recovered without replaying the write.",
+              assistantMessage: {
+                role: "assistant",
+                content: "Recovered without replaying the write.",
+              },
+            };
+          },
+        }),
+      });
+      await continuedRuntime.runTurn({
+        request: {
+          conversationKey,
+          mode: "agent",
+          userText: "continue",
+          model: "gpt-4o-mini",
+          apiBase: "https://api.openai.com/v1/chat/completions",
+          apiKey: "test",
+        },
+      });
+
+      const serialized = JSON.stringify(continuedMessages);
+      assert.include(serialized, "recovery-call");
+      assert.include(serialized, `actionId=${actionId}`);
+      assert.include(serialized, "status=applied");
+      assert.include(serialized, "affectedCount=2");
+      assert.include(serialized, "reversibility=full");
+      assert.equal(writes, 1, "the committed write must not be replayed");
+    } finally {
+      installed();
+    }
+  });
+
+  it("uses only a bounded goal and journal summary when an interrupted run's compatibility key changed", async function () {
+    const installed = installMockDb();
+    try {
+      await initAgentChangeJournal();
+      const conversationKey = 703;
+      const actionId = "changed-key-action";
+      let writes = 0;
+      const registry = new AgentToolRegistry();
+      registry.register({
+        spec: {
+          name: "changed_key_write",
+          description: "write",
+          inputSchema: { type: "object" },
+          mutability: "write",
+          requiresConfirmation: false,
+        },
+        validate: () => ({ ok: true, value: {} }),
+        planMutation: () => ({ effect: "write", reversibility: "full" }),
+        execute: async (_input, context) => {
+          writes += 1;
+          await prepareJournalAction({
+            actionId,
+            runId: context.runId!,
+            conversationKey,
+            toolName: "changed_key_write",
+            description: "commit before transcript append",
+            effect: "write",
+            reversibility: "partial",
+          });
+          await updateJournalAction({
+            actionId,
+            status: "partially_applied",
+            affectedCount: 1,
+          });
+          return {
+            content: { status: "partially_saved" },
+            effect: "partial",
+          };
+        },
+      });
+      let step = 0;
+      const interruptedRuntime = new AgentRuntime({
+        registry,
+        adapterFactory: () => ({
+          getCapabilities: () => ({
+            streaming: false,
+            toolCalls: true,
+            multimodal: false,
+            fileInputs: false,
+            reasoning: true,
+          }),
+          supportsTools: () => true,
+          async runStep(): Promise<AgentModelStep> {
+            step += 1;
+            if (step === 1) {
+              return {
+                kind: "tool_calls",
+                calls: [
+                  {
+                    id: "changed-key-call",
+                    name: "changed_key_write",
+                    arguments: {},
+                  },
+                ],
+                assistantMessage: {
+                  role: "assistant",
+                  content: "",
+                  tool_calls: [
+                    {
+                      id: "changed-key-call",
+                      name: "changed_key_write",
+                      arguments: {},
+                    },
+                  ],
+                },
+              };
+            }
+            throw new Error("simulated restart before final response");
+          },
+        }),
+      });
+
+      try {
+        await interruptedRuntime.runTurn({
+          request: {
+            conversationKey,
+            mode: "agent",
+            userText: "preserve this original goal",
+            model: "gpt-4o-mini",
+            apiBase: "https://api.openai.com/v1/chat/completions",
+            apiKey: "test",
+          },
+        });
+        assert.fail("expected interruption");
+      } catch (error) {
+        assert.equal(
+          (error as Error).message,
+          "simulated restart before final response",
+        );
+      }
+
+      // Fault injection: retain the pre-inference user checkpoint but remove
+      // the pair, matching a crash after the journal commit and before the
+      // transcript append reached durable storage.
+      for (
+        let index = installed.transcripts.length - 1;
+        index >= 0;
+        index -= 1
+      ) {
+        const message = JSON.parse(
+          String(installed.transcripts[index].messageJson),
+        ) as AgentModelMessage;
+        if (message.role !== "user") installed.transcripts.splice(index, 1);
+      }
+      await initAgentTraceStore();
+      clearAgentTranscriptStore();
+
+      let continuedMessages: AgentModelMessage[] = [];
+      const continuedRuntime = new AgentRuntime({
+        registry,
+        adapterFactory: () => ({
+          getCapabilities: () => ({
+            streaming: false,
+            toolCalls: true,
+            multimodal: false,
+            fileInputs: false,
+            reasoning: true,
+          }),
+          supportsTools: () => true,
+          async runStep(params): Promise<AgentModelStep> {
+            continuedMessages = params.messages;
+            return {
+              kind: "final",
+              text: "Recovered from the summary only.",
+              assistantMessage: {
+                role: "assistant",
+                content: "Recovered from the summary only.",
+              },
+            };
+          },
+        }),
+      });
+      await continuedRuntime.runTurn({
+        request: {
+          conversationKey,
+          mode: "agent",
+          userText: "continue after the model change",
+          model: "gpt-4.1-mini",
+          apiBase: "https://api.openai.com/v1/chat/completions",
+          apiKey: "test",
+        },
+      });
+
+      const serialized = JSON.stringify(continuedMessages);
+      assert.include(serialized, "Prior goal: preserve this original goal");
+      assert.include(serialized, `actionId=${actionId}`);
+      assert.include(serialized, "status=partially_applied");
+      assert.include(serialized, "affectedCount=1");
+      assert.include(serialized, "reversibility=partial");
+      assert.notInclude(serialized, "changed-key-call");
+      assert.notInclude(serialized, "partially_saved");
+      assert.equal(writes, 1, "recovery must not replay the prior write");
+    } finally {
+      installed();
     }
   });
 
@@ -3985,12 +4621,15 @@ describe("shallow guard round-limit safety", function () {
           // The exact ledger shape the gateway returns when every row was
           // rejected: the operation ran, and nothing moved.
           return {
-            movedCount: 0,
-            selectedCount: 2,
-            items: [
-              { itemId: 1, status: "missing", reason: "wrong type" },
-              { itemId: 2, status: "missing", reason: "wrong type" },
-            ],
+            content: {
+              movedCount: 0,
+              selectedCount: 2,
+              items: [
+                { itemId: 1, status: "missing", reason: "wrong type" },
+                { itemId: 2, status: "missing", reason: "wrong type" },
+              ],
+            },
+            effect: "none",
           };
         },
       } as never);
@@ -4086,7 +4725,13 @@ describe("shallow guard round-limit safety", function () {
           fields: [],
         }),
         async execute() {
-          return { movedCount: 1, items: [{ itemId: 1, status: "moved" }] };
+          return {
+            content: {
+              movedCount: 1,
+              items: [{ itemId: 1, status: "moved" }],
+            },
+            effect: "applied",
+          };
         },
       } as never);
 
@@ -4197,20 +4842,30 @@ describe("shallow guard round-limit safety", function () {
           call += 1;
           return call === 1
             ? {
-                movedCount: 0,
-                selectedCount: 3,
-                items: [
-                  { itemId: 1, status: "missing", reason: "wrong collection" },
-                ],
+                content: {
+                  movedCount: 0,
+                  selectedCount: 3,
+                  items: [
+                    {
+                      itemId: 1,
+                      status: "missing",
+                      reason: "wrong collection",
+                    },
+                  ],
+                },
+                effect: "none",
               }
             : {
-                movedCount: 3,
-                selectedCount: 3,
-                items: [
-                  { itemId: 1, status: "moved" },
-                  { itemId: 2, status: "moved" },
-                  { itemId: 3, status: "moved" },
-                ],
+                content: {
+                  movedCount: 3,
+                  selectedCount: 3,
+                  items: [
+                    { itemId: 1, status: "moved" },
+                    { itemId: 2, status: "moved" },
+                    { itemId: 3, status: "moved" },
+                  ],
+                },
+                effect: "applied",
               };
         },
       } as never);

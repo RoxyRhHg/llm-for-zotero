@@ -71,7 +71,6 @@ describe("library_batch", function () {
       actionRegistry,
       toolRegistry: {} as never,
       zoteroGateway: {} as never,
-      services: {} as never,
       now: () => 1000,
     });
   }
@@ -139,10 +138,8 @@ describe("library_batch", function () {
     assert.isTrue(validated.ok);
     if (!validated.ok) return;
 
-    const output = (await tool.execute(validated.value, context)) as Record<
-      string,
-      unknown
-    >;
+    const output = (await tool.execute(validated.value, context))
+      .content as Record<string, unknown>;
     assert.equal(
       output.appliedCount,
       42,
@@ -205,7 +202,7 @@ describe("library_batch", function () {
             },
           ],
         },
-        changed: true,
+        effect: "applied" as const,
         affectedCount: 1,
       }),
       captureOperationState: async (operation: { itemIds: number[] }) => ({
@@ -230,7 +227,7 @@ describe("library_batch", function () {
       }),
       execute: async (_input, toolContext) => {
         itemId += 1;
-        return executeLibraryMutationAction({
+        const coordinated = await executeLibraryMutationAction({
           service: mutationService as never,
           operations: [
             {
@@ -242,6 +239,10 @@ describe("library_batch", function () {
           context: toolContext,
           facadeToolName: "batch_test_write",
         });
+        return {
+          content: coordinated,
+          effect: coordinated.effect,
+        };
       },
     });
     const actionRegistry = new ActionRegistry();
@@ -269,7 +270,6 @@ describe("library_batch", function () {
       actionRegistry,
       toolRegistry,
       zoteroGateway: {} as never,
-      services: {} as never,
       now: () => 1000,
       batchJobStore: makeJobStore(),
     });
@@ -277,8 +277,9 @@ describe("library_batch", function () {
     assert.isTrue(validated.ok);
     if (!validated.ok) return;
 
-    await tool.execute(validated.value, context);
+    const execution = await tool.execute(validated.value, context);
 
+    assert.equal(execution.effect, "applied");
     assert.equal(db.actions.size, 1);
     assert.equal(db.steps.size, 2);
     const action = [...db.actions.values()][0];
@@ -365,7 +366,6 @@ describe("library_batch", function () {
       actionRegistry,
       toolRegistry: {} as never,
       zoteroGateway: {} as never,
-      services: {} as never,
       now: () => 1000,
       batchJobStore: makeJobStore({
         onAdvance: (value) => advances.push(value),
@@ -406,7 +406,6 @@ describe("library_batch", function () {
       actionRegistry,
       toolRegistry: {} as never,
       zoteroGateway: {} as never,
-      services: {} as never,
       batchJobStore: makeJobStore({ interrupted: [interrupted] }),
     });
     const validated = tool.validate({ listInterrupted: true });
@@ -416,7 +415,7 @@ describe("library_batch", function () {
     assert.isFalse(
       await tool.shouldRequireConfirmation?.(validated.value, context),
     );
-    const result = (await tool.execute(validated.value, context)) as {
+    const result = (await tool.execute(validated.value, context)).content as {
       interruptedJobs: Array<Record<string, unknown>>;
     };
     assert.deepInclude(result.interruptedJobs[0], {
@@ -472,7 +471,6 @@ describe("library_batch", function () {
       actionRegistry,
       toolRegistry: {} as never,
       zoteroGateway: {} as never,
-      services: {} as never,
       now: () => 1000,
       batchJobStore: makeJobStore({
         record,
@@ -486,10 +484,8 @@ describe("library_batch", function () {
     assert.isTrue(validated.ok);
     if (!validated.ok) return;
 
-    const output = (await tool.execute(validated.value, context)) as Record<
-      string,
-      unknown
-    >;
+    const output = (await tool.execute(validated.value, context))
+      .content as Record<string, unknown>;
 
     assert.equal(marked, record.jobId);
     assert.deepEqual(resumedInput._batchItemIds, [31, 32]);
@@ -536,7 +532,6 @@ describe("library_batch", function () {
       actionRegistry,
       toolRegistry: {} as never,
       zoteroGateway: {} as never,
-      services: {} as never,
       batchJobStore: makeJobStore({ record, claim: false }),
     });
     const validated = tool.validate({ resumeJobId: record.jobId });
@@ -573,7 +568,6 @@ describe("library_batch", function () {
       actionRegistry,
       toolRegistry: {} as never,
       zoteroGateway: {} as never,
-      services: {} as never,
     });
 
     const result = tool.validate({ job: "discover_related" });
@@ -601,7 +595,6 @@ describe("library_batch", function () {
       actionRegistry,
       toolRegistry: {} as never,
       zoteroGateway: {} as never,
-      services: {} as never,
     });
 
     const result = tool.validate({ job: "" });
@@ -623,7 +616,6 @@ describe("library_batch", function () {
       actionRegistry,
       toolRegistry: {} as never,
       zoteroGateway: {} as never,
-      services: {} as never,
     });
 
     const result = tool.validate({

@@ -5,6 +5,7 @@ import type {
   AgentRunEventRecord,
   AgentTraceDetail,
   AgentToolArtifact,
+  AgentToolEffect,
   AgentToolResultCard,
   AgentTraceChip,
   AgentTraceRequestSummary,
@@ -2518,6 +2519,7 @@ function resolveToolPresentationSummary(
     label: string;
     args?: unknown;
     content?: unknown;
+    effect?: AgentToolEffect;
     request?: AgentTraceRequestSummary;
   },
 ): string | null {
@@ -2986,6 +2988,7 @@ function summarizeAgentTraceToolResult(
   name: string,
   ok: boolean,
   content: unknown,
+  effect?: AgentToolEffect,
   request?: AgentTraceRequestSummary,
 ): AgentTraceSummaryRow | null {
   const label = toolLabelFromName(name);
@@ -2998,7 +3001,7 @@ function summarizeAgentTraceToolResult(
     const text =
       resolveToolPresentationSummary(
         getToolDefinition(name)?.presentation?.summaries?.onError,
-        { label, content, request },
+        { label, content, effect, request },
       ) || `Could not complete ${label}: ${rawError || "Tool failed"}`;
     return {
       kind: "skip",
@@ -3013,11 +3016,11 @@ function summarizeAgentTraceToolResult(
       isEmpty
         ? getToolDefinition(name)?.presentation?.summaries?.onEmpty
         : getToolDefinition(name)?.presentation?.summaries?.onSuccess,
-      { label, content, request },
+      { label, content, effect, request },
     ) ||
     resolveToolPresentationSummary(
       getToolDefinition(name)?.presentation?.summaries?.onSuccess,
-      { label, content, request },
+      { label, content, effect, request },
     ) ||
     (isEmpty ? `No results from ${label}` : "");
   if (!text) {
@@ -3491,6 +3494,7 @@ function appendLegacyAgentTraceEvent(
         entry.payload.name,
         entry.payload.ok,
         entry.payload.content,
+        entry.payload.effect,
         ctx.requestSummary,
       );
       if (row) {

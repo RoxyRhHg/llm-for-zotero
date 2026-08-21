@@ -260,15 +260,17 @@ describe("editCurrentNote create tracking", function () {
           : null,
     } as never);
 
-    const result = await tool.execute(
-      {
-        mode: "create",
-        content: '<div style="color: red">Styled note</div>',
-        _isHtml: true,
-        target: "item",
-      },
-      baseContext,
-    );
+    const result = (
+      await tool.execute(
+        {
+          mode: "create",
+          content: '<div style="color: red">Styled note</div>',
+          _isHtml: true,
+          target: "item",
+        },
+        baseContext,
+      )
+    ).content;
     assert.deepEqual(result, {
       status: "created",
       noteId: 100,
@@ -309,14 +311,16 @@ describe("editCurrentNote create tracking", function () {
     rememberAssistantNoteForParent(9, 50);
 
     const tool = createEditCurrentNoteTool(new ZoteroGateway());
-    const result = await tool.execute(
-      {
-        mode: "create",
-        content: "Agent-created note",
-        target: "item",
-      },
-      baseContext,
-    );
+    const result = (
+      await tool.execute(
+        {
+          mode: "create",
+          content: "Agent-created note",
+          target: "item",
+        },
+        baseContext,
+      )
+    ).content;
 
     assert.equal((result as any).result.status, "created");
     assert.equal(trackedNote.getNote(), "<p>Tracked response save</p>");
@@ -327,27 +331,29 @@ describe("editCurrentNote create tracking", function () {
 
   it("agent create attaches to the only selected paper when no active item exists", async function () {
     const tool = createEditCurrentNoteTool(new ZoteroGateway());
-    const result = await tool.execute(
-      {
-        mode: "create",
-        content: "Selected-paper note",
-        target: "item",
-      },
-      {
-        ...baseContext,
-        request: {
-          ...baseContext.request,
-          activeItemId: undefined,
-          selectedPaperContexts: [
-            {
-              itemId: 9,
-              contextItemId: 9,
-              title: "Parent Paper",
-            },
-          ],
+    const result = (
+      await tool.execute(
+        {
+          mode: "create",
+          content: "Selected-paper note",
+          target: "item",
         },
-      },
-    );
+        {
+          ...baseContext,
+          request: {
+            ...baseContext.request,
+            activeItemId: undefined,
+            selectedPaperContexts: [
+              {
+                itemId: 9,
+                contextItemId: 9,
+                title: "Parent Paper",
+              },
+            ],
+          },
+        },
+      )
+    ).content;
 
     assert.equal((result as any).result.status, "created");
     assert.lengthOf(childNotes(9), 1);
@@ -358,14 +364,16 @@ describe("editCurrentNote create tracking", function () {
     const existing = saveExistingNote(60, 9, "<p>Existing body</p>");
     const tool = createEditCurrentNoteTool(new ZoteroGateway());
 
-    const result = await tool.execute(
-      {
-        mode: "append",
-        targetNoteId: 60,
-        content: "Appended body",
-      },
-      baseContext,
-    );
+    const result = (
+      await tool.execute(
+        {
+          mode: "append",
+          targetNoteId: 60,
+          content: "Appended body",
+        },
+        baseContext,
+      )
+    ).content;
 
     assert.equal((result as any).status, "appended");
     assert.equal((result as any).noteId, 60);

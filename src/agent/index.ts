@@ -11,11 +11,7 @@ import { initAgentToolResultHandleStore } from "./store/toolResultHandles";
 import { initAgentEvidenceStore } from "./context/cacheManagement";
 import { initAgentCoverageStore } from "./context/coverageLedger";
 import { createAgentModelAdapter } from "./model/factory";
-import {
-  createBuiltInActionRegistry,
-  type ActionRegistry,
-  type ActionServices,
-} from "./actions";
+import { createBuiltInActionRegistry, type ActionRegistry } from "./actions";
 import { createLibraryBatchTool } from "./tools/write/libraryBatch";
 import {
   initAgentBatchJobStore,
@@ -108,10 +104,6 @@ async function createAgentSubsystemRuntime(
       actionRegistry,
       toolRegistry,
       zoteroGateway,
-      // Actions reach everything through callTool and ctx.zoteroGateway;
-      // `services` is vestigial and the public runAction API passes the same
-      // empty object.
-      services: {} as ActionServices,
     }),
   );
   await initAgentBatchJobStore();
@@ -357,7 +349,6 @@ export function getAgentApi() {
         // conversation 0 and neither undo path can find it.
         conversationKey: opts.conversationKey,
         zoteroGateway: _zoteroGateway,
-        services: {} as import("./actions").ActionServices,
         libraryID,
         confirmationMode: opts.confirmationMode ?? "native_ui",
         onProgress: opts.onProgress ?? (() => {}),

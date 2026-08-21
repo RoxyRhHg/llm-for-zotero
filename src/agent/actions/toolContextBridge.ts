@@ -6,7 +6,6 @@ import type {
   ActionCheckpoint,
   ActionExecutionContext,
   ActionProgressEvent,
-  ActionServices,
 } from "./types";
 
 /**
@@ -24,7 +23,6 @@ export function buildActionExecutionContext(params: {
   context: AgentToolContext;
   registry: AgentToolRegistry;
   zoteroGateway: ZoteroGateway;
-  services: ActionServices;
   confirmationMode: ActionConfirmationMode;
   runId?: string;
   journalActionScope?: ActionExecutionContext["journalActionScope"];
@@ -37,7 +35,7 @@ export function buildActionExecutionContext(params: {
   const request = context.request;
 
   return {
-    // registry / zoteroGateway / services are constructor dependencies of the
+    // Registry and gateway are constructor dependencies of the
     // tool that calls this, not data carried on the context.
     registry: params.registry,
     // Carried so every change an action makes is filed under the user's real
@@ -48,7 +46,6 @@ export function buildActionExecutionContext(params: {
     journalActionScope: params.journalActionScope,
     journalToolName: params.journalToolName,
     zoteroGateway: params.zoteroGateway,
-    services: params.services,
     libraryID: Number(request.libraryID) > 0 ? Number(request.libraryID) : 1,
     confirmationMode: params.confirmationMode,
     /**

@@ -12,7 +12,6 @@ function makeContext(
   return {
     registry: {} as never,
     zoteroGateway: {} as never,
-    services: {} as never,
     libraryID: 1,
     confirmationMode: "native_ui",
     onProgress: () => {},

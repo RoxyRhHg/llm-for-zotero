@@ -42,7 +42,6 @@ describe("organize_unfiled under auto_approve", function () {
           fields: { abstractNote: "An abstract" },
         }),
       } as never,
-      services: {} as never,
       libraryID: 1,
       confirmationMode: "auto_approve",
       onProgress: (event) => progress.push(event as never),

@@ -9,7 +9,7 @@
  * and an agent able to rewrite those can lock a user out of their own
  * library.
  */
-import type { AgentToolDefinition } from "../../types";
+import type { AgentWriteToolDefinition } from "../../types";
 import type { ZoteroGateway } from "../../services/zoteroGateway";
 import { executeExternalMutation } from "../../services/mutationCoordinator";
 import { ok, fail, validateObject } from "../shared";
@@ -22,7 +22,7 @@ type LibrarySettingsInput = {
 
 export function createLibrarySettingsTool(
   zoteroGateway: ZoteroGateway,
-): AgentToolDefinition<LibrarySettingsInput, unknown> {
+): AgentWriteToolDefinition<LibrarySettingsInput, unknown> {
   return {
     spec: {
       name: "library_settings",
@@ -154,10 +154,16 @@ export function createLibrarySettingsTool(
 
     async execute(input, context) {
       if (input.action === "list") {
-        return { settings: zoteroGateway.listSettings() };
+        return {
+          content: { settings: zoteroGateway.listSettings() },
+          effect: "none",
+        };
       }
       if (input.action === "syncStatus") {
-        return zoteroGateway.getSyncStatus();
+        return {
+          content: zoteroGateway.getSyncStatus(),
+          effect: "none",
+        };
       }
       const key = input.key as string;
       return executeExternalMutation({
@@ -199,7 +205,7 @@ export function createLibrarySettingsTool(
           });
           return {
             result,
-            changed: result.status === "updated",
+            effect: result.status === "updated" ? "applied" : "none",
             affectedCount: result.status === "updated" ? 1 : 0,
             expectedPostcondition: {
               kind: "preference",

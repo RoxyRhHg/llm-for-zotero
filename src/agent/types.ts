@@ -296,6 +296,7 @@ export type AgentEvent =
       callId: string;
       name: string;
       ok: boolean;
+      effect?: AgentToolEffect;
       content: unknown;
       artifacts?: AgentToolArtifact[];
     }
@@ -505,11 +506,6 @@ export type ClassifiedTurnIntent = {
 };
 
 export type AgentRuntimeRequest = AgentRequest & {
-  /**
-   * Groups a run's journalled changes so they can be reverted as a unit.
-   * Set by batch jobs; absent for ordinary turns, which group by conversation.
-   */
-  agentRunId?: string;
   /** Generation captured when this turn started; Clear advances it. */
   conversationGeneration?: number;
   /** Set by the runtime after per-turn classification; absent on fallback. */
@@ -662,10 +658,25 @@ export type AgentToolExecutionOutput<TResult = unknown> =
   | {
       content: TResult;
       artifacts?: AgentToolArtifact[];
+      effect?: AgentToolEffect;
     };
 
+/** Explicit execution contract for tools whose validated operation can write. */
+export type AgentWriteToolOutput<TResult = unknown> = {
+  content: TResult;
+  effect: AgentToolEffect;
+  artifacts?: AgentToolArtifact[];
+};
+
 export type AgentJournalStepOutcome = {
-  status: "applied" | "no_effect" | "irreversible" | "uncertain" | "failed";
+  effect: AgentToolEffect;
+  status:
+    | "applied"
+    | "partially_applied"
+    | "no_effect"
+    | "irreversible"
+    | "uncertain"
+    | "failed";
   reversibility: "full" | "partial" | "none";
   affectedCount: number;
 };
@@ -679,6 +690,8 @@ export type AgentJournalActionScope = {
 
 export type AgentToolContext = {
   request: AgentRuntimeRequest;
+  /** Durable identity of the execution that owns any journalled writes. */
+  runId?: string;
   item: Zotero.Item | null;
   currentAnswerText: string;
   modelName: string;
@@ -714,6 +727,7 @@ export type AgentToolPresentationSummaryInput = {
   label: string;
   args?: unknown;
   content?: unknown;
+  effect?: AgentToolEffect;
   request?: AgentTraceRequestSummary;
 };
 
@@ -824,6 +838,21 @@ export type AgentToolDefinition<TInput = unknown, TResult = unknown> = {
     resolution: AgentConfirmationResolution,
     context: AgentToolContext,
   ) => AgentToolReviewResolution | Promise<AgentToolReviewResolution>;
+};
+
+/**
+ * Built-in write definitions use this narrower type so every successful
+ * execution reports its effect without registry-side result inspection.
+ */
+export type AgentWriteToolDefinition<
+  TInput = unknown,
+  TResult = unknown,
+> = Omit<AgentToolDefinition<TInput, TResult>, "spec" | "execute"> & {
+  spec: ToolSpec & { mutability: "write" };
+  execute: (
+    input: TInput,
+    context: AgentToolContext,
+  ) => Promise<AgentWriteToolOutput<TResult>>;
 };
 
 export type PreparedToolExecutionResult = {

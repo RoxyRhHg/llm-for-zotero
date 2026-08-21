@@ -2,7 +2,7 @@
  * Focused facade tool for creating and deleting Zotero collections (folders).
  * Provides a self-describing schema for managing Zotero collections.
  */
-import type { AgentToolDefinition } from "../../types";
+import type { AgentWriteToolDefinition } from "../../types";
 import {
   LibraryMutationService,
   type UpdateCollectionOperation,
@@ -25,7 +25,7 @@ type ManageCollectionsInput = {
 
 export function createManageCollectionsTool(
   zoteroGateway: ZoteroGateway,
-): AgentToolDefinition<ManageCollectionsInput, unknown> {
+): AgentWriteToolDefinition<ManageCollectionsInput, unknown> {
   const mutationService = new LibraryMutationService(zoteroGateway);
 
   return {

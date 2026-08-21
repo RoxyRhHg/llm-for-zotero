@@ -3,7 +3,7 @@
  * Keeps one master item and merges children (attachments, notes, tags,
  * collections, related links) from duplicates into it, then trashes the rest.
  */
-import type { AgentToolDefinition } from "../../types";
+import type { AgentWriteToolDefinition } from "../../types";
 import {
   LibraryMutationService,
   type MergeItemsOperation,
@@ -30,7 +30,7 @@ type MergeItemsInput = {
 
 export function createMergeItemsTool(
   zoteroGateway: ZoteroGateway,
-): AgentToolDefinition<MergeItemsInput, unknown> {
+): AgentWriteToolDefinition<MergeItemsInput, unknown> {
   const mutationService = new LibraryMutationService(zoteroGateway);
 
   return {

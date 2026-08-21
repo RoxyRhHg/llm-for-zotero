@@ -1,5 +1,5 @@
 import type { GeneratedChatImage, PaperContextRef } from "../../shared/types";
-import type { AgentToolContext } from "../types";
+import type { AgentToolContext, AgentToolEffect } from "../types";
 import type {
   BatchMoveAssignment,
   BatchTagAssignment,
@@ -340,7 +340,7 @@ export type LibraryMutationExecutionResult = {
 export type LibraryMutationExecution = {
   result: LibraryMutationExecutionResult;
   inverse?: LibraryMutationInverse | null;
-  changed: boolean;
+  effect: AgentToolEffect;
   affectedCount: number;
 };
 
@@ -689,6 +689,66 @@ function mutationAffectedCount(
     case "save_note":
       return 1;
   }
+}
+
+function mutationTargetCount(operation: LibraryMutationOperation): number {
+  switch (operation.type) {
+    case "apply_tags":
+      return new Set(
+        directTagAssignments(operation).map((assignment) => assignment.itemId),
+      ).size;
+    case "move_to_collection":
+      return new Set(
+        directMoveAssignments(operation).map((assignment) => assignment.itemId),
+      ).size;
+    case "remove_tags":
+    case "remove_from_collection":
+    case "trash_items":
+      return operation.itemIds.length;
+    case "set_item_tags":
+    case "set_item_collections":
+    case "reparent_items":
+      return operation.assignments.length;
+    case "save_notes_batch":
+      return operation.notes.length;
+    case "create_items":
+      return operation.items.length;
+    case "relate_items":
+      return operation.relatedItemIds.length;
+    case "import_identifiers":
+      return operation.identifiers.length;
+    case "import_local_files":
+      return operation.filePaths.length;
+    case "restore_from_trash":
+      return (
+        (operation.itemIds?.length || 0) +
+        (operation.collectionIds?.length || 0) +
+        (operation.savedSearchIds?.length || 0)
+      );
+    case "merge_items":
+      return operation.otherItemIds.length;
+    case "update_metadata":
+    case "create_collection":
+    case "save_saved_search":
+    case "delete_saved_search":
+    case "update_collection":
+    case "update_library_tag":
+    case "delete_collection":
+    case "save_note":
+    case "delete_attachment":
+    case "rename_attachment":
+    case "relink_attachment":
+      return 1;
+  }
+}
+
+function mutationEffect(
+  operation: LibraryMutationOperation,
+  affectedCount: number,
+): AgentToolEffect {
+  if (affectedCount <= 0) return "none";
+  const targetCount = mutationTargetCount(operation);
+  return targetCount > affectedCount ? "partial" : "applied";
 }
 
 function normalizeLibraryID(value: unknown): number {
@@ -1531,7 +1591,11 @@ export class LibraryMutationService {
       operation,
       execution.result.result,
     );
-    return { ...execution, changed: affectedCount > 0, affectedCount };
+    return {
+      ...execution,
+      effect: mutationEffect(operation, affectedCount),
+      affectedCount,
+    };
   }
 
   private async performOperation(

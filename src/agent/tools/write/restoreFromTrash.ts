@@ -5,7 +5,7 @@
  * had just performed, so anything the user trashed themselves — or anything
  * trashed in an earlier session — could not be recovered by asking.
  */
-import type { AgentToolDefinition } from "../../types";
+import type { AgentWriteToolDefinition } from "../../types";
 import {
   LibraryMutationService,
   type RestoreFromTrashOperation,
@@ -38,7 +38,7 @@ function describeTargets(operation: RestoreFromTrashOperation): string {
 
 export function createRestoreFromTrashTool(
   zoteroGateway: ZoteroGateway,
-): AgentToolDefinition<RestoreFromTrashInput, unknown> {
+): AgentWriteToolDefinition<RestoreFromTrashInput, unknown> {
   const mutationService = new LibraryMutationService(zoteroGateway);
 
   return {

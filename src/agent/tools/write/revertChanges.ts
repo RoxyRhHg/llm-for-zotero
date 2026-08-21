@@ -1,4 +1,4 @@
-import type { AgentToolDefinition } from "../../types";
+import type { AgentWriteToolDefinition } from "../../types";
 import type { ZoteroGateway } from "../../services/zoteroGateway";
 import {
   analyzeJournalActions,
@@ -30,7 +30,7 @@ type RevertChangesInput = {
  */
 export function createRevertChangesTool(
   zoteroGateway: ZoteroGateway,
-): AgentToolDefinition<RevertChangesInput, unknown> {
+): AgentWriteToolDefinition<RevertChangesInput, unknown> {
   return {
     spec: {
       name: "revert_changes",
@@ -172,27 +172,33 @@ export function createRevertChangesTool(
           context,
         });
         return {
-          dryRun: true,
-          changes: pending.map((action) => ({
-            actionId: action.actionId,
-            description: action.description,
-            toolName: action.toolName,
-            stepCount: action.steps.length,
-            itemCount: action.affectedCount,
-            reversibility: action.reversibility,
-            reason: action.recovery,
-          })),
-          conflicts,
+          content: {
+            dryRun: true,
+            changes: pending.map((action) => ({
+              actionId: action.actionId,
+              description: action.description,
+              toolName: action.toolName,
+              stepCount: action.steps.length,
+              itemCount: action.affectedCount,
+              reversibility: action.reversibility,
+              reason: action.recovery,
+            })),
+            conflicts,
+          },
+          effect: "none",
         };
       }
 
       if (!pending.length) {
         return {
-          reverted: 0,
-          partiallyReverted: 0,
-          residuals: [],
-          skipped: [],
-          message: "There are no recorded changes left to undo.",
+          content: {
+            reverted: 0,
+            partiallyReverted: 0,
+            residuals: [],
+            skipped: [],
+            message: "There are no recorded changes left to undo.",
+          },
+          effect: "none",
         };
       }
 
@@ -202,13 +208,23 @@ export function createRevertChangesTool(
         context,
       });
       return {
-        reverted: outcome.reverted,
-        partiallyReverted: outcome.partiallyReverted,
-        residuals: outcome.residuals,
-        // Named explicitly so the agent reports what it could NOT put back
-        // rather than implying a clean rollback.
-        skipped: outcome.skipped,
-        conflicts: outcome.conflicts,
+        content: {
+          reverted: outcome.reverted,
+          partiallyReverted: outcome.partiallyReverted,
+          residuals: outcome.residuals,
+          // Named explicitly so the agent reports what it could NOT put back
+          // rather than implying a clean rollback.
+          skipped: outcome.skipped,
+          conflicts: outcome.conflicts,
+        },
+        effect:
+          outcome.reverted + outcome.partiallyReverted === 0
+            ? "none"
+            : outcome.partiallyReverted > 0 ||
+                outcome.skipped.length > 0 ||
+                outcome.conflicts.length > 0
+              ? "partial"
+              : "applied",
       };
     },
   };

@@ -2,7 +2,7 @@
  * Focused facade tool for moving Zotero items to the trash.
  * Provides a self-describing schema for trashing Zotero items.
  */
-import type { AgentToolDefinition } from "../../types";
+import type { AgentWriteToolDefinition } from "../../types";
 import {
   LibraryMutationService,
   type TrashItemsOperation,
@@ -23,7 +23,7 @@ type TrashItemsInput = {
 
 export function createTrashItemsTool(
   zoteroGateway: ZoteroGateway,
-): AgentToolDefinition<TrashItemsInput, unknown> {
+): AgentWriteToolDefinition<TrashItemsInput, unknown> {
   const mutationService = new LibraryMutationService(zoteroGateway);
 
   return {

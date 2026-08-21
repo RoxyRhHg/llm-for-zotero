@@ -4,7 +4,7 @@
  * .bib, .enw, .nbib, RDF) are read through Zotero's translators rather than
  * attached, which is what "import my references" means.
  */
-import type { AgentToolDefinition } from "../../types";
+import type { AgentWriteToolDefinition } from "../../types";
 import {
   LibraryMutationService,
   type ImportLocalFilesOperation,
@@ -31,7 +31,7 @@ type ImportLocalFilesInput = {
 
 export function createImportLocalFilesTool(
   zoteroGateway: ZoteroGateway,
-): AgentToolDefinition<ImportLocalFilesInput, unknown> {
+): AgentWriteToolDefinition<ImportLocalFilesInput, unknown> {
   const mutationService = new LibraryMutationService(zoteroGateway);
 
   return {

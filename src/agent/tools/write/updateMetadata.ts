@@ -7,7 +7,7 @@
  *   internally by review cards
  */
 import type { PaperContextRef } from "../../../shared/types";
-import type { AgentToolDefinition } from "../../types";
+import type { AgentWriteToolDefinition } from "../../types";
 import {
   buildPagedReviewActionConfig,
   buildPageSizeSelectField,
@@ -75,7 +75,7 @@ function normalizeOperationEntry(
 
 export function createUpdateMetadataTool(
   zoteroGateway: ZoteroGateway,
-): AgentToolDefinition<UpdateMetadataInput, unknown> {
+): AgentWriteToolDefinition<UpdateMetadataInput, unknown> {
   const mutationService = new LibraryMutationService(zoteroGateway);
 
   return {

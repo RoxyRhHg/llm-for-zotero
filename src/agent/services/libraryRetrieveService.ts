@@ -51,7 +51,6 @@ import {
   mergeQuoteCitations,
 } from "../../modules/contextPanel/quoteCitations";
 import type {
-  AgentLibraryFilters,
   EditableArticleMetadataSnapshot,
   LibraryItemTarget,
   ZoteroGateway,
@@ -1446,6 +1445,16 @@ export class LibraryRetrieveService {
     }
 
     const records = this.buildResourceRecords(scope.items, input);
+    let poolBm25Corpus: ReturnType<typeof buildChunkIndex> | undefined;
+    const rescorePoolBm25 = (queryPlan: RetrievalQueryPlan): void => {
+      if (!queryPlan.lexicalTerms.length || !records.length) return;
+      poolBm25Corpus ??= buildChunkIndex(
+        records.map((record) =>
+          [record.target.title, record.abstractText].filter(Boolean).join("\n"),
+        ),
+      );
+      this.applyPoolBm25Scores(records, queryPlan, poolBm25Corpus);
+    };
     if (records.length) methodsUsed.add("metadata");
     if (records.some((record) => record.abstractText))
       methodsUsed.add("abstract");
@@ -1459,7 +1468,7 @@ export class LibraryRetrieveService {
       truncated: false,
     };
 
-    this.applyPoolBm25Scores(records, input.queryPlan);
+    rescorePoolBm25(input.queryPlan);
 
     let probeRounds = 0;
     const variantsTried = new Set(
@@ -1561,7 +1570,7 @@ export class LibraryRetrieveService {
           matched: indexedScan.matched,
           truncated: indexedScan.truncated || rescan.truncated,
         };
-        this.applyPoolBm25Scores(records, input.queryPlan);
+        rescorePoolBm25(input.queryPlan);
       }
       indexedScan = {
         ...indexedScan,
@@ -1731,7 +1740,7 @@ export class LibraryRetrieveService {
               .length,
             truncated: indexedScan.truncated || rescan.truncated,
           };
-          this.applyPoolBm25Scores(records, input.queryPlan);
+          rescorePoolBm25(input.queryPlan);
           // Papers matched only by the rescan must be able to reach the
           // ledger and snippet expansion — counters alone would overstate
           // coverage the answer never saw.
@@ -1978,15 +1987,9 @@ export class LibraryRetrieveService {
   private applyPoolBm25Scores(
     records: ResourceRecord[],
     queryPlan: RetrievalQueryPlan,
+    corpus: ReturnType<typeof buildChunkIndex>,
   ): void {
-    if (!queryPlan.lexicalTerms.length || !records.length) return;
-    // Treat each record's title+abstract as one BM25 document; reusing the
-    // chunk index means pool scoring shares the CJK-aware tokenizer. Cost is
-    // one tokenize pass per record, the same class as scoreMetadata.
-    const docs = records.map((record) =>
-      [record.target.title, record.abstractText].filter(Boolean).join("\n"),
-    );
-    const { chunkStats, docFreq, avgChunkLength } = buildChunkIndex(docs);
+    const { chunkStats, docFreq, avgChunkLength } = corpus;
     records.forEach((record, index) => {
       const stats = chunkStats[index];
       if (!stats) return;
@@ -2301,60 +2304,28 @@ export class LibraryRetrieveService {
         ? records.length
         : input.maxCandidatePapers;
     try {
-      const allRecordItemIds = Array.from(byItemId.keys());
       const runQuicksearch = async (
         query: string,
-        options: {
-          filters?: AgentLibraryFilters;
-          allowedItemIds?: number[];
-        } = {},
+        allowedItemIds?: number[],
       ): Promise<void> => {
         const result = await this.zoteroGateway.searchAllLibraryItems({
           libraryID: scope.libraryID,
           query,
-          filters: options.filters,
-          allowedItemIds: options.allowedItemIds,
+          allowedItemIds,
           limit: scanLimit,
         });
         if (result.totalCount > result.items.length) scan.truncated = true;
         result.items.forEach((target) => mark(target.itemId, query));
       };
 
-      if (scope.collectionIds.length) {
-        for (const query of probes) {
-          for (const collectionId of scope.collectionIds) {
-            await runQuicksearch(query, {
-              filters: { collectionId },
-            });
-          }
-        }
-      }
-      if (scope.tagContexts.length) {
-        for (const query of probes) {
-          if (scope.tagItemIds.length) {
-            await runQuicksearch(query, {
-              allowedItemIds: scope.tagItemIds,
-            });
-          }
-        }
-      }
-      const explicit = new Set(scope.explicitItemIds);
-      if (explicit.size) {
-        const explicitRecordIds = allRecordItemIds.filter((itemId) =>
-          explicit.has(itemId),
-        );
-        for (const query of probes) {
-          await runQuicksearch(query, {
-            allowedItemIds: explicitRecordIds,
-          });
-        }
-      }
-      if (scope.collectionIds.length || scope.tagContexts.length) {
-        scan.matched = matchedIds.size;
-        return scan;
-      }
-      if (!explicit.size) {
-        for (const query of probes) await runQuicksearch(query);
+      const scoped = Boolean(
+        scope.collectionIds.length ||
+        scope.tagContexts.length ||
+        scope.explicitItemIds.length,
+      );
+      const allowedItemIds = scoped ? Array.from(byItemId.keys()) : undefined;
+      for (const query of probes) {
+        await runQuicksearch(query, allowedItemIds);
       }
       scan.matched = matchedIds.size;
       return scan;

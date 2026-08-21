@@ -32,7 +32,7 @@ describe("zotero_script chaining", function () {
     journalFallbackApproved: true,
   };
 
-  function run(script: string) {
+  async function run(script: string) {
     (globalThis as typeof globalThis & { Zotero?: unknown }).Zotero = {
       Items: { get: () => null },
       debug: () => undefined,
@@ -47,9 +47,8 @@ describe("zotero_script chaining", function () {
     });
     assert.isTrue(validated.ok, JSON.stringify(validated));
     if (!validated.ok) throw new Error("unreachable");
-    return tool.execute(validated.value, context) as Promise<
-      Record<string, unknown>
-    >;
+    const output = await tool.execute(validated.value, context);
+    return output.content as Record<string, unknown>;
   }
 
   it("delivers the script's return value in full", async function () {
@@ -162,10 +161,8 @@ describe("zotero_script write-mode snapshotting", function () {
     assert.isTrue(validated.ok, JSON.stringify(validated));
     if (!validated.ok) return;
 
-    const result = (await tool.execute(validated.value, context)) as Record<
-      string,
-      unknown
-    >;
+    const result = (await tool.execute(validated.value, context))
+      .content as Record<string, unknown>;
 
     assert.isUndefined(
       result.error,
@@ -191,10 +188,8 @@ describe("zotero_script write-mode snapshotting", function () {
     });
     assert.isTrue(validated.ok);
     if (!validated.ok) return;
-    const result = (await tool.execute(validated.value, context)) as Record<
-      string,
-      unknown
-    >;
+    const result = (await tool.execute(validated.value, context))
+      .content as Record<string, unknown>;
     assert.isUndefined(result.error);
     assert.equal(result.itemsAffected, 1);
   });
@@ -246,10 +241,8 @@ describe("zotero_script scope control", function () {
     assert.isTrue(validated.ok, JSON.stringify(validated));
     if (!validated.ok) return;
 
-    const result = (await tool.execute(validated.value, context)) as Record<
-      string,
-      unknown
-    >;
+    const result = (await tool.execute(validated.value, context))
+      .content as Record<string, unknown>;
     assert.isDefined(result.error, "raw SQL must not silently succeed");
     assert.include(String(result.error), "Zotero.DB");
   });
@@ -271,10 +264,8 @@ describe("zotero_script scope control", function () {
     });
     assert.isTrue(validated.ok);
     if (!validated.ok) return;
-    const result = (await tool.execute(validated.value, context)) as Record<
-      string,
-      unknown
-    >;
+    const result = (await tool.execute(validated.value, context))
+      .content as Record<string, unknown>;
     assert.isUndefined(result.error);
     assert.equal(result.returnValue, 1);
   });
@@ -348,10 +339,8 @@ describe("zotero_script sandbox engagement", function () {
     assert.isTrue(validated.ok);
     if (!validated.ok) return;
 
-    const result = (await tool.execute(validated.value, context)) as Record<
-      string,
-      unknown
-    >;
+    const result = (await tool.execute(validated.value, context))
+      .content as Record<string, unknown>;
 
     assert.equal(sandboxBuilt, 1, "the sandbox constructor must be reached");
     assert.equal(evaluated, 1, "the evaluator must come from the same object");
@@ -377,10 +366,8 @@ describe("zotero_script sandbox engagement", function () {
     });
     assert.isTrue(validated.ok);
     if (!validated.ok) return;
-    const result = (await tool.execute(validated.value, context)) as Record<
-      string,
-      unknown
-    >;
+    const result = (await tool.execute(validated.value, context))
+      .content as Record<string, unknown>;
     assert.include(String(result.error), "sandbox is unavailable");
   });
 });

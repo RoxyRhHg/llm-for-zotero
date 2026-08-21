@@ -1,4 +1,4 @@
-import type { AgentToolDefinition } from "../../types";
+import type { AgentWriteToolDefinition } from "../../types";
 import { ok } from "../shared";
 import type { ZoteroGateway } from "../../services/zoteroGateway";
 import { revertActions } from "../../services/changeReverter";
@@ -8,7 +8,7 @@ type UndoLastActionInput = Record<string, never>;
 
 export function createUndoLastActionTool(
   zoteroGateway: ZoteroGateway,
-): AgentToolDefinition<UndoLastActionInput, unknown> {
+): AgentWriteToolDefinition<UndoLastActionInput, unknown> {
   return {
     spec: {
       name: "undo_last_action",
@@ -116,12 +116,15 @@ export function createUndoLastActionTool(
         );
       }
       return {
-        status: outcome.partiallyReverted ? "partially_undone" : "undone",
-        toolName: action.toolName,
-        description: action.description,
-        reverted: outcome.reverted,
-        partiallyReverted: outcome.partiallyReverted,
-        residuals: outcome.residuals,
+        content: {
+          status: outcome.partiallyReverted ? "partially_undone" : "undone",
+          toolName: action.toolName,
+          description: action.description,
+          reverted: outcome.reverted,
+          partiallyReverted: outcome.partiallyReverted,
+          residuals: outcome.residuals,
+        },
+        effect: outcome.partiallyReverted ? "partial" : "applied",
       };
     },
   };

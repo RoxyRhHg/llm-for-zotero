@@ -6,12 +6,12 @@ import type {
   AgentToolCall,
   AgentToolContext,
   AgentToolDefinition,
+  AgentToolEffect,
   PreparedToolExecution,
   ToolSpec,
 } from "../types";
 import { isAgentChangeJournalAvailable } from "../store/changeJournal";
 import { isMalformedToolArgumentsDiagnostic } from "../toolArgumentDiagnostics";
-import { deriveToolEffect } from "./effect";
 import { getAgentLibraryWriteMode } from "../libraryWriteMode";
 
 function createSyntheticErrorResult(
@@ -71,11 +71,13 @@ function withRecoveryWarning(
 function normalizeExecutionOutput(value: AgentToolExecutionOutput<any>): {
   content: unknown;
   artifacts?: AgentToolArtifact[];
+  effect?: AgentToolEffect;
 } {
   if (value && typeof value === "object" && !Array.isArray(value)) {
     const record = value as {
       content?: unknown;
       artifacts?: unknown;
+      effect?: unknown;
     };
     if (Object.prototype.hasOwnProperty.call(record, "content")) {
       return {
@@ -83,6 +85,12 @@ function normalizeExecutionOutput(value: AgentToolExecutionOutput<any>): {
         artifacts: Array.isArray(record.artifacts)
           ? (record.artifacts as AgentToolArtifact[])
           : undefined,
+        effect:
+          record.effect === "applied" ||
+          record.effect === "partial" ||
+          record.effect === "none"
+            ? record.effect
+            : undefined,
       };
     }
   }
@@ -215,26 +223,47 @@ export class AgentToolRegistry {
       resolvedInput: typeof validation.value,
       executionContext: AgentToolContext = context,
     ) => {
+      const lifecycleError = () => ({
+        tool,
+        input: resolvedInput,
+        result: {
+          callId: call.id,
+          name: call.name,
+          ok: false,
+          content: {
+            error:
+              "Conversation lifecycle changed before this tool could execute.",
+          },
+        },
+      });
       const execute = async () => {
         if (options.isExecutionAllowed && !options.isExecutionAllowed()) {
-          return {
-            tool,
-            input: resolvedInput,
-            result: {
-              callId: call.id,
-              name: call.name,
-              ok: false,
-              content: {
-                error:
-                  "Conversation lifecycle changed before this tool could execute.",
-              },
-            },
-          };
+          return lifecycleError();
         }
         try {
           const executionOutput = normalizeExecutionOutput(
             await tool.execute(resolvedInput, executionContext),
           );
+          if (options.isExecutionAllowed && !options.isExecutionAllowed()) {
+            return lifecycleError();
+          }
+          if (
+            tool.spec.mutability === "write" &&
+            executionOutput.effect === undefined
+          ) {
+            return {
+              tool,
+              input: resolvedInput,
+              result: {
+                callId: call.id,
+                name: call.name,
+                ok: false,
+                content: {
+                  error: `${call.name} completed without the required explicit write effect. Its outcome is unknown; inspect current state before retrying.`,
+                },
+              },
+            };
+          }
           return {
             tool,
             input: resolvedInput,
@@ -248,13 +277,16 @@ export class AgentToolRegistry {
               ok: true,
               effect:
                 tool.spec.mutability === "write"
-                  ? deriveToolEffect(executionOutput.content)
+                  ? executionOutput.effect
                   : undefined,
               content: executionOutput.content,
               artifacts: executionOutput.artifacts,
             },
           };
         } catch (error) {
+          if (options.isExecutionAllowed && !options.isExecutionAllowed()) {
+            return lifecycleError();
+          }
           return {
             tool,
             input: resolvedInput,
@@ -269,7 +301,7 @@ export class AgentToolRegistry {
           };
         }
       };
-      return options.executeWithLock
+      return mutationPlan.effect === "write" && options.executeWithLock
         ? options.executeWithLock(execute)
         : execute();
     };

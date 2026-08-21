@@ -5,7 +5,7 @@
  * nothing, so ordinary requests — "add this book by hand", "move that note
  * onto the paper", "link these two" — had no path but a raw script.
  */
-import type { AgentToolDefinition } from "../../types";
+import type { AgentWriteToolDefinition } from "../../types";
 import {
   LibraryMutationService,
   type CreateItemsOperation,
@@ -49,7 +49,7 @@ const CREATOR_SCHEMA = {
 
 export function createCreateItemsTool(
   zoteroGateway: ZoteroGateway,
-): AgentToolDefinition<{ operation: CreateItemsOperation }, unknown> {
+): AgentWriteToolDefinition<{ operation: CreateItemsOperation }, unknown> {
   const mutationService = new LibraryMutationService(zoteroGateway);
 
   return {
@@ -204,7 +204,7 @@ export function createCreateItemsTool(
 
 export function createReparentItemsTool(
   zoteroGateway: ZoteroGateway,
-): AgentToolDefinition<{ operation: ReparentItemsOperation }, unknown> {
+): AgentWriteToolDefinition<{ operation: ReparentItemsOperation }, unknown> {
   const mutationService = new LibraryMutationService(zoteroGateway);
 
   return {
@@ -344,7 +344,7 @@ export function createReparentItemsTool(
 
 export function createRelateItemsTool(
   zoteroGateway: ZoteroGateway,
-): AgentToolDefinition<{ operation: RelateItemsOperation }, unknown> {
+): AgentWriteToolDefinition<{ operation: RelateItemsOperation }, unknown> {
   const mutationService = new LibraryMutationService(zoteroGateway);
 
   return {
