@@ -20,6 +20,7 @@ import {
   setItemFailed,
   clearItemStatus,
   getItemStatus,
+  runMineruTaskOnce,
 } from "./mineruProcessingStatus";
 import {
   cleanupMineruArtifactsForRemovedAttachment,
@@ -38,6 +39,8 @@ type QueueEntry = {
 type QueueValidationResult =
   | { item: Zotero.Item }
   | { item: null; reason: string; retryable: boolean };
+
+class StaleAutoWatchAttachmentError extends Error {}
 
 type ProgressListener = (status: AutoWatchStatus) => void;
 
@@ -383,8 +386,6 @@ async function processQueue(): Promise<void> {
       continue;
     }
 
-    setItemProcessing(entry.attachmentId);
-
     const AbortCtor = getAbortControllerCtor();
     const abort = AbortCtor ? new AbortCtor() : null;
     currentAbort = abort;
@@ -417,42 +418,53 @@ async function processQueue(): Promise<void> {
 
       ztoolkit.log(`MinerU auto-parse: processing ${entry.title}`);
       let lastProgressStage = "";
-      const result = await parsePdfWithMineru(
-        pdfPath as string,
+      const { value: result } = await runMineruTaskOnce(
+        entry.attachmentId,
+        async (report) => {
+          setItemProcessing(entry.attachmentId);
+          const parsed = await parsePdfWithMineru(
+            pdfPath as string,
+            report,
+            abort?.signal,
+          );
+          if (!parsed?.mdContent) return parsed;
+
+          if (!getValidatedQueueItem(entry)) {
+            throw new StaleAutoWatchAttachmentError(
+              "attachment changed before cache write",
+            );
+          }
+
+          await writeMineruCacheFiles(
+            entry.attachmentId,
+            parsed.mdContent,
+            parsed.files,
+          );
+          await writeMineruSourceProvenanceForAttachment(pdfItem);
+          setItemCached(entry.attachmentId);
+          void publishMineruCachePackageForAttachment(entry.attachmentId).then(
+            (published) => {
+              if (published.status === "error") {
+                ztoolkit.log(
+                  "LLM: MinerU sync package publish failed",
+                  published,
+                );
+              }
+            },
+          );
+          // Flush stale in-memory text cache and disk embedding cache so the
+          // next query picks up MinerU-quality chunks and re-generates embeddings.
+          invalidateCachedContextText(entry.attachmentId);
+          return parsed;
+        },
         (stage) => {
           lastProgressStage = stage;
           currentStatusMessage = `${stage} — ${entry.title}`;
           notifyProgress();
         },
-        abort?.signal,
       );
 
       if (result?.mdContent) {
-        if (!getValidatedQueueItem(entry)) {
-          discardStaleEntry(entry, "attachment changed before cache write");
-          continue;
-        }
-
-        await writeMineruCacheFiles(
-          entry.attachmentId,
-          result.mdContent,
-          result.files,
-        );
-        await writeMineruSourceProvenanceForAttachment(pdfItem);
-        setItemCached(entry.attachmentId);
-        void publishMineruCachePackageForAttachment(entry.attachmentId).then(
-          (published) => {
-            if (published.status === "error") {
-              ztoolkit.log(
-                "LLM: MinerU sync package publish failed",
-                published,
-              );
-            }
-          },
-        );
-        // Flush stale in-memory text cache and disk embedding cache so the
-        // next query picks up MinerU-quality chunks and re-generates embeddings.
-        invalidateCachedContextText(entry.attachmentId);
         processedCount++;
         currentStatusMessage = `Cached: ${entry.title}`;
         notifyProgress();
@@ -469,6 +481,10 @@ async function processQueue(): Promise<void> {
         );
       }
     } catch (e) {
+      if (e instanceof StaleAutoWatchAttachmentError) {
+        discardStaleEntry(entry, e.message);
+        continue;
+      }
       if (e instanceof MineruCancelledError) {
         if (staleAbortAttachmentIds.has(entry.attachmentId)) {
           staleAbortAttachmentIds.delete(entry.attachmentId);
@@ -569,7 +585,7 @@ function shouldConsiderModifiedPdf(attachmentId: number): boolean {
   }
   if (readinessRetryTimers.has(attachmentId)) return true;
   const status = getItemStatus(attachmentId)?.status;
-  return status === "failed" || status === "processing";
+  return status === "failed";
 }
 
 async function enqueuePdfIfEligible(

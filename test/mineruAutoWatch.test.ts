@@ -15,6 +15,7 @@ import {
   getAllFailedIds,
   getAllProcessingIds,
   getItemStatus,
+  setItemProcessing,
 } from "../src/modules/mineruProcessingStatus";
 import {
   hasCachedMineruMd,
@@ -362,7 +363,7 @@ describe("mineruAutoWatch", function () {
       [pdf.id, pdf],
     ]);
     const io = setupZotero(items);
-    io.files.set("/tmp/paper.pdf", bytes(pdfText(412)));
+    io.files.set("/tmp/paper.pdf", bytes(pdfText(150)));
 
     await handleAutoWatchNotificationForTests("add", "item", [pdf.id]);
 
@@ -531,6 +532,21 @@ describe("mineruAutoWatch", function () {
     await handleAutoWatchNotificationForTests("modify", "item", [pdf.id]);
 
     assert.isTrue(await hasCachedMineruMd(pdf.id));
+    assert.lengthOf(getAutoWatchQueueSnapshotForTests(), 0);
+  });
+
+  it("ignores modified PDFs that are already being processed", async function () {
+    const parent = createParent();
+    const pdf = createPdf();
+    const items = new Map<number, MockItem>([
+      [parent.id, parent],
+      [pdf.id, pdf],
+    ]);
+    setupZotero(items);
+    setItemProcessing(pdf.id);
+
+    await handleAutoWatchNotificationForTests("modify", "item", [pdf.id]);
+
     assert.lengthOf(getAutoWatchQueueSnapshotForTests(), 0);
   });
 

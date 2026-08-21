@@ -3,6 +3,7 @@ import { readFileSync } from "fs";
 import { zipSync } from "fflate";
 import {
   buildCloudBatchRequestBody,
+  buildMineruCloudProgressMessageForTests,
   getMineruCloudPollDecisionForTests,
   MineruCancelledError,
   parsePdfWithMineruCloud,
@@ -132,6 +133,16 @@ function buildMineruWindowsOutputPath(
 
 describe("mineruClient", function () {
   describe("cloud poll policy", function () {
+    it("includes server-reported page progress for active jobs", function () {
+      const message = buildMineruCloudProgressMessageForTests("running", 94, {
+        extracted_pages: 37,
+        total_pages: 200,
+      });
+
+      assert.include(message, "37/200");
+      assert.include(message, "94");
+    });
+
     it("times out pending jobs after the pre-processing window", function () {
       const decision = getMineruCloudPollDecisionForTests({
         state: "pending",

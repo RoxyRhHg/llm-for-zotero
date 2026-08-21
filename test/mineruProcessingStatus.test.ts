@@ -1,4 +1,5 @@
 import { assert } from "chai";
+import * as mineruProcessingStatus from "../src/modules/mineruProcessingStatus";
 import {
   clearAllStatuses,
   getMineruStatus,
@@ -130,5 +131,53 @@ describe("mineruProcessingStatus", function () {
     setItemFailed(pdf.id, "parse failed");
 
     assert.equal(await getMineruStatus(pdf.id), "failed");
+  });
+
+  it("shares one in-flight attachment task across concurrent callers", async function () {
+    const runOnce = (
+      mineruProcessingStatus as unknown as {
+        runMineruTaskOnce?: <T>(
+          attachmentId: number,
+          task: (report: (stage: string) => void) => Promise<T>,
+          onProgress?: (stage: string) => void,
+        ) => Promise<{ joined: boolean; value: T }>;
+      }
+    ).runMineruTaskOnce;
+    assert.isFunction(runOnce);
+
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    let executions = 0;
+    const firstProgress: string[] = [];
+    const secondProgress: string[] = [];
+    const first = runOnce!(
+      42,
+      async (report) => {
+        executions++;
+        report("server processing");
+        await gate;
+        return "cached";
+      },
+      (stage) => firstProgress.push(stage),
+    );
+    await Promise.resolve();
+    const second = runOnce!(
+      42,
+      async () => {
+        executions++;
+        return "duplicate";
+      },
+      (stage) => secondProgress.push(stage),
+    );
+
+    release();
+    const [firstResult, secondResult] = await Promise.all([first, second]);
+    assert.equal(executions, 1);
+    assert.deepEqual(firstResult, { joined: false, value: "cached" });
+    assert.deepEqual(secondResult, { joined: true, value: "cached" });
+    assert.deepEqual(firstProgress, ["server processing"]);
+    assert.deepEqual(secondProgress, ["server processing"]);
   });
 });

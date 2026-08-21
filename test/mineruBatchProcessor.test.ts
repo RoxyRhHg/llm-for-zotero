@@ -519,7 +519,7 @@ describe("mineruBatchProcessor", function () {
       ]),
       {
         files: {
-          "/tmp/long-start-all.pdf": pdfText(412),
+          "/tmp/long-start-all.pdf": pdfText(150),
           "/tmp/short-translated.pdf": pdfText(12),
         },
         pref: (key) =>
@@ -589,7 +589,7 @@ describe("mineruBatchProcessor", function () {
       ]),
       {
         files: {
-          "/tmp/long-selected.pdf": pdfText(412),
+          "/tmp/long-selected.pdf": pdfText(150),
           "/tmp/selected-translated.pdf": pdfText(12),
         },
         pref: (key) =>

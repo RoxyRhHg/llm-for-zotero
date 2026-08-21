@@ -11,6 +11,14 @@ interface ItemStatus {
 const processingMap = new Map<number, ItemStatus>();
 const listeners = new Set<() => void>();
 
+type ActiveMineruTask = {
+  promise: Promise<unknown>;
+  progressListeners: Set<(stage: string) => void>;
+  lastProgress: string;
+};
+
+const activeTasks = new Map<number, ActiveMineruTask>();
+
 function notifyListeners(): void {
   for (const listener of listeners) {
     try {
@@ -73,6 +81,60 @@ export function clearAllCachedStatuses(): void {
 
 export function getItemStatus(attachmentId: number): ItemStatus | undefined {
   return processingMap.get(attachmentId);
+}
+
+export async function runMineruTaskOnce<T>(
+  attachmentId: number,
+  task: (report: (stage: string) => void) => Promise<T>,
+  onProgress?: (stage: string) => void,
+): Promise<{ joined: boolean; value: T }> {
+  const existing = activeTasks.get(attachmentId);
+  if (existing) {
+    if (onProgress) {
+      existing.progressListeners.add(onProgress);
+      if (existing.lastProgress) onProgress(existing.lastProgress);
+    }
+    try {
+      return {
+        joined: true,
+        value: (await existing.promise) as T,
+      };
+    } finally {
+      if (onProgress) existing.progressListeners.delete(onProgress);
+    }
+  }
+
+  const progressListeners = new Set<(stage: string) => void>();
+  if (onProgress) progressListeners.add(onProgress);
+  const active: ActiveMineruTask = {
+    promise: Promise.resolve(),
+    progressListeners,
+    lastProgress: "",
+  };
+  const report = (stage: string) => {
+    active.lastProgress = stage;
+    for (const listener of active.progressListeners) {
+      try {
+        listener(stage);
+      } catch {
+        /* ignore progress-listener failures */
+      }
+    }
+  };
+  active.promise = Promise.resolve()
+    .then(() => task(report))
+    .finally(() => {
+      if (activeTasks.get(attachmentId) === active) {
+        activeTasks.delete(attachmentId);
+      }
+    });
+  activeTasks.set(attachmentId, active);
+
+  try {
+    return { joined: false, value: (await active.promise) as T };
+  } finally {
+    if (onProgress) progressListeners.delete(onProgress);
+  }
 }
 
 export type MineruStatus = "cached" | "processing" | "failed" | "idle";
