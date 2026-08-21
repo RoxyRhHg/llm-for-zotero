@@ -29,6 +29,7 @@ describe("zotero_script chaining", function () {
     item: null,
     currentAnswerText: "",
     modelName: "test-model",
+    journalFallbackApproved: true,
   };
 
   function run(script: string) {
@@ -116,6 +117,7 @@ describe("zotero_script write-mode snapshotting", function () {
     item: null,
     currentAnswerText: "",
     modelName: "test-model",
+    journalFallbackApproved: true,
   };
 
   function installItem(over: Record<string, unknown>) {
@@ -223,6 +225,7 @@ describe("zotero_script scope control", function () {
     item: null,
     currentAnswerText: "",
     modelName: "test-model",
+    journalFallbackApproved: true,
   };
 
   it("refuses Zotero.DB to write scripts, which no mechanism can invert", async function () {
@@ -237,7 +240,7 @@ describe("zotero_script scope control", function () {
     const validated = tool.validate({
       mode: "write",
       script:
-        "env.addUndoStep(async () => {}); await Zotero.DB.queryAsync('DELETE FROM items'); return 'done';",
+        "env.addInverse({ version: 1, kind: 'library_operations', operations: [] }); await Zotero.DB.queryAsync('DELETE FROM items'); return 'done';",
       description: "raw sql",
     });
     assert.isTrue(validated.ok, JSON.stringify(validated));
@@ -309,6 +312,7 @@ describe("zotero_script sandbox engagement", function () {
     item: null,
     currentAnswerText: "",
     modelName: "test-model",
+    journalFallbackApproved: true,
   };
 
   it("compiles inside the sandbox when Components.utils is available", async function () {
@@ -368,7 +372,7 @@ describe("zotero_script sandbox engagement", function () {
     const validated = tool.validate({
       mode: "write",
       script:
-        "env.addUndoStep(async () => {}); await Zotero.DB.queryAsync('x');",
+        "env.addInverse({ version: 1, kind: 'library_operations', operations: [] }); await Zotero.DB.queryAsync('x');",
       description: "sql",
     });
     assert.isTrue(validated.ok);

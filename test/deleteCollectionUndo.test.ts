@@ -1,5 +1,6 @@
 import { assert } from "chai";
 import { LibraryMutationService } from "../src/agent/services/libraryMutationService";
+import { replayLibraryInverse } from "./helpers/replayLibraryInverse";
 
 /**
  * `delete_collection` used to call `eraseTx`, Zotero's *permanent* erase,
@@ -54,9 +55,7 @@ describe("delete_collection reversibility", function () {
       context,
     );
 
-    assert.deepEqual(calls.deleted, [
-      { collectionId: 42, deleteItems: undefined, permanent: undefined },
-    ]);
+    assert.deepEqual(calls.deleted, [{ collectionId: 42 }]);
     const result = (outcome.result as { result: { status: string } }).result;
     assert.equal(result.status, "trashed");
   });
@@ -69,12 +68,12 @@ describe("delete_collection reversibility", function () {
       { type: "delete_collection", collectionId: 42 },
       context,
     );
-    assert.exists(outcome.undo, "a delete must record an inverse");
-    assert.deepEqual(outcome.undo?.inverseOperations, [
+    assert.exists(outcome.inverse, "a delete must record an inverse");
+    assert.deepEqual(outcome.inverse?.inverseOperations, [
       { type: "restore_from_trash", collectionIds: [42] },
     ]);
 
-    await outcome.undo?.revert();
+    await replayLibraryInverse(service, outcome, context);
 
     // The original id comes back, so anything referencing it still resolves.
     // The old undo created a *new* collection with a new id instead.
@@ -110,7 +109,7 @@ describe("delete_collection reversibility", function () {
     ).result;
     assert.equal(result.status, "trashed");
     assert.equal(result.childCollectionCount, 2);
-    assert.exists(outcome.undo);
+    assert.exists(outcome.inverse);
   });
 
   it("restores trashed items too, but only when the delete took them", async function () {
@@ -121,14 +120,14 @@ describe("delete_collection reversibility", function () {
       { type: "delete_collection", collectionId: 42, deleteItems: true },
       context,
     );
-    assert.deepEqual(outcome.undo?.inverseOperations, [
+    assert.deepEqual(outcome.inverse?.inverseOperations, [
       {
         type: "restore_from_trash",
         collectionIds: [42],
         itemIds: [11, 12],
       },
     ]);
-    await outcome.undo?.revert();
+    await replayLibraryInverse(service, outcome, context);
 
     assert.deepEqual(calls.restoredCollections, [{ collectionIds: [42] }]);
     assert.deepEqual(calls.restoredItems, [{ itemIds: [11, 12] }]);
@@ -143,12 +142,10 @@ describe("delete_collection reversibility", function () {
       context,
     );
 
-    assert.deepEqual(calls.deleted, [
-      { collectionId: 42, deleteItems: undefined, permanent: true },
-    ]);
+    assert.deepEqual(calls.deleted, [{ collectionId: 42, permanent: true }]);
     const result = (outcome.result as { result: { status: string } }).result;
     assert.equal(result.status, "erased");
     // Promising a revert it cannot honour would be worse than admitting none.
-    assert.notExists(outcome.undo);
+    assert.notExists(outcome.inverse);
   });
 });

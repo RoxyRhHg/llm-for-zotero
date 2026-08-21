@@ -6,6 +6,7 @@ import { AgentRuntime } from "../src/agent/runtime";
 import { clearAgentReadLedger } from "../src/agent/context/resourceContextPlan";
 import { clearAgentCoverageLedger } from "../src/agent/context/coverageLedger";
 import { getAgentRunTrace } from "../src/agent/store/traceStore";
+import { initAgentChangeJournal } from "../src/agent/store/changeJournal";
 import { clearAgentTranscriptStore } from "../src/agent/store/transcriptStore";
 import {
   clearAgentToolResultHandleStore,
@@ -35,6 +36,7 @@ import type {
   AgentModelAdapter,
   AgentStepParams,
 } from "../src/agent/model/adapter";
+import { ChangeJournalTestDb } from "./helpers/changeJournalTestDb";
 
 type MockDbRow = Record<string, unknown>;
 
@@ -42,6 +44,7 @@ function installMockDb() {
   const runs = new Map<string, MockDbRow>();
   const events: MockDbRow[] = [];
   const prefs = new Map<string, unknown>();
+  const journalDb = new ChangeJournalTestDb();
   const originalZotero = (
     globalThis as typeof globalThis & { Zotero?: unknown }
   ).Zotero;
@@ -96,7 +99,7 @@ function installMockDb() {
           const run = runs.get(String(params[0]));
           return run ? [run] : [];
         }
-        return [];
+        return journalDb.queryAsync(sql, params);
       },
     },
     Prefs: {
@@ -1488,6 +1491,7 @@ describe("AgentRuntime", function () {
   it("issues one corrective continuation when an Obsidian note request finishes without a file write", async function () {
     const restoreDb = installMockDb();
     try {
+      await initAgentChangeJournal();
       (
         globalThis as typeof globalThis & {
           Zotero: {
@@ -1513,6 +1517,10 @@ describe("AgentRuntime", function () {
           requiresConfirmation: false,
         },
         validate: (args: unknown) => ({ ok: true, value: args }),
+        planMutation: async () => ({
+          effect: "write",
+          reversibility: "full",
+        }),
         execute: async (input) => {
           writes.push(input);
           return input;
@@ -1741,6 +1749,7 @@ describe("AgentRuntime", function () {
   it("does not force file writes after a standalone Zotero note request is satisfied", async function () {
     const restoreDb = installMockDb();
     try {
+      await initAgentChangeJournal();
       (
         globalThis as typeof globalThis & {
           Zotero: {
@@ -1779,6 +1788,10 @@ describe("AgentRuntime", function () {
           requiresConfirmation: false,
         },
         validate: (args: unknown) => ({ ok: true, value: args }),
+        planMutation: async () => ({
+          effect: "write",
+          reversibility: "full",
+        }),
         execute: async (input) => {
           noteWrites.push(input);
           return { status: "saved" };
@@ -1897,6 +1910,7 @@ describe("AgentRuntime", function () {
     const createdDirs: string[] = [];
     const writes: Array<{ path: string; text: string }> = [];
     try {
+      await initAgentChangeJournal();
       (
         globalThis as typeof globalThis & {
           Zotero: {
@@ -3893,6 +3907,7 @@ describe("shallow guard round-limit safety", function () {
   it("corrects the model once when a library write changed nothing", async function () {
     const restoreDb = installMockDb();
     try {
+      await initAgentChangeJournal();
       const registry = new AgentToolRegistry();
       registry.register({
         spec: {
@@ -3903,6 +3918,10 @@ describe("shallow guard round-limit safety", function () {
           requiresConfirmation: false,
         },
         validate: (args) => ({ ok: true, value: args as never }),
+        planMutation: async () => ({
+          effect: "write",
+          reversibility: "full",
+        }),
         async execute() {
           // The exact ledger shape the gateway returns when every row was
           // rejected: the operation ran, and nothing moved.
@@ -4099,6 +4118,7 @@ describe("shallow guard round-limit safety", function () {
   it("does not correct a zero-effect write that a later call superseded", async function () {
     const restoreDb = installMockDb();
     try {
+      await initAgentChangeJournal();
       let call = 0;
       const registry = new AgentToolRegistry();
       registry.register({
@@ -4110,6 +4130,10 @@ describe("shallow guard round-limit safety", function () {
           requiresConfirmation: false,
         },
         validate: (args) => ({ ok: true, value: args as never }),
+        planMutation: async () => ({
+          effect: "write",
+          reversibility: "full",
+        }),
         async execute() {
           call += 1;
           return call === 1

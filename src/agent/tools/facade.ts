@@ -103,6 +103,11 @@ export function createRenamedTool<TInput, TResult>(params: {
       : params.label
         ? { label: params.label }
         : undefined,
+    execute: (input, context) =>
+      tool.execute(input, {
+        ...context,
+        journalToolName: context.journalToolName || params.name,
+      }),
     createPendingAction: tool.createPendingAction
       ? async (input, context) =>
           clonePendingAction(
@@ -159,6 +164,22 @@ export function createDelegatingTool<TResult = unknown>(params: {
       }
       return tool.spec.requiresConfirmation;
     },
+    async planMutation(input, context) {
+      const tool = input.delegateTool;
+      if (tool.planMutation) {
+        return tool.planMutation(input.delegateInput, context);
+      }
+      const requiresConfirmation = tool.shouldRequireConfirmation
+        ? await tool.shouldRequireConfirmation(input.delegateInput, context)
+        : tool.spec.requiresConfirmation;
+      return {
+        effect: requiresConfirmation ? ("write" as const) : ("none" as const),
+        reversibility: "none" as const,
+        reason: requiresConfirmation
+          ? "The delegated operation did not provide a durable inverse plan."
+          : undefined,
+      };
+    },
     async acceptInheritedApproval(input, approval, context) {
       const tool = input.delegateTool;
       return Boolean(
@@ -197,9 +218,10 @@ export function createDelegatingTool<TResult = unknown>(params: {
     },
     async execute(input, context): Promise<AgentToolExecutionOutput<TResult>> {
       const tool = input.delegateTool;
-      return tool.execute(input.delegateInput, context) as Promise<
-        AgentToolExecutionOutput<TResult>
-      >;
+      return tool.execute(input.delegateInput, {
+        ...context,
+        journalToolName: context.journalToolName || params.name,
+      }) as Promise<AgentToolExecutionOutput<TResult>>;
     },
     async buildFollowupMessage(
       result: AgentToolResult,

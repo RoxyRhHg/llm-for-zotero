@@ -1,6 +1,7 @@
 import { assert } from "chai";
 import { ZoteroGateway } from "../src/agent/services/zoteroGateway";
 import { LibraryMutationService } from "../src/agent/services/libraryMutationService";
+import { replayLibraryInverse } from "./helpers/replayLibraryInverse";
 
 /**
  * Three object kinds the matrix declared operable and nothing implemented:
@@ -13,6 +14,7 @@ import { LibraryMutationService } from "../src/agent/services/libraryMutationSer
 describe("collections, tags and saved searches as objects", function () {
   let collections: Map<number, Record<string, unknown>>;
   let tagCalls: Array<[string, unknown[]]>;
+  let tagNames: Set<string>;
   let searches: Map<number, Record<string, unknown>>;
 
   function makeCollection(
@@ -42,17 +44,19 @@ describe("collections, tags and saved searches as objects", function () {
       [30, makeCollection(30, "Child", 10)],
     ]);
     tagCalls = [];
+    tagNames = new Set(["ML"]);
     searches = new Map();
 
     (globalThis as Record<string, unknown>).Zotero = {
       Collections: { get: (id: number) => collections.get(id) || null },
       Items: { get: () => null },
       Tags: {
-        getID: (name: string) =>
-          name === "ML" ? 7 : name === "gone" ? false : 8,
+        getID: (name: string) => (tagNames.has(name) ? 7 : false),
         getTagItems: async () => [1, 2, 3],
         rename: async (...args: unknown[]) => {
           tagCalls.push(["rename", args]);
+          tagNames.delete(String(args[1] || ""));
+          tagNames.add(String(args[2] || ""));
         },
         removeFromLibrary: async (...args: unknown[]) => {
           tagCalls.push(["removeFromLibrary", args]);
@@ -158,7 +162,7 @@ describe("collections, tags and saved searches as objects", function () {
         { request: { conversationKey: 1, libraryID: 1 } } as never,
       );
       assert.equal(collections.get(30)?.name, "Renamed");
-      await outcome.undo?.revert();
+      await replayLibraryInverse(service, outcome);
       assert.equal(collections.get(30)?.name, "Child");
       assert.equal(collections.get(30)?.parentID, 10);
     });
@@ -196,7 +200,7 @@ describe("collections, tags and saved searches as objects", function () {
       // Which items carried the tag is gone with it, so offering an undo
       // would promise a restore that restores nothing.
       assert.include(
-        outcome.undo?.irreversibleReason || "",
+        outcome.inverse?.irreversibleReason || "",
         "cannot be restored",
       );
     });
@@ -213,9 +217,38 @@ describe("collections, tags and saved searches as objects", function () {
         { request: { conversationKey: 1, libraryID: 1 } } as never,
       );
 
-      assert.notExists(outcome.undo?.inverseOperations);
+      assert.notExists(outcome.inverse?.inverseOperations);
       assert.include(
-        outcome.undo?.irreversibleReason || "",
+        outcome.inverse?.irreversibleReason || "",
+        "cannot be separated",
+      );
+    });
+
+    it("uses the same lossless-rename decision for planning and execution", async function () {
+      const service = new LibraryMutationService(gateway());
+      const operation = {
+        type: "update_library_tag" as const,
+        action: "rename" as const,
+        tag: "ML",
+        newTag: "machine learning",
+      };
+      const reversible = await service.planOperation(operation, {
+        request: { conversationKey: 1, libraryID: 1 },
+      } as never);
+      assert.equal(reversible.reversibility, "full");
+
+      tagNames.add("machine learning");
+      const lossy = await service.planOperation(operation, {
+        request: { conversationKey: 1, libraryID: 1 },
+      } as never);
+      const outcome = await service.executeOperation(operation, {
+        request: { conversationKey: 1, libraryID: 1 },
+      } as never);
+
+      assert.equal(lossy.reversibility, "none");
+      assert.notExists(outcome.inverse?.inverseOperations);
+      assert.include(
+        outcome.inverse?.irreversibleReason || "",
         "cannot be separated",
       );
     });
@@ -231,7 +264,7 @@ describe("collections, tags and saved searches as objects", function () {
         },
         { request: { conversationKey: 1, libraryID: 1 } } as never,
       );
-      await outcome.undo?.revert();
+      await replayLibraryInverse(service, outcome);
       assert.deepEqual(tagCalls.at(-1), [
         "rename",
         [1, "machine learning", "ML"],
@@ -309,7 +342,7 @@ describe("collections, tags and saved searches as objects", function () {
         },
         { request: { conversationKey: 1, libraryID: 1 } } as never,
       );
-      assert.exists(outcome.undo);
+      assert.exists(outcome.inverse);
     });
   });
 });

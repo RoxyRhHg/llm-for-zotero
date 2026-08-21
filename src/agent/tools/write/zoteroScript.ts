@@ -9,7 +9,20 @@
  */
 import type { AgentToolDefinition, AgentToolContext } from "../../types";
 import { ok, fail, validateObject } from "../shared";
-import { pushUndoEntry } from "../../store/undoStore";
+import {
+  currentMutationActionId,
+  executeExternalMutation,
+} from "../../services/mutationCoordinator";
+import { listJournalObservationObjectIds } from "../../store/changeJournal";
+import {
+  sha256Bytes,
+  sha256Text,
+  storeRecoveryText,
+} from "../../store/journalRecoveryBlobStore";
+import { zoteroChangeDispatcher } from "../../../services/zoteroChangeDispatcher";
+import { LibraryMutationService } from "../../services/libraryMutationService";
+import { ZoteroGateway } from "../../services/zoteroGateway";
+import { parseInverseValue } from "../../services/changeReverter";
 
 // ── Types ───────────────────────────────────────────────────────────────────
 
@@ -25,10 +38,10 @@ type ZoteroScriptRuntimeOptions = {
   allowUnsandboxedTestExecution?: boolean;
 };
 
-type ItemSnapshot = {
+export type ItemSnapshot = {
   itemId: number;
   fields: Record<string, string>;
-  tags: Array<{ tag: string }>;
+  tags: Array<{ tag: string; type?: number }>;
   collectionIds: number[];
   creators: unknown[];
   /**
@@ -64,7 +77,8 @@ type ScriptResult = {
   /** True when `output` was cut short, so the caller can say so out loud. */
   outputTruncated?: boolean;
   snapshots: Map<number, ItemSnapshot>;
-  undoSteps: Array<() => Promise<void>>;
+  declarativeInverses: unknown[];
+  createdItemIds: Set<number>;
   error?: string;
 };
 
@@ -256,11 +270,16 @@ function captureItemSnapshot(item: any): ItemSnapshot {
       /* field may not be valid for this item type */
     }
   }
-  let tags: Array<{ tag: string }> = [];
+  let tags: Array<{ tag: string; type?: number }> = [];
   try {
-    tags = (item.getTags?.() || []).map((t: any) => ({
-      tag: String(t.tag || t),
-    }));
+    tags = (item.getTags?.() || []).map((entry: any) => {
+      const tag = String(entry?.tag || entry || "");
+      const type = Number(entry?.type);
+      return {
+        tag,
+        ...(Number.isFinite(type) ? { type } : {}),
+      };
+    });
   } catch {
     /* ignore */
   }
@@ -301,155 +320,146 @@ function captureItemSnapshot(item: any): ItemSnapshot {
   };
 }
 
-// ── Undo ────────────────────────────────────────────────────────────────────
-
-function buildRevertFunction(
-  snapshots: Map<number, ItemSnapshot>,
-  undoSteps: Array<() => Promise<void>>,
-): () => Promise<void> {
-  return async () => {
-    // Restore snapshots
-    for (const snapshot of snapshots.values()) {
+function captureScriptItemPostconditions(itemIds: Iterable<number>): unknown[] {
+  return [...new Set(itemIds)]
+    .sort((left, right) => left - right)
+    .map((itemId) => {
+      const item = (
+        Zotero as unknown as { Items?: { get?: (id: number) => any } }
+      ).Items?.get?.(itemId);
+      if (!item) return { itemId, exists: false };
+      let json: unknown;
       try {
-        const item = (Zotero as any).Items.get(snapshot.itemId);
-        if (!item) continue;
-
-        // Restore the item type FIRST. Zotero drops fields that are invalid
-        // for the current type, so setting fields before the type would throw
-        // them away again.
-        try {
-          if (
-            snapshot.itemTypeID !== undefined &&
-            item.itemTypeID !== snapshot.itemTypeID
-          ) {
-            item.setType(snapshot.itemTypeID);
-          }
-        } catch {
-          /* ignore */
-        }
-
-        // Restore anything the flat field list does not cover, from the full
-        // pre-image, before the explicit restores below take precedence.
-        try {
-          if (snapshot.json && typeof item.fromJSON === "function") {
-            item.fromJSON(snapshot.json);
-          }
-        } catch {
-          /* a partial restore is better than none */
-        }
-
-        // Restore parenting and trash state.
-        try {
-          if (item.parentID !== snapshot.parentID) {
-            item.parentID = snapshot.parentID ?? false;
-          }
-        } catch {
-          /* ignore */
-        }
-        try {
-          if (
-            snapshot.deleted !== undefined &&
-            item.deleted !== snapshot.deleted
-          ) {
-            item.deleted = snapshot.deleted;
-          }
-        } catch {
-          /* ignore */
-        }
-        try {
-          if (
-            snapshot.noteHtml !== undefined &&
-            typeof item.setNote === "function"
-          ) {
-            item.setNote(snapshot.noteHtml);
-          }
-        } catch {
-          /* ignore */
-        }
-
-        // Restore fields
-        for (const [field, value] of Object.entries(snapshot.fields)) {
-          try {
-            item.setField(field, value);
-          } catch {
-            /* skip invalid fields */
-          }
-        }
-
-        // Restore creators
-        try {
-          if (Array.isArray(snapshot.creators) && item.setCreators) {
-            item.setCreators(snapshot.creators);
-          }
-        } catch {
-          /* ignore */
-        }
-
-        // Restore tags: remove added, re-add removed
-        const currentTagList: string[] = (item.getTags?.() || []).map(
-          (t: any) => String(t.tag || t),
-        );
-        const currentTags = new Set(currentTagList);
-        const snapshotTags = new Set(snapshot.tags.map((t) => t.tag));
-        for (const tag of currentTagList) {
-          if (!snapshotTags.has(tag)) {
-            try {
-              item.removeTag(tag);
-            } catch {
-              /* ignore */
-            }
-          }
-        }
-        for (const { tag } of snapshot.tags) {
-          if (!currentTags.has(tag)) {
-            try {
-              item.addTag(tag);
-            } catch {
-              /* ignore */
-            }
-          }
-        }
-
-        // Restore collections: remove added, re-add removed
-        const currentColls = new Set<number>(item.getCollections?.() || []);
-        const snapshotColls = new Set(snapshot.collectionIds);
-        for (const id of currentColls) {
-          if (!snapshotColls.has(id)) {
-            try {
-              item.removeFromCollection(id);
-            } catch {
-              /* ignore */
-            }
-          }
-        }
-        for (const id of snapshotColls) {
-          if (!currentColls.has(id)) {
-            try {
-              item.addToCollection(id);
-            } catch {
-              /* ignore */
-            }
-          }
-        }
-
-        await item.saveTx();
-      } catch (error) {
-        Zotero.debug?.(
-          `[llm-for-zotero] Undo snapshot restore failed for item ${snapshot.itemId}: ${
-            error instanceof Error ? error.message : String(error)
-          }`,
-        );
-      }
-    }
-
-    // Run custom undo steps in reverse
-    for (const step of [...undoSteps].reverse()) {
-      try {
-        await step();
+        json = item.toJSON?.();
       } catch {
-        /* ignore */
+        json = undefined;
       }
+      return {
+        itemId,
+        exists: true,
+        json,
+        parentID: Number(item.parentID) || null,
+        deleted: item.deleted === true,
+        tags: item.getTags?.() || [],
+        collectionIds: item.getCollections?.() || [],
+        noteHtml: captureNoteHtml(item),
+      };
+    });
+}
+
+async function captureScriptFilePostcondition(path: string): Promise<{
+  kind: "file";
+  path: string;
+  exists: boolean;
+  checksum: string | null;
+}> {
+  const io = (globalThis as { IOUtils?: any }).IOUtils;
+  const exists = Boolean(await io?.exists?.(path));
+  if (!exists) return { kind: "file", path, exists: false, checksum: null };
+  if (typeof io?.read !== "function") {
+    throw new Error(`Cannot guard declarative file inverse for ${path}`);
+  }
+  const bytes = new Uint8Array(await io.read(path));
+  return {
+    kind: "file",
+    path,
+    exists: true,
+    checksum: await sha256Bytes(bytes),
+  };
+}
+
+async function captureDeclaredInverseGuards(
+  values: unknown[],
+  context: AgentToolContext,
+): Promise<{ guards: unknown[]; itemIds: number[] }> {
+  const gateway = new ZoteroGateway();
+  const service = new LibraryMutationService(gateway);
+  const guards: unknown[] = [];
+  const itemIds = new Set<number>();
+  for (const value of values) {
+    const inverse = parseInverseValue(value);
+    if (!inverse || inverse.kind === "script_snapshots") {
+      throw new Error(
+        "env.addInverse recorded an unsupported declarative inverse",
+      );
     }
+    if (inverse.kind === "library_operations") {
+      for (const operation of inverse.operations) {
+        const state = await service.captureOperationState(operation, context);
+        for (const item of state.items || []) itemIds.add(item.itemId);
+        guards.push({ kind: "library_operation", operation, state });
+      }
+      continue;
+    }
+    if (inverse.kind === "note_html") {
+      const item = gateway.getItem(inverse.noteId);
+      itemIds.add(inverse.noteId);
+      guards.push({
+        kind: "note_html",
+        noteId: inverse.noteId,
+        checksum: await sha256Text(item?.getNote?.() || ""),
+      });
+      continue;
+    }
+    if (inverse.kind === "file") {
+      guards.push(await captureScriptFilePostcondition(inverse.path));
+      continue;
+    }
+    const setting = gateway
+      .listSettings()
+      .find((entry) => entry.key === inverse.key);
+    guards.push({
+      kind: "preference",
+      key: inverse.key,
+      existed: setting?.value !== undefined,
+      value: setting?.value,
+    });
+  }
+  return { guards, itemIds: [...itemIds] };
+}
+
+async function captureScriptPostcondition(
+  itemIds: Iterable<number>,
+  declarativeInverses: unknown[],
+  context: AgentToolContext,
+): Promise<{ postcondition: unknown; guardedItemIds: number[] }> {
+  const declared = await captureDeclaredInverseGuards(
+    declarativeInverses,
+    context,
+  );
+  const guardedItemIds = [...new Set([...itemIds, ...declared.itemIds])].sort(
+    (left, right) => left - right,
+  );
+  return {
+    postcondition: {
+      kind: "script_effects",
+      items: captureScriptItemPostconditions(guardedItemIds),
+      declared: declared.guards,
+    },
+    guardedItemIds,
+  };
+}
+
+function scriptResultContent(
+  input: ZoteroScriptInput,
+  result: ScriptResult,
+  uncoveredObservedIds: number[] = [],
+): Record<string, unknown> {
+  return {
+    mode: input.mode,
+    description: input.description,
+    output: result.output,
+    returnValue: result.returnValue,
+    outputTruncated: result.outputTruncated || undefined,
+    itemsAffected: new Set([
+      ...result.snapshots.keys(),
+      ...result.createdItemIds,
+    ]).size,
+    declaredInverseCount: result.declarativeInverses.length || undefined,
+    uncoveredObservedIds: uncoveredObservedIds.length
+      ? uncoveredObservedIds
+      : undefined,
+    error: result.error || undefined,
   };
 }
 
@@ -464,7 +474,8 @@ async function executeScript(params: {
 }): Promise<ScriptResult> {
   const logBuffer: string[] = [];
   const snapshots = new Map<number, ItemSnapshot>();
-  const undoSteps: Array<() => Promise<void>> = [];
+  const declarativeInverses: unknown[] = [];
+  const createdItemIds = new Set<number>();
   const isWrite = params.mode === "write";
   const deadline = Date.now() + params.timeoutMs;
 
@@ -502,9 +513,39 @@ async function executeScript(params: {
         }
       }
     },
-    addUndoStep: (fn: () => Promise<void>) => {
-      if (!isWrite) return; // no-op in read mode
-      undoSteps.push(fn);
+    addInverse: (inverse: unknown) => {
+      if (!isWrite) return;
+      try {
+        // Cross-realm functions and cyclic objects must never enter the
+        // durable journal. A JSON round-trip also gives us detached data.
+        const serialized = JSON.stringify(inverse);
+        if (!serialized || serialized === "null") {
+          throw new Error("inverse must be a serializable object");
+        }
+        declarativeInverses.push(JSON.parse(serialized) as unknown);
+      } catch (error) {
+        throw new Error(
+          `env.addInverse requires declarative JSON data: ${
+            error instanceof Error ? error.message : String(error)
+          }`,
+        );
+      }
+    },
+    recordCreatedItem: (itemOrId: unknown) => {
+      if (!isWrite) return;
+      const id = Math.floor(
+        Number(
+          itemOrId && typeof itemOrId === "object"
+            ? (itemOrId as { id?: unknown }).id
+            : itemOrId,
+        ),
+      );
+      if (!Number.isFinite(id) || id <= 0) {
+        throw new Error(
+          "env.recordCreatedItem requires a saved item or item ID",
+        );
+      }
+      createdItemIds.add(id);
     },
   };
 
@@ -542,7 +583,8 @@ async function executeScript(params: {
             logBuffer.join("\n") +
             `\n[Script exceeded its ${params.timeoutMs}ms deadline and then failed: ${message}]`,
           snapshots,
-          undoSteps,
+          declarativeInverses,
+          createdItemIds,
           error: message,
         };
       }
@@ -552,7 +594,8 @@ async function executeScript(params: {
           `\n[Script exceeded its ${params.timeoutMs}ms deadline but was allowed to settle before this result was returned. Check env.shouldStop() inside long loops and return early.]`,
         returnValue: settledValue,
         snapshots,
-        undoSteps,
+        declarativeInverses,
+        createdItemIds,
         error: `Script timed out after ${params.timeoutMs}ms`,
       };
     }
@@ -568,14 +611,16 @@ async function executeScript(params: {
       outputTruncated: truncated,
       returnValue: raceResult,
       snapshots,
-      undoSteps,
+      declarativeInverses,
+      createdItemIds,
     };
   } catch (error) {
     const errMsg = error instanceof Error ? error.message : String(error);
     return {
       output: logBuffer.join("\n") + `\n[Error: ${errMsg}]`,
       snapshots,
-      undoSteps,
+      declarativeInverses,
+      createdItemIds,
       error: errMsg,
     };
   }
@@ -593,7 +638,9 @@ function resolveLibraryID(context: AgentToolContext): number {
 }
 
 function hasUndoInstrumentation(script: string): boolean {
-  return /\benv\s*\.\s*(?:snapshot|addUndoStep)\s*\(/.test(script);
+  return /\benv\s*\.\s*(?:snapshot|addInverse|recordCreatedItem)\s*\(/.test(
+    script,
+  );
 }
 
 function attemptsDirectNoteWrite(script: string): boolean {
@@ -617,7 +664,8 @@ Your script receives two globals:
 - \`env.libraryID\`: number (active library ID)
 - \`env.log(msg)\`: append output (shown to user / returned to agent)
 - \`env.snapshot(item)\`: capture item state for undo (write mode only, call BEFORE mutating)
-- \`env.addUndoStep(fn)\`: register custom undo function (write mode only)
+- \`env.addInverse(data)\`: register a supported declarative inverse as JSON data
+- \`env.recordCreatedItem(itemOrId)\`: record a newly saved item so undo can trash it
 
 ### Write mode template
 \`\`\`javascript
@@ -674,7 +722,7 @@ several areas have no typed tool at all — reach for them directly:
 - Create collection: \`const c = new Zotero.Collection(); c.libraryID = env.libraryID; c.name = "Name"; await c.saveTx();\`
 
 ### Rules
-1. Write mode: ALWAYS call \`env.snapshot(item)\` before mutating any item (enables undo)
+1. Write mode: ALWAYS call \`env.snapshot(item)\` before mutating an existing item. For newly saved items call \`env.recordCreatedItem(item)\`. For non-item changes use \`env.addInverse(data)\`; callback undo functions are rejected because they do not survive restart.
 2. Write mode: ALWAYS call \`await item.saveTx()\` after mutations
 3. Use \`env.log(msg)\` for PROGRESS ONLY — the log is capped at 8000 characters and is truncated silently past that. **Return your data instead**: whatever the script returns is delivered to you in full. \`return itemIds\` beats logging four hundred lines of them.
 3a. For results too large to hold in one turn, write them to a file with \`IOUtils.writeUTF8(path, JSON.stringify(data))\` and read them back in pages with \`file_io\`. The filesystem is your scratch space between steps.
@@ -682,7 +730,7 @@ several areas have no typed tool at all — reach for them directly:
 5. Do NOT use \`eraseTx()\` — use Zotero trash instead (item.deleted = true; await item.saveTx())
 6. Do NOT create or edit Zotero notes here. Use note_write for all Zotero note creation, edits, and appends so note validation still runs.
 7. Write mode runs with \`Zotero.DB\` withheld: raw SQL emits no change notifications and cannot be undone, so use the item and collection APIs. Read mode keeps it.
-8. Write straightforward code — no dry-run branching needed. The script runs directly, and undo_last_action uses snapshots/custom undo steps to revert it.
+8. Write straightforward code — no dry-run branching needed. The script runs directly, and undo_last_action uses durable snapshots and declarative inverses to revert covered effects.
 9. In any loop over more than a few dozen items, check \`env.shouldStop()\` and return early when it is true. The timeout cannot interrupt a running script — it only stops *waiting* for it — so a script that ignores this keeps mutating the library after the tool has already reported failure, and those later changes cannot be undone. Return partial results; a partial answer you can undo beats a complete one you cannot.
    \`\`\`
    const done = [];
@@ -706,8 +754,8 @@ export function createZoteroScriptTool(
         "Execute a JavaScript script inside Zotero's runtime with full API access. " +
         "All scripts require source review because the Zotero API is privileged. " +
         "Two modes: mode:'read' for gathering data without undo instrumentation; " +
-        "mode:'write' for mutations (runs directly with undo support; env.snapshot(item) or env.addUndoStep(fn) is required). " +
-        "The script receives the global Zotero object and an env helper (env.log, env.snapshot, env.addUndoStep, env.libraryID, env.shouldStop, env.remainingMs). " +
+        "mode:'write' for mutations (runs directly with durable recovery; env.snapshot(item), env.recordCreatedItem(item), or env.addInverse(data) is required). " +
+        "The script receives the global Zotero object and an env helper (env.log, env.snapshot, env.recordCreatedItem, env.addInverse, env.libraryID, env.shouldStop, env.remainingMs). " +
         "Long loops must check env.shouldStop() and return early; an over-deadline script is allowed to settle before the tool returns. " +
         "Not for ordinary Zotero paper/library reading when semantic Zotero tools can answer.",
       inputSchema: {
@@ -802,7 +850,7 @@ export function createZoteroScriptTool(
       const script = args.script.trim();
       if (mode === "write" && !hasUndoInstrumentation(script)) {
         return fail(
-          "mode 'write' scripts must call env.snapshot(item) before mutating Zotero items, or env.addUndoStep(fn) for custom changes, so undo_last_action can revert the operation",
+          "mode 'write' scripts must call env.snapshot(item) before mutating existing items, env.recordCreatedItem(item) after creating items, or env.addInverse(data) for supported custom changes, so the durable journal can describe recovery",
         );
       }
       // Not gated on mode: `mode` is a declaration, not a sandbox — the
@@ -841,6 +889,25 @@ export function createZoteroScriptTool(
       return true;
     },
 
+    planMutation(input) {
+      if (input.mode === "read") {
+        return {
+          effect: "write",
+          reversibility: "none",
+          requiresConfirmation: true,
+          reason:
+            "Read mode relaxes undo instrumentation but still exposes mutable privileged APIs, so effects cannot be proven absent or recovered.",
+        };
+      }
+      return {
+        effect: "write",
+        reversibility: "partial",
+        requiresConfirmation: true,
+        reason:
+          "Only snapshotted, explicitly created, and declaratively inverted effects can be recovered.",
+      };
+    },
+
     createPendingAction(input) {
       return {
         toolName: "zotero_script",
@@ -874,40 +941,106 @@ export function createZoteroScriptTool(
 
     async execute(input, context) {
       const libraryID = resolveLibraryID(context);
+      const isWrite = input.mode === "write";
 
-      const result = await executeScript({
-        script: input.script,
-        mode: input.mode,
-        timeoutMs: input.timeoutMs,
-        libraryID,
-        runtimeOptions,
+      return executeExternalMutation({
+        context,
+        toolName: "zotero_script",
+        plan: {
+          operation: "zotero_script",
+          description: input.description,
+          forward: {
+            script: input.script,
+            mode: input.mode,
+            libraryID,
+            timeoutMs: input.timeoutMs,
+          },
+          reversibility: isWrite ? "partial" : "none",
+          deferredInverse: isWrite,
+          reason: isWrite
+            ? "Only snapshotted, explicitly created, and declaratively inverted effects are covered."
+            : "Read mode exposes mutable privileged APIs without undo instrumentation, so any effects are irreversible.",
+        },
+        execute: async () => {
+          const result = await executeScript({
+            script: input.script,
+            mode: input.mode,
+            timeoutMs: input.timeoutMs,
+            libraryID,
+            runtimeOptions,
+          });
+          await zoteroChangeDispatcher.flush();
+          const actionId = currentMutationActionId();
+          const observedIds = actionId
+            ? await listJournalObservationObjectIds(actionId)
+            : [];
+          if (!isWrite) {
+            return {
+              result: scriptResultContent(input, result, observedIds),
+              reversibility: "none" as const,
+              reason:
+                "Read mode exposes mutable privileged APIs without undo instrumentation, so the journal conservatively records the invocation as irreversible.",
+              affectedCount: observedIds.length || 1,
+              // The API is not structurally read-only, and raw DB effects do
+              // not emit notifier events. Treating the invocation as no-effect
+              // would recreate the exact unjournalled-write escape hatch this
+              // coordinator is meant to close.
+              changed: true,
+            };
+          }
+          const instrumentedIds = new Set([
+            ...result.snapshots.keys(),
+            ...result.createdItemIds,
+          ]);
+          const capturedPostcondition = await captureScriptPostcondition(
+            instrumentedIds,
+            result.declarativeInverses,
+            context,
+          );
+          const coveredIds = new Set(capturedPostcondition.guardedItemIds);
+          const uncoveredObservedIds = observedIds.filter(
+            (itemId) => !coveredIds.has(itemId),
+          );
+          const snapshots = [...result.snapshots.values()];
+          const createdItemIds = [...result.createdItemIds];
+          const inverse =
+            snapshots.length ||
+            createdItemIds.length ||
+            result.declarativeInverses.length
+              ? {
+                  version: 1,
+                  kind: "script_snapshots",
+                  payload: await storeRecoveryText(
+                    JSON.stringify({
+                      snapshots,
+                      createdItemIds,
+                      declaredInverses: result.declarativeInverses,
+                    }),
+                  ),
+                }
+              : undefined;
+          const reversibility = inverse ? "partial" : "none";
+          const reason = uncoveredObservedIds.length
+            ? `Notifier observations included uncovered item IDs: ${uncoveredObservedIds.join(", ")}.`
+            : result.error
+              ? `The script reported an error after execution began: ${result.error}`
+              : "Arbitrary script effects outside declared snapshots and inverses cannot be proven recoverable.";
+          return {
+            result: scriptResultContent(input, result, uncoveredObservedIds),
+            inverse,
+            expectedPostcondition: inverse
+              ? capturedPostcondition.postcondition
+              : undefined,
+            reversibility,
+            reason,
+            affectedCount: coveredIds.size,
+            // A write-mode script is conservatively treated as an effect even
+            // when it forgot to declare coverage. That truthfully records an
+            // irreversible action instead of silently calling it a no-op.
+            changed: true,
+          };
+        },
       });
-
-      // Register undo for write mode
-      if (
-        input.mode === "write" &&
-        (result.snapshots.size > 0 || result.undoSteps.length > 0)
-      ) {
-        pushUndoEntry(context.request.conversationKey, {
-          id: `undo-zotero_script-${Date.now()}`,
-          toolName: "zotero_script",
-          description: `Undo: ${input.description} (${result.snapshots.size} item${result.snapshots.size === 1 ? "" : "s"} snapshotted)`,
-          revert: buildRevertFunction(result.snapshots, result.undoSteps),
-        });
-      }
-
-      return {
-        mode: input.mode,
-        description: input.description,
-        output: result.output,
-        // The script's own return value, delivered whole. Logging is for
-        // progress; data should be returned, and large results should be
-        // written to a file and read back in pages.
-        returnValue: result.returnValue,
-        outputTruncated: result.outputTruncated || undefined,
-        itemsAffected: result.snapshots.size,
-        error: result.error || undefined,
-      };
     },
   };
 }

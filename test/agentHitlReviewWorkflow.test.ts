@@ -16,6 +16,7 @@ import type {
   AgentModelAdapter,
   AgentStepParams,
 } from "../src/agent/model/adapter";
+import { initAgentChangeJournal } from "../src/agent/store/changeJournal";
 
 type MockDbRow = Record<string, unknown>;
 
@@ -219,6 +220,7 @@ describe("AgentRuntime HITL review workflow", function () {
   it("routes approved metadata reviews directly into a metadata update review", async function () {
     const restoreDb = installMockDb();
     try {
+      await initAgentChangeJournal();
       const registry = new AgentToolRegistry();
       registry.register(
         createStubSearchTool(async () => ({
@@ -369,6 +371,7 @@ describe("AgentRuntime HITL review workflow", function () {
   it("can import selected reviewed papers through library_import", async function () {
     const restoreDb = installMockDb();
     try {
+      await initAgentChangeJournal();
       const registry = new AgentToolRegistry();
       registry.register(
         createStubSearchTool(async () => ({
@@ -476,6 +479,7 @@ describe("AgentRuntime HITL review workflow", function () {
   it("can save reviewed papers into a note through note_write", async function () {
     const restoreDb = installMockDb();
     try {
+      await initAgentChangeJournal();
       const registry = new AgentToolRegistry();
       registry.register(
         createStubSearchTool(async () => ({
@@ -574,6 +578,7 @@ describe("AgentRuntime HITL review workflow", function () {
   it("can rerun the online search from the review card without resuming model reasoning", async function () {
     const restoreDb = installMockDb();
     try {
+      await initAgentChangeJournal();
       const searchQueries: string[] = [];
       const searchWorkflows: unknown[] = [];
       const registry = new AgentToolRegistry();
@@ -682,6 +687,7 @@ describe("AgentRuntime HITL review workflow", function () {
   it("stops immediately when the user cancels the review card", async function () {
     const restoreDb = installMockDb();
     try {
+      await initAgentChangeJournal();
       const registry = new AgentToolRegistry();
       registry.register(
         createStubSearchTool(async () => ({

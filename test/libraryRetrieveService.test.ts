@@ -208,6 +208,79 @@ function makeGateway(
         totalCount: tagItems.length,
       };
     },
+    resolveLibraryScopeItemIds: async ({
+      itemIds = [],
+      collectionIds = [],
+      tagContexts = [],
+    }: {
+      itemIds?: number[];
+      collectionIds?: number[];
+      tagContexts?: Array<{
+        name: string;
+        normalizedName?: string;
+        scope?: "allTagged" | "untagged";
+      }>;
+    }) => {
+      const union = new Set<number>();
+      const tagItemIds = new Set<number>();
+      let summedScopeCount = 0;
+      const add = (
+        scopedEntries: ReturnType<typeof makeItem>[],
+        tagScope = false,
+      ) => {
+        for (const entry of scopedEntries) {
+          union.add(entry.target.itemId);
+          if (tagScope) tagItemIds.add(entry.target.itemId);
+        }
+        return scopedEntries.length;
+      };
+
+      add(
+        itemIds
+          .map((itemId) => byItemId.get(itemId))
+          .filter((entry): entry is ReturnType<typeof makeItem> =>
+            Boolean(entry),
+          ),
+      );
+
+      const collectionNames: string[] = [];
+      for (const collectionId of collectionIds) {
+        collectionNames.push(`Root / Collection ${collectionId}`);
+        const matches = collectionItems.filter((entry) =>
+          entry.target.collectionIds.includes(collectionId),
+        );
+        summedScopeCount += add(matches);
+      }
+
+      const tagNames: string[] = [];
+      for (const tagContext of tagContexts) {
+        tagNames.push(tagContext.name);
+        const normalizedName = (
+          tagContext.normalizedName || tagContext.name
+        ).toLowerCase();
+        const matches = entries.filter((entry) => {
+          if (tagContext.scope === "allTagged") {
+            return entry.target.tags.length > 0;
+          }
+          if (tagContext.scope === "untagged") {
+            return entry.target.tags.length === 0;
+          }
+          return entry.target.tags.some(
+            (tag) =>
+              tag === tagContext.name || tag.toLowerCase() === normalizedName,
+          );
+        });
+        summedScopeCount += add(matches, true);
+      }
+
+      return {
+        itemIds: [...union],
+        tagItemIds: [...tagItemIds],
+        collectionNames,
+        tagNames,
+        summedScopeCount,
+      };
+    },
     getBibliographicItemTargetsByItemIds: (itemIds: number[]) =>
       itemIds
         .map((itemId) => byItemId.get(itemId)?.target)
@@ -1720,6 +1793,57 @@ describe("LibraryRetrieveService", function () {
     assert.deepEqual(
       result.candidates.map((candidate) => candidate.itemId),
       ["8"],
+    );
+  });
+
+  it("quicksearches explicit items alongside a tag scope in one mixed union", async function () {
+    const explicitTagged = makeItem(1, "Explicit tagged paper", "", {
+      hasPdf: true,
+      tags: ["Stable"],
+    });
+    const untagged = makeItem(8, "Untagged paper", "", {
+      hasPdf: true,
+      tags: [],
+    });
+    const quicksearchCalls: Array<{
+      query?: string;
+      allowedItemIds?: number[];
+    }> = [];
+    const service = new LibraryRetrieveService(
+      makeGateway([explicitTagged, untagged], {
+        quicksearchCalls,
+        quicksearchItemIds: [1],
+      }) as any,
+      { ensurePaperContext: async () => makePdfContext([]) } as any,
+      async () => [],
+    );
+
+    const result = await service.retrieve({
+      scope: {
+        libraryID: 1,
+        itemIds: [1],
+        tagScopes: ["untagged"],
+      },
+      query: "rare explicit indexed phrase",
+      intent: "enumerate",
+      depth: "evidence",
+      methods: ["metadata", "fts"],
+      request: {
+        conversationKey: 1,
+        mode: "agent",
+        userText: "Search this item and untagged papers",
+        libraryID: 1,
+      },
+    });
+
+    assert.deepEqual(quicksearchCalls[0]?.allowedItemIds, [8]);
+    assert.deepEqual(quicksearchCalls[1]?.allowedItemIds, [1]);
+    assert.equal(result.resourcePool.type, "mixed");
+    assert.equal(result.resourcePool.queryCoverage.indexedTextMatched, 1);
+    assert.equal(result.candidates[0]?.itemId, "1");
+    assert.include(
+      result.paperMatches.find((match) => match.itemId === "1")?.basis || [],
+      "indexed_text",
     );
   });
 

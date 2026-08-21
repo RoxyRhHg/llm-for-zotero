@@ -13,7 +13,7 @@ import {
   openStandaloneChat,
 } from "./modules/contextPanel";
 import { resolveActiveLibraryID } from "./modules/contextPanel/portalScope";
-import { invalidatePaperSearchCache } from "./modules/contextPanel/paperSearch";
+import { zoteroChangeDispatcher } from "./services/zoteroChangeDispatcher";
 import { registerZoteroItemContextMenu } from "./modules/contextPanel/zoteroItemContextMenu";
 import { initChatStore } from "./utils/chatStore";
 import { initClaudeCodeStore } from "./claudeCode/store";
@@ -437,10 +437,6 @@ async function onMainWindowUnload(win: Window): Promise<void> {
 }
 
 function onShutdown(): void {
-  if (paperSearchInvalidateTimer !== null) {
-    clearTimeout(paperSearchInvalidateTimer);
-    paperSearchInvalidateTimer = null;
-  }
   ztoolkit.unregisterAll();
   unregisterReaderSelectionTracking();
   unregisterAllNoteEditingSelectionTracking();
@@ -482,14 +478,8 @@ function onShutdown(): void {
  * This function is just an example of dispatcher for Notify events.
  * Any operations should be placed in a function to keep this funcion clear.
  */
-let paperSearchInvalidateTimer: ReturnType<typeof setTimeout> | null = null;
-
-export function flushPaperSearchInvalidationForTests(): void {
-  if (paperSearchInvalidateTimer !== null) {
-    clearTimeout(paperSearchInvalidateTimer);
-    paperSearchInvalidateTimer = null;
-  }
-  invalidatePaperSearchCache();
+export async function flushPaperSearchInvalidationForTests(): Promise<void> {
+  await zoteroChangeDispatcher.flush();
 }
 
 async function onNotify(
@@ -498,21 +488,7 @@ async function onNotify(
   ids: Array<string | number>,
   extraData: { [key: string]: any },
 ) {
-  const shouldInvalidatePaperSearch =
-    (type === "item" || type === "file") &&
-    ["add", "modify", "delete", "move", "remove", "trash", "refresh"].includes(
-      event,
-    );
-  if (shouldInvalidatePaperSearch) {
-    // Debounce: during bulk operations (import, sync) this fires hundreds
-    // of times — coalesce into a single invalidation after 500ms of quiet.
-    if (paperSearchInvalidateTimer !== null)
-      clearTimeout(paperSearchInvalidateTimer);
-    paperSearchInvalidateTimer = setTimeout(() => {
-      paperSearchInvalidateTimer = null;
-      invalidatePaperSearchCache();
-    }, 500);
-  }
+  await zoteroChangeDispatcher.dispatch({ event, type, ids, extraData });
   // You can add your code to the corresponding notify type
   ztoolkit.log("notify", event, type, ids, extraData);
   return;

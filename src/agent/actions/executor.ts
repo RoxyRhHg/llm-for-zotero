@@ -43,6 +43,8 @@ function buildToolContext(
     item: syntheticItem,
     currentAnswerText: "",
     modelName: "action",
+    journalActionScope: ctx.journalActionScope,
+    journalToolName: ctx.journalToolName,
   };
 }
 
@@ -114,7 +116,13 @@ export async function callTool(
     // An action is started by an explicit user gesture (a slash command or
     // the action picker), which is its own consent — autonomy gates that
     // bound the model's tool loop do not apply here.
-    { callerKind: "action" },
+    {
+      callerKind: "action",
+      // Native action pages are an explicit review workflow. Preserve that
+      // workflow even when the operation is fully reversible and the global
+      // write mode would otherwise auto-approve it.
+      forceConfirmation: ctx.confirmationMode !== "auto_approve",
+    },
   );
 
   if (prepared.kind === "result") {

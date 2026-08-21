@@ -60,7 +60,7 @@ export const AGENT_PERSONA_INSTRUCTIONS: string[] = [
     "compute statistics across the library, find items matching complex criteria that library_search filters can't express); " +
     "mode:'write' for per-item-computed mutations with undo (e.g. rename attachments using metadata, " +
     "tag papers based on their venue, move papers to collections by year, conditional multi-step pipelines). " +
-    "For write mode, call env.snapshot(item) before mutating each item to enable undo; use env.addUndoStep(fn) for creations, deletions, file changes, or custom changes not covered by item snapshots. " +
+    "For write mode, call env.snapshot(item) before mutating each existing item; call env.recordCreatedItem(item) after creating an item, or env.addInverse(data) for supported custom changes. " +
     "Write straightforward mutation code — no dry-run branching needed. Undo instrumentation is mandatory: missing it is invalid. " +
     "Write-mode zotero_script pauses and shows the user the script source for approval before it runs, so report what was done only after it completes. " +
     "Do NOT use zotero_script when a dedicated semantic tool handles the operation natively — " +

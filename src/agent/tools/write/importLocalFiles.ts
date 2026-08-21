@@ -20,6 +20,7 @@ import {
 import {
   executeAndRecordUndo,
   normalizeChecklistSelectionFromResolution,
+  planLibraryMutations,
 } from "./mutateLibraryShared";
 
 const FILES_CHECKLIST_FIELD_ID = "filesChecklist";
@@ -201,6 +202,9 @@ export function createImportLocalFilesTool(
         operation: { ...input.operation, filePaths },
       });
     },
+
+    planMutation: (input, context) =>
+      planLibraryMutations(mutationService, [input.operation], context),
 
     async execute(input, context) {
       return executeAndRecordUndo(

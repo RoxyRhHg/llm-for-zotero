@@ -1,6 +1,7 @@
 import { assert } from "chai";
 import { ZoteroGateway } from "../src/agent/services/zoteroGateway";
 import { LibraryMutationService } from "../src/agent/services/libraryMutationService";
+import { replayLibraryInverse } from "./helpers/replayLibraryInverse";
 
 /**
  * `addItemsToCollections` only ever called `addToCollection`, yet the result
@@ -201,7 +202,7 @@ describe("collection move semantics", function () {
     );
     assert.deepEqual(items.get(102)?.collections, [30]);
 
-    await outcome.undo?.revert();
+    await replayLibraryInverse(service, outcome);
 
     // The old inverse emitted remove_from_collection, which would have
     // unfiled the item entirely instead of putting 10 and 20 back.
@@ -216,7 +217,7 @@ describe("collection move semantics", function () {
       { type: "move_to_collection", itemIds: [102], targetCollectionId: 30 },
       { request: { conversationKey: 1, libraryID: 1 } } as never,
     );
-    await outcome.undo?.revert();
+    await replayLibraryInverse(service, outcome);
 
     assert.deepEqual(items.get(102)?.collections.sort(), [10, 20]);
   });

@@ -14,8 +14,10 @@ import {
   ZOTERO_MCP_SCOPE_HEADER,
 } from "../src/agent/mcp/server";
 import { AgentToolRegistry } from "../src/agent/tools/registry";
+import { initAgentChangeJournal } from "../src/agent/store/changeJournal";
 import type { AgentToolContext, AgentToolDefinition } from "../src/agent/types";
 import { createPaperReadTool } from "../src/agent/tools/read/paperRead";
+import { ChangeJournalTestDb } from "./helpers/changeJournalTestDb";
 
 type EndpointReply = [number, string, string];
 
@@ -71,9 +73,10 @@ describe("Zotero MCP server", function () {
   const originalZotero = globalThis.Zotero;
   const prefStore = new Map<string, unknown>();
 
-  beforeEach(function () {
+  beforeEach(async function () {
     prefStore.clear();
     (globalThis as typeof globalThis & { Zotero: typeof Zotero }).Zotero = {
+      DB: new ChangeJournalTestDb(),
       Prefs: {
         get: (key: string) => {
           if (key === "httpServer.port") return 24680;
@@ -93,6 +96,7 @@ describe("Zotero MCP server", function () {
         Endpoints: {},
       },
     } as unknown as typeof Zotero;
+    await initAgentChangeJournal();
   });
 
   afterEach(function () {
@@ -942,6 +946,10 @@ describe("Zotero MCP server", function () {
           requiresConfirmation: false,
         },
         validate: (args) => ({ ok: true, value: args ?? {} }),
+        planMutation: async () => ({
+          effect: "none",
+          reversibility: "none",
+        }),
         execute: async () => {
           executed.push(name);
           return { name };
@@ -1709,6 +1717,10 @@ describe("Zotero MCP server", function () {
         requiresConfirmation: false,
       },
       validate: (args) => ({ ok: true, value: args ?? {} }),
+      planMutation: async () => ({
+        effect: "write",
+        reversibility: "full",
+      }),
       execute: async () => {
         writeExecuteCount += 1;
         return { writeExecuteCount };
@@ -2186,6 +2198,10 @@ describe("Zotero MCP server", function () {
           requiresConfirmation: true,
         },
         validate: (args) => ({ ok: true, value: args ?? {} }),
+        planMutation: async () => ({
+          effect: "none",
+          reversibility: "none",
+        }),
         shouldRequireConfirmation: async () => false,
         createPendingAction: async () => ({
           toolName: name,
@@ -2696,6 +2712,10 @@ describe("Zotero MCP server", function () {
         requiresConfirmation: false,
       },
       validate: (args) => ({ ok: true, value: args ?? {} }),
+      planMutation: async () => ({
+        effect: "write",
+        reversibility: "full",
+      }),
       createPendingAction: async () => {
         throw new Error("zotero_script should not request confirmation");
       },
@@ -2731,7 +2751,8 @@ describe("Zotero MCP server", function () {
             arguments: {
               mode: "write",
               description: "Run directly",
-              script: "env.addUndoStep(async () => {});",
+              script:
+                "env.addInverse({ version: 1, kind: 'library_operations', operations: [] });",
             },
           },
         },

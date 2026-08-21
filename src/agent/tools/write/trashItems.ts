@@ -12,6 +12,7 @@ import { ok, fail, validateObject, normalizePositiveIntArray } from "../shared";
 import {
   executeAndRecordUndo,
   normalizeChecklistItemIdsFromResolution,
+  planLibraryMutations,
 } from "./mutateLibraryShared";
 
 const TRASH_CHECKLIST_FIELD_ID = "trashItemsChecklist";
@@ -154,6 +155,9 @@ export function createTrashItemsTool(
         operation: { ...input.operation, itemIds },
       });
     },
+
+    planMutation: (input, context) =>
+      planLibraryMutations(mutationService, [input.operation], context),
 
     async execute(input, context) {
       return executeAndRecordUndo(

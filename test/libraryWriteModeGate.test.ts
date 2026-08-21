@@ -1,6 +1,8 @@
 import { assert } from "chai";
+import { initAgentChangeJournal } from "../src/agent/store/changeJournal";
 import { AgentToolRegistry } from "../src/agent/tools/registry";
 import type { AgentToolContext } from "../src/agent/types";
+import { ChangeJournalTestDb } from "./helpers/changeJournalTestDb";
 
 /**
  * The mode is enforced at `prepareExecution` — the one point the in-plugin
@@ -19,11 +21,14 @@ describe("library write mode gate", function () {
       originalZotero;
   });
 
-  function installMode(mode: string) {
+  async function installMode(mode: string) {
+    const db = new ChangeJournalTestDb();
     (globalThis as typeof globalThis & { Zotero?: unknown }).Zotero = {
+      DB: db,
       Prefs: { get: () => mode },
       debug: () => undefined,
     };
+    await initAgentChangeJournal();
   }
 
   const context: AgentToolContext = {
@@ -50,6 +55,18 @@ describe("library write mode gate", function () {
         requiresConfirmation: false,
       },
       validate: (args) => ({ ok: true, value: args as never }),
+      planMutation: async () => ({
+        effect: "write",
+        reversibility: "full",
+      }),
+      createPendingAction: () => ({
+        toolName: "library_batch",
+        title: "Review batch",
+        description: "Review this library batch",
+        confirmLabel: "Apply",
+        cancelLabel: "Cancel",
+        fields: [],
+      }),
       async execute() {
         ran = true;
         return { ok: true };
@@ -61,7 +78,7 @@ describe("library write mode gate", function () {
   const call = { id: "c1", name: "library_batch", arguments: {} };
 
   it("refuses a yolo-only tool in safe mode, at execution", async function () {
-    installMode("safe");
+    await installMode("safe");
     const { registry, didRun } = makeRegistry();
     const prepared = await registry.prepareExecution(call, context);
     assert.equal(prepared.kind, "result");
@@ -75,35 +92,36 @@ describe("library write mode gate", function () {
   });
 
   it("allows it in yolo", async function () {
-    installMode("yolo");
+    await installMode("yolo");
     const { registry, didRun } = makeRegistry();
     const prepared = await registry.prepareExecution(call, context);
     assert.equal(prepared.kind, "result");
     assert.isTrue(didRun());
   });
 
-  it("does not gate a slash command, which is its own consent", async function () {
-    installMode("safe");
+  it("bypasses the yolo-only gate for a slash command but still reviews the plan", async function () {
+    await installMode("safe");
     const { registry, didRun } = makeRegistry();
     const prepared = await registry.prepareExecution(call, context, {
       callerKind: "action",
     });
-    assert.equal(prepared.kind, "result");
-    assert.isTrue(
-      didRun(),
-      "an explicit user gesture is not the model acting on its own",
-    );
+    assert.equal(prepared.kind, "confirmation");
+    assert.isFalse(didRun());
+    if (prepared.kind !== "confirmation") return;
+    const execution = await prepared.execute();
+    assert.isTrue(execution.result.ok);
+    assert.isTrue(didRun());
   });
 
   it("defaults an undeclared caller to the stricter treatment", async function () {
-    installMode("safe");
+    await installMode("safe");
     const { registry, didRun } = makeRegistry();
     await registry.prepareExecution(call, context, {});
     assert.isFalse(didRun());
   });
 
-  it("leaves ordinary write tools alone — they already stop at a card", async function () {
-    installMode("safe");
+  it("reviews ordinary writes in safe mode from the same mutation plan", async function () {
+    await installMode("safe");
     const registry = new AgentToolRegistry();
     let ran = false;
     registry.register({
@@ -115,15 +133,28 @@ describe("library write mode gate", function () {
         requiresConfirmation: false,
       },
       validate: (args) => ({ ok: true, value: args as never }),
+      planMutation: async () => ({
+        effect: "write",
+        reversibility: "full",
+      }),
+      createPendingAction: () => ({
+        toolName: "library_update",
+        title: "Review update",
+        description: "Review this library update",
+        confirmLabel: "Apply",
+        cancelLabel: "Cancel",
+        fields: [],
+      }),
       async execute() {
         ran = true;
         return { ok: true };
       },
     } as never);
-    await registry.prepareExecution(
+    const prepared = await registry.prepareExecution(
       { id: "c2", name: "library_update", arguments: {} },
       context,
     );
-    assert.isTrue(ran, "gating these would duplicate a control the user has");
+    assert.equal(prepared.kind, "confirmation");
+    assert.isFalse(ran);
   });
 });

@@ -1,6 +1,7 @@
 import { assert } from "chai";
 import { ZoteroGateway } from "../src/agent/services/zoteroGateway";
 import { LibraryMutationService } from "../src/agent/services/libraryMutationService";
+import { replayLibraryInverse } from "./helpers/replayLibraryInverse";
 
 /**
  * Item creation, reparenting and related links were all declared `allowed` by
@@ -40,6 +41,7 @@ describe("item creation, reparenting and relations", function () {
     getCreatorsJSON: () => unknown[];
     addRelatedItem: (other: FakeItem) => boolean;
     removeRelatedItem: (other: FakeItem) => Promise<boolean>;
+    save: () => Promise<boolean>;
     saveTx: () => Promise<boolean>;
   };
 
@@ -80,6 +82,10 @@ describe("item creation, reparenting and relations", function () {
       removeRelatedItem: async (other) => {
         if (!item.related.includes(other.id)) return false;
         item.related = item.related.filter((id) => id !== other.id);
+        return true;
+      },
+      save: async () => {
+        item.saves += 1;
         return true;
       },
       saveTx: async () => {
@@ -124,6 +130,9 @@ describe("item creation, reparenting and relations", function () {
         getItemTypeFields: (typeId: number) => VALID_FOR_TYPE[typeId] || [],
       },
       CreatorTypes: { itemTypeHasCreators: () => true },
+      DB: {
+        executeTransaction: async (task: () => Promise<void>) => task(),
+      },
       debug: () => undefined,
     };
   });
@@ -204,7 +213,7 @@ describe("item creation, reparenting and relations", function () {
         { type: "create_items", items: [{ itemType: "book" }] },
         { request: { conversationKey: 1, libraryID: 1 } } as never,
       );
-      await outcome.undo?.revert();
+      await replayLibraryInverse(service, outcome);
       assert.deepEqual(trashed, [[created[0].id]]);
     });
   });
@@ -272,7 +281,7 @@ describe("item creation, reparenting and relations", function () {
       assert.equal(noteA.parentID, p2.id);
       assert.equal(noteB.parentID, p2.id);
 
-      await outcome.undo?.revert();
+      await replayLibraryInverse(service, outcome);
       // One blanket inverse cannot express this: they came from different
       // places, and one of them came from top level.
       assert.equal(noteA.parentID, p1.id);
@@ -294,6 +303,29 @@ describe("item creation, reparenting and relations", function () {
       });
       assert.deepEqual(a.related, [b.id]);
       assert.deepEqual(b.related, [a.id]);
+      assert.equal(a.saves, 1);
+      assert.equal(b.saves, 1);
+    });
+
+    it("rolls back both in-memory directions when the atomic save fails", async function () {
+      const a = makeItem();
+      const b = makeItem({
+        save: async () => {
+          throw new Error("second relation save failed");
+        },
+      });
+      items.set(a.id, a);
+      items.set(b.id, b);
+
+      const result = await gateway().relateItems({
+        itemId: a.id,
+        relatedItemIds: [b.id],
+        action: "add",
+      });
+
+      assert.equal(result.items[0].status, "error");
+      assert.deepEqual(a.related, []);
+      assert.deepEqual(b.related, []);
     });
 
     it("refuses to relate an item to itself", async function () {
@@ -325,7 +357,7 @@ describe("item creation, reparenting and relations", function () {
         },
         { request: { conversationKey: 1, libraryID: 1 } } as never,
       );
-      await outcome.undo?.revert();
+      await replayLibraryInverse(service, outcome);
       assert.deepEqual(a.related, []);
       assert.deepEqual(b.related, []);
     });

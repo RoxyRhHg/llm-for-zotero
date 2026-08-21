@@ -6,7 +6,8 @@ import {
   resolveHighlightColor,
   type PdfRect,
 } from "../../services/pdfAnnotationGeometry";
-import { pushUndoEntry } from "../../store/undoStore";
+import { executeExternalMutation } from "../../services/mutationCoordinator";
+import { LibraryMutationService } from "../../services/libraryMutationService";
 import { ok, fail, validateObject, normalizePositiveInt } from "../shared";
 
 type AnnotateInput = {
@@ -41,6 +42,7 @@ type AnnotateInput = {
 export function createAnnotatePdfTool(
   zoteroGateway: ZoteroGateway,
 ): AgentToolDefinition<AnnotateInput, unknown> {
+  const mutationService = new LibraryMutationService(zoteroGateway);
   return {
     spec: {
       name: "annotate_pdf",
@@ -198,14 +200,16 @@ export function createAnnotatePdfTool(
       return ok(edited === undefined ? input : { ...input, comment: edited });
     },
 
-    async execute(input, context) {
-      const attachment = zoteroGateway.getItem(input.attachmentId);
-      if (!attachment?.isAttachment?.()) {
-        throw new Error(
-          `Item ${input.attachmentId} is not an attachment. Annotations belong to the PDF attachment, not to the parent paper — use library_read with sections:['attachments'] to find it.`,
-        );
-      }
+    planMutation() {
+      return {
+        effect: "write",
+        reversibility: "partial",
+        reason:
+          "The annotation ID needed by the inverse is assigned only after Zotero commits.",
+      };
+    },
 
+    async execute(input, context) {
       const sortIndex = buildAnnotationSortIndex({
         pageIndex: input.pageIndex,
         charOffset: input.charOffset,
@@ -225,37 +229,78 @@ export function createAnnotatePdfTool(
       if (input.text) json.text = input.text;
       if (input.comment) json.comment = input.comment;
       if (input.pageLabel) json.pageLabel = input.pageLabel;
+      let attachment: Zotero.Item | null = null;
 
-      const saved = await (
-        Zotero as unknown as {
-          Annotations: {
-            saveFromJSON: (
-              attachment: unknown,
-              json: unknown,
-            ) => Promise<{ id?: number }>;
+      return executeExternalMutation({
+        context,
+        toolName: "annotate_pdf",
+        plan: async () => {
+          const currentAttachment = zoteroGateway.getItem(input.attachmentId);
+          if (!currentAttachment?.isAttachment?.()) {
+            throw new Error(
+              `Item ${input.attachmentId} is not an attachment. Annotations belong to the PDF attachment, not to the parent paper — use library_read with sections:['attachments'] to find it.`,
+            );
+          }
+          attachment = currentAttachment;
+          return {
+            operation: "create_pdf_annotation",
+            description: "Create a PDF highlight annotation",
+            forward: { attachmentId: input.attachmentId, json },
+            reversibility: "partial" as const,
+            deferredInverse: true,
+            reason: "The annotation ID is assigned only after Zotero commits.",
           };
-        }
-      ).Annotations.saveFromJSON(attachment, json);
-
-      const annotationId = Number(saved?.id) || 0;
-      if (annotationId > 0) {
-        pushUndoEntry(context.request.conversationKey, {
-          id: `undo-annotate_pdf-${annotationId}`,
-          toolName: "annotate_pdf",
-          description: "Remove the highlight that was just added",
-          revert: async () => {
-            await zoteroGateway.trashItems({ itemIds: [annotationId] });
-          },
-        });
-      }
-
-      return {
-        annotationId: annotationId || undefined,
-        attachmentId: input.attachmentId,
-        pageIndex: input.pageIndex,
-        rectCount: input.rects.length,
-        status: "created",
-      };
+        },
+        execute: async () => {
+          if (!attachment) {
+            throw new Error("The annotation target was not prepared");
+          }
+          const saved = await (
+            Zotero as unknown as {
+              Annotations: {
+                saveFromJSON: (
+                  attachment: unknown,
+                  json: unknown,
+                ) => Promise<{ id?: number }>;
+              };
+            }
+          ).Annotations.saveFromJSON(attachment, json);
+          const annotationId = Number(saved?.id) || 0;
+          const inverseOperation = annotationId
+            ? {
+                type: "trash_items" as const,
+                itemIds: [annotationId],
+              }
+            : undefined;
+          const expectedPostcondition = inverseOperation
+            ? await mutationService.captureOperationState(
+                inverseOperation,
+                context,
+              )
+            : undefined;
+          const result = {
+            annotationId: annotationId || undefined,
+            attachmentId: input.attachmentId,
+            pageIndex: input.pageIndex,
+            rectCount: input.rects.length,
+            status: "created",
+          };
+          return {
+            result,
+            inverse: annotationId
+              ? {
+                  version: 1,
+                  kind: "library_operations",
+                  operations: [inverseOperation],
+                }
+              : undefined,
+            expectedPostcondition,
+            reversibility: annotationId ? ("full" as const) : ("none" as const),
+            affectedCount: annotationId ? 1 : 0,
+            changed: annotationId > 0,
+          };
+        },
+      });
     },
   };
 }

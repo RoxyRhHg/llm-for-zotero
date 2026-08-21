@@ -66,6 +66,9 @@ export function createSelfContainedTestTool(): AgentToolDefinition<
         target,
       });
     },
+    // This development-only tool exercises the confirmation UI but does not
+    // mutate Zotero or the filesystem.
+    planMutation: () => ({ effect: "none", reversibility: "full" }),
     createPendingAction: (input) => ({
       toolName: "self_contained_test_tool",
       title: "Review self-contained demo",

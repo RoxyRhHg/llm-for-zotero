@@ -4,11 +4,13 @@ import { autoTagAction } from "../src/agent/actions/autoTag";
 import { discoverRelatedAction } from "../src/agent/actions/discoverRelated";
 import { organizeUnfiledAction } from "../src/agent/actions/organizeUnfiled";
 import { AgentToolRegistry } from "../src/agent/tools/registry";
+import { initAgentChangeJournal } from "../src/agent/store/changeJournal";
 import type {
   ActionExecutionContext,
   ActionProgressEvent,
 } from "../src/agent/actions/types";
 import type { AgentToolDefinition } from "../src/agent/types";
+import { ChangeJournalTestDb } from "./helpers/changeJournalTestDb";
 
 function createStubTool<TInput extends Record<string, unknown>, TResult>(
   spec: AgentToolDefinition<TInput, TResult>["spec"],
@@ -19,6 +21,14 @@ function createStubTool<TInput extends Record<string, unknown>, TResult>(
     spec,
     validate,
     execute,
+    ...(spec.mutability === "write"
+      ? {
+          planMutation: async () => ({
+            effect: "write" as const,
+            reversibility: "full" as const,
+          }),
+        }
+      : {}),
   };
 }
 
@@ -44,6 +54,22 @@ function createActionContext(
 }
 
 describe("action compatibility after tool refactors", function () {
+  const originalZotero = globalThis.Zotero;
+
+  beforeEach(async function () {
+    const db = new ChangeJournalTestDb();
+    globalThis.Zotero = {
+      DB: db,
+      Prefs: { get: () => "auto" },
+      debug: () => undefined,
+    } as never;
+    await initAgentChangeJournal();
+  });
+
+  afterEach(function () {
+    globalThis.Zotero = originalZotero;
+  });
+
   it("discover_related reads nested read_library results and uses nested import counts", async function () {
     const registry = new AgentToolRegistry();
     let searchArgs: Record<string, unknown> | null = null;

@@ -1,56 +1,85 @@
 import { assert } from "chai";
+import { initAgentChangeJournal } from "../src/agent/store/changeJournal";
+import { executeLibraryMutationAction } from "../src/agent/services/mutationCoordinator";
 import { executeAndRecordUndoBatch } from "../src/agent/tools/write/mutateLibraryShared";
-import { clearUndoStack, peekUndoEntry } from "../src/agent/store/undoStore";
 import type { AgentToolContext } from "../src/agent/types";
+import { ChangeJournalTestDb } from "./helpers/changeJournalTestDb";
+import { zoteroChangeDispatcher } from "../src/services/zoteroChangeDispatcher";
 
-describe("multi-operation mutation recovery", function () {
+describe("multi-operation durable mutation recovery", function () {
   const originalZotero = globalThis.Zotero;
 
   afterEach(function () {
-    clearUndoStack(41);
     globalThis.Zotero = originalZotero;
   });
 
-  it("journals and registers undo for a successful prefix before a later failure", async function () {
-    const journalWrites: unknown[][] = [];
+  async function installJournal() {
+    const db = new ChangeJournalTestDb();
     globalThis.Zotero = {
-      DB: {
-        queryAsync: async (_sql: string, params: unknown[]) => {
-          journalWrites.push(params);
-          return [];
-        },
-      },
-    } as typeof Zotero;
+      DB: db,
+      Items: { get: () => null },
+      debug: () => undefined,
+    } as never;
+    await initAgentChangeJournal();
+    return db;
+  }
 
-    const reverted: number[] = [];
+  const context = {
+    request: { conversationKey: 41, libraryID: 1 },
+    item: null,
+    currentAnswerText: "",
+    modelName: "test-model",
+  } as AgentToolContext;
+
+  function inverseFor(itemId: number) {
+    return {
+      type: "update_metadata" as const,
+      itemId,
+      metadata: { title: "old" },
+    };
+  }
+
+  it("persists one action and every prepared inverse before the write starts", async function () {
+    const db = await installJournal();
     let calls = 0;
+    const applyingWitnesses: Array<{ status: unknown; inverse: unknown }> = [];
     const mutationService = {
-      executeOperation: async () => {
+      planOperation: async (operation: { itemId: number }) => ({
+        effect: "write" as const,
+        reversibility: "full" as const,
+        description: `update ${operation.itemId}`,
+        inverseOperations: [inverseFor(operation.itemId)],
+        precondition: { itemId: operation.itemId, title: "old" },
+      }),
+      executeOperation: async (operation: { itemId: number }) => {
         calls += 1;
+        const step = [...db.steps.values()].find(
+          (row) => row.sequence_no === calls,
+        );
+        applyingWitnesses.push({
+          status: step?.status,
+          inverse: step?.inverse_json,
+        });
         if (calls === 2) throw new Error("second item is invalid");
         return {
-          result: { itemId: 1 },
-          undo: {
-            toolName: "library_mutation",
-            description: "restore item 1",
-            inverseOperations: [
-              {
-                type: "update_metadata",
-                itemId: 1,
-                metadata: { title: "old" },
-              },
-            ],
-            revert: async () => {
-              reverted.push(1);
-            },
+          result: {
+            operation: "update_metadata",
+            result: { status: "updated", itemId: operation.itemId },
           },
+          inverse: {
+            description: `restore item ${operation.itemId}`,
+            inverseOperations: [inverseFor(operation.itemId)],
+          },
+          changed: true,
+          affectedCount: 1,
         };
       },
+      captureOperationState: async (operation: { itemId: number }) => ({
+        version: 1,
+        operation: "update_metadata",
+        items: [{ itemId: operation.itemId, title: "new" }],
+      }),
     };
-    const context = {
-      request: { conversationKey: 41, libraryID: 1 },
-      modelName: "test-model",
-    } as AgentToolContext;
 
     let message = "";
     try {
@@ -68,50 +97,106 @@ describe("multi-operation mutation recovery", function () {
       message = error instanceof Error ? error.message : String(error);
     }
 
-    assert.include(
-      message,
-      "1 operation was applied; available inverses were retained",
+    assert.include(message, "1 operation was applied");
+    assert.equal(db.actions.size, 1, "the batch is one user-visible action");
+    assert.equal(db.steps.size, 2, "each attempted operation is one step");
+    const action = [...db.actions.values()][0];
+    assert.equal(action.status, "partially_applied");
+    const steps = [...db.steps.values()].sort(
+      (left, right) => Number(left.sequence_no) - Number(right.sequence_no),
     );
-    assert.lengthOf(journalWrites, 1, "the successful prefix is journalled");
-    const undo = peekUndoEntry(41);
-    assert.exists(undo, "the successful prefix remains undoable in-session");
-    await undo?.revert();
-    assert.deepEqual(reverted, [1]);
+    assert.deepEqual(
+      steps.map((step) => step.status),
+      ["applied", "uncertain"],
+    );
+    assert.deepEqual(
+      applyingWitnesses.map((witness) => witness.status),
+      ["applying", "applying"],
+      "the durable claim precedes every forward call",
+    );
+    for (const witness of applyingWitnesses) {
+      assert.isString(
+        witness.inverse,
+        "the inverse already exists at claim time",
+      );
+    }
   });
 
-  it("stops before the next mutation when durable journal persistence fails", async function () {
-    globalThis.Zotero = {
-      DB: {
-        queryAsync: async () => {
-          throw new Error("database is read-only");
-        },
+  it("retains an uncertain first operation's planned irreversible barrier", async function () {
+    const db = await installJournal();
+    const mutationService = {
+      planOperation: async () => ({
+        effect: "write" as const,
+        reversibility: "none" as const,
+        description: "irreversible external mutation",
+        reason: "No declarative inverse exists.",
+      }),
+      executeOperation: async () => {
+        throw new Error("the forward call may have committed");
       },
-    } as typeof Zotero;
+      captureOperationState: async () => ({
+        version: 1,
+        operation: "update_metadata",
+      }),
+    };
+
+    let thrown: unknown;
+    try {
+      await executeLibraryMutationAction({
+        service: mutationService as never,
+        operations: [
+          { type: "update_metadata", itemId: 1, metadata: { title: "new" } },
+        ],
+        context,
+        facadeToolName: "update_metadata",
+      });
+    } catch (error) {
+      thrown = error;
+    }
+
+    assert.instanceOf(thrown, Error);
+    const action = [...db.actions.values()][0];
+    const step = [...db.steps.values()][0];
+    assert.equal(action.status, "uncertain");
+    assert.equal(action.reversibility, "none");
+    assert.equal(step.status, "uncertain");
+  });
+
+  it("does not start the next write when its durable step cannot be prepared", async function () {
+    const db = await installJournal();
     let calls = 0;
     const mutationService = {
-      executeOperation: async () => {
+      planOperation: async (operation: { itemId: number }) => ({
+        effect: "write" as const,
+        reversibility: "full" as const,
+        description: `update ${operation.itemId}`,
+        inverseOperations: [inverseFor(operation.itemId)],
+      }),
+      executeOperation: async (operation: { itemId: number }) => {
         calls += 1;
         return {
-          result: { itemId: calls },
-          undo: {
-            toolName: "library_mutation",
-            description: `restore item ${calls}`,
-            inverseOperations: [
-              {
-                type: "update_metadata",
-                itemId: calls,
-                metadata: { title: "old" },
-              },
-            ],
-            revert: async () => undefined,
+          result: {
+            operation: "update_metadata",
+            result: { status: "updated", itemId: operation.itemId },
           },
+          inverse: {
+            description: `restore item ${operation.itemId}`,
+            inverseOperations: [inverseFor(operation.itemId)],
+          },
+          changed: true,
+          affectedCount: 1,
         };
       },
+      captureOperationState: async () => ({
+        version: 1,
+        operation: "update_metadata",
+      }),
     };
-    const context = {
-      request: { conversationKey: 41, libraryID: 1 },
-      modelName: "test-model",
-    } as AgentToolContext;
+    db.failWhen = (sql, params) =>
+      sql.startsWith("INSERT INTO llm_for_zotero_agent_journal_steps_v2") &&
+      params[2] === 2
+        ? new Error("database is read-only")
+        : null;
 
     let message = "";
     try {
@@ -130,10 +215,381 @@ describe("multi-operation mutation recovery", function () {
     }
 
     assert.equal(calls, 1, "no unjournalled second write may start");
-    assert.include(message, "durable undo record could not be saved");
-    assert.include(
-      message,
-      "1 operation was applied; available inverses were retained",
+    assert.include(message, "database is read-only");
+    assert.include(message, "1 operation was applied");
+  });
+
+  it("promotes a finalized deferred creation to fully reversible", async function () {
+    const db = await installJournal();
+    const inverse = {
+      type: "delete_collection" as const,
+      collectionId: 42,
+      permanent: true,
+    };
+    const mutationService = {
+      planOperation: async () => ({
+        effect: "write" as const,
+        reversibility: "partial" as const,
+        description: "create collection",
+        deferredInverse: true,
+        reason: "The collection ID is assigned after commit.",
+      }),
+      executeOperation: async () => ({
+        result: {
+          operation: "create_collection",
+          result: { status: "created", collectionId: 42 },
+        },
+        inverse: {
+          description: "delete collection 42",
+          inverseOperations: [inverse],
+        },
+        changed: true,
+        affectedCount: 1,
+      }),
+      captureOperationState: async () => ({
+        version: 1,
+        operation: "create_collection",
+        collections: [{ collectionId: 42, exists: true }],
+      }),
+    };
+
+    await executeLibraryMutationAction({
+      service: mutationService as never,
+      operations: [{ type: "create_collection", name: "Created" }],
+      context,
+      facadeToolName: "manage_collections",
+    });
+
+    const action = [...db.actions.values()][0];
+    const step = [...db.steps.values()][0];
+    assert.equal(action.status, "applied");
+    assert.equal(action.reversibility, "full");
+    assert.equal(step.status, "applied");
+    assert.isNull(step.error_text);
+  });
+
+  it("does not mistake selection counters for applied effects", async function () {
+    const db = await installJournal();
+    const mutationService = {
+      planOperation: async () => ({
+        effect: "write" as const,
+        reversibility: "full" as const,
+        description: "attempt metadata updates",
+        inverseOperations: [inverseFor(1)],
+      }),
+      executeOperation: async () => ({
+        result: {
+          operation: "update_metadata",
+          result: {
+            selectedCount: 2,
+            updatedCount: 0,
+            skippedCount: 2,
+            items: [
+              { itemId: 1, status: "skipped" },
+              { itemId: 2, status: "unchanged" },
+            ],
+          },
+        },
+        inverse: null,
+        changed: false,
+        affectedCount: 0,
+      }),
+      captureOperationState: async () => ({
+        version: 1,
+        operation: "update_metadata",
+      }),
+    };
+
+    const outcome = await executeAndRecordUndoBatch(
+      mutationService as never,
+      [{ type: "update_metadata", itemId: 1, metadata: { title: "same" } }],
+      context,
+      "update_metadata",
+    );
+
+    assert.equal(outcome.appliedCount, 1, "the attempted step still returned");
+    assert.equal([...db.actions.values()][0].status, "no_effect");
+    assert.equal([...db.actions.values()][0].affected_count, 0);
+    assert.equal([...db.steps.values()][0].status, "no_effect");
+  });
+
+  it("keeps a committed child-note row in durable history when its ID is unavailable", async function () {
+    const db = await installJournal();
+    const mutationService = {
+      planOperation: async () => ({
+        effect: "write" as const,
+        reversibility: "none" as const,
+        description: "create a child note",
+        reason: "The committed note ID was unavailable for recovery.",
+      }),
+      executeOperation: async () => ({
+        result: {
+          operation: "save_notes_batch",
+          result: {
+            createdCount: 0,
+            failedCount: 0,
+            notes: [{ targetItemId: 1, status: "created" }],
+          },
+        },
+        inverse: null,
+        changed: true,
+        affectedCount: 1,
+      }),
+      captureOperationState: async () => ({
+        version: 1,
+        operation: "save_notes_batch",
+      }),
+    };
+
+    await executeLibraryMutationAction({
+      service: mutationService as never,
+      operations: [
+        {
+          type: "save_notes_batch",
+          notes: [{ targetItemId: 1, content: "Created note" }],
+        },
+      ],
+      context,
+      facadeToolName: "note_write",
+    });
+
+    const action = [...db.actions.values()][0];
+    const step = [...db.steps.values()][0];
+    assert.equal(action.status, "irreversible");
+    assert.equal(action.affected_count, 1);
+    assert.equal(step.status, "irreversible");
+  });
+
+  it("records the outer semantic facade instead of its legacy delegate", async function () {
+    const db = await installJournal();
+    const mutationService = {
+      planOperation: async () => ({
+        effect: "write" as const,
+        reversibility: "full" as const,
+        description: "update metadata",
+        inverseOperations: [inverseFor(1)],
+      }),
+      executeOperation: async () => ({
+        result: {
+          operation: "update_metadata",
+          result: { status: "updated", itemId: 1 },
+        },
+        inverse: {
+          description: "restore item 1",
+          inverseOperations: [inverseFor(1)],
+        },
+        changed: true,
+        affectedCount: 1,
+      }),
+      captureOperationState: async () => ({
+        version: 1,
+        operation: "update_metadata",
+        items: [{ itemId: 1, title: "new" }],
+      }),
+    };
+
+    await executeLibraryMutationAction({
+      service: mutationService as never,
+      operations: [
+        { type: "update_metadata", itemId: 1, metadata: { title: "new" } },
+      ],
+      context: { ...context, journalToolName: "library_update" },
+      facadeToolName: "update_metadata",
+    });
+
+    assert.equal([...db.actions.values()][0].tool_name, "library_update");
+  });
+
+  it("serializes cross-conversation write windows and attributes observations", async function () {
+    const db = await installJournal();
+    let releaseFirst!: () => void;
+    let signalFirstStarted!: () => void;
+    const firstStarted = new Promise<void>((resolve) => {
+      signalFirstStarted = resolve;
+    });
+    const firstGate = new Promise<void>((resolve) => {
+      releaseFirst = resolve;
+    });
+    let activeWrites = 0;
+    let maximumActiveWrites = 0;
+    let secondStarted = false;
+    const makeService = (itemId: number, wait: boolean) => ({
+      planOperation: async () => ({
+        effect: "write" as const,
+        reversibility: "full" as const,
+        description: `update ${itemId}`,
+        inverseOperations: [inverseFor(itemId)],
+      }),
+      executeOperation: async () => {
+        activeWrites += 1;
+        maximumActiveWrites = Math.max(maximumActiveWrites, activeWrites);
+        if (wait) {
+          signalFirstStarted();
+          await firstGate;
+        } else {
+          secondStarted = true;
+        }
+        await zoteroChangeDispatcher.dispatch({
+          event: "modify",
+          type: "item",
+          ids: [itemId],
+          extraData: { libraryID: 1 },
+        });
+        activeWrites -= 1;
+        return {
+          result: {
+            operation: "update_metadata",
+            result: { status: "updated", itemId },
+          },
+          inverse: {
+            description: `restore ${itemId}`,
+            inverseOperations: [inverseFor(itemId)],
+          },
+          changed: true,
+          affectedCount: 1,
+        };
+      },
+      captureOperationState: async () => ({
+        version: 1,
+        operation: "update_metadata",
+        items: [{ itemId, exists: true, fields: { title: "new" } }],
+      }),
+    });
+
+    const first = executeLibraryMutationAction({
+      service: makeService(1, true) as never,
+      operations: [
+        { type: "update_metadata", itemId: 1, metadata: { title: "new" } },
+      ],
+      context,
+      facadeToolName: "update_metadata",
+    });
+    await firstStarted;
+    const second = executeLibraryMutationAction({
+      service: makeService(2, false) as never,
+      operations: [
+        { type: "update_metadata", itemId: 2, metadata: { title: "new" } },
+      ],
+      context: {
+        ...context,
+        request: { ...context.request, conversationKey: 42 },
+      },
+      facadeToolName: "update_metadata",
+    });
+    await Promise.resolve();
+    await Promise.resolve();
+    assert.isFalse(secondStarted, "the second Zotero write must wait");
+
+    releaseFirst();
+    await Promise.all([first, second]);
+
+    assert.equal(maximumActiveWrites, 1);
+    assert.isTrue(secondStarted);
+    assert.equal(db.observations.size, 2);
+    const observed = [...db.observations.values()].map((row) => ({
+      actionId: String(row.action_id),
+      ids: JSON.parse(String(row.object_ids_json)) as number[],
+    }));
+    for (const row of observed) {
+      const step = [...db.steps.values()].find(
+        (candidate) => candidate.action_id === row.actionId,
+      );
+      const forward = JSON.parse(String(step?.forward_json)) as {
+        itemId: number;
+      };
+      assert.deepEqual(row.ids, [forward.itemId]);
+    }
+  });
+
+  it("refreshes a queued pre-image after another conversation writes", async function () {
+    const db = await installJournal();
+    let title = "original";
+    let releaseFirst!: () => void;
+    let signalFirstStarted!: () => void;
+    const firstStarted = new Promise<void>((resolve) => {
+      signalFirstStarted = resolve;
+    });
+    const firstGate = new Promise<void>((resolve) => {
+      releaseFirst = resolve;
+    });
+    let secondPreparedTitle = "";
+    const service = {
+      planOperation: async (operation: { itemId: number }) => ({
+        effect: "write" as const,
+        reversibility: "full" as const,
+        description: `update ${operation.itemId}`,
+        inverseOperations: [
+          {
+            type: "update_metadata" as const,
+            itemId: operation.itemId,
+            metadata: { title },
+          },
+        ],
+        precondition: { itemId: operation.itemId, title },
+      }),
+      executeOperation: async (operation: { itemId: number }) => {
+        if (operation.itemId === 1) {
+          signalFirstStarted();
+          await firstGate;
+          title = "first write";
+        } else {
+          const step = [...db.steps.values()].find((row) => {
+            const forward = JSON.parse(String(row.forward_json)) as {
+              itemId?: number;
+            };
+            return forward.itemId === 2;
+          });
+          const inverse = JSON.parse(String(step?.inverse_json)) as {
+            operations?: Array<{ metadata?: { title?: string } }>;
+          };
+          secondPreparedTitle = inverse.operations?.[0]?.metadata?.title || "";
+          title = "second write";
+        }
+        return {
+          result: {
+            operation: "update_metadata",
+            result: { status: "updated", itemId: operation.itemId },
+          },
+          inverse: null,
+          changed: true,
+          affectedCount: 1,
+        };
+      },
+      captureOperationState: async (operation: { itemId: number }) => ({
+        version: 1,
+        operation: "update_metadata",
+        items: [{ itemId: operation.itemId, title }],
+      }),
+    };
+
+    const first = executeLibraryMutationAction({
+      service: service as never,
+      operations: [
+        { type: "update_metadata", itemId: 1, metadata: { title: "first" } },
+      ],
+      context,
+      facadeToolName: "update_metadata",
+    });
+    await firstStarted;
+    const second = executeLibraryMutationAction({
+      service: service as never,
+      operations: [
+        { type: "update_metadata", itemId: 2, metadata: { title: "second" } },
+      ],
+      context: {
+        ...context,
+        request: { ...context.request, conversationKey: 42 },
+      },
+      facadeToolName: "update_metadata",
+    });
+    await Promise.resolve();
+    releaseFirst();
+    await Promise.all([first, second]);
+
+    assert.equal(
+      secondPreparedTitle,
+      "first write",
+      "the queued inverse must describe the state immediately before its write",
     );
   });
 });

@@ -1,4 +1,3 @@
-import { writeNeedsConfirmation } from "../capabilities/writeReversibility";
 import type {
   AgentToolArtifact,
   AgentToolExecutionOutput,
@@ -10,6 +9,7 @@ import type {
   PreparedToolExecution,
   ToolSpec,
 } from "../types";
+import { isAgentChangeJournalAvailable } from "../store/changeJournal";
 import { isMalformedToolArgumentsDiagnostic } from "../toolArgumentDiagnostics";
 import { deriveToolEffect } from "./effect";
 import { getAgentLibraryWriteMode } from "../libraryWriteMode";
@@ -46,6 +46,26 @@ function createSyntheticErrorResult(
 
 function createRequestId(): string {
   return `confirm-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
+}
+
+function withRecoveryWarning(
+  action: import("../types").AgentPendingAction,
+  reason: string,
+): import("../types").AgentPendingAction {
+  const warning = `Recovery warning: ${reason}`;
+  return {
+    ...action,
+    description: `${action.description}\n\n${warning}`,
+    fields: [
+      ...(action.fields || []),
+      {
+        type: "text" as const,
+        id: "journalRecoveryWarning",
+        label: "Recovery warning",
+        value: warning,
+      },
+    ],
+  };
 }
 
 function normalizeExecutionOutput(value: AgentToolExecutionOutput<any>): {
@@ -191,7 +211,10 @@ export class AgentToolRegistry {
       );
     }
 
-    const runWithInput = async (resolvedInput: typeof validation.value) => {
+    const runWithInput = async (
+      resolvedInput: typeof validation.value,
+      executionContext: AgentToolContext = context,
+    ) => {
       const execute = async () => {
         if (options.isExecutionAllowed && !options.isExecutionAllowed()) {
           return {
@@ -210,7 +233,7 @@ export class AgentToolRegistry {
         }
         try {
           const executionOutput = normalizeExecutionOutput(
-            await tool.execute(resolvedInput, context),
+            await tool.execute(resolvedInput, executionContext),
           );
           return {
             tool,
@@ -272,30 +295,60 @@ export class AgentToolRegistry {
             },
           };
         }
-        return runWithInput(resolved.value);
+        return runWithInput(
+          resolved.value,
+          journalUnavailable
+            ? { ...context, journalFallbackApproved: true }
+            : context,
+        );
       }
-      return runWithInput(validation.value);
+      return runWithInput(
+        validation.value,
+        journalUnavailable
+          ? { ...context, journalFallbackApproved: true }
+          : context,
+      );
     };
 
     const toolWantsConfirmation =
       (await tool.shouldRequireConfirmation?.(validation.value, context)) ??
       tool.spec.requiresConfirmation;
-    // The tool says whether this call is a write worth reviewing; the user's
-    // write mode says how much review they want. Confirming every write made
-    // one ordinary request raise a card per step, which is a wizard rather
-    // than an agent -- and bought little once every reversible write gained a
-    // journalled inverse. In `auto`, only what cannot be undone still asks.
+    const mutationPlan =
+      tool.spec.mutability === "write"
+        ? ((await tool.planMutation?.(validation.value, context)) ?? {
+            effect: "write" as const,
+            reversibility: "none" as const,
+            reason:
+              "This write tool did not provide a durable operation-specific inverse plan.",
+          })
+        : {
+            effect: "none" as const,
+            reversibility: "none" as const,
+          };
+    const writeMode = getAgentLibraryWriteMode();
+    const journalUnavailable =
+      mutationPlan.effect === "write" && !isAgentChangeJournalAvailable();
+    if (journalUnavailable && writeMode === "yolo") {
+      return createSyntheticErrorResult(
+        call,
+        `${call.name} was refused because the durable change journal is unavailable. Unattended writes cannot run without restart-safe recovery.`,
+      );
+    }
+    const planRequiresConfirmation =
+      mutationPlan.requiresConfirmation === true ||
+      (mutationPlan.effect === "write" &&
+        (writeMode === "safe" ||
+          (writeMode === "auto" &&
+            (mutationPlan.reversibility !== "full" || journalUnavailable))));
     const shouldRequireConfirmation =
       options.forceConfirmation && tool.createPendingAction
         ? true
-        : toolWantsConfirmation &&
-          writeNeedsConfirmation({
-            mode: getAgentLibraryWriteMode(),
-            toolName: tool.spec.name,
-            input: validation.value,
-          });
+        : mutationPlan.effect === "write"
+          ? planRequiresConfirmation
+          : toolWantsConfirmation;
     const acceptsInheritedApproval =
       shouldRequireConfirmation &&
+      !journalUnavailable &&
       options.inheritedApproval &&
       Boolean(
         await tool.acceptInheritedApproval?.(
@@ -307,15 +360,29 @@ export class AgentToolRegistry {
     if (acceptsInheritedApproval) {
       return {
         kind: "result",
-        execution: await runWithInput(validation.value),
+        execution: await runWithInput(
+          validation.value,
+          journalUnavailable
+            ? { ...context, journalFallbackApproved: true }
+            : context,
+        ),
       };
     }
     if (shouldRequireConfirmation && tool.createPendingAction) {
       const requestId = createRequestId();
+      const pendingAction = await tool.createPendingAction(
+        validation.value,
+        context,
+      );
       return {
         kind: "confirmation",
         requestId,
-        action: await tool.createPendingAction(validation.value, context),
+        action: journalUnavailable
+          ? withRecoveryWarning(
+              pendingAction,
+              "Zotero's durable journal is unavailable. If you continue, this change may not be recoverable after a restart.",
+            )
+          : pendingAction,
         execute: runConfirmedExecution,
         deny: () => ({
           tool,
@@ -328,6 +395,12 @@ export class AgentToolRegistry {
           },
         }),
       };
+    }
+    if (shouldRequireConfirmation) {
+      return createSyntheticErrorResult(
+        call,
+        `${call.name} requires confirmation for this mutation plan, but the tool did not provide a confirmation action. The write was not executed.`,
+      );
     }
 
     return {

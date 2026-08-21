@@ -24,6 +24,7 @@ import {
   normalizeMoveAssignmentsFromResolution,
   getMoveAssignmentFieldId,
   executeAndRecordUndo,
+  planLibraryMutations,
 } from "./mutateLibraryShared";
 
 type MoveToCollectionInput = {
@@ -306,6 +307,9 @@ export function createMoveToCollectionTool(
       };
       return ok({ action: input.action, operation: updatedOperation });
     },
+
+    planMutation: (input, context) =>
+      planLibraryMutations(mutationService, [input.operation], context),
 
     execute: async (input, context) => {
       return executeAndRecordUndo(

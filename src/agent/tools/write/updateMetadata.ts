@@ -33,6 +33,7 @@ import {
   executeAndRecordUndo,
   executeAndRecordUndoBatch,
   normalizeMetadataPatch,
+  planLibraryMutations,
 } from "./mutateLibraryShared";
 
 type UpdateMetadataInput = {
@@ -328,6 +329,9 @@ export function createUpdateMetadataTool(
       // review_table is read-only; pass through unchanged
       return ok(input);
     },
+
+    planMutation: (input, context) =>
+      planLibraryMutations(mutationService, input.operations, context),
 
     async execute(input, context) {
       if (input.operations.length === 1) {

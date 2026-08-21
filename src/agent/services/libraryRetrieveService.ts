@@ -58,6 +58,7 @@ import type {
 } from "./zoteroGateway";
 import type { PdfService } from "./pdfService";
 import type { ModelProfileOverride } from "../../modelCapabilities";
+import { libraryIndexService } from "../../services/libraryIndexService";
 
 export type LibraryRetrieveDepth = "pool" | "metadata" | "evidence" | "verify";
 export type LibraryRetrieveIntent = "enumerate" | "verify" | "summarize";
@@ -2014,15 +2015,11 @@ export class LibraryRetrieveService {
   private buildScopeSourceSamples(scope: ScopeResolution): string[] {
     const withAbstract: string[] = [];
     const titleOnly: string[] = [];
+    const snapshot = libraryIndexService.peekSnapshot(scope.libraryID);
     for (const target of scope.items.slice(0, 20)) {
       if (withAbstract.length >= 3) break;
-      const metadata = this.zoteroGateway.getEditableArticleMetadata(
-        this.zoteroGateway.getItem(target.itemId),
-      );
-      const abstract = normalizeText(metadata?.fields.abstractNote).slice(
-        0,
-        240,
-      );
+      const indexed = snapshot?.itemById.get(target.itemId);
+      const abstract = normalizeText(indexed?.abstractNote).slice(0, 240);
       const sample = [normalizeText(target.title), abstract]
         .filter(Boolean)
         .join("\n");
@@ -2104,103 +2101,81 @@ export class LibraryRetrieveService {
       ? selectedTags
       : explicitTagContexts;
 
-    if (explicitItemIds.length) {
-      const items =
-        this.zoteroGateway.getBibliographicItemTargetsByItemIds(
-          explicitItemIds,
-        );
-      return {
-        type: "items",
-        name: `${items.length} selected items`,
+    if (explicitItemIds.length || collectionIds.length || tagContexts.length) {
+      const resolved = await this.zoteroGateway.resolveLibraryScopeItemIds({
         libraryID,
-        collectionIds: [],
-        tagContexts: [],
-        tagItemIds: [],
-        explicitItemIds,
-        items,
-        totalItems: items.length,
-        warnings,
-      };
-    }
-
-    if (collectionIds.length || tagContexts.length) {
-      const byItemId = new Map<number, LibraryItemTarget>();
-      const tagItemIds = new Set<number>();
-      let totalItems = 0;
-      const names: string[] = [];
-      for (const collectionId of collectionIds) {
-        const result = await this.zoteroGateway.listCollectionItemTargets({
-          libraryID,
-          collectionId,
-          limit: input.maxMetadataItems,
-        });
-        totalItems += result.totalCount;
-        names.push(result.collection.path || result.collection.name);
-        for (const target of result.items) {
-          if (
-            byItemId.size >= input.maxMetadataItems &&
-            !byItemId.has(target.itemId)
-          ) {
-            continue;
-          }
-          byItemId.set(target.itemId, target);
-        }
+        itemIds: explicitItemIds,
+        collectionIds,
+        tagContexts,
+      });
+      const cappedIds = resolved.itemIds.slice(0, input.maxMetadataItems);
+      // Materialize each unique target exactly once, after the complete union
+      // and the single metadata budget have been applied.
+      const items =
+        this.zoteroGateway.getBibliographicItemTargetsByItemIds(cappedIds);
+      const included = new Set(items.map((target) => target.itemId));
+      const filteredExplicitIds = explicitItemIds.filter((id) =>
+        resolved.itemIds.includes(id),
+      );
+      if (filteredExplicitIds.length < explicitItemIds.length) {
+        warnings.push(
+          "Some explicit item IDs were not bibliographic items in the resolved library and were excluded.",
+        );
       }
-      if (collectionIds.length > 1 && byItemId.size < totalItems) {
+      if (
+        resolved.summedScopeCount > resolved.itemIds.length &&
+        collectionIds.length > 1
+      ) {
         warnings.push(
           "Multiple collection totals may include overlapping items; retrieval uses unique item IDs.",
         );
       }
-      for (const tagContext of tagContexts) {
-        const result = await this.zoteroGateway.listTagItemTargets({
-          libraryID,
-          tagContext,
-          limit: input.maxMetadataItems,
-        });
-        totalItems += result.totalCount;
-        names.push(result.tagName);
-        for (const target of result.items) {
-          if (
-            byItemId.size >= input.maxMetadataItems &&
-            !byItemId.has(target.itemId)
-          ) {
-            continue;
-          }
-          byItemId.set(target.itemId, target);
-          tagItemIds.add(target.itemId);
-        }
-      }
-      if (tagContexts.length > 1 && byItemId.size < totalItems) {
+      if (
+        resolved.summedScopeCount > resolved.itemIds.length &&
+        tagContexts.length > 1
+      ) {
         warnings.push(
           "Multiple tag totals may include overlapping items; retrieval uses unique item IDs.",
         );
       }
       if (
+        resolved.summedScopeCount > resolved.itemIds.length &&
         collectionIds.length &&
-        tagContexts.length &&
-        byItemId.size < totalItems
+        tagContexts.length
       ) {
         warnings.push(
           "Selected collection and tag totals may include overlapping items; retrieval uses unique item IDs.",
         );
       }
-      const isMetadataCapped =
-        byItemId.size >= input.maxMetadataItems && totalItems > byItemId.size;
+      const scopeKinds = [
+        explicitItemIds.length ? "items" : "",
+        collectionIds.length ? "collection" : "",
+        tagContexts.length ? "tag" : "",
+      ].filter(Boolean);
+      const names = [
+        ...(explicitItemIds.length
+          ? [`${filteredExplicitIds.length} selected items`]
+          : []),
+        ...resolved.collectionNames,
+        ...resolved.tagNames,
+      ];
       return {
         type:
-          collectionIds.length && tagContexts.length
+          scopeKinds.length > 1
             ? "mixed"
-            : collectionIds.length
-              ? "collection"
-              : "tag",
+            : explicitItemIds.length
+              ? "items"
+              : collectionIds.length
+                ? "collection"
+                : "tag",
         name: names.join(" + "),
         libraryID,
         collectionIds,
         tagContexts,
-        tagItemIds: Array.from(tagItemIds),
-        explicitItemIds: [],
-        items: Array.from(byItemId.values()),
-        totalItems: isMetadataCapped ? totalItems : byItemId.size,
+        tagItemIds: resolved.tagItemIds.filter((id) => included.has(id)),
+        explicitItemIds: filteredExplicitIds,
+        items,
+        totalItems: resolved.itemIds.length,
         warnings,
       };
     }
@@ -2363,16 +2338,23 @@ export class LibraryRetrieveService {
           }
         }
       }
+      const explicit = new Set(scope.explicitItemIds);
+      if (explicit.size) {
+        const explicitRecordIds = allRecordItemIds.filter((itemId) =>
+          explicit.has(itemId),
+        );
+        for (const query of probes) {
+          await runQuicksearch(query, {
+            allowedItemIds: explicitRecordIds,
+          });
+        }
+      }
       if (scope.collectionIds.length || scope.tagContexts.length) {
         scan.matched = matchedIds.size;
         return scan;
       }
-      const explicit = new Set(scope.explicitItemIds);
-      for (const query of probes) {
-        await runQuicksearch(
-          query,
-          explicit.size ? { allowedItemIds: allRecordItemIds } : {},
-        );
+      if (!explicit.size) {
+        for (const query of probes) await runQuicksearch(query);
       }
       scan.matched = matchedIds.size;
       return scan;

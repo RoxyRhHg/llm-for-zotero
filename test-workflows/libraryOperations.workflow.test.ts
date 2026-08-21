@@ -1,6 +1,7 @@
 import { assert } from "chai";
 import { ZoteroGateway } from "../src/agent/services/zoteroGateway";
 import { LibraryMutationService } from "../src/agent/services/libraryMutationService";
+import { replayLibraryInverse } from "../test/helpers/replayLibraryInverse";
 
 declare const Zotero: any;
 
@@ -285,6 +286,9 @@ describe("library operations against real Zotero", function () {
       await item.saveTx();
 
       const service = new LibraryMutationService(gateway());
+      const context = {
+        request: { conversationKey: 1, libraryID: libraryID() },
+      } as never;
       const outcome = await service.executeOperation(
         {
           type: "move_to_collection",
@@ -293,10 +297,10 @@ describe("library operations against real Zotero", function () {
           mode: "move",
           from: "all",
         },
-        { request: { conversationKey: 1, libraryID: libraryID() } } as never,
+        context,
       );
 
-      await outcome.undo?.revert();
+      await replayLibraryInverse(service, outcome, context);
       const rows = await Zotero.DB.columnQueryAsync(
         "SELECT collectionID FROM collectionItems WHERE itemID=?",
         [item.id],

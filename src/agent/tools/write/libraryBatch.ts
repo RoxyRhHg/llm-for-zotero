@@ -1,4 +1,8 @@
-import type { AgentToolDefinition } from "../../types";
+import type {
+  AgentJournalActionScope,
+  AgentJournalStepOutcome,
+  AgentToolDefinition,
+} from "../../types";
 import type { AgentToolRegistry } from "../registry";
 import type { ZoteroGateway } from "../../services/zoteroGateway";
 import type { ActionRegistry, ActionServices } from "../../actions";
@@ -14,6 +18,13 @@ import {
   markBatchJobRunning,
   type BatchJobRecord,
 } from "../../store/batchJobStore";
+import {
+  createJournalId,
+  isAgentChangeJournalAvailable,
+  prepareJournalAction,
+  updateJournalAction,
+  type JournalReversibility,
+} from "../../store/changeJournal";
 import { ok, fail, validateObject, normalizePositiveInt } from "../shared";
 
 type RunBatchInput = {
@@ -62,6 +73,29 @@ const DURABLE_BATCH_JOBS = new Set([
   "organize_unfiled",
   "audit_library",
 ]);
+
+function combineBatchReversibility(
+  outcomes: AgentJournalStepOutcome[],
+): JournalReversibility {
+  const changed = outcomes.filter((outcome) => outcome.status !== "no_effect");
+  if (
+    !changed.length ||
+    changed.every((outcome) => outcome.reversibility === "full")
+  ) {
+    return "full";
+  }
+  if (changed.every((outcome) => outcome.reversibility === "none")) {
+    return "none";
+  }
+  return "partial";
+}
+
+function batchAffectedCount(outcomes: AgentJournalStepOutcome[]): number {
+  return outcomes.reduce(
+    (total, outcome) => total + Math.max(0, outcome.affectedCount),
+    0,
+  );
+}
 
 /**
  * Runs and resumes durable library-wide jobs.
@@ -204,6 +238,19 @@ export function createLibraryBatchTool(deps: {
       return input.kind !== "list";
     },
 
+    planMutation(input) {
+      if (input.kind === "list") {
+        return { effect: "none", reversibility: "full" };
+      }
+      return {
+        effect: "write",
+        reversibility: "partial",
+        reason:
+          "Each applied page is journalled, while external model work and an interrupted remainder are checkpointed separately.",
+        requiresConfirmation: input.kind === "resume",
+      };
+    },
+
     createPendingAction(input, context) {
       if (input.kind === "list") {
         throw new Error(
@@ -321,6 +368,83 @@ export function createLibraryBatchTool(deps: {
       let lastCursor = prepared.baseCursor;
       let lastAppliedCount = prepared.baseAppliedCount;
       let lastTotalCount = prepared.totalCount;
+      const journalOutcomes: AgentJournalStepOutcome[] = [];
+      let journalSequence = 0;
+      let journalActionId: string | null = null;
+      let journalFinalized = false;
+      if (isAgentChangeJournalAvailable()) {
+        journalActionId = createJournalId("action");
+        try {
+          await prepareJournalAction({
+            actionId: journalActionId,
+            runId: prepared.jobId,
+            conversationKey: context.request.conversationKey,
+            toolName: context.journalToolName || "library_batch",
+            description: `${prepared.resumed ? "Resume" : "Run"} ${prepared.job} batch job`,
+            effect: "write",
+            reversibility: "partial",
+            recovery:
+              "The durable batch checkpoint and each applied mutation step are recorded separately.",
+          });
+        } catch (error) {
+          await store.finishBatchJob({
+            jobId: prepared.jobId,
+            status: "failed",
+            now: now(),
+          });
+          throw error;
+        }
+      }
+      const journalActionScope: AgentJournalActionScope | undefined =
+        journalActionId
+          ? {
+              actionId: journalActionId,
+              allocateSequence: () => {
+                journalSequence += 1;
+                return journalSequence;
+              },
+              recordStep: (outcome) => {
+                journalOutcomes.push(outcome);
+              },
+            }
+          : undefined;
+      const finalizeJournal = async (
+        failed: boolean,
+        error?: unknown,
+      ): Promise<void> => {
+        if (!journalActionId || journalFinalized) return;
+        const affectedCount = batchAffectedCount(journalOutcomes);
+        const reversibility = combineBatchReversibility(journalOutcomes);
+        const uncertain = journalOutcomes.some(
+          (outcome) => outcome.status === "uncertain",
+        );
+        await updateJournalAction({
+          actionId: journalActionId,
+          status: failed
+            ? affectedCount > 0
+              ? "partially_applied"
+              : uncertain
+                ? "uncertain"
+                : "failed"
+            : affectedCount === 0
+              ? "no_effect"
+              : reversibility === "none"
+                ? "irreversible"
+                : "applied",
+          reversibility,
+          affectedCount,
+          error:
+            failed && error !== undefined
+              ? error instanceof Error
+                ? error.message
+                : String(error)
+              : undefined,
+          recovery: failed
+            ? "Previously applied batch steps retain their durable inverses; inspect any uncertain step before retrying."
+            : undefined,
+        });
+        journalFinalized = true;
+      };
       const checkpoint = async (value: ActionCheckpoint): Promise<void> => {
         const cursor = prepared.baseCursor + Math.max(0, value.cursor);
         const appliedCount =
@@ -350,6 +474,8 @@ export function createLibraryBatchTool(deps: {
         services: deps.services,
         confirmationMode: "auto_approve",
         runId: prepared.jobId,
+        journalActionScope,
+        journalToolName: context.journalToolName || "library_batch",
         checkpoint,
         onProgress: (event) => {
           if (event.type === "step_done" && event.summary) {
@@ -383,14 +509,24 @@ export function createLibraryBatchTool(deps: {
         }
 
         const stopped = output.stopped === true;
+        if (!result.ok) {
+          const failure = new Error(
+            result.error || `Batch job "${prepared.job}" failed`,
+          );
+          await finalizeJournal(true, failure);
+          await store.finishBatchJob({
+            jobId: prepared.jobId,
+            status: "failed",
+            now: now(),
+          });
+          throw failure;
+        }
+        await finalizeJournal(false);
         await store.finishBatchJob({
           jobId: prepared.jobId,
-          status: !result.ok ? "failed" : stopped ? "cancelled" : "completed",
+          status: stopped ? "cancelled" : "completed",
           now: now(),
         });
-        if (!result.ok) {
-          throw new Error(result.error || `Batch job "${prepared.job}" failed`);
-        }
 
         return {
           job: prepared.job,
@@ -403,6 +539,7 @@ export function createLibraryBatchTool(deps: {
           progress: progress.slice(-20),
         };
       } catch (error) {
+        await finalizeJournal(true, error).catch(() => undefined);
         await store.finishBatchJob({
           jobId: prepared.jobId,
           status: "failed",

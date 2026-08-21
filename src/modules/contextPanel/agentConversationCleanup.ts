@@ -10,7 +10,15 @@ import {
   queueAgentTraceFileCleanupInTransaction,
   rememberAgentTraceRunIDsForDeletedConversation,
 } from "../../agent/store/traceStore";
-import { clearUndoStack } from "../../agent/store/undoStore";
+import {
+  JOURNAL_ACTIONS_TABLE,
+  LEGACY_JOURNAL_TABLE,
+  queueJournalRecoveryBlobCleanupInTransaction,
+  sweepJournalRecoveryBlobCleanup,
+  JOURNAL_OBSERVATIONS_TABLE,
+  JOURNAL_PAYLOADS_TABLE,
+  JOURNAL_STEPS_TABLE,
+} from "../../agent/store/changeJournal";
 import { clearAgentRuntimeTraceState } from "./agentState";
 
 export type AgentConversationCleanupDeps = {
@@ -146,13 +154,40 @@ export async function clearPersistedAgentConversationRowsInTransaction(
      WHERE scope_key = ? OR origin_conversation_key = ?`,
     [`conversation:${key}`, key],
   );
+  await queueJournalRecoveryBlobCleanupInTransaction(key).catch((error) => {
+    if (/no such table|no table/i.test(String(error))) return;
+    throw error;
+  });
+  for (const table of [
+    JOURNAL_OBSERVATIONS_TABLE,
+    JOURNAL_PAYLOADS_TABLE,
+    JOURNAL_STEPS_TABLE,
+  ]) {
+    await deleteIfPresent(
+      db,
+      `DELETE FROM ${table} WHERE action_id IN (
+         SELECT action_id FROM ${JOURNAL_ACTIONS_TABLE}
+         WHERE conversation_key = ?
+       )`,
+      [key],
+    );
+  }
+  await deleteIfPresent(
+    db,
+    `DELETE FROM ${JOURNAL_ACTIONS_TABLE} WHERE conversation_key = ?`,
+    [key],
+  );
+  await deleteIfPresent(
+    db,
+    `DELETE FROM ${LEGACY_JOURNAL_TABLE} WHERE conversation_key = ?`,
+    [key],
+  );
 }
 
 export async function clearAgentConversationState(
   conversationKey: number,
 ): Promise<void> {
   clearRememberedLocalDocumentPaths(conversationKey);
-  clearUndoStack(conversationKey);
   let firstError: unknown;
   const capture = async (task: () => Promise<void>): Promise<void> => {
     try {
@@ -171,6 +206,7 @@ export async function clearAgentConversationState(
     capture(() => clearPersistedAgentToolResultHandles(conversationKey)),
     capture(() => clearPersistedAgentEvidence(conversationKey)),
     capture(() => clearPersistedAgentCoverage(conversationKey)),
+    capture(() => sweepJournalRecoveryBlobCleanup(conversationKey)),
   ]);
   if (firstError) throw firstError;
 }

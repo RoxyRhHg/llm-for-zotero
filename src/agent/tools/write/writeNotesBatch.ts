@@ -16,6 +16,7 @@ import { ok, fail, validateObject, normalizePositiveInt } from "../shared";
 import {
   executeAndRecordUndo,
   normalizeChecklistItemIdsFromResolution,
+  planLibraryMutations,
 } from "./mutateLibraryShared";
 
 const NOTES_CHECKLIST_FIELD_ID = "writeNotesChecklist";
@@ -197,6 +198,9 @@ export function createWriteNotesBatchTool(
       }
       return ok({ operation: { ...input.operation, notes } });
     },
+
+    planMutation: (input, context) =>
+      planLibraryMutations(mutationService, [input.operation], context),
 
     async execute(input, context) {
       return executeAndRecordUndo(

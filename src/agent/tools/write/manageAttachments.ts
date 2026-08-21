@@ -10,7 +10,10 @@ import {
 } from "../../services/libraryMutationService";
 import type { ZoteroGateway } from "../../services/zoteroGateway";
 import { ok, fail, validateObject, normalizePositiveInt } from "../shared";
-import { executeAndRecordUndo } from "./mutateLibraryShared";
+import {
+  executeAndRecordUndo,
+  planLibraryMutations,
+} from "./mutateLibraryShared";
 
 type ManageAttachmentsInput = {
   operation:
@@ -247,6 +250,9 @@ export function createManageAttachmentsTool(
 
       return ok(input);
     },
+
+    planMutation: (input, context) =>
+      planLibraryMutations(mutationService, [input.operation], context),
 
     async execute(input, context) {
       return executeAndRecordUndo(

@@ -20,7 +20,10 @@ import {
   normalizePositiveInt,
   normalizePositiveIntArray,
 } from "../shared";
-import { executeAndRecordUndo } from "./mutateLibraryShared";
+import {
+  executeAndRecordUndo,
+  planLibraryMutations,
+} from "./mutateLibraryShared";
 
 const CREATOR_SCHEMA = {
   type: "array" as const,
@@ -185,6 +188,9 @@ export function createCreateItemsTool(
       return ok(input);
     },
 
+    planMutation: (input, context) =>
+      planLibraryMutations(mutationService, [input.operation], context),
+
     async execute(input, context) {
       return executeAndRecordUndo(
         mutationService,
@@ -322,6 +328,9 @@ export function createReparentItemsTool(
       return ok(input);
     },
 
+    planMutation: (input, context) =>
+      planLibraryMutations(mutationService, [input.operation], context),
+
     async execute(input, context) {
       return executeAndRecordUndo(
         mutationService,
@@ -426,6 +435,9 @@ export function createRelateItemsTool(
     applyConfirmation(input) {
       return ok(input);
     },
+
+    planMutation: (input, context) =>
+      planLibraryMutations(mutationService, [input.operation], context),
 
     async execute(input, context) {
       return executeAndRecordUndo(

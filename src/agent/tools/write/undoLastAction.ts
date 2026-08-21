@@ -1,18 +1,19 @@
 import type { AgentToolDefinition } from "../../types";
 import { ok } from "../shared";
-import { peekUndoEntry, popUndoEntry } from "../../store/undoStore";
+import type { ZoteroGateway } from "../../services/zoteroGateway";
+import { revertActions } from "../../services/changeReverter";
+import { listJournalActions } from "../../store/changeJournal";
 
 type UndoLastActionInput = Record<string, never>;
 
-export function createUndoLastActionTool(): AgentToolDefinition<
-  UndoLastActionInput,
-  unknown
-> {
+export function createUndoLastActionTool(
+  zoteroGateway: ZoteroGateway,
+): AgentToolDefinition<UndoLastActionInput, unknown> {
   return {
     spec: {
       name: "undo_last_action",
       description:
-        "Undo the most recent write action performed by the agent in this conversation — e.g. applied tags, a metadata edit, moved papers, or a created collection. Each session keeps up to 10 undo entries.",
+        "Undo the most recent durable write action performed by the agent in this conversation. The history survives restart and an action's steps are reverted newest-first.",
       inputSchema: {
         type: "object",
         additionalProperties: false,
@@ -29,10 +30,16 @@ export function createUndoLastActionTool(): AgentToolDefinition<
         onApproved: "Approval received - undoing the action",
         onDenied: "Undo cancelled",
         onSuccess: ({ content }) => {
-          const description =
+          const record =
             content && typeof content === "object"
-              ? String((content as { description?: unknown }).description || "")
-              : "";
+              ? (content as Record<string, unknown>)
+              : {};
+          const description = String(record.description || "");
+          if (record.status === "partially_undone") {
+            return description
+              ? `Partially undone: ${description}; some effects may remain`
+              : "The recorded inverse ran, but some effects may remain";
+          }
           return description
             ? `Undone: ${description}`
             : "Last action undone successfully";
@@ -43,14 +50,39 @@ export function createUndoLastActionTool(): AgentToolDefinition<
       return ok<UndoLastActionInput>({});
     },
     shouldRequireConfirmation: async (_input, context) => {
-      return Boolean(peekUndoEntry(context.request.conversationKey));
+      const actions = await listJournalActions({
+        conversationKey: context.request.conversationKey,
+        limit: 1,
+        pendingOnly: true,
+      });
+      return actions.length > 0;
     },
-    createPendingAction: (_input, context) => {
-      const entry = peekUndoEntry(context.request.conversationKey);
+    planMutation: async (_input, context) => {
+      const actions = await listJournalActions({
+        conversationKey: context.request.conversationKey,
+        limit: 1,
+        pendingOnly: true,
+      });
+      return actions.length
+        ? {
+            effect: "write",
+            reversibility: "none",
+            reason:
+              "Undo replays an inverse without creating a redo action, so the undo itself cannot be automatically undone.",
+            requiresConfirmation: true,
+          }
+        : { effect: "none", reversibility: "full" };
+    },
+    createPendingAction: async (_input, context) => {
+      const [action] = await listJournalActions({
+        conversationKey: context.request.conversationKey,
+        limit: 1,
+        pendingOnly: true,
+      });
       return {
         toolName: "undo_last_action",
-        title: entry ? "Confirm undo" : "Nothing to undo",
-        description: entry ? entry.description : undefined,
+        title: action ? "Confirm undo" : "Nothing to undo",
+        description: action?.description,
         confirmLabel: "Undo",
         cancelLabel: "Cancel",
         fields: [
@@ -58,21 +90,38 @@ export function createUndoLastActionTool(): AgentToolDefinition<
             type: "text" as const,
             id: "description",
             label: "Action to undo",
-            value: entry ? entry.description : "There is nothing to undo.",
+            value: action ? action.description : "There is nothing to undo.",
           },
         ],
       };
     },
     execute: async (_input, context) => {
-      const entry = popUndoEntry(context.request.conversationKey);
-      if (!entry) {
+      const [action] = await listJournalActions({
+        conversationKey: context.request.conversationKey,
+        limit: 1,
+        pendingOnly: true,
+      });
+      if (!action) {
         throw new Error("Nothing to undo in this conversation");
       }
-      await entry.revert();
+      const outcome = await revertActions({
+        actions: [action],
+        zoteroGateway,
+        context,
+      });
+      if (!outcome.reverted && !outcome.partiallyReverted) {
+        throw new Error(
+          outcome.skipped[0]?.reason ||
+            "The latest action could not be safely undone",
+        );
+      }
       return {
-        status: "undone",
-        toolName: entry.toolName,
-        description: entry.description,
+        status: outcome.partiallyReverted ? "partially_undone" : "undone",
+        toolName: action.toolName,
+        description: action.description,
+        reverted: outcome.reverted,
+        partiallyReverted: outcome.partiallyReverted,
+        residuals: outcome.residuals,
       };
     },
   };

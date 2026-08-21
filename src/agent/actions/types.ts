@@ -1,4 +1,8 @@
-import type { AgentPendingAction, AgentConfirmationResolution } from "../types";
+import type {
+  AgentConfirmationResolution,
+  AgentJournalActionScope,
+  AgentPendingAction,
+} from "../types";
 import type { AgentToolRegistry } from "../tools/registry";
 import type { ZoteroGateway } from "../services/zoteroGateway";
 import type { LibraryQueryService } from "../services/libraryQueryService";
@@ -101,6 +105,10 @@ export type ActionExecutionContext = {
    * Defaults to the conversation when absent.
    */
   runId?: string;
+  /** Durable action shared by every nested write in a composite invocation. */
+  journalActionScope?: AgentJournalActionScope;
+  /** User-visible tool identity retained across internal action/tool bridges. */
+  journalToolName?: string;
   zoteroGateway: ZoteroGateway;
   services: ActionServices;
   /** The Zotero library ID to operate on. */

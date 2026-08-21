@@ -1,9 +1,17 @@
 import { assert } from "chai";
 import { createMalformedToolArgumentsDiagnostic } from "../src/agent/toolArgumentDiagnostics";
 import { AgentToolRegistry } from "../src/agent/tools/registry";
+import { initAgentChangeJournal } from "../src/agent/store/changeJournal";
 import type { AgentToolContext } from "../src/agent/types";
+import { ChangeJournalTestDb } from "./helpers/changeJournalTestDb";
 
 describe("AgentToolRegistry", function () {
+  const originalZotero = globalThis.Zotero;
+
+  afterEach(function () {
+    globalThis.Zotero = originalZotero;
+  });
+
   const baseContext: AgentToolContext = {
     request: {
       conversationKey: 1,
@@ -174,7 +182,7 @@ describe("AgentToolRegistry", function () {
     assert.equal(result.action.toolName, "mutate_library");
     assert.deepEqual(
       result.action.fields.map((field) => field.id),
-      ["selectedOperations", "operationsJson"],
+      ["selectedOperations", "operationsJson", "journalRecoveryWarning"],
     );
     assert.equal(result.deny().result.ok, false);
     const approved = await result.execute({
@@ -188,6 +196,11 @@ describe("AgentToolRegistry", function () {
   });
 
   it("lets tools opt into explicit inherited approval", async function () {
+    globalThis.Zotero = {
+      DB: new ChangeJournalTestDb(),
+      debug: () => undefined,
+    } as never;
+    await initAgentChangeJournal();
     const registry = new AgentToolRegistry();
     registry.register({
       spec: {
@@ -238,6 +251,59 @@ describe("AgentToolRegistry", function () {
     if (result.kind !== "result") return;
     assert.equal(result.execution.result.ok, true);
     assert.deepEqual(result.execution.result.content, { applied: 1 });
+  });
+
+  it("does not inherit consent for an unjournalled fallback", async function () {
+    globalThis.Zotero = { debug: () => undefined } as never;
+    const registry = new AgentToolRegistry();
+    let executions = 0;
+    registry.register({
+      spec: {
+        name: "mutate_library",
+        description: "apply changes",
+        inputSchema: { type: "object" },
+        mutability: "write",
+        requiresConfirmation: true,
+      },
+      validate: () => ({ ok: true, value: {} }),
+      planMutation: () => ({ effect: "write", reversibility: "full" }),
+      acceptInheritedApproval: () => true,
+      createPendingAction: () => ({
+        toolName: "mutate_library",
+        title: "Apply changes?",
+        confirmLabel: "Approve",
+        cancelLabel: "Cancel",
+        fields: [],
+      }),
+      execute: async () => {
+        executions += 1;
+        return { applied: 1 };
+      },
+    });
+
+    const result = await registry.prepareExecution(
+      { id: "call-unavailable", name: "mutate_library", arguments: {} },
+      baseContext,
+      {
+        inheritedApproval: {
+          sourceToolName: "search_literature_online",
+          sourceActionId: "import",
+          sourceMode: "review",
+        },
+      },
+    );
+
+    assert.equal(result.kind, "confirmation");
+    assert.equal(executions, 0);
+    if (result.kind !== "confirmation") return;
+    assert.include(result.action.description, "Recovery warning");
+    assert.include(
+      result.action.fields.map((field) => field.id),
+      "journalRecoveryWarning",
+    );
+    const confirmed = await result.execute();
+    assert.isTrue(confirmed.result.ok);
+    assert.equal(executions, 1);
   });
 
   it("filters request-scoped tools when they are unavailable", async function () {

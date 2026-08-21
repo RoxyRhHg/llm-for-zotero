@@ -28,6 +28,7 @@ import {
   normalizeTagAssignmentsFromResolution,
   getTagAssignmentFieldId,
   executeAndRecordUndo,
+  planLibraryMutations,
 } from "./mutateLibraryShared";
 
 type ApplyTagsInput = {
@@ -308,6 +309,9 @@ export function createApplyTagsTool(
       // action === "remove" — no editable fields, pass through
       return ok(input);
     },
+
+    planMutation: (input, context) =>
+      planLibraryMutations(mutationService, [input.operation], context),
 
     async execute(input, context) {
       return executeAndRecordUndo(

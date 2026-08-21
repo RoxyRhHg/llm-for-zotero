@@ -664,6 +664,19 @@ export type AgentToolExecutionOutput<TResult = unknown> =
       artifacts?: AgentToolArtifact[];
     };
 
+export type AgentJournalStepOutcome = {
+  status: "applied" | "no_effect" | "irreversible" | "uncertain" | "failed";
+  reversibility: "full" | "partial" | "none";
+  affectedCount: number;
+};
+
+/** Shared by nested tool calls that belong to one user-approved action. */
+export type AgentJournalActionScope = {
+  actionId: string;
+  allocateSequence: () => number;
+  recordStep: (outcome: AgentJournalStepOutcome) => void;
+};
+
 export type AgentToolContext = {
   request: AgentRuntimeRequest;
   item: Zotero.Item | null;
@@ -672,6 +685,20 @@ export type AgentToolContext = {
   modelProviderLabel?: string;
   resourceSignature?: string;
   signal?: AbortSignal;
+  /**
+   * Internal consent witness used only when journal initialization failed.
+   * The registry sets this after an explicit confirmation in safe/auto mode;
+   * direct tool/coordinator calls must not silently bypass durable recovery.
+   */
+  journalFallbackApproved?: boolean;
+  /**
+   * Internal identity of the outer semantic tool that the user invoked.
+   * Facades set this before delegating so durable history does not expose a
+   * legacy implementation-detail tool name.
+   */
+  journalToolName?: string;
+  /** Internal parent action used by composite tools such as library_batch. */
+  journalActionScope?: AgentJournalActionScope;
 };
 
 export type AgentToolInputValidation<T> =
@@ -734,6 +761,22 @@ export type AgentToolPresentation = {
   buildResultCards?: (content: unknown) => AgentToolResultCard[] | null;
 };
 
+/**
+ * The safety-relevant part of a tool's mutation plan.
+ *
+ * This is produced from the validated call, so confirmation policy consumes
+ * the same operation-specific answer that the durable coordinator will use
+ * instead of maintaining a second allowlist of supposedly reversible tools.
+ */
+export type AgentMutationPlan = {
+  effect: "none" | "write";
+  reversibility: "full" | "partial" | "none";
+  reason?: string;
+  /** Recovery resumes and privileged source review may require consent even
+   * when the selected write mode would otherwise auto-approve the call. */
+  requiresConfirmation?: boolean;
+};
+
 export type AgentToolDefinition<TInput = unknown, TResult = unknown> = {
   spec: ToolSpec;
   isAvailable?: (request: AgentRuntimeRequest) => boolean;
@@ -744,6 +787,10 @@ export type AgentToolDefinition<TInput = unknown, TResult = unknown> = {
     input: TInput,
     context: AgentToolContext,
   ) => Promise<AgentToolExecutionOutput<TResult>>;
+  planMutation?: (
+    input: TInput,
+    context: AgentToolContext,
+  ) => AgentMutationPlan | Promise<AgentMutationPlan>;
   shouldRequireConfirmation?: (
     input: TInput,
     context: AgentToolContext,

@@ -541,7 +541,7 @@ export function createBuiltInToolRegistry(
   const importLocalFiles = createImportLocalFilesTool(deps.zoteroGateway);
   const fileIO = createFileIOTool();
   const zoteroScript = createZoteroScriptTool();
-  const undoLastAction = createUndoLastActionTool();
+  const undoLastAction = createUndoLastActionTool(deps.zoteroGateway);
 
   registry.register(
     createRenamedTool({

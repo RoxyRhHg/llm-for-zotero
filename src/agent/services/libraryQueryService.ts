@@ -424,26 +424,15 @@ export class LibraryQueryService {
       tag: filters.tag,
       deleted: filters.deleted,
     };
-    // A sort or an offset has to be applied across the whole result set, so
-    // the gateway's own limit is withheld and the window is taken last.
-    // Truncating first and sorting the truncation would answer a different
-    // question than the one asked.
-    const needsFullSet = Boolean(params.sort) || Boolean(params.offset);
     const result = await this.zoteroGateway.listItemsByFilters({
       libraryID: params.libraryID,
       filters: agentFilters,
-      limit: needsFullSet ? undefined : params.limit,
+      limit: params.limit,
+      offset: params.offset,
+      sort: params.sort,
+      order: params.order,
     });
-    const windowed = needsFullSet
-      ? applyLimit(
-          applyOffset(
-            applySort(result.items, params.sort, params.order),
-            params.offset,
-          ),
-          params.limit,
-        )
-      : result.items;
-    const enriched = windowed.map((item) =>
+    const enriched = result.items.map((item) =>
       enrichItemTarget(item, this.zoteroGateway, params.include),
     );
     return { results: enriched, totalCount: result.totalCount, warnings: [] };

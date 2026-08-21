@@ -1,9 +1,12 @@
 import type { AgentToolDefinition } from "../../types";
 import type { ZoteroGateway } from "../../services/zoteroGateway";
-import { revertEntries } from "../../services/changeReverter";
 import {
-  listChangeJournal,
-  type ChangeJournalEntry,
+  analyzeJournalActions,
+  revertActions,
+} from "../../services/changeReverter";
+import {
+  listJournalActions,
+  type JournalActionWithSteps,
 } from "../../store/changeJournal";
 import { ok, fail, validateObject, normalizePositiveInt } from "../shared";
 
@@ -32,7 +35,7 @@ export function createRevertChangesTool(
     spec: {
       name: "revert_changes",
       description:
-        "Undo recent library changes recorded in the agent's change history. Use dryRun first to show the user what would be undone. Survives restarts, unlike undo_last_action.",
+        "Undo recent durable actions recorded in the agent's change history. Use dryRun first to analyze conflicts. Each action's steps are reverted newest-first.",
       inputSchema: {
         type: "object",
         additionalProperties: false,
@@ -66,10 +69,14 @@ export function createRevertChangesTool(
               ? (content as Record<string, unknown>)
               : {};
           if (record.dryRun) return "Listed the changes that can be undone";
-          const reverted = record.reverted;
-          return typeof reverted === "number"
-            ? `Undid ${reverted} change${reverted === 1 ? "" : "s"}`
-            : "Undo finished";
+          const reverted = Number(record.reverted) || 0;
+          const partiallyReverted = Number(record.partiallyReverted) || 0;
+          if (partiallyReverted) {
+            return reverted
+              ? `Undid ${reverted} change${reverted === 1 ? "" : "s"} fully and ${partiallyReverted} partially`
+              : `Partially undid ${partiallyReverted} change${partiallyReverted === 1 ? "" : "s"}; some effects may remain`;
+          }
+          return `Undid ${reverted} change${reverted === 1 ? "" : "s"}`;
         },
       },
     },
@@ -94,7 +101,7 @@ export function createRevertChangesTool(
      */
     async shouldRequireConfirmation(input, context) {
       if (input.dryRun) return false;
-      const entries = await listChangeJournal({
+      const entries = await listJournalActions({
         conversationKey: context.request.conversationKey,
         limit: input.count,
         pendingOnly: true,
@@ -102,10 +109,30 @@ export function createRevertChangesTool(
       return entries.length > 0;
     },
 
+    async planMutation(input, context) {
+      if (input.dryRun) {
+        return { effect: "none", reversibility: "full" };
+      }
+      const actions = await listJournalActions({
+        conversationKey: context.request.conversationKey,
+        limit: input.count,
+        pendingOnly: true,
+      });
+      return actions.length
+        ? {
+            effect: "write",
+            reversibility: "none",
+            reason:
+              "Reverting history does not create redo entries, so the revert itself cannot be automatically undone.",
+            requiresConfirmation: true,
+          }
+        : { effect: "none", reversibility: "full" };
+    },
+
     async createPendingAction(input, context) {
       // pendingOnly at the SQL level: filtering after LIMIT would spend the
       // budget on rows a previous undo already reverted.
-      const pending = await listChangeJournal({
+      const pending = await listJournalActions({
         conversationKey: context.request.conversationKey,
         limit: input.count,
         pendingOnly: true,
@@ -132,55 +159,70 @@ export function createRevertChangesTool(
     },
 
     async execute(input, context) {
-      const pending = await listChangeJournal({
+      const pending = await listJournalActions({
         conversationKey: context.request.conversationKey,
         limit: input.count,
         pendingOnly: true,
       });
 
       if (input.dryRun) {
+        const conflicts = await analyzeJournalActions({
+          actions: pending,
+          zoteroGateway,
+          context,
+        });
         return {
           dryRun: true,
-          changes: pending.map((entry) => ({
-            description: entry.description,
-            operation: entry.operation,
-            itemCount: entry.itemCount,
-            reversible: entry.status === "reversible",
-            reason: entry.irreversibleReason,
+          changes: pending.map((action) => ({
+            actionId: action.actionId,
+            description: action.description,
+            toolName: action.toolName,
+            stepCount: action.steps.length,
+            itemCount: action.affectedCount,
+            reversibility: action.reversibility,
+            reason: action.recovery,
           })),
+          conflicts,
         };
       }
 
       if (!pending.length) {
         return {
           reverted: 0,
+          partiallyReverted: 0,
+          residuals: [],
           skipped: [],
           message: "There are no recorded changes left to undo.",
         };
       }
 
-      const outcome = await revertEntries({
-        entries: pending,
+      const outcome = await revertActions({
+        actions: pending,
         zoteroGateway,
         context,
       });
       return {
         reverted: outcome.reverted,
+        partiallyReverted: outcome.partiallyReverted,
+        residuals: outcome.residuals,
         // Named explicitly so the agent reports what it could NOT put back
         // rather than implying a clean rollback.
         skipped: outcome.skipped,
+        conflicts: outcome.conflicts,
       };
     },
   };
 }
 
-function describeEntries(entries: ChangeJournalEntry[]): string {
+function describeEntries(entries: JournalActionWithSteps[]): string {
   return entries
     .map((entry) => {
       const suffix =
-        entry.status === "irreversible"
-          ? ` — cannot be undone: ${entry.irreversibleReason || "no inverse recorded"}`
-          : "";
+        entry.reversibility === "none"
+          ? ` — cannot be undone: ${entry.recovery || "no inverse recorded"}`
+          : entry.reversibility === "partial"
+            ? " — partially reversible"
+            : "";
       return `• ${entry.description}${suffix}`;
     })
     .join("\n");

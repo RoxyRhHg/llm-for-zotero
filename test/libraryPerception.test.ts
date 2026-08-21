@@ -201,10 +201,25 @@ describe("library_search ordering through the tool", function () {
         papers: targets,
         totalCount: targets.length,
       }),
-      listItemsByFilters: async () => ({
-        items: targets,
-        totalCount: targets.length,
-      }),
+      listItemsByFilters: async ({
+        sort,
+        order,
+        offset,
+        limit,
+      }: {
+        sort?: "dateAdded" | "title";
+        order?: "asc" | "desc";
+        offset?: number;
+        limit?: number;
+      }) => {
+        const sorted = applySort(targets, sort, order);
+        const windowed = applyOffset(sorted, offset);
+        const items =
+          Number.isFinite(limit) && Number(limit) > 0
+            ? windowed.slice(0, Math.floor(Number(limit)))
+            : windowed;
+        return { items, totalCount: targets.length };
+      },
       getItemCollectionIds: () => [],
       getItem: () => null,
       getEditableArticleMetadata: () => undefined,

@@ -1,6 +1,7 @@
 import { assert } from "chai";
 import { LibraryMutationService } from "../src/agent/services/libraryMutationService";
 import { createWriteNotesBatchTool } from "../src/agent/tools/write/writeNotesBatch";
+import { replayLibraryInverse } from "./helpers/replayLibraryInverse";
 
 /**
  * The binding constraint on "write a summary note for each of my 50 most
@@ -106,7 +107,7 @@ describe("batched note writing", function () {
       },
       context,
     );
-    await outcome.undo?.revert();
+    await replayLibraryInverse(service, outcome, context as never);
     assert.deepEqual(trashed, [[500, 501]]);
   });
 

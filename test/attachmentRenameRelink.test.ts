@@ -1,6 +1,7 @@
 import { assert } from "chai";
 import { ZoteroGateway } from "../src/agent/services/zoteroGateway";
 import { LibraryMutationService } from "../src/agent/services/libraryMutationService";
+import { replayLibraryInverse } from "./helpers/replayLibraryInverse";
 
 /**
  * Two attachment defects that reported success while doing nothing, or
@@ -173,15 +174,15 @@ describe("attachment rename and relink", function () {
         { request: { conversationKey: 1, libraryID: 1 } } as never,
       );
 
-      assert.exists(outcome.undo, "renaming recorded no inverse at all");
-      assert.deepEqual(outcome.undo?.inverseOperations, [
+      assert.exists(outcome.inverse, "renaming recorded no inverse at all");
+      assert.deepEqual(outcome.inverse?.inverseOperations, [
         {
           type: "rename_attachment",
           attachmentId: 55,
           newName: "old.pdf",
         },
       ]);
-      await outcome.undo?.revert();
+      await replayLibraryInverse(service, outcome);
       assert.equal(att.renameCalls.at(-1)?.newName, "old.pdf");
     });
   });
@@ -241,15 +242,15 @@ describe("attachment rename and relink", function () {
         },
         { request: { conversationKey: 1, libraryID: 1 } } as never,
       );
-      assert.exists(outcome.undo);
-      assert.deepEqual(outcome.undo?.inverseOperations, [
+      assert.exists(outcome.inverse);
+      assert.deepEqual(outcome.inverse?.inverseOperations, [
         {
           type: "relink_attachment",
           attachmentId: 55,
           newPath: "/Zotero/storage/ABCD/old.pdf",
         },
       ]);
-      await outcome.undo?.revert();
+      await replayLibraryInverse(service, outcome);
       assert.equal(withFile.relinkCalls.at(-1), "/Zotero/storage/ABCD/old.pdf");
 
       const missing = makeAttachment({ filePath: false });
@@ -262,7 +263,7 @@ describe("attachment rename and relink", function () {
         },
         { request: { conversationKey: 1, libraryID: 1 } } as never,
       );
-      assert.notExists(outcome2.undo, "nothing to restore, so no undo");
+      assert.notExists(outcome2.inverse, "nothing to restore, so no inverse");
     });
   });
 });

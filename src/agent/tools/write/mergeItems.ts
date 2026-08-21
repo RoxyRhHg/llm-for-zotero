@@ -19,6 +19,7 @@ import {
 import {
   executeAndRecordUndo,
   normalizeChecklistItemIdsFromResolution,
+  planLibraryMutations,
 } from "./mutateLibraryShared";
 
 const DUPLICATES_CHECKLIST_FIELD_ID = "duplicatesChecklist";
@@ -187,6 +188,9 @@ export function createMergeItemsTool(
         operation: { ...input.operation, otherItemIds },
       });
     },
+
+    planMutation: (input, context) =>
+      planLibraryMutations(mutationService, [input.operation], context),
 
     async execute(input, context) {
       return executeAndRecordUndo(

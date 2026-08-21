@@ -11,6 +11,7 @@
  */
 import type { AgentToolDefinition } from "../../types";
 import type { ZoteroGateway } from "../../services/zoteroGateway";
+import { executeExternalMutation } from "../../services/mutationCoordinator";
 import { ok, fail, validateObject } from "../shared";
 
 type LibrarySettingsInput = {
@@ -104,6 +105,25 @@ export function createLibrarySettingsTool(
     // Reading settings changes nothing, so only a write needs approval.
     shouldRequireConfirmation: (input) => input.action === "set",
 
+    planMutation(input) {
+      if (input.action !== "set") {
+        return { effect: "none", reversibility: "full" };
+      }
+      const current = zoteroGateway
+        .listSettings()
+        .find((entry) => entry.key === input.key);
+      if (current && Object.is(current.value, input.value)) {
+        return { effect: "none", reversibility: "full" };
+      }
+      return {
+        effect: "write",
+        reversibility: current ? "full" : "none",
+        reason: current
+          ? "The previous allowlisted preference value is journalled before the update."
+          : "The previous value could not be read, so the setting cannot be restored automatically.",
+      };
+    },
+
     createPendingAction(input) {
       const current = zoteroGateway
         .listSettings()
@@ -132,16 +152,63 @@ export function createLibrarySettingsTool(
       return ok(input);
     },
 
-    async execute(input) {
+    async execute(input, context) {
       if (input.action === "list") {
         return { settings: zoteroGateway.listSettings() };
       }
       if (input.action === "syncStatus") {
         return zoteroGateway.getSyncStatus();
       }
-      return zoteroGateway.updateSetting({
-        key: input.key as string,
-        value: input.value,
+      const key = input.key as string;
+      return executeExternalMutation({
+        context,
+        toolName: "library_settings",
+        plan: async () => {
+          const current = zoteroGateway
+            .listSettings()
+            .find((entry) => entry.key === key);
+          return {
+            operation: "update_preference",
+            description: `Change Zotero preference ${key}`,
+            forward: { key, value: input.value },
+            inverse: current
+              ? {
+                  version: 1,
+                  kind: "preference",
+                  key,
+                  existed: current.value !== undefined,
+                  value: current.value,
+                }
+              : undefined,
+            precondition: {
+              kind: "preference",
+              key,
+              existed: Boolean(current && current.value !== undefined),
+              value: current?.value,
+            },
+            reversibility: current ? ("full" as const) : ("none" as const),
+            reason: current
+              ? undefined
+              : "The previous value of this Zotero preference could not be read.",
+          };
+        },
+        execute: async () => {
+          const result = await zoteroGateway.updateSetting({
+            key,
+            value: input.value,
+          });
+          return {
+            result,
+            changed: result.status === "updated",
+            affectedCount: result.status === "updated" ? 1 : 0,
+            expectedPostcondition: {
+              kind: "preference",
+              key,
+              existed: result.value !== undefined,
+              value: result.value,
+            },
+          };
+        },
       });
     },
   };

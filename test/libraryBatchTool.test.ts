@@ -2,8 +2,13 @@ import { assert } from "chai";
 import { createLibraryBatchTool } from "../src/agent/tools/write/libraryBatch";
 import type { LibraryBatchJobStore } from "../src/agent/tools/write/libraryBatch";
 import { ActionRegistry } from "../src/agent/actions/registry";
+import { callTool } from "../src/agent/actions/executor";
+import { AgentToolRegistry } from "../src/agent/tools/registry";
+import { executeLibraryMutationAction } from "../src/agent/services/mutationCoordinator";
+import { initAgentChangeJournal } from "../src/agent/store/changeJournal";
 import type { AgentToolContext } from "../src/agent/types";
 import type { BatchJobRecord } from "../src/agent/store/batchJobStore";
+import { ChangeJournalTestDb } from "./helpers/changeJournalTestDb";
 
 /**
  * The batch engine was a complete propose/paginate/apply system that the
@@ -159,6 +164,131 @@ describe("library_batch", function () {
     if (!validated.ok) return;
     await tool.execute(validated.value, context);
     assert.equal(seenMode, "auto_approve");
+  });
+
+  it("records one user-visible action with ordered steps across batch pages", async function () {
+    const db = new ChangeJournalTestDb();
+    (globalThis as typeof globalThis & { Zotero?: unknown }).Zotero = {
+      DB: db,
+      Prefs: { get: () => "yolo" },
+      Items: { get: () => null },
+      debug: () => undefined,
+    };
+    await initAgentChangeJournal();
+
+    let itemId = 0;
+    const mutationService = {
+      planOperation: async (operation: { itemIds: number[] }) => ({
+        effect: "write" as const,
+        reversibility: "full" as const,
+        description: `tag item ${operation.itemIds[0]}`,
+        inverseOperations: [
+          {
+            type: "remove_tags" as const,
+            itemIds: operation.itemIds,
+            tags: ["reviewed"],
+          },
+        ],
+      }),
+      executeOperation: async (operation: { itemIds: number[] }) => ({
+        result: {
+          operation: "add_tags",
+          result: { status: "updated", itemId: operation.itemIds[0] },
+        },
+        inverse: {
+          description: `remove tag from ${operation.itemIds[0]}`,
+          inverseOperations: [
+            {
+              type: "remove_tags" as const,
+              itemIds: operation.itemIds,
+              tags: ["reviewed"],
+            },
+          ],
+        },
+        changed: true,
+        affectedCount: 1,
+      }),
+      captureOperationState: async (operation: { itemIds: number[] }) => ({
+        version: 1,
+        operation: "add_tags",
+        items: [{ itemId: operation.itemIds[0], tags: ["reviewed"] }],
+      }),
+    };
+    const toolRegistry = new AgentToolRegistry();
+    toolRegistry.register({
+      spec: {
+        name: "batch_test_write",
+        description: "Apply one test page",
+        inputSchema: { type: "object" },
+        mutability: "write",
+        requiresConfirmation: false,
+      },
+      validate: () => ({ ok: true as const, value: {} }),
+      planMutation: () => ({
+        effect: "write" as const,
+        reversibility: "full" as const,
+      }),
+      execute: async (_input, toolContext) => {
+        itemId += 1;
+        return executeLibraryMutationAction({
+          service: mutationService as never,
+          operations: [
+            {
+              type: "add_tags",
+              itemIds: [itemId],
+              tags: ["reviewed"],
+            },
+          ],
+          context: toolContext,
+          facadeToolName: "batch_test_write",
+        });
+      },
+    });
+    const actionRegistry = new ActionRegistry();
+    actionRegistry.register({
+      name: "auto_tag",
+      description: "Tag papers",
+      inputSchema: { type: "object" },
+      execute: async (_input: unknown, actionContext: unknown) => {
+        await callTool(
+          "batch_test_write",
+          {},
+          actionContext as never,
+          "page 1",
+        );
+        await callTool(
+          "batch_test_write",
+          {},
+          actionContext as never,
+          "page 2",
+        );
+        return { ok: true, output: { tagged: 2, processed: 2 } };
+      },
+    } as never);
+    const tool = createLibraryBatchTool({
+      actionRegistry,
+      toolRegistry,
+      zoteroGateway: {} as never,
+      services: {} as never,
+      now: () => 1000,
+      batchJobStore: makeJobStore(),
+    });
+    const validated = tool.validate({ job: "auto_tag", jobArgs: {} });
+    assert.isTrue(validated.ok);
+    if (!validated.ok) return;
+
+    await tool.execute(validated.value, context);
+
+    assert.equal(db.actions.size, 1);
+    assert.equal(db.steps.size, 2);
+    const action = [...db.actions.values()][0];
+    assert.equal(action.tool_name, "library_batch");
+    assert.equal(action.status, "applied");
+    assert.equal(action.affected_count, 2);
+    assert.deepEqual(
+      [...db.steps.values()].map((step) => step.sequence_no),
+      [1, 2],
+    );
   });
 
   it("surfaces the script arguments on the confirmation card", function () {

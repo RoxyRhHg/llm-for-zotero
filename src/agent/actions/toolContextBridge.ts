@@ -27,6 +27,8 @@ export function buildActionExecutionContext(params: {
   services: ActionServices;
   confirmationMode: ActionConfirmationMode;
   runId?: string;
+  journalActionScope?: ActionExecutionContext["journalActionScope"];
+  journalToolName?: string;
   onProgress?: (event: ActionProgressEvent) => void;
   checkpoint?: (checkpoint: ActionCheckpoint) => Promise<void>;
   requestConfirmation?: ActionExecutionContext["requestConfirmation"];
@@ -43,6 +45,8 @@ export function buildActionExecutionContext(params: {
     // and neither undo path could ever find the entries.
     conversationKey: request.conversationKey,
     runId: params.runId,
+    journalActionScope: params.journalActionScope,
+    journalToolName: params.journalToolName,
     zoteroGateway: params.zoteroGateway,
     services: params.services,
     libraryID: Number(request.libraryID) > 0 ? Number(request.libraryID) : 1,

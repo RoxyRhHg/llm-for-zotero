@@ -1,6 +1,7 @@
 import { assert } from "chai";
 import { LibraryMutationService } from "../src/agent/services/libraryMutationService";
 import { createRestoreFromTrashTool } from "../src/agent/tools/write/restoreFromTrash";
+import { replayLibraryInverse } from "./helpers/replayLibraryInverse";
 
 /**
  * Restoring was previously reachable only as the inverse of a mutation the
@@ -15,12 +16,14 @@ describe("restore_from_trash", function () {
       searches: unknown[];
       trashed: unknown[];
       deleted: unknown[];
+      deletedSearches: unknown[];
     } = {
       items: [],
       collections: [],
       searches: [],
       trashed: [],
       deleted: [],
+      deletedSearches: [],
     };
     const gateway = {
       restoreItems: async (params: { itemIds: number[] }) => {
@@ -29,20 +32,36 @@ describe("restore_from_trash", function () {
         const restored = params.itemIds.filter((id) => id !== 999);
         return { restoredCount: restored.length, itemIds: restored };
       },
-      restoreCollections: async (params: unknown) => {
+      restoreCollections: async (params: { collectionIds: number[] }) => {
         calls.collections.push(params);
-        return { restoredCount: 1 };
+        const restored = params.collectionIds.filter((id) => id !== 999);
+        return { restoredCount: restored.length, collectionIds: restored };
       },
-      restoreSavedSearches: async (params: unknown) => {
+      restoreSavedSearches: async (params: { savedSearchIds: number[] }) => {
         calls.searches.push(params);
-        return { restoredCount: 1 };
+        const restored = params.savedSearchIds.filter((id) => id !== 999);
+        return { restoredCount: restored.length, savedSearchIds: restored };
       },
       trashItems: async (params: unknown) => {
         calls.trashed.push(params);
         return { trashedCount: 1, items: [] };
       },
+      snapshotCollectionForDelete: ({
+        collectionId,
+      }: {
+        collectionId: number;
+      }) => ({
+        name: `Collection ${collectionId}`,
+        libraryID: 1,
+        itemIds: [],
+        childCollectionCount: 0,
+      }),
       deleteCollection: async (params: unknown) => {
         calls.deleted.push(params);
+      },
+      deleteSavedSearch: async (params: { savedSearchId: number }) => {
+        calls.deletedSearches.push(params);
+        return { savedSearchId: params.savedSearchId, status: "trashed" };
       },
       getItem: () => null,
       ...overrides,
@@ -88,12 +107,34 @@ describe("restore_from_trash", function () {
       { type: "restore_from_trash", itemIds: [11, 999] },
       context,
     );
-    assert.deepEqual(outcome.undo?.inverseOperations, [
+    assert.deepEqual(outcome.inverse?.inverseOperations, [
       { type: "trash_items", itemIds: [11] },
     ]);
-    await outcome.undo?.revert();
+    await replayLibraryInverse(service, outcome, context);
 
     assert.deepEqual(calls.trashed, [{ itemIds: [11] }]);
+  });
+
+  it("re-trashes only the collections and searches actually restored", async function () {
+    const { gateway, calls } = makeGateway();
+    const service = new LibraryMutationService(gateway as never);
+
+    const outcome = await service.executeOperation(
+      {
+        type: "restore_from_trash",
+        collectionIds: [42, 999],
+        savedSearchIds: [7, 999],
+      },
+      context,
+    );
+    assert.deepEqual(outcome.inverse?.inverseOperations, [
+      { type: "delete_collection", collectionId: 42 },
+      { type: "delete_saved_search", savedSearchId: 7 },
+    ]);
+    await replayLibraryInverse(service, outcome, context);
+
+    assert.deepEqual(calls.deleted, [{ collectionId: 42 }]);
+    assert.deepEqual(calls.deletedSearches, [{ savedSearchId: 7 }]);
   });
 
   it("records no undo when nothing needed restoring", async function () {
@@ -107,7 +148,7 @@ describe("restore_from_trash", function () {
       context,
     );
 
-    assert.notExists(outcome.undo);
+    assert.notExists(outcome.inverse);
   });
 
   it("rejects a call that names nothing to restore", function () {

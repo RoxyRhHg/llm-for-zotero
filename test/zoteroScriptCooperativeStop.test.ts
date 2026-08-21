@@ -1,7 +1,12 @@
 import { assert } from "chai";
+import { revertActions } from "../src/agent/services/changeReverter";
+import {
+  initAgentChangeJournal,
+  listJournalActions,
+} from "../src/agent/store/changeJournal";
 import { createZoteroScriptTool } from "../src/agent/tools/write/zoteroScript";
-import { peekUndoEntry, clearUndoStack } from "../src/agent/store/undoStore";
 import type { AgentToolContext } from "../src/agent/types";
+import { ChangeJournalTestDb } from "./helpers/changeJournalTestDb";
 
 /**
  * The time budget was enforced with `Promise.race`, which stops *waiting* for
@@ -33,12 +38,15 @@ describe("zotero_script cooperative cancellation", function () {
     modelName: "test-model",
   };
 
-  function run(script: string, timeoutMs?: number) {
+  async function run(script: string, timeoutMs?: number) {
+    const db = new ChangeJournalTestDb();
     (globalThis as typeof globalThis & { Zotero?: unknown }).Zotero = {
+      DB: db,
       Items: { get: () => null },
       Libraries: { userLibraryID: 1 },
       debug: () => undefined,
     };
+    await initAgentChangeJournal();
     const tool = createZoteroScriptTool({
       allowUnsandboxedTestExecution: true,
     });
@@ -127,11 +135,14 @@ describe("zotero_script cooperative cancellation", function () {
       },
     });
     for (const id of [1, 2, 3]) items.set(id, makeItem(id));
+    const db = new ChangeJournalTestDb();
     (globalThis as typeof globalThis & { Zotero?: unknown }).Zotero = {
+      DB: db,
       Items: { get: (id: number) => items.get(id) || null },
       Libraries: { userLibraryID: 1 },
       debug: () => undefined,
     };
+    await initAgentChangeJournal();
 
     const tool = createZoteroScriptTool({
       allowUnsandboxedTestExecution: true,
@@ -159,21 +170,40 @@ describe("zotero_script cooperative cancellation", function () {
 
     assert.include(String(result.error), "timed out");
 
-    const entry = peekUndoEntry(context.request.conversationKey);
-    assert.exists(entry, "a timed-out write script must still record an undo");
-
     assert.deepEqual(
       snapshotted,
       [1, 2, 3],
       "the tool must not return before later snapshots are recorded",
     );
 
-    await entry?.revert();
+    const actions = await listJournalActions({
+      conversationKey: context.request.conversationKey,
+    });
+    assert.lengthOf(actions, 1, "the timed-out script is one durable action");
+    assert.equal(actions[0].status, "applied");
+    assert.equal(actions[0].reversibility, "partial");
+    assert.lengthOf(actions[0].steps, 1);
+    assert.include(
+      String(actions[0].steps[0].inverseJson),
+      '"storage":"inline"',
+      "script snapshots are stored as a checksummed recovery payload",
+    );
+
+    const outcome = await revertActions({
+      actions,
+      zoteroGateway: {
+        getItem: (id: number) => items.get(id) || null,
+        trashItems: async () => ({ trashedCount: 0 }),
+      } as never,
+      context,
+    });
+    assert.equal(outcome.reverted, 0);
+    assert.equal(outcome.partiallyReverted, 1);
+    assert.equal(outcome.residuals[0]?.actionId, actions[0].actionId);
     assert.deepEqual(
       restored.sort(),
       [1, 2, 3],
       "every recorded mutation remains undoable when the tool returns",
     );
-    clearUndoStack(context.request.conversationKey);
   });
 });

@@ -2,10 +2,12 @@ import { assert } from "chai";
 import { autoTagAction } from "../src/agent/actions/autoTag";
 import type { ActionExecutionContext } from "../src/agent/actions";
 import { AgentToolRegistry } from "../src/agent/tools/registry";
+import { initAgentChangeJournal } from "../src/agent/store/changeJournal";
 import type {
   AgentToolDefinition,
   AgentToolInputValidation,
 } from "../src/agent/types";
+import { ChangeJournalTestDb } from "./helpers/changeJournalTestDb";
 
 function createStubTool<TInput extends Record<string, unknown>, TResult>(
   spec: AgentToolDefinition<TInput, TResult>["spec"],
@@ -17,6 +19,14 @@ function createStubTool<TInput extends Record<string, unknown>, TResult>(
     spec,
     validate,
     execute,
+    ...(spec.mutability === "write"
+      ? {
+          planMutation: async () => ({
+            effect: "write" as const,
+            reversibility: "full" as const,
+          }),
+        }
+      : {}),
     ...extras,
   };
 }
@@ -104,6 +114,10 @@ function registerReviewApplyTagsTool(
         args as { assignments: Array<{ itemId: number; tags: string[] }> },
       );
     },
+    planMutation: async () => ({
+      effect: "write",
+      reversibility: "full",
+    }),
     createPendingAction(input) {
       return {
         toolName: "apply_tags",
@@ -136,6 +150,22 @@ function registerReviewApplyTagsTool(
 }
 
 describe("autoTag action", function () {
+  const originalZotero = globalThis.Zotero;
+
+  beforeEach(async function () {
+    const db = new ChangeJournalTestDb();
+    globalThis.Zotero = {
+      DB: db,
+      Prefs: { get: () => "auto" },
+      debug: () => undefined,
+    } as never;
+    await initAgentChangeJournal();
+  });
+
+  afterEach(function () {
+    globalThis.Zotero = originalZotero;
+  });
+
   it("uses a frozen durable-batch target order and checkpoints exact remaining IDs", async function () {
     const registry = new AgentToolRegistry();
     const applied: number[] = [];

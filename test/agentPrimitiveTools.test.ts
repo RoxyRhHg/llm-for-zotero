@@ -1,7 +1,6 @@
 import { assert } from "chai";
 import { buildAgentInitialMessages } from "../src/agent/model/messageBuilder";
 import { EDITABLE_ARTICLE_METADATA_FIELDS } from "../src/agent/services/zoteroGateway";
-import { clearUndoStack, peekUndoEntry } from "../src/agent/store/undoStore";
 import { AgentToolRegistry } from "../src/agent/tools/registry";
 import { PdfService } from "../src/agent/services/pdfService";
 import { RetrievalService } from "../src/agent/services/retrievalService";
@@ -15,7 +14,6 @@ import { createEditCurrentNoteTool } from "../src/agent/tools/write/editCurrentN
 import { createApplyTagsTool } from "../src/agent/tools/write/applyTags";
 import { createUpdateMetadataTool } from "../src/agent/tools/write/updateMetadata";
 import { createRunCommandTool } from "../src/agent/tools/write/runCommand";
-import { createUndoLastActionTool } from "../src/agent/tools/write/undoLastAction";
 import { createZoteroScriptTool } from "../src/agent/tools/write/zoteroScript";
 import { getNotesDirectoryConfig } from "../src/utils/notesDirectoryConfig";
 import type { AgentModelMessage, AgentToolContext } from "../src/agent/types";
@@ -184,7 +182,17 @@ describe("primitive agent tools", function () {
     item: null,
     currentAnswerText: "",
     modelName: "gpt-5.4",
+    journalFallbackApproved: true,
   };
+
+  const activeDraftNoteSnapshot = () => ({
+    noteId: 55,
+    title: "Draft Note",
+    html: "<p>Original body</p>",
+    text: "Original body",
+    libraryID: 1,
+    noteKind: "standalone" as const,
+  });
 
   before(function () {
     globalScope.Zotero = {
@@ -198,10 +206,6 @@ describe("primitive agent tools", function () {
 
   after(function () {
     globalScope.Zotero = originalZotero;
-  });
-
-  afterEach(function () {
-    clearUndoStack(baseContext.request.conversationKey);
   });
 
   it("query_library searches items and enriches requested fields", async function () {
@@ -928,7 +932,6 @@ describe("primitive agent tools", function () {
     const fileContent = new Map<string, string>([
       ["/tmp/existing.md", "Original note."],
     ]);
-    const removedPaths: string[] = [];
     const originalIOUtils = (globalThis as { IOUtils?: unknown }).IOUtils;
     (globalThis as { IOUtils?: unknown }).IOUtils = {
       exists: async (path: string) => existingPaths.has(path),
@@ -942,7 +945,6 @@ describe("primitive agent tools", function () {
       remove: async (path: string) => {
         existingPaths.delete(path);
         fileContent.delete(path);
-        removedPaths.push(path);
       },
     };
     const context: AgentToolContext = {
@@ -976,8 +978,6 @@ describe("primitive agent tools", function () {
       );
       await tool.execute(write.value, context);
       assert.equal(fileContent.get("/tmp/output.md"), "Saved note.");
-      await peekUndoEntry(context.request.conversationKey)?.revert();
-      assert.deepEqual(removedPaths, ["/tmp/output.md"]);
 
       const overwrite = tool.validate({
         action: "write",
@@ -1002,10 +1002,7 @@ describe("primitive agent tools", function () {
       if (!approved?.ok) return;
       await tool.execute(approved.value, context);
       assert.equal(fileContent.get("/tmp/existing.md"), "Updated note.");
-      await peekUndoEntry(context.request.conversationKey)?.revert();
-      assert.equal(fileContent.get("/tmp/existing.md"), "Original note.");
     } finally {
-      clearUndoStack(context.request.conversationKey);
       (globalThis as { IOUtils?: unknown }).IOUtils = originalIOUtils;
     }
   });
@@ -1088,7 +1085,6 @@ describe("primitive agent tools", function () {
       assert.notProperty(result, "requestedFilePath");
       assert.notProperty(result, "correctedToNotesDirectory");
     } finally {
-      clearUndoStack(context.request.conversationKey);
       (globalThis as { IOUtils?: unknown }).IOUtils = originalIOUtils;
       (globalThis as { OS?: unknown }).OS = originalOS;
     }
@@ -1148,7 +1144,6 @@ describe("primitive agent tools", function () {
         "Note outside the configured notes directory.",
       );
     } finally {
-      clearUndoStack(context.request.conversationKey);
       (globalThis as { IOUtils?: unknown }).IOUtils = originalIOUtils;
     }
   });
@@ -1247,7 +1242,6 @@ describe("primitive agent tools", function () {
       assert.notProperty(result, "error");
       assert.deepEqual(writes, ["/tmp/obsidian-vault/Zotero Notes/figures.md"]);
     } finally {
-      clearUndoStack(context.request.conversationKey);
       (globalThis as { IOUtils?: unknown }).IOUtils = originalIOUtils;
     }
   });
@@ -1341,7 +1335,6 @@ describe("primitive agent tools", function () {
         "/tmp/obsidian-vault/Zotero Notes/captionless.md",
       ]);
     } finally {
-      clearUndoStack(context.request.conversationKey);
       (globalThis as { IOUtils?: unknown }).IOUtils = originalIOUtils;
     }
   });
@@ -1627,7 +1620,6 @@ describe("primitive agent tools", function () {
         content,
       );
     } finally {
-      clearUndoStack(context.request.conversationKey);
       (globalThis as { IOUtils?: unknown }).IOUtils = originalIOUtils;
     }
   });
@@ -1722,7 +1714,6 @@ describe("primitive agent tools", function () {
         content,
       );
     } finally {
-      clearUndoStack(context.request.conversationKey);
       (globalThis as { IOUtils?: unknown }).IOUtils = originalIOUtils;
     }
   });
@@ -1830,13 +1821,7 @@ describe("primitive agent tools", function () {
         fileContent.get("/tmp/obsidian-vault/Papers/existing.md"),
         "Updated note.",
       );
-      await peekUndoEntry(context.request.conversationKey)?.revert();
-      assert.equal(
-        fileContent.get("/tmp/obsidian-vault/Papers/existing.md"),
-        "Original note.",
-      );
     } finally {
-      clearUndoStack(context.request.conversationKey);
       (globalThis as { IOUtils?: unknown }).IOUtils = originalIOUtils;
     }
   });
@@ -1924,15 +1909,12 @@ describe("primitive agent tools", function () {
       "/tmp/existing.md",
       "/tmp/existing-dir",
     ]);
-    const removedPaths: string[] = [];
     const originalIOUtils = (globalThis as { IOUtils?: unknown }).IOUtils;
     const originalChromeUtils = (globalThis as { ChromeUtils?: unknown })
       .ChromeUtils;
     (globalThis as { IOUtils?: unknown }).IOUtils = {
       exists: async (path: string) => existingPaths.has(path),
-      remove: async (path: string) => {
-        removedPaths.push(path);
-      },
+      remove: async () => undefined,
     };
     (globalThis as { ChromeUtils?: unknown }).ChromeUtils = {
       importESModule: () => ({
@@ -1996,9 +1978,13 @@ describe("primitive agent tools", function () {
       assert.isFalse(
         await tool.shouldRequireConfirmation?.(newRedirect.value, context),
       );
+      const newRedirectPlan = await tool.planMutation?.(
+        newRedirect.value,
+        context,
+      );
+      assert.equal(newRedirectPlan?.effect, "write");
+      assert.equal(newRedirectPlan?.reversibility, "partial");
       await tool.execute(newRedirect.value, context);
-      await peekUndoEntry(context.request.conversationKey)?.revert();
-      assert.deepEqual(removedPaths, ["/tmp/new-note.md"]);
 
       const overwriteRedirect = tool.validate({
         command: 'printf "note" > "/tmp/existing.md"',
@@ -2020,6 +2006,18 @@ describe("primitive agent tools", function () {
       assert.isTrue(
         await tool.shouldRequireConfirmation?.(existingMkdir.value, context),
       );
+      const approvedMkdir = tool.applyConfirmation?.(
+        existingMkdir.value,
+        {},
+        context,
+      );
+      assert.isTrue(approvedMkdir?.ok);
+      if (!approvedMkdir?.ok) return;
+      const mkdirResult = (await tool.execute(
+        approvedMkdir.value,
+        context,
+      )) as { exitCode: number };
+      assert.equal(mkdirResult.exitCode, 0);
 
       const dateSet = tool.validate({ command: "date -s 2026-05-15" });
       assert.isTrue(dateSet.ok);
@@ -2059,9 +2057,7 @@ describe("primitive agent tools", function () {
       );
       (globalThis as { IOUtils?: unknown }).IOUtils = {
         exists: async (path: string) => existingPaths.has(path),
-        remove: async (path: string) => {
-          removedPaths.push(path);
-        },
+        remove: async () => undefined,
       };
 
       const destructive = tool.validate({ command: "rm -rf /tmp/example" });
@@ -2092,7 +2088,6 @@ describe("primitive agent tools", function () {
         );
       }
     } finally {
-      clearUndoStack(context.request.conversationKey);
       (globalThis as { IOUtils?: unknown }).IOUtils = originalIOUtils;
       (globalThis as { ChromeUtils?: unknown }).ChromeUtils =
         originalChromeUtils;
@@ -2498,8 +2493,7 @@ describe("primitive agent tools", function () {
     assert.include(systemText, "confirmation card is the deliverable");
   });
 
-  it("edit_current_note confirms, updates the active note, and records undo", async function () {
-    let restoredHtml: { noteId: number; html: string } | null = null;
+  it("edit_current_note confirms and updates the active note", async function () {
     const tool = createEditCurrentNoteTool({
       getActiveNoteSnapshot: () => ({
         noteId: 55,
@@ -2525,9 +2519,7 @@ describe("primitive agent tools", function () {
           nextText: content,
         };
       },
-      restoreNoteHtml: async (params: { noteId: number; html: string }) => {
-        restoredHtml = params;
-      },
+      restoreNoteHtml: async () => undefined,
     } as never);
     const noteRequest = {
       ...baseContext.request,
@@ -2548,6 +2540,26 @@ describe("primitive agent tools", function () {
     });
     assert.isTrue(validated.ok);
     if (!validated.ok) return;
+    const mutationPlan = await tool.planMutation?.(validated.value, {
+      ...baseContext,
+      request: noteRequest,
+    });
+    assert.isTrue(mutationPlan?.requiresConfirmation);
+    const patchOnly = tool.validate({
+      mode: "edit",
+      patches: [{ find: "Original", replace: "Rewritten" }],
+    });
+    assert.isTrue(patchOnly.ok);
+    if (!patchOnly.ok) return;
+    assert.equal(patchOnly.value.content, "");
+    assert.isTrue(
+      (
+        await tool.planMutation?.(patchOnly.value, {
+          ...baseContext,
+          request: noteRequest,
+        })
+      )?.requiresConfirmation,
+    );
 
     const pending = tool.createPendingAction?.(validated.value, {
       ...baseContext,
@@ -2588,14 +2600,50 @@ describe("primitive agent tools", function () {
       title: "Draft Note",
       noteText: "Rewritten body",
     });
+  });
 
-    const undoEntry = peekUndoEntry(baseContext.request.conversationKey);
-    assert.exists(undoEntry);
-    await undoEntry?.revert();
-    assert.deepEqual(restoredHtml, {
-      noteId: 55,
-      html: "<p>Original body</p>",
+  it("edit_current_note applies patches to the explicit target note", function () {
+    const requestedNoteIds: Array<number | undefined> = [];
+    const tool = createEditCurrentNoteTool({
+      getActiveNoteSnapshot: ({ noteId }: { noteId?: number }) => {
+        requestedNoteIds.push(noteId);
+        return noteId === 77
+          ? {
+              noteId: 77,
+              title: "Target Note",
+              html: "<p>Target body</p>",
+              text: "Target body",
+              libraryID: 1,
+              noteKind: "standalone",
+            }
+          : {
+              noteId: 55,
+              title: "Active Note",
+              html: "<p>Active body</p>",
+              text: "Active body",
+              libraryID: 1,
+              noteKind: "standalone",
+            };
+      },
+    } as never);
+    const validated = tool.validate({
+      mode: "edit",
+      targetNoteId: 77,
+      patches: [{ find: "Target", replace: "Rewritten target" }],
     });
+    assert.isTrue(validated.ok);
+    if (!validated.ok) return;
+
+    const pending = tool.createPendingAction?.(validated.value, baseContext);
+    const reviewField = pending?.fields[0] as Extract<
+      NonNullable<typeof pending>["fields"][number],
+      { type: "diff_preview" }
+    >;
+
+    assert.deepEqual(requestedNoteIds, [77, 77]);
+    assert.equal(reviewField.before, "Target body");
+    assert.equal(reviewField.after, "Rewritten target body");
+    assert.equal(validated.value.noteId, 77);
   });
 
   it("edit_current_note does not police incomplete MinerU figure-block embeds before mutation", async function () {
@@ -2710,7 +2758,6 @@ describe("primitive agent tools", function () {
         ].join("\n"),
       );
     } finally {
-      clearUndoStack(context.request.conversationKey);
       (globalThis as { IOUtils?: unknown }).IOUtils = originalIOUtils;
     }
   });
@@ -2835,7 +2882,6 @@ describe("primitive agent tools", function () {
         ].join("\n"),
       );
     } finally {
-      clearUndoStack(context.request.conversationKey);
       (globalThis as { IOUtils?: unknown }).IOUtils = originalIOUtils;
     }
   });
@@ -2843,6 +2889,7 @@ describe("primitive agent tools", function () {
   it("edit_current_note allows extracted PDF figure crop embeds", async function () {
     let replacedContent = "";
     const tool = createEditCurrentNoteTool({
+      getActiveNoteSnapshot: activeDraftNoteSnapshot,
       replaceCurrentNote: async ({ content }: { content: string }) => {
         replacedContent = content;
         return {
@@ -2960,7 +3007,6 @@ describe("primitive agent tools", function () {
       });
       assert.equal(replacedContent, content);
     } finally {
-      clearUndoStack(context.request.conversationKey);
       (globalThis as { IOUtils?: unknown }).IOUtils = originalIOUtils;
     }
   });
@@ -2968,6 +3014,7 @@ describe("primitive agent tools", function () {
   it("edit_current_note does not reject all-figures notes when figure crop metadata is missing", async function () {
     let replacedContent = "";
     const tool = createEditCurrentNoteTool({
+      getActiveNoteSnapshot: activeDraftNoteSnapshot,
       replaceCurrentNote: async ({ content }: { content: string }) => {
         replacedContent = content;
         return {
@@ -3053,7 +3100,6 @@ describe("primitive agent tools", function () {
       });
       assert.equal(replacedContent, content);
     } finally {
-      clearUndoStack(context.request.conversationKey);
       (globalThis as { IOUtils?: unknown }).IOUtils = originalIOUtils;
     }
   });
@@ -3061,6 +3107,7 @@ describe("primitive agent tools", function () {
   it("edit_current_note allows explicit text-only all-figures notes when extraction failed", async function () {
     let replacedContent = "";
     const tool = createEditCurrentNoteTool({
+      getActiveNoteSnapshot: activeDraftNoteSnapshot,
       replaceCurrentNote: async ({ content }: { content: string }) => {
         replacedContent = content;
         return {
@@ -3155,7 +3202,6 @@ describe("primitive agent tools", function () {
       });
       assert.equal(replacedContent, content);
     } finally {
-      clearUndoStack(context.request.conversationKey);
       (globalThis as { IOUtils?: unknown }).IOUtils = originalIOUtils;
     }
   });
@@ -3163,6 +3209,7 @@ describe("primitive agent tools", function () {
   it("edit_current_note allows no-image-crop all-figures notes when extraction failed", async function () {
     let replacedContent = "";
     const tool = createEditCurrentNoteTool({
+      getActiveNoteSnapshot: activeDraftNoteSnapshot,
       replaceCurrentNote: async ({ content }: { content: string }) => {
         replacedContent = content;
         return {
@@ -3257,7 +3304,6 @@ describe("primitive agent tools", function () {
       });
       assert.equal(replacedContent, content);
     } finally {
-      clearUndoStack(context.request.conversationKey);
       (globalThis as { IOUtils?: unknown }).IOUtils = originalIOUtils;
     }
   });
@@ -3265,6 +3311,7 @@ describe("primitive agent tools", function () {
   it("edit_current_note does not reject all-figures notes when figure crop metadata is stale", async function () {
     let replacedContent = "";
     const tool = createEditCurrentNoteTool({
+      getActiveNoteSnapshot: activeDraftNoteSnapshot,
       replaceCurrentNote: async ({ content }: { content: string }) => {
         replacedContent = content;
         return {
@@ -3371,7 +3418,6 @@ describe("primitive agent tools", function () {
       });
       assert.equal(replacedContent, content);
     } finally {
-      clearUndoStack(context.request.conversationKey);
       (globalThis as { IOUtils?: unknown }).IOUtils = originalIOUtils;
     }
   });
@@ -3379,6 +3425,7 @@ describe("primitive agent tools", function () {
   it("edit_current_note accepts all-figures crop embeds when only paper title metadata drifted", async function () {
     let replacedContent = "";
     const tool = createEditCurrentNoteTool({
+      getActiveNoteSnapshot: activeDraftNoteSnapshot,
       replaceCurrentNote: async ({ content }: { content: string }) => {
         replacedContent = content;
         return {
@@ -3534,7 +3581,6 @@ describe("primitive agent tools", function () {
       });
       assert.equal(replacedContent, content);
     } finally {
-      clearUndoStack(context.request.conversationKey);
       (globalThis as { IOUtils?: unknown }).IOUtils = originalIOUtils;
     }
   });
@@ -3542,6 +3588,7 @@ describe("primitive agent tools", function () {
   it("edit_current_note does not reject all-figures notes when expected crops are missing", async function () {
     let replacedContent = "";
     const tool = createEditCurrentNoteTool({
+      getActiveNoteSnapshot: activeDraftNoteSnapshot,
       replaceCurrentNote: async ({ content }: { content: string }) => {
         replacedContent = content;
         return {
@@ -3682,7 +3729,6 @@ describe("primitive agent tools", function () {
       });
       assert.equal(replacedContent, content);
     } finally {
-      clearUndoStack(context.request.conversationKey);
       (globalThis as { IOUtils?: unknown }).IOUtils = originalIOUtils;
     }
   });
@@ -3814,7 +3860,11 @@ env.log('updated');
     assert.equal(fakeItem.getField("title"), "Updated title");
     assert.sameMembers(Array.from(fakeItem.tags), ["existing", "new-tag"]);
     assert.sameMembers(Array.from(fakeItem.collections), [5, 9]);
-    assert.exists(peekUndoEntry(baseContext.request.conversationKey));
+    assert.include(
+      prepared.action.description,
+      "Recovery warning",
+      "a confirmed fallback must state that restart-safe recovery is unavailable",
+    );
   });
 
   it("apply_tags paged actions render through the shared review-card layout", function () {
@@ -3866,48 +3916,6 @@ env.log('updated');
     ]);
   });
 
-  it("undo_last_action reverts a zotero_script snapshot", async function () {
-    const fakeItem = createFakeZoteroItem();
-    globalScope.Zotero = {
-      ...(globalScope.Zotero || {}),
-      Libraries: { userLibraryID: 1 },
-      Items: {
-        get: (id: number) => (id === fakeItem.id ? fakeItem : null),
-      },
-      debug: () => undefined,
-    };
-    const scriptTool = createZoteroScriptTool({
-      allowUnsandboxedTestExecution: true,
-    });
-    const validated = scriptTool.validate({
-      mode: "write",
-      description: "Update then undo one fake item",
-      script: `
-const item = Zotero.Items.get(101);
-env.snapshot(item);
-item.setField('title', 'Temporary title');
-item.addTag('temporary');
-item.removeTag('existing');
-item.addToCollection(9);
-item.removeFromCollection(5);
-await item.saveTx();
-`,
-    });
-    assert.isTrue(validated.ok);
-    if (!validated.ok) return;
-
-    await scriptTool.execute(validated.value, baseContext);
-    assert.equal(fakeItem.getField("title"), "Temporary title");
-    assert.sameMembers(Array.from(fakeItem.tags), ["temporary"]);
-    assert.sameMembers(Array.from(fakeItem.collections), [9]);
-
-    const undoTool = createUndoLastActionTool();
-    await undoTool.execute({}, baseContext);
-    assert.equal(fakeItem.getField("title"), "Original title");
-    assert.sameMembers(Array.from(fakeItem.tags), ["existing"]);
-    assert.sameMembers(Array.from(fakeItem.collections), [5]);
-  });
-
   it("zotero_script rejects write scripts without undo instrumentation", function () {
     const tool = createZoteroScriptTool({
       allowUnsandboxedTestExecution: true,
@@ -3930,7 +3938,7 @@ await item.saveTx();
       mode: "write",
       description: "Create a child note directly",
       script: `
-env.addUndoStep(async () => {});
+env.addInverse({ version: 1, kind: 'library_operations', operations: [] });
 const note = new Zotero.Item("note");
 note.parentID = 3719;
 note.setNote("<p>Figure extraction failed, so no image crops are embedded.</p>");

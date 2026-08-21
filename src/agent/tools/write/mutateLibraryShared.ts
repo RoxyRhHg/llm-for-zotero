@@ -2,15 +2,19 @@
  * Shared helpers used by the focused facade tools for building
  * confirmation cards, normalizing inputs, and executing operations.
  */
-import type { AgentPendingField, AgentToolContext } from "../../types";
 import type {
-  LibraryMutationUndo,
+  AgentMutationPlan,
+  AgentPendingField,
+  AgentToolContext,
+} from "../../types";
+import type {
   ApplyTagsOperation,
   MoveToCollectionOperation,
   UpdateMetadataOperation,
   LibraryMutationOperation,
   LibraryMutationService,
 } from "../../services/libraryMutationService";
+import { executeLibraryMutationAction } from "../../services/mutationCoordinator";
 import type {
   EditableArticleCreator,
   EditableArticleMetadataField,
@@ -20,8 +24,6 @@ import type {
   ZoteroGateway,
 } from "../../services/zoteroGateway";
 import { EDITABLE_ARTICLE_METADATA_FIELDS } from "../../services/zoteroGateway";
-import { pushUndoEntry } from "../../store/undoStore";
-import { recordChange } from "../../store/changeJournal";
 import {
   normalizePositiveInt,
   normalizeStringArray,
@@ -571,80 +573,13 @@ export async function executeAndRecordUndo(
   context: AgentToolContext,
   facadeToolName: string,
 ): Promise<{ result: unknown }> {
-  const executed = await mutationService.executeOperation(operation, context);
-  if (executed.undo) {
-    pushUndoEntry(context.request.conversationKey, {
-      id: `undo-${facadeToolName}-${Date.now()}`,
-      toolName: facadeToolName,
-      description: executed.undo.description,
-      revert: executed.undo.revert,
-    });
-  }
-  // The in-memory stack above is the fast path for "undo that" in the current
-  // conversation. The journal is the durable one: it survives a restart, has
-  // no ten-entry ceiling, and is what the history panel reads.
-  await journalMutation({
+  const coordinated = await executeLibraryMutationAction({
+    service: mutationService,
+    operations: [operation],
     context,
-    operation,
     facadeToolName,
-    undo: executed.undo ?? null,
   });
-  return { result: executed.result };
-}
-
-let journalSequence = 0;
-
-async function journalMutation(params: {
-  context: AgentToolContext;
-  operation: LibraryMutationOperation;
-  facadeToolName: string;
-  undo: LibraryMutationUndo | null;
-}): Promise<void> {
-  const { context, operation, undo } = params;
-  // A batch job supplies its own run id so its pages revert as one unit;
-  // ordinary turns group by conversation, which is what the history lists.
-  const runId =
-    context.request.agentRunId || `conv-${context.request.conversationKey}`;
-  journalSequence += 1;
-  try {
-    await recordChange({
-      entryId: `${runId}-${Date.now()}-${journalSequence}`,
-      runId,
-      conversationKey: context.request.conversationKey,
-      operation: operation.type,
-      description: undo?.description || `Applied ${operation.type}`,
-      inverse: undo?.inverseOperations?.length
-        ? undo.inverseOperations
-        : undefined,
-      irreversibleReason: undo?.inverseOperations?.length
-        ? undefined
-        : undo?.irreversibleReason ||
-          (undo
-            ? "This change can only be undone in the current session"
-            : `${operation.type} did not record a way to undo it`),
-      itemCount: countAffected(operation),
-      now: Date.now(),
-    });
-  } catch (error) {
-    // The mutation has already landed, so this is a partial-success error,
-    // not permission to continue making unjournalled changes.
-    throw new Error(
-      `${operation.type} was applied, but its durable undo record could not be saved: ${
-        error instanceof Error ? error.message : String(error)
-      }`,
-    );
-  }
-}
-
-function countAffected(operation: LibraryMutationOperation): number {
-  const record = operation as unknown as Record<string, unknown>;
-  for (const key of ["itemIds", "identifiers", "filePaths", "otherItemIds"]) {
-    const value = record[key];
-    if (Array.isArray(value)) return value.length;
-  }
-  const assignments = record.assignments;
-  if (Array.isArray(assignments)) return assignments.length;
-  return 1;
+  return { result: coordinated.results[0] };
 }
 
 /**
@@ -658,61 +593,46 @@ export async function executeAndRecordUndoBatch(
   context: AgentToolContext,
   facadeToolName: string,
 ): Promise<{ appliedCount: number; results: unknown[] }> {
-  const results: unknown[] = [];
-  const completed: Array<{
-    operation: LibraryMutationOperation;
-    undo: LibraryMutationUndo | null;
-  }> = [];
-
-  const registerSessionUndo = (): void => {
-    const undoEntries = completed
-      .map((entry) => entry.undo)
-      .filter((undo): undo is LibraryMutationUndo => Boolean(undo));
-    if (!undoEntries.length) return;
-    pushUndoEntry(context.request.conversationKey, {
-      id: `undo-${facadeToolName}-batch-${Date.now()}`,
-      toolName: facadeToolName,
-      description: `Undo ${undoEntries.length} ${facadeToolName} change${
-        undoEntries.length === 1 ? "" : "s"
-      }`,
-      revert: async () => {
-        for (const undo of [...undoEntries].reverse()) {
-          await undo.revert();
-        }
-      },
-    });
+  const coordinated = await executeLibraryMutationAction({
+    service: mutationService,
+    operations,
+    context,
+    facadeToolName,
+  });
+  return {
+    appliedCount: coordinated.appliedCount,
+    results: coordinated.results,
   };
+}
 
-  try {
-    for (const operation of operations) {
-      const executed = await mutationService.executeOperation(
-        operation,
-        context,
-      );
-      results.push(executed.result);
-      const undo = executed.undo ?? null;
-      completed.push({ operation, undo });
-      // Persist each successful mutation before attempting the next one. A
-      // later failure must not erase the only durable recovery path for the
-      // successful prefix.
-      await journalMutation({
-        context,
-        operation,
-        facadeToolName,
-        undo,
-      });
-    }
-  } catch (error) {
-    registerSessionUndo();
-    const message = error instanceof Error ? error.message : String(error);
-    throw new Error(
-      `${message} (${completed.length} operation${
-        completed.length === 1 ? " was" : "s were"
-      } applied; available inverses were retained for in-session undo.)`,
-    );
+/** Build the confirmation decision from the same concrete operations that
+ * will later be persisted and executed by MutationCoordinator. */
+export async function planLibraryMutations(
+  mutationService: LibraryMutationService,
+  operations: LibraryMutationOperation[],
+  context: AgentToolContext,
+): Promise<AgentMutationPlan> {
+  if (!operations.length) {
+    return { effect: "none", reversibility: "full" };
   }
-  registerSessionUndo();
-  return { appliedCount: results.length, results };
+  const plans = [];
+  for (const operation of operations) {
+    plans.push(await mutationService.planOperation(operation, context));
+  }
+  const reversibility = plans.every((plan) => plan.reversibility === "full")
+    ? "full"
+    : plans.every((plan) => plan.reversibility === "none")
+      ? "none"
+      : "partial";
+  return {
+    effect: "write",
+    reversibility,
+    reason:
+      plans
+        .map((plan) => plan.reason)
+        .filter((reason): reason is string => Boolean(reason))
+        .join(" ") || undefined,
+  };
 }
 
 // ── Metadata & Creator normalization ─────────────────────────────────────────

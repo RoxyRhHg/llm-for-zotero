@@ -1333,7 +1333,7 @@ export async function createNoteFromAssistantText(
     queryText?: string;
     figureRender?: NoteFigureRenderOptions;
   } = {},
-): Promise<"created" | "appended"> {
+): Promise<{ status: "created" | "appended"; noteId?: number }> {
   const parentItem = resolveParentItemForNoteTarget(item);
   const parentId = parentItem?.id;
   if (!parentItem || !parentId) {
@@ -1386,7 +1386,7 @@ export async function createNoteFromAssistantText(
         ztoolkit.log(
           `LLM: Appended to existing note ${existingNote.id} for parent ${parentId}`,
         );
-        return "appended";
+        return { status: "appended", noteId: existingNote.id };
       } catch (appendErr) {
         // If appending fails (e.g. note was deleted externally), fall through
         // to create a new note instead.
@@ -1415,7 +1415,7 @@ export async function createNoteFromAssistantText(
       rememberAssistantNoteForParent(parentId, result.noteId);
     }
   }
-  return "created";
+  return { status: "created", noteId: result.noteId };
 }
 
 export async function createStandaloneNoteFromAssistantText(

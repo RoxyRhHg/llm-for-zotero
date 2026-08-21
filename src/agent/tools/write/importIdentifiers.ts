@@ -18,6 +18,7 @@ import {
 import {
   executeAndRecordUndo,
   normalizeChecklistSelectionFromResolution,
+  planLibraryMutations,
 } from "./mutateLibraryShared";
 
 const IDENTIFIERS_CHECKLIST_FIELD_ID = "identifiersChecklist";
@@ -181,6 +182,9 @@ export function createImportIdentifiersTool(
         operation: { ...input.operation, identifiers },
       });
     },
+
+    planMutation: (input, context) =>
+      planLibraryMutations(mutationService, [input.operation], context),
 
     async execute(input, context) {
       return executeAndRecordUndo(

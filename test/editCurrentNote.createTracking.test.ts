@@ -14,6 +14,13 @@ import {
   resolveSvgFigureRasterSize,
 } from "../src/modules/contextPanel/figureExport";
 import type { AgentToolContext } from "../src/agent/types";
+import { revertActions } from "../src/agent/services/changeReverter";
+import {
+  initAgentChangeJournal,
+  listJournalActions,
+} from "../src/agent/store/changeJournal";
+import { sha256Text } from "../src/agent/store/journalRecoveryBlobStore";
+import { ChangeJournalTestDb } from "./helpers/changeJournalTestDb";
 
 describe("editCurrentNote create tracking", function () {
   it("only defers notes that contain supported visual figure fences", function () {
@@ -40,6 +47,7 @@ describe("editCurrentNote create tracking", function () {
     item: null,
     currentAnswerText: "",
     modelName: "gpt-5.4",
+    journalFallbackApproved: true,
   };
 
   const globalScope = globalThis as typeof globalThis & {
@@ -92,6 +100,7 @@ describe("editCurrentNote create tracking", function () {
     parentID?: number;
     deleted = false;
     readonly saveOptionsHistory: Array<{ notifierQueue?: unknown }> = [];
+    wrapOnReload = false;
     private noteHtml = "";
 
     constructor(itemType: string) {
@@ -124,6 +133,15 @@ describe("editCurrentNote create tracking", function () {
         parentNoteIds.push(this.id);
       }
       return this.id;
+    }
+
+    async reload() {
+      if (
+        this.wrapOnReload &&
+        !this.noteHtml.startsWith('<div class="zotero-note ')
+      ) {
+        this.noteHtml = `<div class="zotero-note znv3">${this.noteHtml}</div>`;
+      }
     }
   }
 
@@ -265,6 +283,27 @@ describe("editCurrentNote create tracking", function () {
     assert.isNull(tracked);
   });
 
+  it("preserves styled HTML when note creation skips the review card", async function () {
+    const tool = createEditCurrentNoteTool(new ZoteroGateway());
+    const validated = tool.validate({
+      mode: "create",
+      content:
+        '<div style="color: rgb(180, 20, 20)"><strong>Styled note</strong></div>',
+      target: "item",
+    });
+    assert.isTrue(validated.ok);
+    if (!validated.ok) return;
+
+    await tool.execute(validated.value, baseContext);
+
+    assert.lengthOf(childNotes(9), 1);
+    assert.include(
+      childNotes(9)[0].getNote(),
+      'style="color: rgb(180, 20, 20)"',
+    );
+    assert.include(childNotes(9)[0].getNote(), "<strong>Styled note</strong>");
+  });
+
   it("agent create makes a new item note even when a response-save note is tracked", async function () {
     const trackedNote = saveExistingNote(50, 9, "<p>Tracked response save</p>");
     rememberAssistantNoteForParent(9, 50);
@@ -333,6 +372,43 @@ describe("editCurrentNote create tracking", function () {
     assert.include(existing.getNote(), "Existing body");
     assert.include(existing.getNote(), "<hr/>");
     assert.include(existing.getNote(), "Appended body");
+  });
+
+  it("journals Zotero's reloaded append HTML so immediate undo does not conflict", async function () {
+    const db = new ChangeJournalTestDb();
+    (globalScope.Zotero as unknown as { DB: ChangeJournalTestDb }).DB = db;
+    await initAgentChangeJournal();
+    const existing = saveExistingNote(60, 9, "<p>Existing body</p>");
+    existing.wrapOnReload = true;
+    const gateway = new ZoteroGateway();
+    const tool = createEditCurrentNoteTool(gateway);
+
+    await tool.execute(
+      {
+        mode: "append",
+        targetNoteId: 60,
+        content: "Appended body",
+      },
+      baseContext,
+    );
+    const persistedHtml = existing.getNote();
+    const [action] = await listJournalActions({
+      conversationKey: baseContext.request.conversationKey,
+      limit: 1,
+    });
+    const postcondition = JSON.parse(
+      action.steps[0].expectedPostconditionJson || "{}",
+    ) as { checksum?: string };
+
+    assert.equal(postcondition.checksum, await sha256Text(persistedHtml));
+    const reverted = await revertActions({
+      actions: [action],
+      zoteroGateway: gateway,
+      context: baseContext,
+    });
+    assert.equal(reverted.reverted, 1);
+    assert.include(existing.getNote(), "Existing body");
+    assert.notInclude(existing.getNote(), "Appended body");
   });
 
   it("append mode refuses ambiguous child-note targets", async function () {

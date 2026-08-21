@@ -12,7 +12,10 @@ import {
 } from "../../services/libraryMutationService";
 import type { ZoteroGateway } from "../../services/zoteroGateway";
 import { ok, fail, validateObject, normalizePositiveIntArray } from "../shared";
-import { executeAndRecordUndo } from "./mutateLibraryShared";
+import {
+  executeAndRecordUndo,
+  planLibraryMutations,
+} from "./mutateLibraryShared";
 
 type RestoreFromTrashInput = {
   operation: RestoreFromTrashOperation;
@@ -151,6 +154,9 @@ export function createRestoreFromTrashTool(
       // Text fields are read-only; pass through unchanged.
       return ok(input);
     },
+
+    planMutation: (input, context) =>
+      planLibraryMutations(mutationService, [input.operation], context),
 
     async execute(input, context) {
       return executeAndRecordUndo(

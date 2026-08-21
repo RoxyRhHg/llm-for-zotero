@@ -1,5 +1,6 @@
 import { assert } from "chai";
 import { ZoteroGateway } from "../src/agent/services/zoteroGateway";
+import { libraryIndexService } from "../src/services/libraryIndexService";
 
 /**
  * `buildAgentLibrarySearch` called `addCondition("year", "isGreaterThan", …)`.
@@ -79,13 +80,21 @@ describe("library search year and author filters", function () {
 
     (globalThis as Record<string, unknown>).Zotero = {
       Search: FakeSearch,
-      Items: { get: (id: number) => items.get(id) || null },
+      Items: {
+        get: (id: number) => items.get(id) || null,
+        getAll: async () => [...items.values()],
+      },
+      Collections: { getByLibrary: () => [] },
       debug: () => undefined,
     };
   }
 
-  beforeEach(installFakeZotero);
+  beforeEach(function () {
+    libraryIndexService.clearForTests();
+    installFakeZotero();
+  });
   afterEach(function () {
+    libraryIndexService.clearForTests();
     delete (globalThis as Record<string, unknown>).Zotero;
   });
 

@@ -23,6 +23,7 @@ describe("note into a collection (issue #374)", function () {
     item: null,
     currentAnswerText: "",
     modelName: "test-model",
+    journalFallbackApproved: true,
   };
 
   function makeGateway() {
@@ -114,7 +115,7 @@ describe("note into a collection (issue #374)", function () {
       "the note id must survive the trip back up",
     );
     assert.deepEqual(result.collections, [88]);
-    assert.exists(outcome.undo, "creating a note must be undoable");
+    assert.exists(outcome.inverse, "creating a note must be reversible");
   });
 
   it("treats a collection request as standalone even when target says item", async function () {
