@@ -1096,6 +1096,10 @@ export class LibraryIndexService {
         failed = true;
         coveredChanges.fullRebuild = true;
         this.requeueChanges(state, coveredChanges);
+        // A snapshot that could not be refreshed must not keep serving
+        // peek-only consumers indefinitely: drop it so reads fall back to
+        // live Zotero data and the next getSnapshot rebuilds.
+        state.snapshot = undefined;
         globalThis.Zotero?.debug?.(
           `[llm-for-zotero] Library index rebuild failed: ${
             error instanceof Error ? error.message : String(error)
@@ -1177,6 +1181,11 @@ export class LibraryIndexService {
       const state = this.states.get(id) || { epoch: 0 };
       if (state.loadTask || state.backgroundRefreshTask) {
         this.queueFullRebuild(state);
+        // The in-flight build may predate this invalidation. Drop the
+        // published snapshot so reads fall back to live Zotero data instead
+        // of serving pre-invalidation state (read-your-writes for the agent
+        // write tools); the queued full rebuild restores the index.
+        state.snapshot = undefined;
         this.states.set(id, state);
         return;
       }
@@ -1188,6 +1197,7 @@ export class LibraryIndexService {
     for (const state of this.states.values()) {
       if (state.loadTask || state.backgroundRefreshTask) {
         this.queueFullRebuild(state);
+        state.snapshot = undefined;
         continue;
       }
       state.epoch += 1;

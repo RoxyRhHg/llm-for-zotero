@@ -1007,7 +1007,7 @@ export type AgentEngineDeps = {
   // Request lifecycle (per-conversation)
   cancelledRequestId: (conversationKey: number) => number;
   currentAbortController: (conversationKey: number) => AbortController | null;
-  getAbortControllerCtor: () => new () => AbortController;
+  getAbortControllerCtor: () => (new () => AbortController) | undefined;
   nextRequestId: () => number;
   tryBeginRequest: (
     conversationKey: number,
@@ -1345,7 +1345,7 @@ export async function sendAgentTurn(
       !deps.tryBeginRequest(
         conversationKey,
         thisRequestId,
-        new AbortControllerCtor(),
+        AbortControllerCtor ? new AbortControllerCtor() : null,
       )
     ) {
       return;
@@ -1865,7 +1865,7 @@ export async function retryAgentTurn(
       !deps.tryBeginRequest(
         initialConversationKey,
         thisRequestId,
-        new AbortControllerCtor(),
+        AbortControllerCtor ? new AbortControllerCtor() : null,
       )
     ) {
       return;

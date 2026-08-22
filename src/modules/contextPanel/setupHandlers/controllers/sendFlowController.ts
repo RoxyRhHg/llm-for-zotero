@@ -302,16 +302,16 @@ export function createSendFlowController(deps: SendFlowControllerDeps): {
       deps.persistDraftInput();
       deps.onComposerDraftRestored?.();
     };
-    if (shouldClearDraft) {
-      deps.inputBox.value = "";
-      deps.onComposerDraftCleared?.();
-      deps.persistDraftInput();
-    }
-    deps.closeSlashMenu();
-    deps.closePaperPicker();
-    deps.autoLockGlobalChat();
-
     try {
+      if (shouldClearDraft) {
+        deps.inputBox.value = "";
+        deps.onComposerDraftCleared?.();
+        deps.persistDraftInput();
+      }
+      deps.closeSlashMenu();
+      deps.closePaperPicker();
+      deps.autoLockGlobalChat();
+
       const earlyProfile = deps.getSelectedProfile();
       const codexNativeSkillText =
         earlyProfile?.authMode === "codex_app_server"
@@ -730,6 +730,11 @@ export function createSendFlowController(deps: SendFlowControllerDeps): {
           if (editResult === "missing") {
             deps.setActiveEditSession(null);
             deps.setStatusMessage?.("No editable latest prompt", "error");
+            return;
+          }
+          if (editResult === "cancelled") {
+            // The user stopped the retry; the cancel handler already showed
+            // "Cancelled". The saved edit is not a failure.
             return;
           }
           deps.setStatusMessage?.("Failed to save edited prompt", "error");

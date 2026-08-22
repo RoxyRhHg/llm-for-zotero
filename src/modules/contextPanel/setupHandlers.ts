@@ -177,6 +177,7 @@ import {
   refreshConversationPanels,
   beginPanelRequest,
   finishPanelRequest,
+  clearPendingRequestIdAndSync,
   detectReasoningProvider,
   getReasoningOptions,
   getSelectedReasoningForItem,
@@ -6892,12 +6893,28 @@ export function setupHandlers(
       }
       const finishInlineRequest = () => {
         if (!inlineRequest) return;
-        finishPanelRequest(
+        // The conversation key can change mid-flight (editUserTurnAndRetry
+        // transfers the claim after ensureConversationLoaded). Mirror the
+        // send controller's finally: finish under the current key, then fall
+        // back to the key the claim was taken under so it never strands.
+        const currentConversationKey = getConversationKey(currentItem);
+        const finished = finishPanelRequest(
           body,
           currentItem,
-          getConversationKey(currentItem),
+          currentConversationKey,
           inlineRequest.requestId,
         );
+        if (
+          !finished &&
+          currentConversationKey !== inlineRequest.conversationKey
+        ) {
+          finishPanelRequest(
+            body,
+            currentItem,
+            inlineRequest.conversationKey,
+            inlineRequest.requestId,
+          );
+        }
         if (!providerDispatchStarted) {
           inputBox.value = newText;
           persistDraftInputForCurrentConversation();
@@ -7676,6 +7693,13 @@ export function setupHandlers(
       if (pendingRequestId > 0) {
         setCancelledRequestId(cancelConvKey, pendingRequestId);
       }
+      // Force-release the claim so Cancel always restores a sendable
+      // conversation, even when the in-flight call ignores the abort signal
+      // and never settles. The cancelled-id fence above keeps the zombie
+      // request from dispatching, and its own finally's id-fenced
+      // finishRequest no-ops once the claim is gone.
+      clearPendingRequestIdAndSync(cancelConvKey, body, item);
+      scheduleQueuedFollowUpDrainForThread(getQueuedFollowUpThreadKey());
     }
     if (status) setStatus(status, t("Cancelled"), "ready");
     // Immediately mark the last assistant message as not streaming so any

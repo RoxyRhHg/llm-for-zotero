@@ -1492,7 +1492,7 @@ describe("LibraryIndexService", function () {
     assert.equal(snapshot.itemById.get(9)?.title, "Recovered");
   });
 
-  it("keeps a warm snapshot and lets a later request retry a failed background rebuild", async function () {
+  it("drops the snapshot after a failed background rebuild so readers cannot keep consuming stale data", async function () {
     let calls = 0;
     installFixture({
       topLevel: [],
@@ -1506,7 +1506,7 @@ describe("LibraryIndexService", function () {
       },
     });
     const index = service();
-    const available = await index.getSnapshot(1);
+    await index.getSnapshot(1);
 
     await index.handleChange({
       event: "refresh",
@@ -1517,13 +1517,16 @@ describe("LibraryIndexService", function () {
     });
     await new Promise((resolve) => setTimeout(resolve, 160));
 
-    assert.strictEqual(index.peekSnapshot(1), available);
+    // A snapshot the service failed to refresh must not keep serving
+    // peek-only consumers pre-failure data; they fall back to live Zotero
+    // reads until the next getSnapshot rebuilds.
+    assert.strictEqual(index.peekSnapshot(1), undefined);
     assert.equal(calls, 2);
-    assert.strictEqual(await index.getSnapshot(1), available);
-    await new Promise((resolve) => setTimeout(resolve, 160));
 
+    const recovered = await index.getSnapshot(1);
+    assert.equal(recovered.itemById.get(2)?.title, "Recovered");
+    assert.isAtLeast(calls, 3);
     assert.equal(index.peekSnapshot(1)?.itemById.get(2)?.title, "Recovered");
-    assert.equal(calls, 3);
   });
 
   it("applies repeated patches without rebuilding or retaining overlays", async function () {

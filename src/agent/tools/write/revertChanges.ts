@@ -5,7 +5,8 @@ import {
   revertActions,
 } from "../../services/changeReverter";
 import {
-  listJournalActions,
+  selectRevertJournalActions,
+  type JournalAction,
   type JournalActionWithSteps,
 } from "../../store/changeJournal";
 import { ok, fail, validateObject, normalizePositiveInt } from "../shared";
@@ -101,24 +102,22 @@ export function createRevertChangesTool(
      */
     async shouldRequireConfirmation(input, context) {
       if (input.dryRun) return false;
-      const entries = await listJournalActions({
+      const selection = await selectRevertJournalActions({
         conversationKey: context.request.conversationKey,
-        limit: input.count,
-        pendingOnly: true,
+        count: input.count,
       });
-      return entries.length > 0;
+      return selection.actions.length > 0;
     },
 
     async planMutation(input, context) {
       if (input.dryRun) {
         return { effect: "none", reversibility: "full" };
       }
-      const actions = await listJournalActions({
+      const selection = await selectRevertJournalActions({
         conversationKey: context.request.conversationKey,
-        limit: input.count,
-        pendingOnly: true,
+        count: input.count,
       });
-      return actions.length
+      return selection.actions.length
         ? {
             effect: "write",
             reversibility: "none",
@@ -130,17 +129,23 @@ export function createRevertChangesTool(
     },
 
     async createPendingAction(input, context) {
-      // pendingOnly at the SQL level: filtering after LIMIT would spend the
-      // budget on rows a previous undo already reverted.
-      const pending = await listJournalActions({
+      // Irreversible actions never consume the count budget; they are
+      // disclosed as changes that will remain, matching undo_last_action.
+      const selection = await selectRevertJournalActions({
         conversationKey: context.request.conversationKey,
-        limit: input.count,
-        pendingOnly: true,
+        count: input.count,
       });
+      const pending = selection.actions;
+      const summary = [
+        describeEntries(pending),
+        describeSkippedIrreversible(selection.skippedIrreversible),
+      ]
+        .filter(Boolean)
+        .join("\n\n");
       return {
         toolName: "revert_changes",
         title: `Undo ${pending.length} change${pending.length === 1 ? "" : "s"}`,
-        description: describeEntries(pending),
+        description: summary,
         confirmLabel: "Undo",
         cancelLabel: "Cancel",
         fields: [
@@ -148,7 +153,7 @@ export function createRevertChangesTool(
             type: "text" as const,
             id: "summary",
             label: "Changes to undo",
-            value: describeEntries(pending),
+            value: summary,
           },
         ],
       };
@@ -159,11 +164,17 @@ export function createRevertChangesTool(
     },
 
     async execute(input, context) {
-      const pending = await listJournalActions({
+      const selection = await selectRevertJournalActions({
         conversationKey: context.request.conversationKey,
-        limit: input.count,
-        pendingOnly: true,
+        count: input.count,
       });
+      const pending = selection.actions;
+      const skippedIrreversible = selection.skippedIrreversible.map(
+        (action) => ({
+          entryId: action.actionId,
+          reason: action.recovery || action.error || "No inverse was recorded",
+        }),
+      );
 
       if (input.dryRun) {
         const conflicts = await analyzeJournalActions({
@@ -183,6 +194,7 @@ export function createRevertChangesTool(
               reversibility: action.reversibility,
               reason: action.recovery,
             })),
+            skipped: skippedIrreversible,
             conflicts,
           },
           effect: "none",
@@ -195,8 +207,10 @@ export function createRevertChangesTool(
             reverted: 0,
             partiallyReverted: 0,
             residuals: [],
-            skipped: [],
-            message: "There are no recorded changes left to undo.",
+            skipped: skippedIrreversible,
+            message: skippedIrreversible.length
+              ? "The most recent changes cannot be undone automatically, and no older reversible change was requested."
+              : "There are no recorded changes left to undo.",
           },
           effect: "none",
         };
@@ -214,7 +228,7 @@ export function createRevertChangesTool(
           residuals: outcome.residuals,
           // Named explicitly so the agent reports what it could NOT put back
           // rather than implying a clean rollback.
-          skipped: outcome.skipped,
+          skipped: [...skippedIrreversible, ...outcome.skipped],
           conflicts: outcome.conflicts,
         },
         effect:
@@ -242,4 +256,15 @@ function describeEntries(entries: JournalActionWithSteps[]): string {
       return `• ${entry.description}${suffix}`;
     })
     .join("\n");
+}
+
+function describeSkippedIrreversible(entries: JournalAction[]): string {
+  if (!entries.length) return "";
+  const lines = entries
+    .map(
+      (entry) =>
+        `• ${entry.description} — ${entry.recovery || "no inverse recorded"}`,
+    )
+    .join("\n");
+  return `Newer changes that will remain (cannot be undone):\n${lines}`;
 }

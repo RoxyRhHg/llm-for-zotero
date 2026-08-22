@@ -2,6 +2,7 @@ import {
   buildQuoteTextIndex,
   collectQuoteTextAlignmentRunsAllowingLayoutFragments,
   countCanonicalTextMatches,
+  quoteTextAlignmentBudgetExceeded,
   extractQuoteTextTokens,
   findQuoteSourceSpansAllowingLayoutArtifacts,
   normalizeQuoteTextCanonical,
@@ -690,6 +691,13 @@ function collectCommonQuoteTokenRuns(
   entry: NormalizedQuoteTextSearchEntry,
   quoteIndex: QuoteTextIndex,
 ): CommonQuoteTokenRun[] {
+  // Above its state budget the alignment collector returns nothing at all.
+  // Dense CJK entries reach that budget routinely (each Han/Kana/Hangul
+  // character is one token), so fall back to the uncapped literal collector
+  // rather than silently losing all partial support for the entry.
+  if (quoteTextAlignmentBudgetExceeded(entry.textIndex, quoteIndex)) {
+    return collectLiteralCommonQuoteTokenRuns(entry, quoteIndex);
+  }
   return collectQuoteTextAlignmentRunsAllowingLayoutFragments(
     entry.textIndex,
     quoteIndex,

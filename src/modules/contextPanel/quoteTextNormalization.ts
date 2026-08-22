@@ -787,6 +787,24 @@ function tokensCanStartAlignmentRun(
 }
 
 /**
+ * True when a source/query pair is too large for the alignment collector's
+ * state budget, in which case it returns no runs at all. Callers that need
+ * partial support above the budget must use a cheaper collector instead.
+ */
+export function quoteTextAlignmentBudgetExceeded(
+  sourceIndex: QuoteTextIndex,
+  queryIndex: QuoteTextIndex,
+): boolean {
+  const sourceTokenCount = sourceIndex.tokens.length;
+  const queryTokenCount = queryIndex.tokens.length;
+  return (
+    sourceTokenCount > 0 &&
+    queryTokenCount > 0 &&
+    sourceTokenCount > Math.floor(MAX_QUOTE_ALIGNMENT_STATES / queryTokenCount)
+  );
+}
+
+/**
  * Collect maximal ordered runs that use the same character-preserving layout
  * fragment rules as complete quote matching. A semantic mismatch ends a run;
  * callers may combine the resulting query-token ranges as partial support,

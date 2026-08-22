@@ -1152,6 +1152,53 @@ export async function selectUndoJournalAction(input: {
   };
 }
 
+export type JournalRevertSelection = {
+  actions: JournalActionWithSteps[];
+  /** Newer irreversible actions that were skipped over to reach the targets. */
+  skippedIrreversible: JournalAction[];
+};
+
+/**
+ * Select the newest `count` REVERSIBLE pending actions, the same semantics
+ * selectUndoJournalAction applies for a single target: irreversible actions
+ * never consume the budget, they are surfaced for disclosure instead.
+ */
+export async function selectRevertJournalActions(input: {
+  conversationKey: number;
+  count: number;
+}): Promise<JournalRevertSelection> {
+  const db = getDb();
+  const count = Math.max(0, Math.floor(input.count));
+  if (!db || !count) return { actions: [], skippedIrreversible: [] };
+  const rows = (await db.queryAsync(
+    `SELECT * FROM ${JOURNAL_ACTIONS_TABLE}
+     WHERE conversation_key = ?
+       AND status NOT IN ('reverted','no_effect','failed')
+     ORDER BY created_at DESC, rowid DESC`,
+    [input.conversationKey],
+  )) as Array<Record<string, unknown>> | null;
+  const pending = Array.isArray(rows) ? rows.map(toAction) : [];
+  const targets: JournalAction[] = [];
+  const skippedIrreversible: JournalAction[] = [];
+  for (const action of pending) {
+    if (targets.length >= count) break;
+    if (action.reversibility === "none") {
+      skippedIrreversible.push(action);
+    } else {
+      targets.push(action);
+    }
+  }
+  return {
+    actions: await Promise.all(
+      targets.map(async (action) => ({
+        ...action,
+        steps: await listJournalSteps(action.actionId),
+      })),
+    ),
+    skippedIrreversible,
+  };
+}
+
 export async function deleteConversationJournal(
   conversationKey: number,
 ): Promise<void> {

@@ -129,7 +129,10 @@ import {
   withScrollGuard,
 } from "./chatScrollSnapshots";
 import { resizeTextareaToContent } from "./textareaSizing";
-import { getActiveReaderForSelectedTab } from "./contextResolution";
+import {
+  getActiveReaderForSelectedTab,
+  getAllOpenReaders,
+} from "./contextResolution";
 export {
   isScrollUpdateSuspended,
   withScrollGuard,
@@ -424,16 +427,21 @@ export { getConversationKey } from "./conversationIdentity";
 export { renderAssistantMarkdownHtmlForChat } from "./renderedMarkdown";
 
 /** Get AbortController constructor from global scope */
-function getAbortControllerCtor(): new () => AbortController {
+function getAbortControllerCtor(): (new () => AbortController) | undefined {
   return (
     (ztoolkit.getGlobal("AbortController") as new () => AbortController) ||
     (
       globalThis as typeof globalThis & {
-        AbortController: new () => AbortController;
+        AbortController?: new () => AbortController;
       }
     ).AbortController
   );
 }
+
+// AbortController is not guaranteed in Zotero's Gecko chrome context. When it
+// is absent, requests run without cancellation support instead of failing at
+// admission; this inert signal keeps beginPanelRequest's return shape.
+const INERT_ABORT_SIGNAL = { aborted: false } as AbortSignal;
 
 // Committing hidden turns is best effort: prompt, retry-target, render and
 // history-search correctness all come from filterMessagesInPendingTurns, which
@@ -3116,7 +3124,7 @@ export function beginPanelRequest(
   const conversationKey = getConversationKey(item);
   const requestId = nextRequestId();
   const AbortControllerCtor = getAbortControllerCtor();
-  const abortController = new AbortControllerCtor();
+  const abortController = AbortControllerCtor ? new AbortControllerCtor() : null;
   if (!tryBeginRequest(conversationKey, requestId, abortController)) {
     return null;
   }
@@ -3127,7 +3135,7 @@ export function beginPanelRequest(
   return {
     conversationKey,
     requestId,
-    signal: abortController.signal,
+    signal: abortController ? abortController.signal : INERT_ABORT_SIGNAL,
   };
 }
 
@@ -4998,20 +5006,27 @@ async function collectLivePdfQuoteSecondaryEvidence(params: {
   yieldToMain: () => Promise<void>;
   shouldContinue: () => boolean;
 }): Promise<QuoteSecondaryEvidence[]> {
-  const reader = getActiveReaderForSelectedTab();
-  const readerItemId = Math.floor(
-    Number(reader?._item?.id || reader?.itemID || 0),
-  );
-  if (!reader || !readerItemId) return [];
+  // Route each request to whichever open reader holds its attachment, so the
+  // verdict does not depend on which tab happens to be focused.
+  const readersByItemId = new Map<number, any>();
+  for (const reader of getAllOpenReaders()) {
+    const readerItemId = Math.floor(
+      Number(reader?._item?.id || reader?.itemID || 0),
+    );
+    if (readerItemId && !readersByItemId.has(readerItemId)) {
+      readersByItemId.set(readerItemId, reader);
+    }
+  }
+  if (!readersByItemId.size) return [];
   const requests = collectDisplayedQuoteVerificationRequests({
     markdown: params.markdown,
     sourceIndex: params.sourceIndex,
-  }).filter((request) => request.contextItemId === readerItemId);
+  }).filter((request) => readersByItemId.has(request.contextItemId));
   const out: QuoteSecondaryEvidence[] = [];
   for (const request of requests) {
     if (!params.shouldContinue()) break;
     const verification = await verifyCompleteQuoteInLivePdfJs(
-      reader,
+      readersByItemId.get(request.contextItemId),
       request.contextItemId,
       request.quoteText,
       {
@@ -6872,6 +6887,7 @@ export type EditLatestTurnResult =
   | "missing"
   | "stale"
   | "persist-failed"
+  | "cancelled"
   | "retry-failed";
 
 function normalizeEditableAttachments(
@@ -7736,7 +7752,14 @@ export async function editLatestUserMessageAndRetry(
           requestId,
           onProviderDispatch,
         );
-  if (!retrySucceeded) return "retry-failed";
+  if (!retrySucceeded) {
+    // A deliberate Stop during retry preparation bails with a falsy result;
+    // report it as a cancel, not a failure — the prompt edit itself was saved.
+    return requestId !== undefined &&
+      getCancelledRequestId(conversationKey) >= requestId
+      ? "cancelled"
+      : "retry-failed";
+  }
   return "ok";
 }
 

@@ -1419,6 +1419,31 @@ function cacheLivePdfQuoteVerification(
     livePdfQuoteVerificationCache.delete(oldestKey);
   }
 }
+const MAX_LIVE_PDF_VERIFICATION_EXTRACTION_CACHE_ENTRIES = 3;
+type LivePdfVerificationExtraction = {
+  pages: LivePdfPageText[];
+  indexes: QuoteTextIndex[];
+};
+const livePdfVerificationExtractionCache = new Map<
+  string,
+  LivePdfVerificationExtraction
+>();
+
+function cacheLivePdfVerificationExtraction(
+  key: string,
+  value: LivePdfVerificationExtraction,
+): void {
+  livePdfVerificationExtractionCache.delete(key);
+  livePdfVerificationExtractionCache.set(key, value);
+  while (
+    livePdfVerificationExtractionCache.size >
+    MAX_LIVE_PDF_VERIFICATION_EXTRACTION_CACHE_ENTRIES
+  ) {
+    const oldestKey = livePdfVerificationExtractionCache.keys().next().value;
+    if (typeof oldestKey !== "string") break;
+    livePdfVerificationExtractionCache.delete(oldestKey);
+  }
+}
 const hiddenQuoteLocationTasks = new Map<
   string,
   Promise<HiddenQuoteLocationCacheEntry | null>
@@ -2169,34 +2194,71 @@ export async function verifyCompleteQuoteInLivePdfJs(
     cacheLivePdfQuoteVerification(verificationCacheKey, cachedVerification);
     return cachedVerification;
   }
-  const extracted = await extractPageTextsFromViewer(reader, {
-    pageNative: true,
-    yieldToMain: options?.yieldToMain,
-    shouldContinue: options?.shouldContinue,
-  });
-  const pageCount = Math.floor(Number(extracted?.pageCount || 0));
-  if (
-    !extracted?.pages.length ||
-    !pageCount ||
-    extracted.pages.length !== pageCount ||
-    extracted.pages.some(
-      (page) => !buildQuoteTextIndex(page.text).tokens.length,
-    )
-  ) {
-    return {
-      status: "defer",
-      reason:
-        "PDF.js could not provide complete searchable text for every page.",
-    };
-  }
-
-  const locations = extracted.pages.flatMap((page) =>
-    findQuoteSourceSpansAllowingLayoutArtifacts(
+  const extractionCacheKey = `${itemId}␟${documentFingerprint}`;
+  let extraction = livePdfVerificationExtractionCache.get(extractionCacheKey);
+  if (!extraction) {
+    const extracted = await extractPageTextsFromViewer(reader, {
+      pageNative: true,
+      yieldToMain: options?.yieldToMain,
+      shouldContinue: options?.shouldContinue,
+    });
+    const pageCount = Math.floor(Number(extracted?.pageCount || 0));
+    const indexes = (extracted?.pages ?? []).map((page) =>
       buildQuoteTextIndex(page.text),
+    );
+    if (
+      !extracted?.pages.length ||
+      !pageCount ||
+      extracted.pages.length !== pageCount ||
+      indexes.some((index) => !index.tokens.length)
+    ) {
+      return {
+        status: "defer",
+        reason:
+          "PDF.js could not provide complete searchable text for every page.",
+      };
+    }
+    extraction = { pages: extracted.pages, indexes };
+    cacheLivePdfVerificationExtraction(extractionCacheKey, extraction);
+  }
+  const { pages, indexes } = extraction;
+
+  const locations = pages.flatMap((page, pageOrdinal) =>
+    findQuoteSourceSpansAllowingLayoutArtifacts(
+      indexes[pageOrdinal],
       cleanQuote,
     ).map((span) => ({ page, span })),
   );
   if (!locations.length) {
+    // A genuine quote that straddles a page break matches no single page.
+    // Probe the text around each boundary before condemning the quote; a
+    // boundary match cannot form a per-page navigation certificate, so it
+    // defers instead of matching.
+    const boundaryWindow = cleanQuote.length + 400;
+    for (let i = 0; i + 1 < pages.length; i += 1) {
+      if (options?.shouldContinue && !options.shouldContinue()) {
+        return {
+          status: "defer",
+          reason: "Verification was interrupted before completing.",
+        };
+      }
+      const joined = buildQuoteTextIndex(
+        `${pages[i].text.slice(-boundaryWindow)}\n${pages[i + 1].text.slice(
+          0,
+          boundaryWindow,
+        )}`,
+      );
+      if (
+        findQuoteSourceSpansAllowingLayoutArtifacts(joined, cleanQuote).length
+      ) {
+        return {
+          status: "defer",
+          reason:
+            "The quote spans a page boundary, which per-page verification cannot certify.",
+        };
+      }
+      if (options?.yieldToMain) await options.yieldToMain();
+    }
     const absent: Extract<LivePdfQuoteVerification, { status: "absent" }> = {
       status: "absent",
       documentFingerprint,
@@ -2543,6 +2605,7 @@ export function clearPageTextCache(): void {
   hiddenQuoteLocationCache.clear();
   hiddenQuoteLocationTasks.clear();
   livePdfQuoteVerificationCache.clear();
+  livePdfVerificationExtractionCache.clear();
   clearCitationPageCache();
   anonymousReaderKeys = new WeakMap<object, string>();
   anonymousReaderKeySequence = 0;
