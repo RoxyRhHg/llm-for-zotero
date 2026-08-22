@@ -72,11 +72,10 @@ import {
   pinnedImageKeys,
   pinnedFileKeys,
   setCancelledRequestId,
-  setPendingRequestId,
   getPendingRequestId,
   getAbortController,
-  setAbortController,
   isRequestPending,
+  isRequestOwner,
   responseMenuTarget,
   setResponseMenuTarget,
   promptMenuTarget,
@@ -174,7 +173,8 @@ import {
   withScrollGuard,
   copyTextToClipboard,
   refreshConversationPanels,
-  clearPendingRequestIdAndSync,
+  beginPanelRequest,
+  finishPanelRequest,
   detectReasoningProvider,
   getReasoningOptions,
   getSelectedReasoningForItem,
@@ -6719,6 +6719,10 @@ export function setupHandlers(
     body,
     inputBox,
     getItem: () => item,
+    beginRequest: beginPanelRequest,
+    isRequestOwner,
+    finishRequest: finishPanelRequest,
+    queueFollowUpInput: (text) => queueFollowUpInput(text),
     resolveContextSource: resolveAutoLoadedContextSourceAsync,
     closeSlashMenu,
     closePaperPicker,
@@ -6858,6 +6862,7 @@ export function setupHandlers(
       : undefined,
     editStaleStatusText: EDIT_STALE_STATUS_TEXT,
     onComposerDraftCleared: resetComposerInputHeight,
+    onComposerDraftRestored: resetComposerInputHeight,
     consumeForcedSkillIds,
   });
   doSend = sendFlowController.doSend;
@@ -7018,6 +7023,15 @@ export function setupHandlers(
       ].slice(0, MAX_SELECTED_IMAGES);
       const selectedReasoning = getSelectedReasoning();
       const targetRuntimeMode = getCurrentRuntimeMode();
+      const inlineRequest = newText
+        ? beginPanelRequest(body, currentItem, "Preparing edited retry...")
+        : null;
+      if (newText && !inlineRequest) return;
+      if (inlineRequest) {
+        inputBox.value = "";
+        persistDraftInputForCurrentConversation();
+        resetComposerInputHeight();
+      }
       inlineEditCleanup?.();
       setInlineEditCleanup(null);
       setInlineEditInputSection(null, null, null);
@@ -7025,37 +7039,57 @@ export function setupHandlers(
       setInlineEditTarget(null);
       if (newText) {
         const webchatGreyOut = isWebChatMode();
-        const retrySucceeded = await editUserTurnAndRetry({
-          body,
-          item: currentItem,
-          contextSource,
-          userTimestamp: editTarget.userTimestamp,
-          assistantTimestamp: editTarget.assistantTimestamp,
-          newText,
-          selectedTextContexts: selectedContexts,
-          selectedTexts,
-          selectedTextSources,
-          selectedTextPaperContexts,
-          selectedTextNoteContexts,
-          selectedCollectionContexts,
-          selectedTagContexts,
-          screenshotImages: images,
-          paperContexts: selectedPaperContexts,
-          pdfPaperContexts: pdfModePapers,
-          fullTextPaperContexts,
-          attachments: selectedFiles,
-          modelAttachments: modelFiles,
-          localDocuments,
-          pdfUploadSystemMessages: pdfUploadSystemMessages.length
-            ? pdfUploadSystemMessages
-            : undefined,
-          targetRuntimeMode,
-          model: selectedProfile?.model,
-          apiBase: selectedProfile?.apiBase,
-          apiKey: selectedProfile?.apiKey,
-          reasoning: selectedReasoning,
-          advanced: advancedParams,
-        });
+        let retrySucceeded = false;
+        let providerDispatchStarted = false;
+        try {
+          retrySucceeded = await editUserTurnAndRetry({
+            body,
+            item: currentItem,
+            requestId: inlineRequest!.requestId,
+            onProviderDispatch: () => {
+              providerDispatchStarted = true;
+            },
+            contextSource,
+            userTimestamp: editTarget.userTimestamp,
+            assistantTimestamp: editTarget.assistantTimestamp,
+            newText,
+            selectedTextContexts: selectedContexts,
+            selectedTexts,
+            selectedTextSources,
+            selectedTextPaperContexts,
+            selectedTextNoteContexts,
+            selectedCollectionContexts,
+            selectedTagContexts,
+            screenshotImages: images,
+            paperContexts: selectedPaperContexts,
+            pdfPaperContexts: pdfModePapers,
+            fullTextPaperContexts,
+            attachments: selectedFiles,
+            modelAttachments: modelFiles,
+            localDocuments,
+            pdfUploadSystemMessages: pdfUploadSystemMessages.length
+              ? pdfUploadSystemMessages
+              : undefined,
+            targetRuntimeMode,
+            model: selectedProfile?.model,
+            apiBase: selectedProfile?.apiBase,
+            apiKey: selectedProfile?.apiKey,
+            reasoning: selectedReasoning,
+            advanced: advancedParams,
+          });
+        } finally {
+          finishPanelRequest(
+            body,
+            currentItem,
+            getConversationKey(currentItem),
+            inlineRequest!.requestId,
+          );
+          if (!providerDispatchStarted) {
+            inputBox.value = newText;
+            persistDraftInputForCurrentConversation();
+            resetComposerInputHeight();
+          }
+        }
         if (retrySucceeded) {
           consumePaperModeState(currentItem.id, { webchatGreyOut });
           retainPaperState(currentItem.id);
@@ -7610,8 +7644,10 @@ export function setupHandlers(
       }
     }
     if (cancelConvKey !== null) {
-      setCancelledRequestId(cancelConvKey, getPendingRequestId(cancelConvKey));
-      clearPendingRequestIdAndSync(cancelConvKey, body, item);
+      const pendingRequestId = getPendingRequestId(cancelConvKey);
+      if (pendingRequestId > 0) {
+        setCancelledRequestId(cancelConvKey, pendingRequestId);
+      }
     }
     if (status) setStatus(status, t("Cancelled"), "ready");
     // Immediately mark the last assistant message as not streaming so any
@@ -7621,7 +7657,7 @@ export function setupHandlers(
       const history = chatHistory.get(key);
       if (history) {
         for (let i = history.length - 1; i >= 0; i--) {
-          if (history[i].role === "assistant") {
+          if (history[i].role === "assistant" && history[i].streaming) {
             history[i].streaming = false;
             if (!history[i].text) history[i].text = "[Cancelled]";
             break;
@@ -7630,14 +7666,6 @@ export function setupHandlers(
       }
     }
     body.querySelectorAll(".llm-typing").forEach((el: Element) => el.remove());
-    // Re-enable UI for the cancelled conversation
-    if (inputBox) inputBox.disabled = false;
-    if (sendBtn) {
-      sendBtn.style.display = "";
-      sendBtn.disabled = false;
-    }
-    if (cancelBtn) cancelBtn.style.display = "none";
-    scheduleQueuedFollowUpDrainForThread(getQueuedFollowUpThreadKey());
     return true;
   };
 

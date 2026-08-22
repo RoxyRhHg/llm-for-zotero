@@ -59,6 +59,7 @@ function createDeps(params: {
 }): AgentEngineDeps {
   const chatHistory = new Map<number, any[]>();
   const abortControllers = new Map<number, AbortController | null>();
+  const pendingRequests = new Map<number, number>();
   const contextSnapshots = new Map<number, { contextTokens: number }>();
   return {
     chatHistory,
@@ -66,13 +67,37 @@ function createDeps(params: {
     cancelledRequestId: () => 0,
     currentAbortController: (conversationKey) =>
       abortControllers.get(conversationKey) || null,
-    setCurrentAbortController: (conversationKey, ctrl) => {
-      abortControllers.set(conversationKey, ctrl);
-    },
     getAbortControllerCtor: () => AbortController,
     nextRequestId: () => 77,
-    setPendingRequestId: (conversationKey, id) => {
-      params.pendingWrites.push([conversationKey, id]);
+    tryBeginRequest: (conversationKey, requestId, abortController) => {
+      if (pendingRequests.has(conversationKey)) return false;
+      pendingRequests.set(conversationKey, requestId);
+      abortControllers.set(conversationKey, abortController);
+      params.pendingWrites.push([conversationKey, requestId]);
+      return true;
+    },
+    isRequestOwner: (conversationKey, requestId) =>
+      pendingRequests.get(conversationKey) === requestId,
+    finishRequest: (conversationKey, requestId) => {
+      if (pendingRequests.get(conversationKey) !== requestId) return false;
+      pendingRequests.delete(conversationKey);
+      abortControllers.delete(conversationKey);
+      params.pendingWrites.push([conversationKey, 0]);
+      return true;
+    },
+    transferRequest: (fromConversationKey, toConversationKey, requestId) => {
+      if (
+        pendingRequests.get(fromConversationKey) !== requestId ||
+        pendingRequests.has(toConversationKey)
+      ) {
+        return false;
+      }
+      pendingRequests.delete(fromConversationKey);
+      pendingRequests.set(toConversationKey, requestId);
+      const controller = abortControllers.get(fromConversationKey) || null;
+      abortControllers.delete(fromConversationKey);
+      abortControllers.set(toConversationKey, controller);
+      return true;
     },
     getPanelRequestUI: () => ({}),
     setRequestUIBusy: () => undefined,
@@ -172,6 +197,88 @@ function createDeps(params: {
 }
 
 describe("agent engine final UI release", function () {
+  it("admits only one rapid retry while conversation loading is deferred", async function () {
+    const conversationKey = 122;
+    const userMessage = {
+      role: "user" as const,
+      text: "retry this",
+      timestamp: 100,
+      runMode: "agent" as const,
+    };
+    const assistantMessage: any = {
+      role: "assistant" as const,
+      text: "previous answer",
+      timestamp: 200,
+      runMode: "agent" as const,
+    };
+    let runtimeCalls = 0;
+    const runtime = {
+      getCapabilities: () => ({
+        streaming: true,
+        toolCalls: true,
+        multimodal: false,
+      }),
+      runTurn: async () => {
+        runtimeCalls += 1;
+        throw new Error("stop after admission");
+      },
+    } as unknown as AgentRuntime;
+    const pendingWrites: Array<[number, number]> = [];
+    const deps = createDeps({
+      runtime,
+      pendingWrites,
+      idleRestores: [],
+      statuses: [],
+    });
+    deps.chatHistory.set(conversationKey, [userMessage, assistantMessage]);
+    deps.findLatestRetryPair = () => ({
+      userIndex: 0,
+      userMessage,
+      assistantMessage,
+    });
+    deps.reconstructRetryPayload = () => ({
+      question: userMessage.text,
+      screenshotImages: [],
+      paperContexts: [],
+      pdfPaperContexts: [],
+      fullTextPaperContexts: [],
+      selectedCollectionContexts: [],
+      selectedTagContexts: [],
+    });
+    let resolveLoaded: () => void = () => undefined;
+    const loaded = new Promise<void>((resolve) => {
+      resolveLoaded = resolve;
+    });
+    deps.ensureConversationLoaded = () => loaded;
+    const retry = () =>
+      retryAgentTurn(
+        {} as Element,
+        fakeItem(conversationKey),
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        deps,
+      );
+
+    const first = retry();
+    const second = retry();
+    resolveLoaded();
+    await Promise.all([first, second]);
+
+    assert.equal(runtimeCalls, 1);
+    assert.deepEqual(pendingWrites, [
+      [conversationKey, 77],
+      [conversationKey, 0],
+    ]);
+  });
+
   it("releases the request UI when a final event arrives before runtime bookkeeping settles", async function () {
     const conversationKey = 123;
     const pendingWrites: Array<[number, number]> = [];
@@ -634,7 +741,10 @@ describe("agent engine final UI release", function () {
     );
 
     assert.equal(assistantMessage.text, "Previous grounded answer.");
-    assert.deepEqual(pendingWrites, []);
+    assert.deepEqual(pendingWrites, [
+      [conversationKey, 77],
+      [conversationKey, 0],
+    ]);
   });
 
   it("preserves partial text and flags interruption when the runtime drops mid-stream", async function () {

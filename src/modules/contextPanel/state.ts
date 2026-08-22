@@ -134,6 +134,60 @@ export function resetWebChatConversationSessionState(
 export function getPendingRequestId(conversationKey: number): number {
   return pendingRequestIds.get(conversationKey) || 0;
 }
+
+export function tryBeginRequest(
+  conversationKey: number,
+  requestId: number,
+  abortController: AbortController | null,
+): boolean {
+  const key = normalizeConversationKey(conversationKey);
+  if (!key || requestId <= 0 || pendingRequestIds.has(key)) return false;
+  pendingRequestIds.set(key, requestId);
+  if (abortController) abortControllers.set(key, abortController);
+  return true;
+}
+
+export function isRequestOwner(
+  conversationKey: number,
+  requestId: number,
+): boolean {
+  const key = normalizeConversationKey(conversationKey);
+  return Boolean(
+    key && requestId > 0 && pendingRequestIds.get(key) === requestId,
+  );
+}
+
+export function finishRequest(
+  conversationKey: number,
+  requestId: number,
+): boolean {
+  const key = normalizeConversationKey(conversationKey);
+  if (!key || pendingRequestIds.get(key) !== requestId) return false;
+  pendingRequestIds.delete(key);
+  abortControllers.delete(key);
+  return true;
+}
+
+export function transferRequest(
+  fromConversationKey: number,
+  toConversationKey: number,
+  requestId: number,
+): boolean {
+  const fromKey = normalizeConversationKey(fromConversationKey);
+  const toKey = normalizeConversationKey(toConversationKey);
+  if (!fromKey || !toKey || pendingRequestIds.get(fromKey) !== requestId) {
+    return false;
+  }
+  if (fromKey === toKey) return true;
+  if (pendingRequestIds.has(toKey)) return false;
+  const abortController = abortControllers.get(fromKey) || null;
+  pendingRequestIds.delete(fromKey);
+  abortControllers.delete(fromKey);
+  pendingRequestIds.set(toKey, requestId);
+  if (abortController) abortControllers.set(toKey, abortController);
+  return true;
+}
+
 export function setPendingRequestId(
   conversationKey: number,
   id: number,

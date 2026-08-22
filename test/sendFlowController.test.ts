@@ -345,11 +345,38 @@ describe("sendFlowController", function () {
     let lastEditTagContexts: TagContextRef[] | undefined;
     let lastStatus: { message: string; level: string } | null = null;
     const statuses: Array<{ message: string; level: string }> = [];
+    let activeRequestId = 0;
+    let nextRequestId = 1;
+    let activeAbortController: AbortController | null = null;
 
     const deps = {
       body: {} as Element,
       inputBox,
       getItem: () => item,
+      beginRequest: () => {
+        if (activeRequestId) return null;
+        activeRequestId = nextRequestId++;
+        activeAbortController = new AbortController();
+        return {
+          conversationKey: item.id,
+          requestId: activeRequestId,
+          signal: activeAbortController.signal,
+        };
+      },
+      isRequestOwner: (_conversationKey: number, requestId: number) =>
+        activeRequestId === requestId,
+      finishRequest: (
+        _body: Element,
+        _item: Zotero.Item,
+        _conversationKey: number,
+        requestId: number,
+      ) => {
+        if (activeRequestId !== requestId) return false;
+        activeRequestId = 0;
+        activeAbortController = null;
+        return true;
+      },
+      queueFollowUpInput: () => undefined,
       resolveContextSource: async () => ({
         contextItem: item,
         paperContext: null,
@@ -412,6 +439,7 @@ describe("sendFlowController", function () {
       getLatestEditablePair: async () => null,
       editLatestUserMessageAndRetry: async (opts: any) => {
         editCalled += 1;
+        opts.onProviderDispatch?.();
         lastEditRuntimeMode = opts.targetRuntimeMode || "";
         lastEditDisplayQuestion = opts.displayQuestion || "";
         lastEditImages = opts.screenshotImages;
@@ -421,10 +449,13 @@ describe("sendFlowController", function () {
         lastEditCollectionContexts = opts.selectedCollectionContexts;
         lastEditTagContexts = opts.selectedTagContexts;
         lastEditContextSource = opts.contextSource;
+        activeRequestId = 0;
+        activeAbortController = null;
         return "ok" as const;
       },
       sendQuestion: async (opts: any) => {
         sendCalled += 1;
+        opts.onProviderDispatch?.();
         lastSentQuestion = opts.question;
         lastSentDisplayQuestion = opts.displayQuestion;
         lastRuntimeMode = opts.runtimeMode || "";
@@ -443,6 +474,8 @@ describe("sendFlowController", function () {
         lastSentWebchatPdfPaperContexts = opts.webchatPdfPaperContexts;
         lastSentLocalDocuments = opts.localDocuments;
         opts.onWebChatSendOutcome?.("success");
+        activeRequestId = 0;
+        activeAbortController = null;
       },
       retainPinnedImageState: () => {
         retainImageCalled += 1;
@@ -1155,7 +1188,7 @@ describe("sendFlowController", function () {
 
     assert.equal(getCounts().sendCalled, 0);
     assert.equal(getCounts().editCalled, 0);
-    assert.equal(getCounts().composerDraftClearedCalls, 0);
+    assert.equal(getCounts().composerDraftClearedCalls, 1);
     assert.equal(inputBox.value, "ask question");
     assert.deepEqual(getLastStatus(), {
       message: FULL_PDF_UNSUPPORTED_MESSAGE,
@@ -2471,5 +2504,115 @@ describe("sendFlowController", function () {
         "Codex native app-server does not support pinned PDF or binary file attachments directly (archive.zip). Remove them and try again.",
       level: "error",
     });
+  });
+
+  it("admits only one of three rapid sends while context is preparing", async function () {
+    let resolveContext: ((value: ResolvedContextSource | null) => void) | null =
+      null;
+    const contextReady = new Promise<ResolvedContextSource | null>(
+      (resolve) => {
+        resolveContext = resolve;
+      },
+    );
+    const queued: string[] = [];
+    const { controller, inputBox, getCounts } = createBaseDeps({
+      resolveContextSource: () => contextReady,
+      queueFollowUpInput: (text: string) => queued.push(text),
+    });
+
+    const first = controller.doSend();
+    assert.equal(inputBox.value, "", "the admitted draft clears synchronously");
+    const second = controller.doSend();
+    const third = controller.doSend();
+    resolveContext?.(null);
+    await Promise.all([first, second, third]);
+
+    assert.equal(getCounts().sendCalled, 1);
+    assert.deepEqual(queued, []);
+  });
+
+  it("queues one genuinely new follow-up while preparation owns the conversation", async function () {
+    let resolveContext: ((value: ResolvedContextSource | null) => void) | null =
+      null;
+    const contextReady = new Promise<ResolvedContextSource | null>(
+      (resolve) => {
+        resolveContext = resolve;
+      },
+    );
+    const queued: string[] = [];
+    const { controller, inputBox, getCounts } = createBaseDeps({
+      resolveContextSource: () => contextReady,
+      queueFollowUpInput: (text: string) => {
+        queued.push(text);
+        inputBox.value = "";
+      },
+    });
+
+    const first = controller.doSend();
+    inputBox.value = "a real follow-up";
+    await controller.doSend();
+    await controller.doSend();
+    resolveContext?.(null);
+    await first;
+
+    assert.equal(getCounts().sendCalled, 1);
+    assert.deepEqual(queued, ["a real follow-up"]);
+  });
+
+  it("restores the captured draft when preparation is cancelled", async function () {
+    let resolveContext: ((value: ResolvedContextSource | null) => void) | null =
+      null;
+    const contextReady = new Promise<ResolvedContextSource | null>(
+      (resolve) => {
+        resolveContext = resolve;
+      },
+    );
+    const abortController = new AbortController();
+    let owner = 91;
+    const { controller, inputBox, getCounts, getDraftValue } = createBaseDeps({
+      resolveContextSource: () => contextReady,
+      beginRequest: () => ({
+        conversationKey: item.id,
+        requestId: 91,
+        signal: abortController.signal,
+      }),
+      isRequestOwner: (_conversationKey: number, requestId: number) =>
+        owner === requestId,
+      finishRequest: (
+        _body: Element,
+        _item: Zotero.Item,
+        _conversationKey: number,
+        requestId: number,
+      ) => {
+        if (owner !== requestId) return false;
+        owner = 0;
+        return true;
+      },
+    });
+
+    const send = controller.doSend();
+    assert.equal(inputBox.value, "");
+    abortController.abort();
+    resolveContext?.(null);
+    await send;
+
+    assert.equal(getCounts().sendCalled, 0);
+    assert.equal(owner, 0);
+    assert.equal(inputBox.value, "ask question");
+    assert.equal(getDraftValue(), "ask question");
+  });
+
+  it("restores the captured draft when preparation fails", async function () {
+    const { controller, inputBox, getCounts, getDraftValue } = createBaseDeps({
+      resolveContextSource: async () => {
+        throw new Error("context failed");
+      },
+    });
+
+    await controller.doSend().catch(() => undefined);
+
+    assert.equal(getCounts().sendCalled, 0);
+    assert.equal(inputBox.value, "ask question");
+    assert.equal(getDraftValue(), "ask question");
   });
 });

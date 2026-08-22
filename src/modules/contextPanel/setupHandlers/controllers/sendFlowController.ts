@@ -71,6 +71,23 @@ type SendFlowControllerDeps = {
   body: Element;
   inputBox: HTMLTextAreaElement;
   getItem: () => Zotero.Item | null;
+  beginRequest: (
+    body: Element,
+    item: Zotero.Item,
+    statusText?: string,
+  ) => {
+    conversationKey: number;
+    requestId: number;
+    signal: AbortSignal;
+  } | null;
+  isRequestOwner: (conversationKey: number, requestId: number) => boolean;
+  finishRequest: (
+    body: Element,
+    item: Zotero.Item,
+    conversationKey: number,
+    requestId: number,
+  ) => boolean;
+  queueFollowUpInput: (text: string) => void;
   resolveContextSource: () => Promise<ResolvedContextSource | null>;
   closeSlashMenu: () => void;
   closePaperPicker: () => void;
@@ -211,6 +228,7 @@ type SendFlowControllerDeps = {
   setStatusMessage?: (message: string, level: StatusLevel) => void;
   editStaleStatusText: string;
   onComposerDraftCleared?: () => void;
+  onComposerDraftRestored?: () => void;
   /** Consume forced skill IDs from slash menu selection. Returns the IDs and clears state. */
   consumeForcedSkillIds?: () => string[] | undefined;
   // [webchat]
@@ -248,15 +266,43 @@ export function createSendFlowController(deps: SendFlowControllerDeps): {
     const item = deps.getItem();
     if (!item) return;
 
+    const textContextConversationKey = deps.getConversationKey(item);
+    const capturedDraft = deps.inputBox.value;
+    const draftText = capturedDraft.trim();
+    const rawSubmittedText = (options?.overrideText ?? draftText).trim();
+    const request = deps.beginRequest(
+      deps.body,
+      item,
+      "Preparing attached context…",
+    );
+    if (!request) {
+      if (rawSubmittedText) deps.queueFollowUpInput(rawSubmittedText);
+      return;
+    }
+    const requestIsActive = () =>
+      deps.isRequestOwner(request.conversationKey, request.requestId) &&
+      !request.signal.aborted;
+    const shouldClearDraft = !options?.preserveInputDraft;
+    let draftRestored = false;
+    let providerDispatchStarted = false;
+    const restoreCapturedDraft = () => {
+      if (!shouldClearDraft || draftRestored) return;
+      draftRestored = true;
+      deps.inputBox.value = capturedDraft;
+      deps.persistDraftInput();
+      deps.onComposerDraftRestored?.();
+    };
+    if (shouldClearDraft) {
+      deps.inputBox.value = "";
+      deps.onComposerDraftCleared?.();
+      deps.persistDraftInput();
+    }
     deps.closeSlashMenu();
     deps.closePaperPicker();
     deps.autoLockGlobalChat();
 
     try {
-      const textContextConversationKey = deps.getConversationKey(item);
-      const draftText = deps.inputBox.value.trim();
       const earlyProfile = deps.getSelectedProfile();
-      const rawSubmittedText = (options?.overrideText ?? draftText).trim();
       const codexNativeSkillText =
         earlyProfile?.authMode === "codex_app_server"
           ? resolveSkillDirectiveText(rawSubmittedText, getAllSkills())
@@ -275,6 +321,7 @@ export function createSendFlowController(deps: SendFlowControllerDeps): {
       );
       const primarySelectedText = selectedTexts[0] || "";
       const contextSource = await deps.resolveContextSource();
+      if (!requestIsActive()) return;
       const allSelectedPaperContexts = deps.getSelectedPaperContexts(item.id);
       const selectedCollectionContexts = deps.getSelectedCollectionContexts(
         item.id,
@@ -306,6 +353,7 @@ export function createSendFlowController(deps: SendFlowControllerDeps): {
             paperContexts: allSelectedPaperContexts,
           })
         : [];
+      if (!requestIsActive()) return;
       // Resolve PDFs based on model capability. The visible chip/attachment state
       // stays unchanged; these variables are the provider-specific model inputs.
       const isWebChat = earlyProfile?.authMode === "webchat";
@@ -406,6 +454,7 @@ export function createSendFlowController(deps: SendFlowControllerDeps): {
         isWebChat,
         useCodexAttachmentPolicy,
       });
+      if (!requestIsActive()) return;
       if (!pdfInputs.ok) return;
       const {
         selectedFiles,
@@ -417,6 +466,7 @@ export function createSendFlowController(deps: SendFlowControllerDeps): {
       if (localDocuments.length && deps.isClaudeConversationSystem()) {
         try {
           await deps.preflightLocalPdfCapability?.();
+          if (!requestIsActive()) return;
         } catch (error) {
           deps.setStatusMessage?.(
             error instanceof Error && error.message.trim()
@@ -592,6 +642,7 @@ export function createSendFlowController(deps: SendFlowControllerDeps): {
       const activeEditSession = deps.getActiveEditSession();
       if (activeEditSession) {
         const latest = await deps.getLatestEditablePair();
+        if (!requestIsActive()) return;
         if (!latest) {
           deps.setActiveEditSession(null);
           deps.setStatusMessage?.("No editable latest prompt", "error");
@@ -613,6 +664,10 @@ export function createSendFlowController(deps: SendFlowControllerDeps): {
         const editResult = await deps.editLatestUserMessageAndRetry({
           body: deps.body,
           item,
+          requestId: request.requestId,
+          onProviderDispatch: () => {
+            providerDispatchStarted = true;
+          },
           contextSource,
           displayQuestion,
           selectedTextContexts: selectedContexts.length
@@ -656,6 +711,7 @@ export function createSendFlowController(deps: SendFlowControllerDeps): {
           advanced: advancedParams,
         });
         if (editResult !== "ok") {
+          restoreCapturedDraft();
           if (editResult === "stale") {
             deps.setActiveEditSession(null);
             deps.setStatusMessage?.(deps.editStaleStatusText, "error");
@@ -669,12 +725,8 @@ export function createSendFlowController(deps: SendFlowControllerDeps): {
           deps.setStatusMessage?.("Failed to save edited prompt", "error");
           return;
         }
+        if (!providerDispatchStarted) restoreCapturedDraft();
 
-        if (!options?.preserveInputDraft) {
-          deps.inputBox.value = "";
-          deps.onComposerDraftCleared?.();
-          deps.persistDraftInput();
-        }
         deps.retainPinnedImageState(item.id);
         if (hasPaperComposeState) {
           deps.consumePaperModeState(item.id, {
@@ -698,11 +750,6 @@ export function createSendFlowController(deps: SendFlowControllerDeps): {
         return;
       }
 
-      if (!options?.preserveInputDraft) {
-        deps.inputBox.value = "";
-        deps.onComposerDraftCleared?.();
-        deps.persistDraftInput();
-      }
       deps.retainPinnedImageState(item.id);
       if (selectedFiles.length) {
         deps.retainPinnedFileState(item.id);
@@ -738,6 +785,7 @@ export function createSendFlowController(deps: SendFlowControllerDeps): {
           : composedQuestion;
       if (shouldRetainClaudeRuntime) {
         await deps.retainClaudeRuntime?.(deps.body, item);
+        if (!requestIsActive()) return;
       }
       const activeNoteScope = resolveNoteEditingScope(item);
       const activeNoteContext = buildNoteEditingTurnContext({
@@ -748,6 +796,10 @@ export function createSendFlowController(deps: SendFlowControllerDeps): {
       const sendTask = deps.sendQuestion({
         body: deps.body,
         item,
+        requestId: request.requestId,
+        onProviderDispatch: () => {
+          providerDispatchStarted = true;
+        },
         contextSource,
         question: questionForSend,
         images,
@@ -813,7 +865,11 @@ export function createSendFlowController(deps: SendFlowControllerDeps): {
       }
       try {
         await sendTask;
+        if (!providerDispatchStarted && !requestIsActive()) {
+          restoreCapturedDraft();
+        }
       } catch (err) {
+        if (!providerDispatchStarted) restoreCapturedDraft();
         restoreWebChatPdfModeAfterUnverifiedSend();
         if (isWebChat && webchatForceNewChat) {
           deps.markWebChatForceNewChatIntent?.();
@@ -836,6 +892,27 @@ export function createSendFlowController(deps: SendFlowControllerDeps): {
       }
       deps.refreshGlobalHistoryHeader();
     } finally {
+      if (request.signal.aborted && !providerDispatchStarted) {
+        restoreCapturedDraft();
+      }
+      const currentConversationKey = deps.getConversationKey(item);
+      let finished = deps.finishRequest(
+        deps.body,
+        item,
+        currentConversationKey,
+        request.requestId,
+      );
+      if (!finished && currentConversationKey !== request.conversationKey) {
+        finished = deps.finishRequest(
+          deps.body,
+          item,
+          request.conversationKey,
+          request.requestId,
+        );
+      }
+      if (finished && shouldClearDraft && !providerDispatchStarted) {
+        restoreCapturedDraft();
+      }
       deps.autoUnlockGlobalChat();
       deps.onSendSettled?.();
     }

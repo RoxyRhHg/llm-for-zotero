@@ -1007,19 +1007,20 @@ export type AgentEngineDeps = {
   // Request lifecycle (per-conversation)
   cancelledRequestId: (conversationKey: number) => number;
   currentAbortController: (conversationKey: number) => AbortController | null;
-  setCurrentAbortController: (
-    conversationKey: number,
-    ctrl: AbortController | null,
-    expectedRequestId?: number,
-  ) => void;
   getAbortControllerCtor: () => new () => AbortController;
   nextRequestId: () => number;
-  setPendingRequestId: (
+  tryBeginRequest: (
     conversationKey: number,
-    id: number,
-    expectedCurrentId?: number,
-  ) => void;
-
+    requestId: number,
+    abortController: AbortController | null,
+  ) => boolean;
+  isRequestOwner: (conversationKey: number, requestId: number) => boolean;
+  finishRequest: (conversationKey: number, requestId: number) => boolean;
+  transferRequest: (
+    fromConversationKey: number,
+    toConversationKey: number,
+    requestId: number,
+  ) => boolean;
   // UI helpers
   getPanelRequestUI: (body: Element) => PanelRequestUIShape;
   setRequestUIBusy: (
@@ -1205,10 +1206,7 @@ type RequestUiReleaseController = {
 };
 
 function createRequestUiReleaseController(params: {
-  deps: Pick<
-    AgentEngineDeps,
-    "restoreRequestUIIdle" | "setCurrentAbortController" | "setPendingRequestId"
-  >;
+  deps: Pick<AgentEngineDeps, "finishRequest" | "restoreRequestUIIdle">;
   body: Element;
   conversationKey: number;
   requestId: number;
@@ -1219,16 +1217,9 @@ function createRequestUiReleaseController(params: {
   const releaseReady = () => {
     if (released) return;
     released = true;
-    params.deps.setCurrentAbortController(
-      params.conversationKey,
-      null,
-      params.requestId,
-    );
-    params.deps.setPendingRequestId(
-      params.conversationKey,
-      0,
-      params.requestId,
-    );
+    if (!params.deps.finishRequest(params.conversationKey, params.requestId)) {
+      return;
+    }
     params.deps.restoreRequestUIIdle(
       params.body,
       params.conversationKey,
@@ -1266,6 +1257,8 @@ export async function sendAgentTurn(
   opts: {
     body: Element;
     item: Zotero.Item;
+    requestId?: number;
+    onProviderDispatch?: () => void;
     contextSource?: ResolvedContextSource | null;
     question: string;
     images?: string[];
@@ -1343,9 +1336,23 @@ export async function sendAgentTurn(
   } = opts;
   const conversationKey = deps.getConversationKey(item);
   const ui = deps.getPanelRequestUI(body);
-  const thisRequestId = deps.nextRequestId();
-  deps.setPendingRequestId(conversationKey, thisRequestId);
+  const thisRequestId = opts.requestId ?? deps.nextRequestId();
+  if (opts.requestId !== undefined) {
+    if (!deps.isRequestOwner(conversationKey, thisRequestId)) return;
+  } else {
+    const AbortControllerCtor = deps.getAbortControllerCtor();
+    if (
+      !deps.tryBeginRequest(
+        conversationKey,
+        thisRequestId,
+        new AbortControllerCtor(),
+      )
+    ) {
+      return;
+    }
+  }
   deps.setRequestUIBusy(body, ui, conversationKey, "Preparing agent...");
+  if (ui.inputBox) ui.inputBox.disabled = true;
 
   const selectedTextContextsForMessage = synthesizeSelectedTextContexts({
     selectedTextContexts,
@@ -1640,6 +1647,8 @@ export async function sendAgentTurn(
   const agentRuntime = deps.getAgentRuntime();
   const capabilities = agentRuntime.getCapabilities(runtimeRequest);
   if (!capabilities.toolCalls) {
+    if (ui.inputBox) ui.inputBox.disabled = false;
+    opts.onProviderDispatch?.();
     const fallback = await agentRuntime.runTurn({
       request: runtimeRequest,
     });
@@ -1648,6 +1657,8 @@ export async function sendAgentTurn(
       await deps.sendChatFallback({
         body,
         item,
+        requestId: thisRequestId,
+        onProviderDispatch: opts.onProviderDispatch,
         question,
         images,
         model,
@@ -1713,12 +1724,6 @@ export async function sendAgentTurn(
   };
 
   try {
-    const AbortControllerCtor = deps.getAbortControllerCtor();
-    deps.setCurrentAbortController(
-      conversationKey,
-      AbortControllerCtor ? new AbortControllerCtor() : null,
-    );
-
     const pushTraceEvent = (runId: string, event: AgentEvent) => {
       const list = deps.agentRunTraceCache.get(runId) || [];
       list.push({
@@ -1732,6 +1737,8 @@ export async function sendAgentTurn(
     };
     let compactEventHandled = false;
 
+    if (ui.inputBox) ui.inputBox.disabled = false;
+    opts.onProviderDispatch?.();
     const outcome = await agentRuntime.runTurn({
       request: runtimeRequest,
       signal: deps.currentAbortController(conversationKey)?.signal,
@@ -1804,10 +1811,10 @@ export async function sendAgentTurn(
     });
   } finally {
     if (!uiRelease.isReleased()) {
-      deps.setPendingRequestId(conversationKey, 0, thisRequestId);
-      deps.restoreRequestUIIdle(body, conversationKey, thisRequestId);
-      deps.setCurrentAbortController(conversationKey, null, thisRequestId);
-      scheduleQueueDrain();
+      if (deps.finishRequest(conversationKey, thisRequestId)) {
+        deps.restoreRequestUIIdle(body, conversationKey, thisRequestId);
+        scheduleQueueDrain();
+      }
     }
   }
 }
@@ -1844,10 +1851,72 @@ export async function retryAgentTurn(
   advanced: AdvancedModelParams | undefined,
   modelAttachmentsOverride: ChatAttachment[] | undefined,
   deps: AgentEngineDeps,
+  requestId?: number,
+  onProviderDispatch?: () => void,
 ): Promise<void> {
   const ui = deps.getPanelRequestUI(body);
-  await deps.ensureConversationLoaded(item);
+  const initialConversationKey = deps.getConversationKey(item);
+  const thisRequestId = requestId ?? deps.nextRequestId();
+  if (requestId !== undefined) {
+    if (!deps.isRequestOwner(initialConversationKey, thisRequestId)) return;
+  } else {
+    const AbortControllerCtor = deps.getAbortControllerCtor();
+    if (
+      !deps.tryBeginRequest(
+        initialConversationKey,
+        thisRequestId,
+        new AbortControllerCtor(),
+      )
+    ) {
+      return;
+    }
+  }
+  deps.setRequestUIBusy(
+    body,
+    ui,
+    initialConversationKey,
+    "Preparing agent retry...",
+  );
+  if (ui.inputBox) ui.inputBox.disabled = true;
+  try {
+    await deps.ensureConversationLoaded(item);
+  } catch (error) {
+    if (deps.finishRequest(initialConversationKey, thisRequestId)) {
+      deps.restoreRequestUIIdle(body, initialConversationKey, thisRequestId);
+    }
+    throw error;
+  }
   const conversationKey = deps.getConversationKey(item);
+  if (
+    conversationKey !== initialConversationKey &&
+    !deps.transferRequest(
+      initialConversationKey,
+      conversationKey,
+      thisRequestId,
+    )
+  ) {
+    if (deps.finishRequest(initialConversationKey, thisRequestId)) {
+      deps.restoreRequestUIIdle(body, initialConversationKey, thisRequestId);
+    }
+    return;
+  }
+  const requestIsActive = () =>
+    deps.isRequestOwner(conversationKey, thisRequestId) &&
+    !Boolean(deps.currentAbortController(conversationKey)?.signal.aborted) &&
+    deps.cancelledRequestId(conversationKey) < thisRequestId;
+  const releaseRequest = () => {
+    if (!deps.finishRequest(conversationKey, thisRequestId)) return false;
+    deps.restoreRequestUIIdle(body, conversationKey, thisRequestId);
+    deps.scheduleQueuedInputDrain(body, {
+      conversationSystem: deps.getConversationSystem(),
+      conversationKey,
+    });
+    return true;
+  };
+  if (!requestIsActive()) {
+    releaseRequest();
+    return;
+  }
   // Select the retry target and slice the prompt from the user-visible view;
   // turns queued for deletion must stay invisible even if finalize failed.
   const history = filterMessagesInPendingTurns(
@@ -1860,6 +1929,7 @@ export async function retryAgentTurn(
       // Best-effort status update without full createPanelUpdateHelpers
       ui.status.textContent = "No retryable response found";
     }
+    releaseRequest();
     return;
   }
   const reconstructedRetryPayload = deps.reconstructRetryPayload(
@@ -1889,10 +1959,18 @@ export async function retryAgentTurn(
     if (usesLocalPdfTransport && pdfPaperContexts.length) {
       retryLocalDocuments =
         await deps.resolveLocalPdfResources(pdfPaperContexts);
+      if (!requestIsActive()) {
+        releaseRequest();
+        return;
+      }
       if (retryLocalDocuments.length !== pdfPaperContexts.length) {
         throw new Error("Could not resolve every selected raw PDF.");
       }
       await deps.preflightLocalPdfCapability();
+      if (!requestIsActive()) {
+        releaseRequest();
+        return;
+      }
     }
   } catch (error) {
     if (ui.status) {
@@ -1901,12 +1979,9 @@ export async function retryAgentTurn(
           ? error.message
           : "Could not resolve the selected raw PDF.";
     }
+    releaseRequest();
     return;
   }
-
-  const thisRequestId = deps.nextRequestId();
-  deps.setPendingRequestId(conversationKey, thisRequestId);
-  deps.setRequestUIBusy(body, ui, conversationKey, "Preparing agent retry...");
 
   const assistantMessage = retryPair.assistantMessage;
 
@@ -2031,8 +2106,7 @@ export async function retryAgentTurn(
     restoreRetryUserSnapshot(retryPair.userMessage, userSnapshot);
     refreshChatSafely();
     setStatusSafely("Nothing to retry for latest turn", "error");
-    deps.setPendingRequestId(conversationKey, 0, thisRequestId);
-    deps.restoreRequestUIIdle(body, conversationKey, thisRequestId);
+    releaseRequest();
     return;
   }
 
@@ -2067,6 +2141,13 @@ export async function retryAgentTurn(
       ),
     ]),
   });
+  if (!requestIsActive()) {
+    restorePreviousAssistant();
+    restoreRetryUserSnapshot(retryPair.userMessage, userSnapshot);
+    refreshChatSafely();
+    releaseRequest();
+    return;
+  }
   assistantMessage.quoteCitations = buildSelectedTextQuoteCitations(
     selectedTextsRaw,
     selectedTextSourcesRaw,
@@ -2116,6 +2197,13 @@ export async function retryAgentTurn(
     effectiveRequestConfig,
     history: historyForLLM,
   });
+  if (!requestIsActive()) {
+    restorePreviousAssistant();
+    restoreRetryUserSnapshot(retryPair.userMessage, userSnapshot);
+    refreshChatSafely();
+    releaseRequest();
+    return;
+  }
 
   let assistantPersisted = false;
   const persistAssistantOnce = async () => {
@@ -2150,12 +2238,6 @@ export async function retryAgentTurn(
 
   const agentRuntime = deps.getAgentRuntime();
   try {
-    const AbortControllerCtor = deps.getAbortControllerCtor();
-    deps.setCurrentAbortController(
-      conversationKey,
-      AbortControllerCtor ? new AbortControllerCtor() : null,
-    );
-
     const pushTraceEvent = (runId: string, event: AgentEvent) => {
       const list = deps.agentRunTraceCache.get(runId) || [];
       list.push({
@@ -2168,6 +2250,8 @@ export async function retryAgentTurn(
       deps.agentRunTraceCache.set(runId, list);
     };
 
+    if (ui.inputBox) ui.inputBox.disabled = false;
+    onProviderDispatch?.();
     const outcome = await agentRuntime.runTurn({
       request: runtimeRequest,
       signal: deps.currentAbortController(conversationKey)?.signal,
@@ -2237,10 +2321,10 @@ export async function retryAgentTurn(
     });
   } finally {
     if (!uiRelease.isReleased()) {
-      deps.setPendingRequestId(conversationKey, 0, thisRequestId);
-      deps.restoreRequestUIIdle(body, conversationKey, thisRequestId);
-      deps.setCurrentAbortController(conversationKey, null, thisRequestId);
-      scheduleQueueDrain();
+      if (deps.finishRequest(conversationKey, thisRequestId)) {
+        deps.restoreRequestUIIdle(body, conversationKey, thisRequestId);
+        scheduleQueueDrain();
+      }
     }
   }
 }

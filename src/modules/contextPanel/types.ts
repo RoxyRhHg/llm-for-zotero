@@ -434,6 +434,10 @@ import type { ReasoningConfig as LLMReasoningConfig } from "../../utils/llmClien
 export type SendQuestionOptions = {
   body: Element;
   item: Zotero.Item;
+  /** Existing conversation request ownership claimed by the compose flow. */
+  requestId?: number;
+  /** Internal notification that asynchronous preparation has handed off to the provider. */
+  onProviderDispatch?: () => void;
   /** Resolved panel/source context selected by compose UI. */
   contextSource?: ResolvedContextSource | null;
   question: string;
@@ -496,6 +500,10 @@ export type SendQuestionOptions = {
 export type EditRetryOptions = {
   body: Element;
   item: Zotero.Item;
+  /** Existing conversation request ownership claimed by the compose flow. */
+  requestId?: number;
+  /** Internal notification that asynchronous preparation has handed off to the provider. */
+  onProviderDispatch?: () => void;
   /** Resolved panel/source context selected by compose UI. */
   contextSource?: ResolvedContextSource | null;
   displayQuestion: string;
