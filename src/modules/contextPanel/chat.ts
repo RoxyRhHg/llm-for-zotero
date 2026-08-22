@@ -397,6 +397,7 @@ import {
   scheduleQueuedFollowUpDrainForThread,
   SCHEDULE_QUEUED_FOLLOW_UP_DRAIN_PROPERTY,
   SCHEDULE_QUEUED_FOLLOW_UP_THREAD_DRAIN_PROPERTY,
+  transferQueuedFollowUpThreadState,
 } from "./queuedFollowUps";
 import { getConversationKey } from "./conversationIdentity";
 import { recordContextCacheTelemetry } from "../../contextCache/manager";
@@ -2776,6 +2777,29 @@ function normalizeQueuedInputConversationSystem(
   value: ConversationSystem | string | null | undefined,
 ): ConversationSystem {
   return value === "claude_code" || value === "codex" ? value : "upstream";
+}
+
+function transferPanelRequest(
+  conversationSystem: ConversationSystem | string | null | undefined,
+  fromConversationKey: number,
+  toConversationKey: number,
+  requestId: number,
+): boolean {
+  if (!transferRequest(fromConversationKey, toConversationKey, requestId)) {
+    return false;
+  }
+  const system = normalizeQueuedInputConversationSystem(conversationSystem);
+  transferQueuedFollowUpThreadState(
+    buildQueuedFollowUpThreadKey({
+      conversationSystem: system,
+      conversationKey: fromConversationKey,
+    }),
+    buildQueuedFollowUpThreadKey({
+      conversationSystem: system,
+      conversationKey: toConversationKey,
+    }),
+  );
+  return true;
 }
 
 function scheduleQueuedInputDrain(
@@ -7225,7 +7249,12 @@ export async function editLatestUserMessageAndRetry(
   if (requestId !== undefined) {
     if (
       conversationKey !== initialConversationKey &&
-      !transferRequest(initialConversationKey, conversationKey, requestId)
+      !transferPanelRequest(
+        resolveConversationSystemForItem(item),
+        initialConversationKey,
+        conversationKey,
+        requestId,
+      )
     ) {
       return "stale";
     }
@@ -7234,7 +7263,7 @@ export async function editLatestUserMessageAndRetry(
     requestId === undefined ||
     (isRequestOwner(conversationKey, requestId) &&
       getCancelledRequestId(conversationKey) < requestId &&
-      !Boolean(getAbortController(conversationKey)?.signal.aborted));
+      !getAbortController(conversationKey)?.signal.aborted);
   if (!requestIsActive()) return "stale";
   // Retry must act on the state the user SEES: complete any pending turn
   // deletion first so the hidden turn cannot be the retry target. finalize is
@@ -7596,7 +7625,12 @@ export async function retryLatestAssistantResponse(
   const conversationKey = getConversationKey(item);
   if (
     conversationKey !== initialConversationKey &&
-    !transferRequest(initialConversationKey, conversationKey, thisRequestId)
+    !transferPanelRequest(
+      resolveConversationSystemForItem(item),
+      initialConversationKey,
+      conversationKey,
+      thisRequestId,
+    )
   ) {
     finishPanelRequest(body, item, initialConversationKey, thisRequestId);
     return;
@@ -7604,7 +7638,7 @@ export async function retryLatestAssistantResponse(
   const requestIsActive = () =>
     isRequestOwner(conversationKey, thisRequestId) &&
     getCancelledRequestId(conversationKey) < thisRequestId &&
-    !Boolean(getAbortController(conversationKey)?.signal.aborted);
+    !getAbortController(conversationKey)?.signal.aborted;
   const releaseRequest = () => {
     if (!finishPanelRequest(body, item, conversationKey, thisRequestId)) {
       return false;
@@ -8539,7 +8573,12 @@ export async function editUserTurnAndRetry(opts: {
   if (requestId !== undefined) {
     if (
       conversationKey !== initialConversationKey &&
-      !transferRequest(initialConversationKey, conversationKey, requestId)
+      !transferPanelRequest(
+        resolveConversationSystemForItem(item),
+        initialConversationKey,
+        conversationKey,
+        requestId,
+      )
     ) {
       return false;
     }
@@ -8548,7 +8587,7 @@ export async function editUserTurnAndRetry(opts: {
     requestId === undefined ||
     (isRequestOwner(conversationKey, requestId) &&
       getCancelledRequestId(conversationKey) < requestId &&
-      !Boolean(getAbortController(conversationKey)?.signal.aborted));
+      !getAbortController(conversationKey)?.signal.aborted);
   if (!requestIsActive()) return false;
   // Edit acts on the state the user SEES: complete any pending turn deletion
   // first. history stays RAW below on purpose — truncation after the edited
@@ -9452,7 +9491,14 @@ function buildAgentEngineDeps(
     isRequestOwner,
     finishRequest,
     transferRequest: (fromConversationKey, toConversationKey, requestId) => {
-      if (!transferRequest(fromConversationKey, toConversationKey, requestId)) {
+      if (
+        !transferPanelRequest(
+          getEffectiveConversationSystem(),
+          fromConversationKey,
+          toConversationKey,
+          requestId,
+        )
+      ) {
         return false;
       }
       syncRequestUIForConversation(fromConversationKey, null, null);
@@ -9826,7 +9872,7 @@ export async function sendQuestion(
   const requestIsActive = (conversationKey: number) =>
     isRequestOwner(conversationKey, thisRequestId) &&
     getCancelledRequestId(conversationKey) < thisRequestId &&
-    !Boolean(getAbortController(conversationKey)?.signal.aborted);
+    !getAbortController(conversationKey)?.signal.aborted;
   const finishBeforeDispatch = () => {
     if (!claimedHere) return false;
     const currentConversationKey = getConversationKey(item);
@@ -9973,7 +10019,8 @@ export async function sendQuestion(
   const provisionalConversationKey = getConversationKey(item);
   if (provisionalConversationKey !== initialConversationKey) {
     if (
-      !transferRequest(
+      !transferPanelRequest(
+        resolveConversationSystemForItem(item),
         initialConversationKey,
         provisionalConversationKey,
         thisRequestId,

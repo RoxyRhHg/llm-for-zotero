@@ -1,6 +1,9 @@
 import { assert } from "chai";
 import { initAgentChangeJournal } from "../src/agent/store/changeJournal";
-import { executeLibraryMutationAction } from "../src/agent/services/mutationCoordinator";
+import {
+  executeLibraryMutationAction,
+  summarizeMutationOutcomes,
+} from "../src/agent/services/mutationCoordinator";
 import { LibraryMutationService } from "../src/agent/services/libraryMutationService";
 import { executeAndRecordUndoBatch } from "../src/agent/tools/write/mutateLibraryShared";
 import type { AgentToolContext } from "../src/agent/types";
@@ -39,6 +42,23 @@ describe("multi-operation durable mutation recovery", function () {
       metadata: { title: "old" },
     };
   }
+
+  it("keeps an uncertain irreversible step in the parent recovery barrier", function () {
+    const summary = summarizeMutationOutcomes([
+      {
+        effect: "none",
+        status: "uncertain",
+        reversibility: "none",
+        affectedCount: 0,
+      },
+    ]);
+
+    assert.deepEqual(summary, {
+      effect: "none",
+      reversibility: "none",
+      affectedCount: 0,
+    });
+  });
 
   it("reports applied, partial, and zero effects from changed targets", async function () {
     const assignments = [

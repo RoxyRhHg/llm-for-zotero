@@ -10,6 +10,7 @@ import {
   SCHEDULE_QUEUED_FOLLOW_UP_DRAIN_PROPERTY,
   setQueuedFollowUpBodySyncCallback,
   shiftQueuedFollowUp,
+  transferQueuedFollowUpThreadState,
 } from "../src/modules/contextPanel/queuedFollowUps";
 
 describe("queuedFollowUps", function () {
@@ -81,6 +82,34 @@ describe("queuedFollowUps", function () {
       getQueuedFollowUps(key).map((entry) => entry.text),
       ["second"],
     );
+  });
+
+  it("moves queued prompts and registered panels to a provisioned thread", function () {
+    const sourceKey = "upstream:9";
+    const targetKey = "upstream:19";
+    let drainCalls = 0;
+    const body = {
+      isConnected: true,
+      [SCHEDULE_QUEUED_FOLLOW_UP_DRAIN_PROPERTY]: () => {
+        drainCalls += 1;
+      },
+    } as unknown as Element;
+    const synced: Element[] = [];
+    setQueuedFollowUpBodySyncCallback((candidate) => synced.push(candidate));
+    registerQueuedFollowUpBody(sourceKey, body);
+    enqueueQueuedFollowUp(sourceKey, "queued before provisioning");
+    enqueueQueuedFollowUp(targetKey, "already on the provisioned thread");
+
+    transferQueuedFollowUpThreadState(sourceKey, targetKey);
+
+    assert.deepEqual(getQueuedFollowUps(sourceKey), []);
+    assert.deepEqual(
+      getQueuedFollowUps(targetKey).map((entry) => entry.text),
+      ["queued before provisioning", "already on the provisioned thread"],
+    );
+    assert.isTrue(scheduleQueuedFollowUpDrainForThread(targetKey));
+    assert.equal(drainCalls, 1);
+    assert.deepEqual(synced, [body, body]);
   });
 
   it("syncs registered bodies only for the changed thread", function () {

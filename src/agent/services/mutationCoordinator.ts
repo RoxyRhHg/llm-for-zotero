@@ -82,7 +82,10 @@ function combineEffects(values: AgentToolEffect[]): AgentToolEffect {
 
 export function summarizeMutationOutcomes(
   outcomes: ReadonlyArray<
-    Pick<AgentJournalStepOutcome, "effect" | "reversibility" | "affectedCount">
+    Pick<
+      AgentJournalStepOutcome,
+      "effect" | "status" | "reversibility" | "affectedCount"
+    >
   >,
 ): {
   effect: AgentToolEffect;
@@ -90,10 +93,13 @@ export function summarizeMutationOutcomes(
   affectedCount: number;
 } {
   const changed = outcomes.filter((outcome) => outcome.effect !== "none");
+  const recoveryRelevant = outcomes.filter(
+    (outcome) => outcome.status !== "no_effect",
+  );
   return {
     effect: combineEffects(changed.map((outcome) => outcome.effect)),
     reversibility: combineReversibility(
-      changed.map((outcome) => outcome.reversibility),
+      recoveryRelevant.map((outcome) => outcome.reversibility),
     ),
     affectedCount: changed.reduce(
       (total, outcome) => total + Math.max(0, outcome.affectedCount),
@@ -143,6 +149,7 @@ async function executeJournaledStep<T>(params: {
   result: T;
   reversibility: JournalReversibility;
   effect: AgentToolEffect;
+  status: AgentJournalStepOutcome["status"];
   affectedCount: number;
 }> {
   const { context, actionId, sequence } = params;
@@ -266,6 +273,7 @@ async function executeJournaledStep<T>(params: {
         result: outcome.result,
         reversibility,
         effect: outcome.effect,
+        status,
         affectedCount: outcome.affectedCount,
       };
     } catch (error) {
@@ -365,11 +373,7 @@ export async function executeLibraryMutationAction(params: {
   const ownsAction = Boolean(actionId && !parentScope);
 
   const results: LibraryMutationExecutionResult[] = [];
-  const completedOutcomes: Array<{
-    effect: AgentToolEffect;
-    reversibility: JournalReversibility;
-    affectedCount: number;
-  }> = [];
+  const completedOutcomes: AgentJournalStepOutcome[] = [];
   let affectedCount = 0;
   try {
     for (let index = 0; index < operations.length; index += 1) {
@@ -401,6 +405,7 @@ export async function executeLibraryMutationAction(params: {
       results.push(executed.result);
       completedOutcomes.push({
         effect: executed.effect,
+        status: executed.status,
         reversibility: executed.reversibility,
         affectedCount: executed.affectedCount,
       });

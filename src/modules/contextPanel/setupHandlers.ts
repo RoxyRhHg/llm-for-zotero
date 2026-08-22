@@ -4497,6 +4497,7 @@ export function setupHandlers(
       : 0;
   };
   const syncConversationPanelState = () => {
+    syncQueuedFollowUpRegistration();
     syncRequestUiForCurrentConversation();
     restoreDraftInputForCurrentConversation();
     updatePaperPreview();
@@ -6875,6 +6876,31 @@ export function setupHandlers(
       const currentItem = item;
       const editTarget = inlineEditTarget;
       const newText = inputBox?.value.trim() ?? "";
+      if (!newText && isRequestPending(getConversationKey(currentItem))) return;
+      const inlineRequest = newText
+        ? beginPanelRequest(body, currentItem, "Preparing edited retry...")
+        : null;
+      if (newText && !inlineRequest) return;
+      let providerDispatchStarted = false;
+      if (inlineRequest) {
+        inputBox.value = "";
+        persistDraftInputForCurrentConversation();
+        resetComposerInputHeight();
+      }
+      const finishInlineRequest = () => {
+        if (!inlineRequest) return;
+        finishPanelRequest(
+          body,
+          currentItem,
+          getConversationKey(currentItem),
+          inlineRequest.requestId,
+        );
+        if (!providerDispatchStarted) {
+          inputBox.value = newText;
+          persistDraftInputForCurrentConversation();
+          resetComposerInputHeight();
+        }
+      };
       const textContextKey = getTextContextConversationKey();
       const selectedContexts = textContextKey
         ? getSelectedTextContextEntries(textContextKey)
@@ -6893,7 +6919,12 @@ export function setupHandlers(
         ),
         selectedTagContexts: selectedTagContextCache.get(currentItem.id),
       });
-      const contextSource = await resolveAutoLoadedContextSourceAsync();
+      const contextSource = await resolveAutoLoadedContextSourceAsync().catch(
+        (error) => {
+          finishInlineRequest();
+          throw error;
+        },
+      );
       const allPaperContexts = getManualPaperContextsForItem(
         currentItem.id,
         currentItem.id === item?.id ? resolveAutoLoadedPaperContext() : null,
@@ -6982,8 +7013,14 @@ export function setupHandlers(
           : null,
         currentModelName: activeModelName,
         isWebChat: isWebChatMode(),
+      }).catch((error) => {
+        finishInlineRequest();
+        throw error;
       });
-      if (!pdfInputs.ok) return;
+      if (!pdfInputs.ok) {
+        finishInlineRequest();
+        return;
+      }
       const {
         selectedFiles,
         modelFiles,
@@ -7006,6 +7043,7 @@ export function setupHandlers(
               "error",
             );
           }
+          finishInlineRequest();
           return;
         }
       }
@@ -7023,15 +7061,6 @@ export function setupHandlers(
       ].slice(0, MAX_SELECTED_IMAGES);
       const selectedReasoning = getSelectedReasoning();
       const targetRuntimeMode = getCurrentRuntimeMode();
-      const inlineRequest = newText
-        ? beginPanelRequest(body, currentItem, "Preparing edited retry...")
-        : null;
-      if (newText && !inlineRequest) return;
-      if (inlineRequest) {
-        inputBox.value = "";
-        persistDraftInputForCurrentConversation();
-        resetComposerInputHeight();
-      }
       inlineEditCleanup?.();
       setInlineEditCleanup(null);
       setInlineEditInputSection(null, null, null);
@@ -7040,7 +7069,6 @@ export function setupHandlers(
       if (newText) {
         const webchatGreyOut = isWebChatMode();
         let retrySucceeded = false;
-        let providerDispatchStarted = false;
         try {
           retrySucceeded = await editUserTurnAndRetry({
             body,
@@ -7078,17 +7106,7 @@ export function setupHandlers(
             advanced: advancedParams,
           });
         } finally {
-          finishPanelRequest(
-            body,
-            currentItem,
-            getConversationKey(currentItem),
-            inlineRequest!.requestId,
-          );
-          if (!providerDispatchStarted) {
-            inputBox.value = newText;
-            persistDraftInputForCurrentConversation();
-            resetComposerInputHeight();
-          }
+          finishInlineRequest();
         }
         if (retrySucceeded) {
           consumePaperModeState(currentItem.id, { webchatGreyOut });

@@ -1,5 +1,6 @@
 import { assert } from "chai";
 import { describe, it, afterEach } from "mocha";
+import { readFileSync } from "node:fs";
 
 import {
   clearPendingRequestIdAndSync,
@@ -111,5 +112,33 @@ describe("chat request lifecycle sync", function () {
     assert.isFalse(isRequestPending(101));
     assert.isTrue(isRequestOwner(202, 7));
     assert.strictEqual(getAbortController(202), controller);
+  });
+
+  it("claims an inline edit before asynchronous context preparation", function () {
+    const source = readFileSync(
+      "src/modules/contextPanel/setupHandlers.ts",
+      "utf8",
+    );
+    const inlineStart = source.indexOf("if (inlineEditTarget && item) {");
+    const inlineEnd = source.indexOf(
+      "if (isQueuedFollowUpSendAvailable())",
+      inlineStart,
+    );
+    const inlineBlock = source.slice(inlineStart, inlineEnd);
+    const admission = inlineBlock.indexOf("beginPanelRequest(");
+    const contextPreparation = inlineBlock.indexOf(
+      "await resolveAutoLoadedContextSourceAsync()",
+    );
+    const pdfPreparation = inlineBlock.indexOf(
+      "await resolvePdfModeModelInputs(",
+    );
+
+    assert.isAtLeast(admission, 0);
+    assert.isBelow(admission, contextPreparation);
+    assert.isBelow(admission, pdfPreparation);
+    assert.include(
+      inlineBlock,
+      "!newText && isRequestPending(getConversationKey(currentItem))",
+    );
   });
 });

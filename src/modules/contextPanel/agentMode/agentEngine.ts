@@ -1902,7 +1902,7 @@ export async function retryAgentTurn(
   }
   const requestIsActive = () =>
     deps.isRequestOwner(conversationKey, thisRequestId) &&
-    !Boolean(deps.currentAbortController(conversationKey)?.signal.aborted) &&
+    !deps.currentAbortController(conversationKey)?.signal.aborted &&
     deps.cancelledRequestId(conversationKey) < thisRequestId;
   const releaseRequest = () => {
     if (!deps.finishRequest(conversationKey, thisRequestId)) return false;

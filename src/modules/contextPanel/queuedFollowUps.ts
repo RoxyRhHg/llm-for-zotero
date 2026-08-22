@@ -93,6 +93,34 @@ export function shiftQueuedFollowUp(
   return next;
 }
 
+export function transferQueuedFollowUpThreadState(
+  fromThreadKey: string | null,
+  toThreadKey: string | null,
+): void {
+  if (!fromThreadKey || !toThreadKey || fromThreadKey === toThreadKey) return;
+
+  const fromQueue = queuedFollowUpsByThread.get(fromThreadKey) || [];
+  if (fromQueue.length) {
+    const merged = [
+      ...(queuedFollowUpsByThread.get(toThreadKey) || []),
+      ...fromQueue,
+    ].sort((left, right) => left.id - right.id);
+    queuedFollowUpsByThread.set(toThreadKey, merged);
+    queuedFollowUpsByThread.delete(fromThreadKey);
+  }
+
+  const fromBodies = queuedFollowUpBodiesByThread.get(fromThreadKey);
+  if (fromBodies?.size) {
+    const toBodies =
+      queuedFollowUpBodiesByThread.get(toThreadKey) || new Set<Element>();
+    fromBodies.forEach((body) => toBodies.add(body));
+    queuedFollowUpBodiesByThread.set(toThreadKey, toBodies);
+    queuedFollowUpBodiesByThread.delete(fromThreadKey);
+  }
+
+  syncQueuedFollowUpBodies(toThreadKey);
+}
+
 export function registerQueuedFollowUpBody(
   threadKey: string | null,
   body: Element,

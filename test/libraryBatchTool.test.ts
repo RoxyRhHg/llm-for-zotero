@@ -324,6 +324,62 @@ describe("library_batch", function () {
     );
   });
 
+  it("retains an uncertain irreversible recovery barrier on the batch action", async function () {
+    const db = new ChangeJournalTestDb();
+    (globalThis as typeof globalThis & { Zotero?: unknown }).Zotero = {
+      DB: db,
+      Prefs: { get: () => "yolo" },
+      Items: { get: () => null },
+      debug: () => undefined,
+    };
+    await initAgentChangeJournal();
+    const actionRegistry = new ActionRegistry();
+    actionRegistry.register({
+      name: "auto_tag",
+      description: "Tag papers",
+      inputSchema: { type: "object" },
+      execute: async (_input: unknown, actionContext: unknown) => {
+        const journalActionScope = (
+          actionContext as {
+            journalActionScope?: {
+              recordStep: (outcome: {
+                effect: "none";
+                status: "uncertain";
+                reversibility: "none";
+                affectedCount: number;
+              }) => void;
+            };
+          }
+        ).journalActionScope;
+        assert.isDefined(journalActionScope);
+        journalActionScope!.recordStep({
+          effect: "none",
+          status: "uncertain",
+          reversibility: "none",
+          affectedCount: 0,
+        });
+        return { ok: false, error: "the forward call may have committed" };
+      },
+    } as never);
+    const tool = createLibraryBatchTool({
+      actionRegistry,
+      toolRegistry: {} as never,
+      zoteroGateway: {} as never,
+      now: () => 1000,
+      batchJobStore: makeJobStore(),
+    });
+    const validated = tool.validate({ job: "auto_tag", jobArgs: {} });
+    assert.isTrue(validated.ok);
+    if (!validated.ok) return;
+
+    await tool.execute(validated.value, context).catch(() => undefined);
+
+    const action = [...db.actions.values()][0];
+    assert.equal(action.status, "uncertain");
+    assert.equal(action.reversibility, "none");
+    assert.equal(action.affected_count, 0);
+  });
+
   it("surfaces the script arguments on the confirmation card", function () {
     installMode("yolo");
     const tool = makeTool();
