@@ -306,7 +306,7 @@ describe("webchat isolation", function () {
     assert.isAbove(resetEnd, resetStart);
     assert.include(resetBlock, "chatHistory.set(key, []);");
     assert.include(resetBlock, "markNextWebChatSendAsNewChat();");
-    assert.include(resetBlock, "webChatDraftInputCache.delete(key);");
+    assert.include(resetBlock, "clearTransientComposeStateForItem(item.id);");
 
     const controllerSource = readFileSync(
       resolve(
@@ -333,6 +333,7 @@ describe("webchat isolation", function () {
     assert.isAbove(branchEnd, webchatBranch);
     assert.include(newChatBlock, "markNextWebChatSendAsNewChat();");
     assert.include(newChatBlock, "chatHistory.set(key, []);");
+    assert.include(newChatBlock, "clearTransientComposeStateForItem(item.id);");
   });
 
   it("shares the fresh-chat send flag by conversation key", function () {

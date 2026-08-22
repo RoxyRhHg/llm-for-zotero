@@ -453,6 +453,9 @@ export const selectedCollectionContextCache = new Map<
   CollectionContextRef[]
 >();
 export const selectedTagContextCache = new Map<number, TagContextRef[]>();
+// Conversations whose paper/collection/tag composer state has been initialized.
+// Membership is significant even when every corresponding context cache is empty.
+export const initializedConversationComposeContextKeys = new Set<number>();
 // Flat override maps: key = "ownerItemId:paperItemId:contextItemId"
 export const paperContextModeOverrides = new Map<
   string,
@@ -594,6 +597,7 @@ export function clearAllState(): void {
   selectedPaperContextCache.clear();
   selectedOtherRefContextCache.clear();
   selectedCollectionContextCache.clear();
+  initializedConversationComposeContextKeys.clear();
   paperContextModeOverrides.clear();
   paperContentSourceOverrides.clear();
   selectedPaperPreviewExpandedCache.clear();

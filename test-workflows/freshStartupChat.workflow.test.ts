@@ -107,7 +107,7 @@ describe("workflow: startup chat restoration", function () {
     });
     fixtures.push(fixture);
 
-    const initialPanel = await api.renderPanelForItem(fixture.parentItemId);
+    const initialPanel = await api.renderPanelForItem(fixture.pdfAttachmentId);
     const paperContext = initialPanel.contextSnapshot?.paperContext;
     assert.isOk(paperContext, diagnosticsMessage(initialPanel));
     await api.seedPanelStoredUserMessage(
@@ -122,7 +122,7 @@ describe("workflow: startup chat restoration", function () {
     );
 
     const startupPanel = await api.renderStartupPanelForItem(
-      fixture.parentItemId,
+      fixture.pdfAttachmentId,
     );
     const restored = await api.getDiagnostics(startupPanel.panelId);
 
@@ -136,6 +136,27 @@ describe("workflow: startup chat restoration", function () {
       [title],
       diagnosticsMessage(restored),
     );
+    assert.deepEqual(
+      restored.composerPaperContextKeys,
+      [`${paperContext!.itemId}:${paperContext!.contextItemId}`],
+      diagnosticsMessage(restored),
+    );
+
+    const followUp = await api.ask(
+      startupPanel.panelId,
+      "workflow paper continuation marker",
+    );
+    assert.equal(
+      followUp.contextSource?.paperContext?.itemId,
+      paperContext!.itemId,
+    );
+    assert.equal(
+      followUp.contextSource?.paperContext?.contextItemId,
+      paperContext!.contextItemId,
+    );
+    assert.deepEqual(followUp.paperContexts || [], []);
+    assert.deepEqual(followUp.fullTextPaperContexts || [], []);
+    assert.deepEqual(followUp.pdfPaperContexts || [], []);
   });
 
   it("restores library mode and its last conversation on startup", async function () {
@@ -279,6 +300,133 @@ describe("workflow: startup chat restoration", function () {
         "Workflow Restart Library Context",
       ],
       diagnosticsMessage(restored),
+    );
+    assert.deepEqual(
+      restored.composerPaperContextKeys,
+      [`${selectedPaper.itemId}:${selectedPaper.contextItemId}`],
+      diagnosticsMessage(restored),
+    );
+    assert.deepEqual(
+      restored.composerCollectionLabels,
+      ["Workflow Methods"],
+      diagnosticsMessage(restored),
+    );
+    assert.deepEqual(
+      restored.composerTagLabels,
+      ["Workflow Stability"],
+      diagnosticsMessage(restored),
+    );
+
+    const followUp = await api.ask(
+      startupPanel.panelId,
+      "workflow library continuation marker",
+    );
+    assert.deepEqual(
+      (followUp.paperContexts || []).map(
+        (paper) => `${paper.itemId}:${paper.contextItemId}`,
+      ),
+      [`${selectedPaper.itemId}:${selectedPaper.contextItemId}`],
+    );
+    assert.deepEqual(followUp.fullTextPaperContexts || [], []);
+    assert.deepEqual(followUp.pdfPaperContexts || [], []);
+    assert.lengthOf(followUp.selectedCollectionContexts || [], 1);
+    assert.lengthOf(followUp.selectedTagContexts || [], 1);
+
+    const standalone = await api.openStandaloneForLibraryAfterRestart();
+    assert.deepEqual(
+      standalone.composerPaperContextKeys,
+      [`${selectedPaper.itemId}:${selectedPaper.contextItemId}`],
+      diagnosticsMessage(standalone),
+    );
+    assert.deepEqual(
+      standalone.composerCollectionLabels,
+      ["Workflow Methods"],
+      diagnosticsMessage(standalone),
+    );
+    assert.deepEqual(
+      standalone.composerTagLabels,
+      ["Workflow Stability"],
+      diagnosticsMessage(standalone),
+    );
+  });
+
+  it("keeps explicit new Paper and Library chats at their default context", async function () {
+    const title = "Workflow New Conversation Defaults";
+    const fixture = await api.createPaperWithPdfFixture({
+      title,
+      pdfTitle: "Workflow New Conversation Defaults PDF",
+    });
+    fixtures.push(fixture);
+
+    const panel = await api.renderPanelForItem(fixture.pdfAttachmentId);
+    await api.seedPanelStoredUserMessage(
+      panel.panelId,
+      "workflow context before new paper chat",
+      {
+        selectedCollectionContexts: [
+          {
+            collectionId: 77,
+            libraryID: Zotero.Libraries.userLibraryID,
+            name: "Old collection",
+          },
+        ],
+      },
+    );
+    const restoredPanel = await api.renderStartupPanelForItem(
+      fixture.pdfAttachmentId,
+    );
+    const restored = await api.getDiagnostics(restoredPanel.panelId);
+    assert.deepEqual(
+      restored.composerCollectionLabels,
+      ["Old collection"],
+      diagnosticsMessage(restored),
+    );
+    const newPaper = await api.startNewPanelConversation(
+      restoredPanel.panelId,
+      { allowReusedDraft: true },
+    );
+    assert.deepEqual(
+      newPaper.composerPaperContextKeys,
+      [`${fixture.parentItemId}:${fixture.pdfAttachmentId}`],
+      diagnosticsMessage(newPaper),
+    );
+    assert.deepEqual(
+      newPaper.composerCollectionLabels,
+      [],
+      diagnosticsMessage(newPaper),
+    );
+    assert.deepEqual(
+      newPaper.composerTagLabels,
+      [],
+      diagnosticsMessage(newPaper),
+    );
+
+    const library = await api.togglePanelConversationMode(
+      restoredPanel.panelId,
+    );
+    assert.equal(
+      library.conversationKind,
+      "global",
+      diagnosticsMessage(library),
+    );
+    const newLibrary = await api.startNewPanelConversation(
+      restoredPanel.panelId,
+      { allowReusedDraft: true },
+    );
+    assert.deepEqual(
+      newLibrary.composerPaperContextKeys,
+      [],
+      diagnosticsMessage(newLibrary),
+    );
+    assert.deepEqual(
+      newLibrary.composerCollectionLabels,
+      [],
+      diagnosticsMessage(newLibrary),
+    );
+    assert.deepEqual(
+      newLibrary.composerTagLabels,
+      [],
+      diagnosticsMessage(newLibrary),
     );
   });
 

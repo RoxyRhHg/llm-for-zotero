@@ -146,7 +146,10 @@ export type WorkflowTestDiagnostics = {
   noteParentItemId?: number;
   contextSnapshot?: ResolvedContextSource | null;
   chipText: string[];
+  composerPaperContextKeys: string[];
   selectedContextLabels: string[];
+  composerCollectionLabels: string[];
+  composerTagLabels: string[];
   sentContextBadgeLabels: string[];
   sentContextItemLabels: string[];
   historyNewVisible?: boolean;
@@ -193,7 +196,10 @@ export type WorkflowTestStandaloneDiagnostics = {
   conversationSystem?: string;
   titleText?: string;
   chipText: string[];
+  composerPaperContextKeys: string[];
   selectedContextLabels: string[];
+  composerCollectionLabels: string[];
+  composerTagLabels: string[];
   messageText?: string;
   paperTabText?: string;
   openTabText?: string;
@@ -323,6 +329,7 @@ export type WorkflowTestApi = {
   renderStartupPanelForItem: (itemId: number) => Promise<WorkflowTestPanel>;
   startNewPanelConversation: (
     panelId: string,
+    options?: { allowReusedDraft?: boolean },
   ) => Promise<WorkflowTestDiagnostics>;
   togglePanelConversationMode: (
     panelId: string,

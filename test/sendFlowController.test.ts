@@ -2,6 +2,7 @@ import { assert } from "chai";
 import type {
   ChatAttachment,
   CollectionContextRef,
+  Message,
   PaperContextRef,
   ResolvedSelectedTextAnchor,
   ResolvedContextSource,
@@ -10,6 +11,7 @@ import type {
 } from "../src/modules/contextPanel/types";
 import {
   buildAgentRuntimeRequestForTests,
+  deriveConversationComposeContextSnapshotForTests,
   getMessageDisplayPaperContextsForTests,
   includeAutoLoadedPaperContextForTests,
   normalizeStoredPaperContextRoutesForTests,
@@ -294,6 +296,89 @@ describe("sendFlowController", function () {
       display.map((paper) => `${paper.itemId}:${paper.contextItemId}`),
       ["1:11", "2:22", "3:33"],
     );
+  });
+
+  it("derives a retrieval-only continuation snapshot from the latest user turn", function () {
+    const activePaper = {
+      itemId: 1,
+      contextItemId: 11,
+      title: "Active paper",
+    };
+    const ordinaryPaper = {
+      itemId: 2,
+      contextItemId: 22,
+      title: "Ordinary paper",
+    };
+    const fullTextPaper = {
+      itemId: 3,
+      contextItemId: 33,
+      title: "Full-text paper",
+      contentSourceMode: "mineru" as const,
+    };
+    const pdfPaper = {
+      itemId: 4,
+      contextItemId: 44,
+      title: "PDF paper",
+      contentSourceMode: "pdf" as const,
+    };
+    const latestUserMessage: Message = {
+      role: "user",
+      text: "Continue with these sources",
+      timestamp: 200,
+      paperContexts: [activePaper, ordinaryPaper],
+      fullTextPaperContexts: [activePaper, fullTextPaper],
+      pdfPaperContexts: [pdfPaper],
+      selectedCollectionContexts: [selectedCollection, selectedCollection],
+      selectedTagContexts: [selectedTag, selectedTag],
+    };
+
+    const snapshot = deriveConversationComposeContextSnapshotForTests(
+      123,
+      [
+        {
+          role: "user",
+          text: "Older context",
+          timestamp: 100,
+          paperContexts: [{ itemId: 9, contextItemId: 99, title: "Old" }],
+        },
+        latestUserMessage,
+        { role: "assistant", text: "Answer", timestamp: 300 },
+      ],
+      activePaper,
+    );
+
+    assert.deepEqual(
+      snapshot.paperContexts.map((paper) => paper.title),
+      ["Ordinary paper", "Full-text paper", "PDF paper"],
+    );
+    assert.isTrue(
+      snapshot.paperContexts.every(
+        (paper) => paper.contentSourceMode === undefined,
+      ),
+    );
+    assert.deepEqual(snapshot.collectionContexts, [selectedCollection]);
+    assert.lengthOf(snapshot.tagContexts, 1);
+    assert.deepInclude(snapshot.tagContexts[0], selectedTag);
+  });
+
+  it("treats a context-free latest user turn as an intentionally empty snapshot", function () {
+    const snapshot = deriveConversationComposeContextSnapshotForTests(123, [
+      {
+        role: "user",
+        text: "Older context",
+        timestamp: 100,
+        paperContexts: [{ itemId: 9, contextItemId: 99, title: "Old" }],
+        selectedCollectionContexts: [selectedCollection],
+        selectedTagContexts: [selectedTag],
+      },
+      { role: "user", text: "No context now", timestamp: 200 },
+    ]);
+
+    assert.deepEqual(snapshot, {
+      paperContexts: [],
+      collectionContexts: [],
+      tagContexts: [],
+    });
   });
 
   function createBaseDeps(overrides: Record<string, unknown> = {}) {

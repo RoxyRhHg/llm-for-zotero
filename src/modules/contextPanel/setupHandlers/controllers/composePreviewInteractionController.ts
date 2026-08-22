@@ -41,6 +41,7 @@ import {
   selectedPaperContextListExpandedCache,
   selectedPaperPreviewExpandedCache,
   selectedTagContextCache,
+  initializedConversationComposeContextKeys,
 } from "../../state";
 import type {
   PaperContentSourceMode,
@@ -412,6 +413,7 @@ export function attachComposePreviewInteractionController(
           } else {
             selectedCollectionContextCache.delete(item.id);
           }
+          initializedConversationComposeContextKeys.add(item.id);
           deps.updatePaperPreviewPreservingScroll();
           setStatus(t("Collection context removed."), "ready");
         }
@@ -433,6 +435,7 @@ export function attachComposePreviewInteractionController(
           } else {
             selectedTagContextCache.delete(item.id);
           }
+          initializedConversationComposeContextKeys.add(item.id);
           deps.updatePaperPreviewPreservingScroll();
           setStatus(t("Tag context removed."), "ready");
         }
@@ -474,6 +477,7 @@ export function attachComposePreviewInteractionController(
       } else {
         clearSelectedPaperState(item.id);
       }
+      initializedConversationComposeContextKeys.add(item.id);
       deps.updatePaperPreviewPreservingScroll();
       setStatus(`Paper context removed (${nextPapers.length})`, "ready");
       deps.closePaperChipMenu();

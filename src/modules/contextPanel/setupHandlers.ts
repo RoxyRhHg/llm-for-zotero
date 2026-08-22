@@ -67,6 +67,7 @@ import {
   selectedOtherRefContextCache,
   selectedCollectionContextCache,
   selectedTagContextCache,
+  initializedConversationComposeContextKeys,
   paperContextModeOverrides,
   selectedPaperPreviewExpandedCache,
   pinnedSelectedTextKeys,
@@ -2589,6 +2590,7 @@ export function setupHandlers(
   const retainPinnedTextState = (itemId: number) =>
     retainPinnedTextState_(pinnedSelectedTextKeys, itemId);
   const clearTransientComposeStateForItem = (itemId: number) => {
+    initializedConversationComposeContextKeys.delete(itemId);
     clearDraftInputState(itemId);
     clearSelectedImageState(itemId);
     clearAllRefContextState(itemId);
@@ -5558,7 +5560,7 @@ export function setupHandlers(
   const resetCurrentWebChatConversation = () => {
     if (!item) return;
     const key = getConversationKey(item);
-    webChatDraftInputCache.delete(key);
+    clearTransientComposeStateForItem(item.id);
     webChatIsolatedConversationKeys.add(key);
     chatHistory.set(key, []);
     loadedConversationKeys.add(key);

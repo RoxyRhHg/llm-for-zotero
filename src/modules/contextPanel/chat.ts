@@ -209,7 +209,9 @@ import {
   selectedPaperContextCache,
   selectedCollectionContextCache,
   selectedTagContextCache,
+  initializedConversationComposeContextKeys,
   paperContextModeOverrides,
+  paperContentSourceOverrides,
   activeContextPanels,
   activeContextPanelStateSync,
   getCancelledRequestId,
@@ -1928,6 +1930,116 @@ function getMessageDisplayPaperContexts(
 export const getMessageDisplayPaperContextsForTests =
   getMessageDisplayPaperContexts;
 
+type ConversationComposeContextSnapshot = {
+  paperContexts: PaperContextRef[];
+  collectionContexts: CollectionContextRef[];
+  tagContexts: TagContextRef[];
+};
+
+function toContinuationPaperContext(
+  paperContext: PaperContextRef,
+): PaperContextRef {
+  const { contentSourceMode: _consumedSourceMode, ...identity } = paperContext;
+  return identity;
+}
+
+function deriveConversationComposeContextSnapshot(
+  conversationKey: number,
+  messages: Message[],
+  autoLoadedPaperContext?: PaperContextRef | null,
+): ConversationComposeContextSnapshot {
+  const latestUserMessage = [
+    ...filterMessagesInPendingTurns(conversationKey, messages),
+  ]
+    .reverse()
+    .find((message) => message.role === "user");
+  if (!latestUserMessage) {
+    return { paperContexts: [], collectionContexts: [], tagContexts: [] };
+  }
+  const autoPaperKey = autoLoadedPaperContext
+    ? `${autoLoadedPaperContext.itemId}:${autoLoadedPaperContext.contextItemId}`
+    : "";
+  const paperContexts = getMessageDisplayPaperContexts(latestUserMessage)
+    .filter(
+      (paperContext) =>
+        `${paperContext.itemId}:${paperContext.contextItemId}` !== autoPaperKey,
+    )
+    .map(toContinuationPaperContext);
+  return {
+    paperContexts,
+    collectionContexts: normalizeCollectionContexts(
+      latestUserMessage.selectedCollectionContexts,
+    ),
+    tagContexts: normalizeTagContexts(latestUserMessage.selectedTagContexts),
+  };
+}
+
+export const deriveConversationComposeContextSnapshotForTests =
+  deriveConversationComposeContextSnapshot;
+
+function clearPaperContinuationOverrides(itemId: number): void {
+  const prefix = `${itemId}:`;
+  for (const key of Array.from(paperContextModeOverrides.keys())) {
+    if (key.startsWith(prefix)) paperContextModeOverrides.delete(key);
+  }
+  for (const key of Array.from(paperContentSourceOverrides.keys())) {
+    if (key.startsWith(prefix)) paperContentSourceOverrides.delete(key);
+  }
+}
+
+export function restoreConversationComposeContext(item: Zotero.Item): boolean {
+  const conversationKey = getConversationKey(item);
+  const itemId = Math.floor(Number(item.id || 0));
+  if (
+    conversationKey <= 0 ||
+    itemId <= 0 ||
+    !loadedConversationKeys.has(conversationKey) ||
+    initializedConversationComposeContextKeys.has(conversationKey)
+  ) {
+    return false;
+  }
+  if (
+    selectedPaperContextCache.has(itemId) ||
+    selectedCollectionContextCache.has(itemId) ||
+    selectedTagContextCache.has(itemId)
+  ) {
+    initializedConversationComposeContextKeys.add(conversationKey);
+    return false;
+  }
+
+  const snapshot = deriveConversationComposeContextSnapshot(
+    conversationKey,
+    chatHistory.get(conversationKey) || [],
+    resolveAutoLoadedPaperContextForItem(item),
+  );
+  if (snapshot.paperContexts.length) {
+    selectedPaperContextCache.set(itemId, snapshot.paperContexts);
+  } else {
+    selectedPaperContextCache.delete(itemId);
+  }
+  if (snapshot.collectionContexts.length) {
+    selectedCollectionContextCache.set(itemId, snapshot.collectionContexts);
+  } else {
+    selectedCollectionContextCache.delete(itemId);
+  }
+  if (snapshot.tagContexts.length) {
+    selectedTagContextCache.set(itemId, snapshot.tagContexts);
+  } else {
+    selectedTagContextCache.delete(itemId);
+  }
+  clearPaperContinuationOverrides(itemId);
+  initializedConversationComposeContextKeys.add(conversationKey);
+
+  for (const [body, getItem] of activeContextPanels) {
+    const activeItem = getItem();
+    if (!activeItem || getConversationKey(activeItem) !== conversationKey) {
+      continue;
+    }
+    activeContextPanelStateSync.get(body)?.();
+  }
+  return true;
+}
+
 function toPanelMessage(message: StoredChatMessage): Message {
   const screenshotImages = Array.isArray(message.screenshotImages)
     ? message.screenshotImages.filter((entry) => Boolean(entry))
@@ -2087,6 +2199,7 @@ export async function ensureConversationLoaded(
 
   if (loadedConversationKeys.has(conversationKey)) {
     await loadConversationForkLinkCache(conversationKey);
+    restoreConversationComposeContext(item);
     return;
   }
   if (
@@ -2095,6 +2208,7 @@ export async function ensureConversationLoaded(
   ) {
     await loadConversationForkLinkCache(conversationKey, loadGeneration);
     loadedConversationKeys.add(conversationKey);
+    restoreConversationComposeContext(item);
     return;
   }
   if (blockedConversationLoadKeys.has(conversationKey)) {
@@ -2106,6 +2220,7 @@ export async function ensureConversationLoaded(
   const existingTask = loadingConversationTasks.get(conversationKey);
   if (existingTask) {
     await existingTask;
+    restoreConversationComposeContext(item);
     return;
   }
 
@@ -2229,6 +2344,7 @@ export async function ensureConversationLoaded(
 
   loadingConversationTasks.set(conversationKey, task);
   await task;
+  restoreConversationComposeContext(item);
 }
 
 async function ensureAgentRunTraceLoaded(
@@ -7200,6 +7316,7 @@ function syncComposeContextForInlineEdit(
     );
   }
 
+  initializedConversationComposeContextKeys.add(conversationKey);
   activeContextPanelStateSync.get(body)?.();
 }
 

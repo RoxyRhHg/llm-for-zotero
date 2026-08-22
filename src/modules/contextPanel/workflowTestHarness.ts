@@ -11,6 +11,11 @@ import {
   selectedRuntimeModeCache,
   loadedConversationKeys,
   paperContextModeOverrides,
+  paperContentSourceOverrides,
+  selectedPaperContextCache,
+  selectedCollectionContextCache,
+  selectedTagContextCache,
+  initializedConversationComposeContextKeys,
   isRequestPending,
 } from "./state";
 import type { ResolvedContextSource, SendQuestionOptions } from "./types";
@@ -674,6 +679,12 @@ function clearWorkflowConversationRuntimeState(): void {
   activeCodexConversationModeByLibrary.clear();
   activeCodexGlobalConversationByLibrary.clear();
   activeCodexPaperConversationByPaper.clear();
+  selectedPaperContextCache.clear();
+  selectedCollectionContextCache.clear();
+  selectedTagContextCache.clear();
+  initializedConversationComposeContextKeys.clear();
+  paperContextModeOverrides.clear();
+  paperContentSourceOverrides.clear();
 }
 
 async function renderPanelForItemInternal(
@@ -699,6 +710,7 @@ async function renderPanelForItemInternal(
   refreshChat(body, mountedItem);
   await Zotero.Promise.delay(50);
   const contextSnapshot = await resolveContextSourceItemAsync(mountedItem);
+  activeContextPanelStateSync.get(body)?.();
   const panel = { id: panelId, body, item: mountedItem, contextSnapshot };
   panels.set(panelId, panel);
   return { panelId, itemId, contextSnapshot };
@@ -725,6 +737,8 @@ async function waitForPanelConversationChange(params: {
   panelId: string;
   previousConversationKey?: number;
   previousConversationKind?: string;
+  allowReusedDraft?: boolean;
+  previousStatusText?: string;
 }): Promise<WorkflowTestDiagnostics> {
   const startedAt = Date.now();
   // Generous deadline: the switch path does several DB round-trips, and a
@@ -740,6 +754,13 @@ async function waitForPanelConversationChange(params: {
       params.previousConversationKind === undefined ||
       diagnostics.conversationKind !== params.previousConversationKind;
     if (keyChanged && kindChanged) return diagnostics;
+    if (
+      params.allowReusedDraft &&
+      diagnostics.statusText !== params.previousStatusText &&
+      /^(Reused existing new|Started new)/.test(diagnostics.statusText || "")
+    ) {
+      return diagnostics;
+    }
     await Zotero.Promise.delay(25);
   }
   throw new Error(`Timed out waiting for panel ${params.panelId} to switch`);
@@ -747,6 +768,7 @@ async function waitForPanelConversationChange(params: {
 
 async function startNewPanelConversation(
   panelId: string,
+  options?: { allowReusedDraft?: boolean },
 ): Promise<WorkflowTestDiagnostics> {
   assertWorkflowTestEnabled();
   const panel = getPanel(panelId);
@@ -755,6 +777,8 @@ async function startNewPanelConversation(
   return waitForPanelConversationChange({
     panelId,
     previousConversationKey: before.conversationKey,
+    allowReusedDraft: options?.allowReusedDraft,
+    previousStatusText: before.statusText,
   });
 }
 
@@ -1768,10 +1792,30 @@ function readStandaloneDiagnostics(): WorkflowTestStandaloneDiagnostics {
     conversationSystem: panelRoot?.dataset.conversationSystem || undefined,
     titleText: titleEl?.textContent?.trim() || undefined,
     chipText: Array.from(
-      contentArea?.querySelectorAll(".llm-paper-context-chip-text") || [],
+      contentArea?.querySelectorAll(
+        "#llm-paper-context-preview .llm-paper-context-chip > .llm-paper-context-chip-header .llm-paper-context-chip-text",
+      ) || [],
     ).map((node) => ((node as Element).textContent || "").trim()),
+    composerPaperContextKeys: Array.from(
+      contentArea?.querySelectorAll(
+        "#llm-paper-context-preview .llm-paper-context-chip",
+      ) || [],
+    ).map((node) => {
+      const chip = node as HTMLElement;
+      return `${chip.dataset.paperItemId}:${chip.dataset.paperContextItemId}`;
+    }),
     selectedContextLabels: Array.from(
       contentArea?.querySelectorAll(".llm-selected-context-meta") || [],
+    ).map((node) => ((node as Element).textContent || "").trim()),
+    composerCollectionLabels: Array.from(
+      contentArea?.querySelectorAll(
+        "#llm-paper-context-preview .llm-collection-chip-title",
+      ) || [],
+    ).map((node) => ((node as Element).textContent || "").trim()),
+    composerTagLabels: Array.from(
+      contentArea?.querySelectorAll(
+        "#llm-paper-context-preview .llm-tag-chip-title",
+      ) || [],
     ).map((node) => ((node as Element).textContent || "").trim()),
     messageText: chatBox?.textContent?.trim() || undefined,
     paperTabText: paperTab?.textContent?.trim() || undefined,
@@ -2282,10 +2326,30 @@ async function getDiagnostics(
     noteParentItemId: parsePositiveInt(panelRoot?.dataset.noteParentItemId),
     contextSnapshot: panel?.contextSnapshot,
     chipText: Array.from(
-      body?.querySelectorAll(".llm-paper-context-chip-text") || [],
+      body?.querySelectorAll(
+        "#llm-paper-context-preview .llm-paper-context-chip > .llm-paper-context-chip-header .llm-paper-context-chip-text",
+      ) || [],
     ).map((node) => ((node as Element).textContent || "").trim()),
+    composerPaperContextKeys: Array.from(
+      body?.querySelectorAll(
+        "#llm-paper-context-preview .llm-paper-context-chip",
+      ) || [],
+    ).map((node) => {
+      const chip = node as HTMLElement;
+      return `${chip.dataset.paperItemId}:${chip.dataset.paperContextItemId}`;
+    }),
     selectedContextLabels: Array.from(
       body?.querySelectorAll(".llm-selected-context-meta") || [],
+    ).map((node) => ((node as Element).textContent || "").trim()),
+    composerCollectionLabels: Array.from(
+      body?.querySelectorAll(
+        "#llm-paper-context-preview .llm-collection-chip-title",
+      ) || [],
+    ).map((node) => ((node as Element).textContent || "").trim()),
+    composerTagLabels: Array.from(
+      body?.querySelectorAll(
+        "#llm-paper-context-preview .llm-tag-chip-title",
+      ) || [],
     ).map((node) => ((node as Element).textContent || "").trim()),
     sentContextBadgeLabels: Array.from(
       body?.querySelectorAll("#llm-chat-box .llm-user-context-badges button") ||

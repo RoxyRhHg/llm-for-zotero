@@ -35,7 +35,6 @@ import {
   activeGlobalConversationByLibrary,
   activePaperConversationByPaper,
   draftInputCache,
-  selectedImageCache,
   inlineEditCleanup,
   setInlineEditCleanup,
   setInlineEditTarget,
@@ -3393,7 +3392,7 @@ export function createHistoryLifecycleController(
   const createAndSwitchGlobalConversation = async (
     options: boolean | CreateConversationOptions = false,
   ): Promise<boolean> => {
-    const { excludeConversationKey } =
+    const { excludeConversationKey, forceFresh } =
       normalizeCreateConversationOptions(options);
     if (!item) return false;
     closeHistoryNewMenu();
@@ -3495,6 +3494,9 @@ export function createHistoryLifecycleController(
     if (reuseReason) {
       await touchEmptyDraftActivity(targetConversationKey, "global");
     }
+    if (forceFresh) {
+      clearTransientComposeStateForItem(targetConversationKey);
+    }
     await switchGlobalConversation(targetConversationKey);
     if (status) {
       setStatus(
@@ -3512,7 +3514,7 @@ export function createHistoryLifecycleController(
   const createAndSwitchPaperConversation = async (
     options: boolean | CreateConversationOptions = false,
   ): Promise<boolean> => {
-    const { excludeConversationKey } =
+    const { excludeConversationKey, forceFresh } =
       normalizeCreateConversationOptions(options);
     if (!item) return false;
     closeHistoryNewMenu();
@@ -3573,6 +3575,9 @@ export function createHistoryLifecycleController(
 
     if (reuseReason) {
       await touchEmptyDraftActivity(targetConversationKey, "paper");
+    }
+    if (forceFresh) {
+      clearTransientComposeStateForItem(targetConversationKey);
     }
     await switchPaperConversation(targetConversationKey);
     if (status) {
@@ -3688,12 +3693,11 @@ export function createHistoryLifecycleController(
         // The next send carries an explicit force_new_chat intent to the relay,
         // and we also trigger a remote new-chat command immediately.
         markNextWebChatSendAsNewChat();
-        primeFreshWebChatPaperChipState();
-        // Clear cached images so stale screenshots don't auto-attach to ChatGPT
         if (item) {
-          selectedImageCache.delete(item.id);
+          clearTransientComposeStateForItem(item.id);
           updateImagePreviewPreservingScroll();
         }
+        primeFreshWebChatPaperChipState();
         void (async () => {
           try {
             const [{ getRelayBaseUrl }, { sendNewChat }] = await Promise.all([
