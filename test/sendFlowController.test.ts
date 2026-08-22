@@ -10,6 +10,7 @@ import type {
 } from "../src/modules/contextPanel/types";
 import {
   buildAgentRuntimeRequestForTests,
+  getMessageDisplayPaperContextsForTests,
   includeAutoLoadedPaperContextForTests,
   normalizeStoredPaperContextRoutesForTests,
 } from "../src/modules/contextPanel/chat";
@@ -257,6 +258,42 @@ describe("sendFlowController", function () {
     assert.deepInclude(normalized.paperContexts[0], text);
     assert.deepInclude(normalized.pdfPaperContexts[0], pdf);
     assert.deepInclude(normalized.fullTextPaperContexts[0], full);
+  });
+
+  it("renders every sent paper route exactly once after stored-route normalization", function () {
+    const activePaper = {
+      itemId: 1,
+      contextItemId: 11,
+      title: "Active paper",
+    };
+    const libraryPaper = {
+      itemId: 2,
+      contextItemId: 22,
+      title: "Library paper",
+      contentSourceMode: "mineru" as const,
+    };
+    const pdfPaper = {
+      itemId: 3,
+      contextItemId: 33,
+      title: "PDF paper",
+      contentSourceMode: "pdf" as const,
+    };
+    const storedRoutes = normalizeStoredPaperContextRoutesForTests({
+      paperContexts: [activePaper, libraryPaper],
+      pdfPaperContexts: [pdfPaper],
+      fullTextPaperContexts: [activePaper, libraryPaper],
+    });
+
+    const display = getMessageDisplayPaperContextsForTests(storedRoutes);
+
+    assert.deepEqual(
+      display.map((paper) => paper.title),
+      ["Active paper", "Library paper", "PDF paper"],
+    );
+    assert.deepEqual(
+      display.map((paper) => `${paper.itemId}:${paper.contextItemId}`),
+      ["1:11", "2:22", "3:33"],
+    );
   });
 
   function createBaseDeps(overrides: Record<string, unknown> = {}) {

@@ -911,7 +911,22 @@ describe("conversationRepository", function () {
               sql.includes("FROM llm_for_zotero_codex_messages")
             ) {
               return [
-                { role: "user", text: "Prompt", timestamp: 100 },
+                {
+                  role: "user",
+                  text: "Prompt",
+                  timestamp: 100,
+                  collection_contexts_json: JSON.stringify([
+                    { collectionId: 55, libraryID: 7, name: "Methods" },
+                  ]),
+                  tag_contexts_json: JSON.stringify([
+                    {
+                      libraryID: 7,
+                      name: "Stability",
+                      normalizedName: "stability",
+                      includeAutomatic: false,
+                    },
+                  ]),
+                },
                 {
                   role: "assistant",
                   text: "Answer",
@@ -944,6 +959,21 @@ describe("conversationRepository", function () {
       assert.deepEqual(archiveCalls, []);
       assert.equal(persistedProviderSessionId, "thread-forked");
       assert.lengthOf(insertedMessages, 2);
+      assert.include(
+        insertedMessages[0],
+        JSON.stringify([{ collectionId: 55, libraryID: 7, name: "Methods" }]),
+      );
+      assert.include(
+        insertedMessages[0],
+        JSON.stringify([
+          {
+            libraryID: 7,
+            name: "Stability",
+            normalizedName: "stability",
+            includeAutomatic: false,
+          },
+        ]),
+      );
       assert.deepEqual(
         insertedMessages.map((params) => params.slice(1, 7)),
         [
@@ -1347,7 +1377,22 @@ describe("conversationRepository", function () {
             sql.includes("ORDER BY timestamp ASC")
           ) {
             return [
-              { role: "user", text: "First", timestamp: 100 },
+              {
+                role: "user",
+                text: "First",
+                timestamp: 100,
+                collection_contexts_json: JSON.stringify([
+                  { collectionId: 55, libraryID: 7, name: "Methods" },
+                ]),
+                tag_contexts_json: JSON.stringify([
+                  {
+                    libraryID: 7,
+                    name: "Stability",
+                    normalizedName: "stability",
+                    includeAutomatic: false,
+                  },
+                ]),
+              },
               { role: "assistant", text: "Answer", timestamp: 200 },
             ];
           }
@@ -1387,6 +1432,21 @@ describe("conversationRepository", function () {
     });
     assert.equal(targetTitle, "Fork: Source title");
     assert.lengthOf(insertedMessages, 2);
+    assert.include(
+      insertedMessages[0],
+      JSON.stringify([{ collectionId: 55, libraryID: 7, name: "Methods" }]),
+    );
+    assert.include(
+      insertedMessages[0],
+      JSON.stringify([
+        {
+          libraryID: 7,
+          name: "Stability",
+          normalizedName: "stability",
+          includeAutomatic: false,
+        },
+      ]),
+    );
     assert.equal(
       insertedMessages[0]?.[0],
       buildConversationID({

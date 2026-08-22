@@ -1907,6 +1907,22 @@ function normalizeStoredPaperContextRoutes(params: {
 export const normalizeStoredPaperContextRoutesForTests =
   normalizeStoredPaperContextRoutes;
 
+function getMessageDisplayPaperContexts(
+  message: Pick<
+    Message,
+    "paperContexts" | "pdfPaperContexts" | "fullTextPaperContexts"
+  >,
+): PaperContextRef[] {
+  return normalizePaperContexts([
+    ...(message.paperContexts || []),
+    ...(message.fullTextPaperContexts || []),
+    ...(message.pdfPaperContexts || []),
+  ]);
+}
+
+export const getMessageDisplayPaperContextsForTests =
+  getMessageDisplayPaperContexts;
+
 function toPanelMessage(message: StoredChatMessage): Message {
   const screenshotImages = Array.isArray(message.screenshotImages)
     ? message.screenshotImages.filter((entry) => Boolean(entry))
@@ -11467,10 +11483,7 @@ export function refreshChat(
         hasContextBadge = true;
       }
 
-      const paperContexts = normalizePaperContexts([
-        ...(msg.paperContexts || []),
-        ...(msg.pdfPaperContexts || []),
-      ]);
+      const paperContexts = getMessageDisplayPaperContexts(msg);
       hasUserContext = hasUserContext || paperContexts.length > 0;
       if (paperContexts.length) {
         const displayPaperContexts = paperContexts.map(

@@ -13,6 +13,8 @@ import {
   normalizeSelectedTextSource,
   synthesizeSelectedTextContexts,
   normalizePaperContextRefs,
+  normalizeCollectionContextRefs,
+  normalizeTagContextRefs,
 } from "../modules/contextPanel/normalizers";
 import { normalizeQuoteCitations } from "../modules/contextPanel/quoteCitations";
 import type { StoredChatMessage } from "../utils/chatStore";
@@ -160,6 +162,8 @@ const CODEX_MESSAGE_SELECT_COLUMNS_SQL = `id,
             full_text_paper_contexts_json AS fullTextPaperContextsJson,
             citation_paper_contexts_json AS citationPaperContextsJson,
             quote_citations_json AS quoteCitationsJson,
+            collection_contexts_json AS collectionContextsJson,
+            tag_contexts_json AS tagContextsJson,
             screenshot_images AS screenshotImages,
             attachments_json AS attachmentsJson,
             generated_images_json AS generatedImagesJson,
@@ -662,6 +666,8 @@ const MESSAGE_TRANSFER_COLUMNS = [
   "full_text_paper_contexts_json",
   "citation_paper_contexts_json",
   "quote_citations_json",
+  "collection_contexts_json",
+  "tag_contexts_json",
   "screenshot_images",
   "attachments_json",
   "generated_images_json",
@@ -696,6 +702,8 @@ const CODEX_MESSAGE_COPY_COLUMNS = [
   "full_text_paper_contexts_json",
   "citation_paper_contexts_json",
   "quote_citations_json",
+  "collection_contexts_json",
+  "tag_contexts_json",
   "screenshot_images",
   "attachments_json",
   "generated_images_json",
@@ -1001,6 +1009,23 @@ export async function repairMisroutedCodexConversationRows(): Promise<void> {
     "selected_text_contexts_json",
     "selected_text_contexts_json TEXT",
   );
+  for (const tableName of [CLAUDE_MESSAGES_TABLE, CODEX_MESSAGES_TABLE]) {
+    const columns = (await Zotero.DB.queryAsync(
+      `PRAGMA table_info(${tableName})`,
+    )) as Array<{ name?: unknown }> | undefined;
+    await ensureColumn(
+      tableName,
+      columns,
+      "collection_contexts_json",
+      "collection_contexts_json TEXT",
+    );
+    await ensureColumn(
+      tableName,
+      columns,
+      "tag_contexts_json",
+      "tag_contexts_json TEXT",
+    );
+  }
   await ensureColumn(
     CODEX_MESSAGES_TABLE,
     (await Zotero.DB.queryAsync(
@@ -1321,6 +1346,8 @@ export async function initCodexAppServerStore(): Promise<void> {
         full_text_paper_contexts_json TEXT,
         citation_paper_contexts_json TEXT,
         quote_citations_json TEXT,
+        collection_contexts_json TEXT,
+        tag_contexts_json TEXT,
         screenshot_images TEXT,
         attachments_json TEXT,
         generated_images_json TEXT,
@@ -1414,6 +1441,18 @@ export async function initCodexAppServerStore(): Promise<void> {
          ADD COLUMN quote_citations_json TEXT`,
       );
     }
+    await ensureColumn(
+      CODEX_MESSAGES_TABLE,
+      columns,
+      "collection_contexts_json",
+      "collection_contexts_json TEXT",
+    );
+    await ensureColumn(
+      CODEX_MESSAGES_TABLE,
+      columns,
+      "tag_contexts_json",
+      "tag_contexts_json TEXT",
+    );
     await ensureColumn(
       CODEX_MESSAGES_TABLE,
       columns,
@@ -1701,6 +1740,12 @@ export async function appendCodexMessage(
     message.citationPaperContexts,
   );
   const quoteCitations = normalizeQuoteCitations(message.quoteCitations);
+  const selectedCollectionContexts = normalizeCollectionContextRefs(
+    message.selectedCollectionContexts,
+  );
+  const selectedTagContexts = normalizeTagContextRefs(
+    message.selectedTagContexts,
+  );
   const screenshotImages = Array.isArray(message.screenshotImages)
     ? message.screenshotImages.filter(
         (entry): entry is string =>
@@ -1753,8 +1798,8 @@ export async function appendCodexMessage(
         const identityPlaceholder = identityAvailable ? ", ?" : "";
         await Zotero.DB.queryAsync(
           `INSERT INTO ${CODEX_MESSAGES_TABLE}
-        (conversation_id, conversation_key, role, text, timestamp, run_mode, agent_run_id, selected_text, selected_text_contexts_json, selected_texts_json, selected_text_sources_json, selected_text_paper_contexts_json, selected_text_note_contexts_json, forced_skill_ids_json, paper_contexts_json, pdf_paper_contexts_json, full_text_paper_contexts_json, citation_paper_contexts_json, quote_citations_json, screenshot_images, attachments_json, generated_images_json, model_name, model_entry_id, model_provider_label, interrupted, webchat_run_state, webchat_completion_reason, reasoning_summary, reasoning_details, compact_marker, context_tokens, context_window${identityColumn})
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?${identityPlaceholder})`,
+        (conversation_id, conversation_key, role, text, timestamp, run_mode, agent_run_id, selected_text, selected_text_contexts_json, selected_texts_json, selected_text_sources_json, selected_text_paper_contexts_json, selected_text_note_contexts_json, forced_skill_ids_json, paper_contexts_json, pdf_paper_contexts_json, full_text_paper_contexts_json, citation_paper_contexts_json, quote_citations_json, collection_contexts_json, tag_contexts_json, screenshot_images, attachments_json, generated_images_json, model_name, model_entry_id, model_provider_label, interrupted, webchat_run_state, webchat_completion_reason, reasoning_summary, reasoning_details, compact_marker, context_tokens, context_window${identityColumn})
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?${identityPlaceholder})`,
           [
             conversationID,
             normalizedKey,
@@ -1789,6 +1834,12 @@ export async function appendCodexMessage(
               ? JSON.stringify(citationPaperContexts)
               : null,
             quoteCitations.length ? JSON.stringify(quoteCitations) : null,
+            selectedCollectionContexts.length
+              ? JSON.stringify(selectedCollectionContexts)
+              : null,
+            selectedTagContexts.length
+              ? JSON.stringify(selectedTagContexts)
+              : null,
             screenshotImages.length ? JSON.stringify(screenshotImages) : null,
             attachments.length ? JSON.stringify(attachments) : null,
             generatedImages.length ? JSON.stringify(generatedImages) : null,
@@ -2058,6 +2109,33 @@ export async function loadCodexConversation(
         return undefined;
       }
     })();
+    const selectedCollectionContexts = (() => {
+      if (
+        typeof row.collectionContextsJson !== "string" ||
+        !row.collectionContextsJson
+      )
+        return undefined;
+      try {
+        const normalized = normalizeCollectionContextRefs(
+          JSON.parse(row.collectionContextsJson) as unknown,
+        );
+        return normalized.length ? normalized : undefined;
+      } catch {
+        return undefined;
+      }
+    })();
+    const selectedTagContexts = (() => {
+      if (typeof row.tagContextsJson !== "string" || !row.tagContextsJson)
+        return undefined;
+      try {
+        const normalized = normalizeTagContextRefs(
+          JSON.parse(row.tagContextsJson) as unknown,
+        );
+        return normalized.length ? normalized : undefined;
+      } catch {
+        return undefined;
+      }
+    })();
     const screenshotImages = (() => {
       if (typeof row.screenshotImages !== "string" || !row.screenshotImages)
         return undefined;
@@ -2155,6 +2233,8 @@ export async function loadCodexConversation(
       fullTextPaperContexts,
       citationPaperContexts,
       quoteCitations,
+      selectedCollectionContexts,
+      selectedTagContexts,
       screenshotImages,
       attachments,
       generatedImages,
@@ -2430,6 +2510,8 @@ export async function updateLatestCodexUserMessage(
     | "pdfPaperContexts"
     | "fullTextPaperContexts"
     | "citationPaperContexts"
+    | "selectedCollectionContexts"
+    | "selectedTagContexts"
     | "screenshotImages"
     | "attachments"
   >,
@@ -2454,6 +2536,12 @@ export async function updateLatestCodexUserMessage(
   const selectedTextNoteContexts = selectedTextContexts.map(
     (context) => context.noteContext,
   );
+  const selectedCollectionContexts = normalizeCollectionContextRefs(
+    message.selectedCollectionContexts,
+  );
+  const selectedTagContexts = normalizeTagContextRefs(
+    message.selectedTagContexts,
+  );
   const messageTimestamp = Number.isFinite(message.timestamp)
     ? Math.floor(message.timestamp)
     : Date.now();
@@ -2477,6 +2565,8 @@ export async function updateLatestCodexUserMessage(
            pdf_paper_contexts_json = ?,
            full_text_paper_contexts_json = ?,
            citation_paper_contexts_json = ?,
+           collection_contexts_json = ?,
+           tag_contexts_json = ?,
            screenshot_images = ?,
            attachments_json = ?
        WHERE id = (
@@ -2527,6 +2617,10 @@ export async function updateLatestCodexUserMessage(
               normalizePaperContextRefs(message.citationPaperContexts),
             )
           : null,
+        selectedCollectionContexts.length
+          ? JSON.stringify(selectedCollectionContexts)
+          : null,
+        selectedTagContexts.length ? JSON.stringify(selectedTagContexts) : null,
         message.screenshotImages?.length
           ? JSON.stringify(message.screenshotImages)
           : null,

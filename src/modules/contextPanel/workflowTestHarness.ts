@@ -836,6 +836,14 @@ async function exercisePanelDraftStateRefresh(
 async function seedPanelStoredUserMessage(
   panelId: string,
   text: string,
+  contexts: Pick<
+    Message,
+    | "paperContexts"
+    | "pdfPaperContexts"
+    | "fullTextPaperContexts"
+    | "selectedCollectionContexts"
+    | "selectedTagContexts"
+  > = {},
 ): Promise<WorkflowTestDiagnostics> {
   assertWorkflowTestEnabled();
   const panel = getPanel(panelId);
@@ -852,6 +860,7 @@ async function seedPanelStoredUserMessage(
     throw new Error("Workflow panel has no active conversation key");
   }
   const message = {
+    ...contexts,
     role: "user" as const,
     text,
     timestamp: Date.now(),
@@ -2277,6 +2286,13 @@ async function getDiagnostics(
     ).map((node) => ((node as Element).textContent || "").trim()),
     selectedContextLabels: Array.from(
       body?.querySelectorAll(".llm-selected-context-meta") || [],
+    ).map((node) => ((node as Element).textContent || "").trim()),
+    sentContextBadgeLabels: Array.from(
+      body?.querySelectorAll("#llm-chat-box .llm-user-context-badges button") ||
+        [],
+    ).map((node) => ((node as Element).textContent || "").trim()),
+    sentContextItemLabels: Array.from(
+      body?.querySelectorAll("#llm-chat-box .llm-user-papers-item-title") || [],
     ).map((node) => ((node as Element).textContent || "").trim()),
     historyNewVisible: historyNewBtn
       ? historyNewBtn.style.display !== "none"

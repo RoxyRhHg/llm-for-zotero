@@ -147,6 +147,8 @@ export type WorkflowTestDiagnostics = {
   contextSnapshot?: ResolvedContextSource | null;
   chipText: string[];
   selectedContextLabels: string[];
+  sentContextBadgeLabels: string[];
+  sentContextItemLabels: string[];
   historyNewVisible?: boolean;
   historyToggleVisible?: boolean;
   runtimeSystemToggles: WorkflowTestRuntimeSystemToggle[];
@@ -347,6 +349,14 @@ export type WorkflowTestApi = {
   seedPanelStoredUserMessage: (
     panelId: string,
     text: string,
+    contexts?: Pick<
+      import("./types").Message,
+      | "paperContexts"
+      | "pdfPaperContexts"
+      | "fullTextPaperContexts"
+      | "selectedCollectionContexts"
+      | "selectedTagContexts"
+    >,
   ) => Promise<WorkflowTestDiagnostics>;
   clickPanelSystemToggle: (
     panelId: string,
