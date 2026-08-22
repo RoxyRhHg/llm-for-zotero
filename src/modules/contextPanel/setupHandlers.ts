@@ -16,6 +16,7 @@ import {
   getQueuedFollowUps,
   registerQueuedFollowUpBody,
   removeQueuedFollowUp,
+  restoreQueuedFollowUp,
   scheduleQueuedFollowUpDrainForThread,
   SCHEDULE_QUEUED_FOLLOW_UP_DRAIN_PROPERTY,
   SCHEDULE_QUEUED_FOLLOW_UP_THREAD_DRAIN_PROPERTY,
@@ -418,7 +419,10 @@ import {
   isZoteroItemDragEvent,
   parseZoteroItemDragData,
 } from "./setupHandlers/controllers/fileIntakeController";
-import { createSendFlowController } from "./setupHandlers/controllers/sendFlowController";
+import {
+  createSendFlowController,
+  type SendFlowOptions,
+} from "./setupHandlers/controllers/sendFlowController";
 import { cancelVisiblePendingConfirmationCards } from "./setupHandlers/controllers/cancelPendingConfirmationController";
 import { buildInlineEditRetryContextSnapshot } from "./setupHandlers/controllers/inlineEditRetryController";
 import { attachAssistantSelectionPopup } from "./setupHandlers/controllers/assistantSelectionPopupController";
@@ -6410,10 +6414,7 @@ export function setupHandlers(
     if (slashToken) return { ...slashToken, trigger: "/" };
     return null;
   };
-  let doSend: (options?: {
-    overrideText?: string;
-    preserveInputDraft?: boolean;
-  }) => Promise<void> = async () => {};
+  let doSend: (options?: SendFlowOptions) => Promise<void> = async () => {};
 
   const actionCommandController = createActionCommandController({
     body,
@@ -7184,12 +7185,19 @@ export function setupHandlers(
     const next = shiftQueuedFollowUp(threadKey);
     renderQueuedFollowUpInputs();
     if (!next) return;
+    let queuedInputRestored = false;
     await doSend({
       overrideText: next.text,
       preserveInputDraft: true,
+      restoreQueuedInput: () => {
+        queuedInputRestored = true;
+        restoreQueuedFollowUp(threadKey, next);
+      },
     });
     persistDraftInputForCurrentConversation();
-    scheduleQueuedFollowUpDrainForThread(getQueuedFollowUpThreadKey());
+    if (!queuedInputRestored) {
+      scheduleQueuedFollowUpDrainForThread(getQueuedFollowUpThreadKey());
+    }
   }
 
   // Send button - use addEventListener

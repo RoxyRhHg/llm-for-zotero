@@ -138,12 +138,7 @@ type ActionCommandControllerDeps = {
     paperContexts: PaperContextRef[],
   ) => PaperContextRef[];
   getSelectedProfile: () => ActionProfile | null;
-  getDoSend: () =>
-    | ((options?: {
-        overrideText?: string;
-        preserveInputDraft?: boolean;
-      }) => Promise<void>)
-    | null;
+  getDoSend: () => (() => Promise<void>) | null;
   closeRetryModelMenu: () => void;
   closeModelMenu: () => void;
   closeReasoningMenu: () => void;

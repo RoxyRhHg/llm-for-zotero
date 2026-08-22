@@ -858,16 +858,21 @@ describe("sendFlowController", function () {
       buildModelPromptWithFileContext: (question: string) => question,
     });
     inputBox.value = "draft typed while waiting";
+    let restoreCalls = 0;
 
     await controller.doSend({
       overrideText: "queued follow-up",
       preserveInputDraft: true,
+      restoreQueuedInput: () => {
+        restoreCalls += 1;
+      },
     });
 
     assert.equal(getLastSend().lastSentQuestion, "queued follow-up");
     assert.equal(inputBox.value, "draft typed while waiting");
     assert.equal(getCounts().persistDraftInputCalls, 0);
     assert.equal(getCounts().composerDraftClearedCalls, 0);
+    assert.equal(restoreCalls, 0);
   });
 
   it("uses retain-pinned callbacks for edit-latest flow", async function () {
@@ -2600,6 +2605,54 @@ describe("sendFlowController", function () {
     assert.equal(owner, 0);
     assert.equal(inputBox.value, "ask question");
     assert.equal(getDraftValue(), "ask question");
+  });
+
+  it("restores a queued follow-up when preparation is cancelled", async function () {
+    let resolveContext: ((value: ResolvedContextSource | null) => void) | null =
+      null;
+    const contextReady = new Promise<ResolvedContextSource | null>(
+      (resolve) => {
+        resolveContext = resolve;
+      },
+    );
+    const abortController = new AbortController();
+    const queued = ["later follow-up"];
+    let owner = 92;
+    const { controller, inputBox, getCounts } = createBaseDeps({
+      resolveContextSource: () => contextReady,
+      beginRequest: () => ({
+        conversationKey: item.id,
+        requestId: 92,
+        signal: abortController.signal,
+      }),
+      isRequestOwner: (_conversationKey: number, requestId: number) =>
+        owner === requestId,
+      finishRequest: (
+        _body: Element,
+        _item: Zotero.Item,
+        _conversationKey: number,
+        requestId: number,
+      ) => {
+        if (owner !== requestId) return false;
+        owner = 0;
+        return true;
+      },
+    });
+    inputBox.value = "draft typed while waiting";
+
+    const send = controller.doSend({
+      overrideText: "queued follow-up",
+      preserveInputDraft: true,
+      restoreQueuedInput: () => queued.unshift("queued follow-up"),
+    });
+    abortController.abort();
+    resolveContext?.(null);
+    await send;
+
+    assert.equal(getCounts().sendCalled, 0);
+    assert.equal(owner, 0);
+    assert.deepEqual(queued, ["queued follow-up", "later follow-up"]);
+    assert.equal(inputBox.value, "draft typed while waiting");
   });
 
   it("restores the captured draft when preparation fails", async function () {

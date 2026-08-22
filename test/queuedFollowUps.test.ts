@@ -6,6 +6,7 @@ import {
   getQueuedFollowUps,
   registerQueuedFollowUpBody,
   removeQueuedFollowUp,
+  restoreQueuedFollowUp,
   scheduleQueuedFollowUpDrainForThread,
   SCHEDULE_QUEUED_FOLLOW_UP_DRAIN_PROPERTY,
   setQueuedFollowUpBodySyncCallback,
@@ -67,6 +68,57 @@ describe("queuedFollowUps", function () {
     assert.equal(shiftQueuedFollowUp(key)?.text, "first");
     assert.equal(shiftQueuedFollowUp(key)?.text, "second");
     assert.isNull(shiftQueuedFollowUp(key));
+  });
+
+  it("restores a cancelled drain in its original FIFO position", function () {
+    const key = "codex:7";
+    enqueueQueuedFollowUp(key, "first");
+    enqueueQueuedFollowUp(key, "second");
+    const first = shiftQueuedFollowUp(key);
+    if (!first) assert.fail("expected a queued prompt");
+
+    restoreQueuedFollowUp(key, first);
+
+    assert.equal(shiftQueuedFollowUp(key)?.text, "first");
+    assert.equal(shiftQueuedFollowUp(key)?.text, "second");
+  });
+
+  it("does not restore a cancelled drain into another active thread", function () {
+    const sourceKey = "upstream:9";
+    const otherKey = "upstream:19";
+    enqueueQueuedFollowUp(sourceKey, "source follow-up");
+    enqueueQueuedFollowUp(otherKey, "other follow-up");
+    const sourceEntry = shiftQueuedFollowUp(sourceKey);
+    if (!sourceEntry) assert.fail("expected a queued prompt");
+
+    restoreQueuedFollowUp(sourceKey, sourceEntry);
+
+    assert.deepEqual(
+      getQueuedFollowUps(sourceKey).map((entry) => entry.text),
+      ["source follow-up"],
+    );
+    assert.deepEqual(
+      getQueuedFollowUps(otherKey).map((entry) => entry.text),
+      ["other follow-up"],
+    );
+  });
+
+  it("restores a cancelled drain through an explicit thread transfer", function () {
+    const sourceKey = "upstream:9";
+    const targetKey = "upstream:19";
+    enqueueQueuedFollowUp(sourceKey, "queued before provisioning");
+    enqueueQueuedFollowUp(targetKey, "already on the provisioned thread");
+    const sourceEntry = shiftQueuedFollowUp(sourceKey);
+    if (!sourceEntry) assert.fail("expected a queued prompt");
+    transferQueuedFollowUpThreadState(sourceKey, targetKey);
+
+    restoreQueuedFollowUp(sourceKey, sourceEntry);
+
+    assert.deepEqual(getQueuedFollowUps(sourceKey), []);
+    assert.deepEqual(
+      getQueuedFollowUps(targetKey).map((entry) => entry.text),
+      ["queued before provisioning", "already on the provisioned thread"],
+    );
   });
 
   it("removes queued prompts by id", function () {

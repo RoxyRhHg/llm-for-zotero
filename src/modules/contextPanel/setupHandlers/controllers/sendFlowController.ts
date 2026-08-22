@@ -67,6 +67,18 @@ type LatestEditablePair = {
   };
 };
 
+export type SendFlowOptions =
+  | {
+      overrideText?: string;
+      preserveInputDraft?: false;
+      restoreQueuedInput?: never;
+    }
+  | {
+      overrideText: string;
+      preserveInputDraft: true;
+      restoreQueuedInput: () => void;
+    };
+
 type SendFlowControllerDeps = {
   body: Element;
   inputBox: HTMLTextAreaElement;
@@ -254,15 +266,9 @@ type SendFlowControllerDeps = {
 };
 
 export function createSendFlowController(deps: SendFlowControllerDeps): {
-  doSend: (options?: {
-    overrideText?: string;
-    preserveInputDraft?: boolean;
-  }) => Promise<void>;
+  doSend: (options?: SendFlowOptions) => Promise<void>;
 } {
-  const doSend = async (options?: {
-    overrideText?: string;
-    preserveInputDraft?: boolean;
-  }) => {
+  const doSend = async (options?: SendFlowOptions) => {
     const item = deps.getItem();
     if (!item) return;
 
@@ -283,11 +289,15 @@ export function createSendFlowController(deps: SendFlowControllerDeps): {
       deps.isRequestOwner(request.conversationKey, request.requestId) &&
       !request.signal.aborted;
     const shouldClearDraft = !options?.preserveInputDraft;
-    let draftRestored = false;
+    let submittedInputRestored = false;
     let providerDispatchStarted = false;
-    const restoreCapturedDraft = () => {
-      if (!shouldClearDraft || draftRestored) return;
-      draftRestored = true;
+    const restoreSubmittedInput = () => {
+      if (providerDispatchStarted || submittedInputRestored) return;
+      submittedInputRestored = true;
+      if (options?.preserveInputDraft) {
+        options.restoreQueuedInput();
+        return;
+      }
       deps.inputBox.value = capturedDraft;
       deps.persistDraftInput();
       deps.onComposerDraftRestored?.();
@@ -711,7 +721,7 @@ export function createSendFlowController(deps: SendFlowControllerDeps): {
           advanced: advancedParams,
         });
         if (editResult !== "ok") {
-          restoreCapturedDraft();
+          restoreSubmittedInput();
           if (editResult === "stale") {
             deps.setActiveEditSession(null);
             deps.setStatusMessage?.(deps.editStaleStatusText, "error");
@@ -725,7 +735,7 @@ export function createSendFlowController(deps: SendFlowControllerDeps): {
           deps.setStatusMessage?.("Failed to save edited prompt", "error");
           return;
         }
-        if (!providerDispatchStarted) restoreCapturedDraft();
+        if (!providerDispatchStarted) restoreSubmittedInput();
 
         deps.retainPinnedImageState(item.id);
         if (hasPaperComposeState) {
@@ -866,10 +876,10 @@ export function createSendFlowController(deps: SendFlowControllerDeps): {
       try {
         await sendTask;
         if (!providerDispatchStarted && !requestIsActive()) {
-          restoreCapturedDraft();
+          restoreSubmittedInput();
         }
       } catch (err) {
-        if (!providerDispatchStarted) restoreCapturedDraft();
+        if (!providerDispatchStarted) restoreSubmittedInput();
         restoreWebChatPdfModeAfterUnverifiedSend();
         if (isWebChat && webchatForceNewChat) {
           deps.markWebChatForceNewChatIntent?.();
@@ -893,7 +903,7 @@ export function createSendFlowController(deps: SendFlowControllerDeps): {
       deps.refreshGlobalHistoryHeader();
     } finally {
       if (request.signal.aborted && !providerDispatchStarted) {
-        restoreCapturedDraft();
+        restoreSubmittedInput();
       }
       const currentConversationKey = deps.getConversationKey(item);
       let finished = deps.finishRequest(
@@ -910,8 +920,8 @@ export function createSendFlowController(deps: SendFlowControllerDeps): {
           request.requestId,
         );
       }
-      if (finished && shouldClearDraft && !providerDispatchStarted) {
-        restoreCapturedDraft();
+      if (finished && !providerDispatchStarted) {
+        restoreSubmittedInput();
       }
       deps.autoUnlockGlobalChat();
       deps.onSendSettled?.();
