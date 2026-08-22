@@ -49,6 +49,7 @@ import type {
   WorkflowTestHistorySearchResult,
   WorkflowTestSeededTurn,
   WorkflowTestConversationPersistenceSnapshot,
+  WorkflowTestStaleAgentTraceIsolationResult,
 } from "./workflowTestTypes";
 import { forcePendingTurnFinalizeFailuresForTests } from "./pendingDeletionWiring";
 import {
@@ -60,7 +61,9 @@ import {
   buildAssistantDisplayMarkdownForRender,
   ensureConversationLoaded,
   getConversationKey,
+  hasAgentRunTraceForTests,
   refreshChat,
+  setAgentRunTraceLoaderForTests,
   updateContextUsageSnapshotFromProvider,
 } from "./chat";
 import {
@@ -714,6 +717,170 @@ async function renderPanelForItemInternal(
   const panel = { id: panelId, body, item: mountedItem, contextSnapshot };
   panels.set(panelId, panel);
   return { panelId, itemId, contextSnapshot };
+}
+
+async function exerciseStaleAgentTracePanelIsolation(input: {
+  panelId: string;
+  paperBItemId: number;
+  paperAMarker: string;
+  paperBMarker: string;
+  paperBAppendMarker: string;
+  runId: string;
+}): Promise<WorkflowTestStaleAgentTraceIsolationResult> {
+  assertWorkflowTestEnabled();
+  const panel = getPanel(input.panelId);
+  const body = panel.body;
+  const paperAItem = activeContextPanels.get(body)?.() || panel.item;
+  const paperAConversationKey = getConversationKey(paperAItem);
+  const paperBItem = Zotero.Items.get(input.paperBItemId);
+  if (!paperAConversationKey || !paperBItem) {
+    throw new Error("Workflow trace isolation requires two mounted papers");
+  }
+
+  const runId = input.runId.trim();
+  if (!runId) throw new Error("Workflow trace isolation requires a run ID");
+  let traceLoadStarted = false;
+  let traceResolved = false;
+  let resolveTrace: (value: { run: null; events: [] }) => void = () => {};
+  const traceResult = new Promise<{ run: null; events: [] }>((resolve) => {
+    resolveTrace = resolve;
+  });
+  setAgentRunTraceLoaderForTests(async (requestedRunId) => {
+    if (requestedRunId !== runId) {
+      throw new Error(`Unexpected workflow trace request: ${requestedRunId}`);
+    }
+    traceLoadStarted = true;
+    return traceResult;
+  });
+
+  try {
+    const paperATimestamp = Date.now() - 10;
+    const paperAUserMessage: Message = {
+      role: "user",
+      text: `${input.paperAMarker} request`,
+      timestamp: paperATimestamp,
+    };
+    const paperAAssistantMessage: Message = {
+      role: "assistant",
+      text: input.paperAMarker,
+      timestamp: paperATimestamp + 1,
+      runMode: "agent",
+      agentRunId: runId,
+    };
+    await appendWorkflowStoredMessage(
+      "upstream",
+      paperAConversationKey,
+      paperAUserMessage,
+    );
+    await appendWorkflowStoredMessage(
+      "upstream",
+      paperAConversationKey,
+      paperAAssistantMessage,
+    );
+    chatHistory.set(paperAConversationKey, [
+      ...(chatHistory.get(paperAConversationKey) || []),
+      paperAUserMessage,
+      paperAAssistantMessage,
+    ]);
+    loadedConversationKeys.add(paperAConversationKey);
+    refreshChat(body, paperAItem);
+
+    const traceStartDeadline = Date.now() + 5000;
+    while (!traceLoadStarted && Date.now() < traceStartDeadline) {
+      await Zotero.Promise.delay(25);
+    }
+    if (!traceLoadStarted) {
+      throw new Error("Timed out waiting for the paper A trace request");
+    }
+
+    disposeSetupHandlers(body);
+    buildUI(body, paperBItem);
+    activeContextPanels.set(body, () => paperBItem);
+    activeContextPanelRawItems.set(body, paperBItem);
+    setupHandlers(body, paperBItem);
+    await ensureConversationLoaded(paperBItem);
+    const paperBConversationKey = getConversationKey(paperBItem);
+    if (!paperBConversationKey) {
+      throw new Error("Workflow paper B has no conversation key");
+    }
+    const paperBMessage: Message = {
+      role: "user",
+      text: input.paperBMarker,
+      timestamp: Date.now(),
+    };
+    await appendWorkflowStoredMessage(
+      "upstream",
+      paperBConversationKey,
+      paperBMessage,
+    );
+    chatHistory.set(paperBConversationKey, [
+      ...(chatHistory.get(paperBConversationKey) || []),
+      paperBMessage,
+    ]);
+    loadedConversationKeys.add(paperBConversationKey);
+    panel.item = paperBItem;
+    panel.contextSnapshot = await resolveContextSourceItemAsync(paperBItem);
+    refreshChat(body, paperBItem);
+    activeContextPanelStateSync.get(body)?.();
+    await Zotero.Promise.delay(100);
+    const beforeTraceResolution = await getDiagnostics(input.panelId);
+
+    resolveTrace({ run: null, events: [] });
+    traceResolved = true;
+    const traceCacheDeadline = Date.now() + 5000;
+    while (
+      !hasAgentRunTraceForTests(runId) &&
+      Date.now() < traceCacheDeadline
+    ) {
+      await Zotero.Promise.delay(25);
+    }
+    const traceCached = hasAgentRunTraceForTests(runId);
+    if (!traceCached) {
+      throw new Error("Timed out waiting for the paper A trace cache");
+    }
+    await Zotero.Promise.delay(100);
+    const afterTraceResolution = await getDiagnostics(input.panelId);
+
+    const paperABefore = await getWorkflowConversationPersistenceSnapshot(
+      "upstream",
+      paperAConversationKey,
+    );
+    const paperBBefore = await getWorkflowConversationPersistenceSnapshot(
+      "upstream",
+      paperBConversationKey,
+    );
+    const afterPaperBAppend = await seedPanelStoredUserMessage(
+      input.panelId,
+      input.paperBAppendMarker,
+    );
+    const paperAAfter = await getWorkflowConversationPersistenceSnapshot(
+      "upstream",
+      paperAConversationKey,
+    );
+    const paperBAfter = await getWorkflowConversationPersistenceSnapshot(
+      "upstream",
+      paperBConversationKey,
+    );
+
+    return {
+      paperAConversationKey,
+      paperBConversationKey,
+      beforeTraceResolution,
+      afterTraceResolution,
+      afterPaperBAppend,
+      traceCached,
+      paperAMessageRowsBeforePaperBAppend: paperABefore.messageRows,
+      paperAMessageRowsAfterPaperBAppend: paperAAfter.messageRows,
+      paperBMessageRowsBeforePaperBAppend: paperBBefore.messageRows,
+      paperBMessageRowsAfterPaperBAppend: paperBAfter.messageRows,
+    };
+  } finally {
+    if (!traceResolved) {
+      resolveTrace({ run: null, events: [] });
+      await Zotero.Promise.delay(0);
+    }
+    setAgentRunTraceLoaderForTests();
+  }
 }
 
 function dispatchWorkflowClick(
@@ -2968,6 +3135,7 @@ async function exerciseHighlightAwareContextRetrieval(input: {
 
 async function reset(): Promise<void> {
   assertWorkflowTestEnabled();
+  setAgentRunTraceLoaderForTests();
   await closeStandalone();
   lastSend = null;
   lastFinalRequest = null;
@@ -3524,6 +3692,7 @@ export function installWorkflowTestHarness(targetAddon: {
     },
     setWorkflowProviderSession,
     getWorkflowConversationPersistenceSnapshot,
+    exerciseStaleAgentTracePanelIsolation,
     createStandaloneAttachmentFixture,
     createItemNoteFixture,
     createStandaloneNoteFixture,

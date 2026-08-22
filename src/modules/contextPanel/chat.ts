@@ -467,6 +467,22 @@ async function awaitPendingTurnFinalize(
 }
 
 const blockedConversationLoadKeys = new Set<number>();
+type AgentRunTraceLoader = typeof getAgentRunTrace;
+let agentRunTraceLoader: AgentRunTraceLoader = getAgentRunTrace;
+
+export function setAgentRunTraceLoaderForTests(
+  loader?: AgentRunTraceLoader,
+): void {
+  agentRunTraceLoader = loader || getAgentRunTrace;
+  if (!loader) {
+    agentRunTraceCache.clear();
+    agentRunTraceLoadingTasks.clear();
+  }
+}
+
+export function hasAgentRunTraceForTests(runId: string): boolean {
+  return agentRunTraceCache.has((runId || "").trim());
+}
 
 function isEffectiveWebChatRequest(item: Zotero.Item): boolean {
   try {
@@ -2384,7 +2400,7 @@ async function ensureAgentRunTraceLoaded(
   }
   const task = (async () => {
     try {
-      const trace = await getAgentRunTrace(normalizedRunId);
+      const trace = await agentRunTraceLoader(normalizedRunId);
       if (!isFrozen()) {
         agentRunTraceCache.set(normalizedRunId, trace.events);
       }
@@ -2393,12 +2409,20 @@ async function ensureAgentRunTraceLoaded(
     } finally {
       agentRunTraceLoadingTasks.delete(normalizedRunId);
       if (body && item && !isFrozen()) {
-        refreshChat(body, item);
+        refreshConversationPanels(body, item);
       }
     }
   })();
   agentRunTraceLoadingTasks.set(normalizedRunId, task);
   await task;
+}
+
+export function ensureAgentRunTraceLoadedForTests(
+  runId: string,
+  body: Element,
+  item: Zotero.Item,
+): Promise<void> {
+  return ensureAgentRunTraceLoaded(runId, body, item);
 }
 
 function getCachedAgentRunEvents(
@@ -2997,6 +3021,24 @@ function getPanelBodyConversationKey(
     return getConversationKey(item);
   }
   return null;
+}
+
+export function isPanelConversationCurrent(
+  body: Element,
+  item: Zotero.Item,
+): boolean {
+  const conversationKey = getConversationKey(item);
+  const panelRoot = body.querySelector("#llm-main") as HTMLElement | null;
+  const displayedKey = Number(panelRoot?.dataset.itemId || 0);
+  if (
+    Number.isFinite(displayedKey) &&
+    displayedKey > 0 &&
+    displayedKey !== conversationKey
+  ) {
+    return false;
+  }
+  const activeItem = activeContextPanels.get(body)?.() || null;
+  return !activeItem || getConversationKey(activeItem) === conversationKey;
 }
 
 function cleanupDisconnectedPanelBody(body: Element): void {
@@ -4562,7 +4604,7 @@ const MAX_QUOTE_VALIDATION_DECISION_ENTRIES = 1000;
 const MAX_QUOTE_VALIDATION_DECISION_BYTES = 4 * 1024 * 1024;
 const MAX_QUOTE_SOURCE_INDEX_ENTRIES = 64;
 const MAX_QUOTE_SOURCE_INDEX_BYTES = 2 * 1024 * 1024;
-const QUOTE_VALIDATION_POLICY_VERSION = 6;
+const QUOTE_VALIDATION_POLICY_VERSION = 7;
 type QuoteValidationDecision = ReturnType<
   typeof finalizeAssistantQuoteCitations
 >;
@@ -11260,7 +11302,7 @@ function buildInlineEditWidget(
     setInlineEditCleanup(null);
     setInlineEditTarget(null);
     const win = body.ownerDocument?.defaultView;
-    if (win) win.setTimeout(() => refreshChat(body, item), 0);
+    if (win) win.setTimeout(() => refreshConversationPanels(body, item), 0);
   };
 
   // Header: "Editing" label + Cancel button
@@ -11384,6 +11426,7 @@ export function refreshChat(
   item?: Zotero.Item | null,
   options: RefreshChatOptions = {},
 ) {
+  if (item && !isPanelConversationCurrent(body, item)) return;
   const chatBox = body.querySelector("#llm-chat-box") as HTMLDivElement | null;
   if (!chatBox) return;
   const doc = body.ownerDocument!;
@@ -12309,7 +12352,7 @@ export function refreshChat(
               assistantTimestamp: Math.floor(assistantPairMsg!.timestamp),
               currentText: msg.text || "",
             });
-            win.setTimeout(() => refreshChat(body, item), 0);
+            win.setTimeout(() => refreshConversationPanels(body, item), 0);
           });
         }
       }
@@ -12804,7 +12847,7 @@ export function refreshChat(
                 reasoningDetails: m.thinking || undefined,
               }));
               chatHistory.set(conversationKey, refreshed);
-              refreshChat(body, item);
+              refreshConversationPanels(body, item);
             } else {
               refreshBtn.title =
                 "No messages found — chat site may be on a different page";
@@ -12920,15 +12963,7 @@ export function refreshConversationPanels(
   const conversationKey = getConversationKey(primaryItem);
   const refreshedPanels = new Set<Element>();
   const refreshOne = (body: Element, item: Zotero.Item) => {
-    const panelRoot = body.querySelector("#llm-main") as HTMLElement | null;
-    const displayedKey = Number(panelRoot?.dataset.itemId || 0);
-    if (
-      Number.isFinite(displayedKey) &&
-      displayedKey > 0 &&
-      displayedKey !== conversationKey
-    ) {
-      return;
-    }
+    if (!isPanelConversationCurrent(body, item)) return;
     const chatBox = body.querySelector(
       "#llm-chat-box",
     ) as HTMLDivElement | null;

@@ -294,6 +294,19 @@ export type WorkflowTestConversationPersistenceSnapshot = {
   pendingDeletionRows: number;
 };
 
+export type WorkflowTestStaleAgentTraceIsolationResult = {
+  paperAConversationKey: number;
+  paperBConversationKey: number;
+  beforeTraceResolution: WorkflowTestDiagnostics;
+  afterTraceResolution: WorkflowTestDiagnostics;
+  afterPaperBAppend: WorkflowTestDiagnostics;
+  traceCached: boolean;
+  paperAMessageRowsBeforePaperBAppend: number;
+  paperAMessageRowsAfterPaperBAppend: number;
+  paperBMessageRowsBeforePaperBAppend: number;
+  paperBMessageRowsAfterPaperBAppend: number;
+};
+
 export type WorkflowTestApi = {
   reset: () => Promise<void>;
   createPaperWithPdfFixture: (input: {
@@ -311,6 +324,14 @@ export type WorkflowTestApi = {
     system: ConversationSystem,
     conversationKey: number,
   ) => Promise<WorkflowTestConversationPersistenceSnapshot>;
+  exerciseStaleAgentTracePanelIsolation: (input: {
+    panelId: string;
+    paperBItemId: number;
+    paperAMarker: string;
+    paperBMarker: string;
+    paperBAppendMarker: string;
+    runId: string;
+  }) => Promise<WorkflowTestStaleAgentTraceIsolationResult>;
   createStandaloneAttachmentFixture: (input: {
     title: string;
     filename: string;

@@ -63,6 +63,8 @@ const MAX_ADJACENT_PAGE_EDGE_GAP_TOKENS = 600;
 const MARKDOWN_IMAGE_PATTERN = /!\[[^\]\n]*\]\([^)\n]+\)/g;
 const COMPLETE_TRAILING_SOURCE_LOCATOR_PATTERN =
   /(\((?:(?:supplementary|supp\.?)\s+)?(?:fig(?:ure)?|table|eq(?:uation)?|appendix)\b[^()\n]{0,120}\)[.!?。！？]+["'”’]?)$/iu;
+const TRAILING_PARTIAL_TOKEN_ELLIPSIS_PATTERN =
+  /([\p{L}\p{M}]{3,})(?:\.{3,}|\u2026)$/u;
 
 function isInvalidTextControlCode(code: number): boolean {
   return (
@@ -2766,6 +2768,93 @@ function resolveExactDisplayedQuoteCitationsWithLabelFallback(params: {
   return resolveDisplayedQuoteCitations(params);
 }
 
+function resolveTrailingPartialTokenQuoteCitation(params: {
+  quoteText: string;
+  sourceIndex: QuoteSourceIndex;
+}): QuoteCitation | undefined {
+  const displayedQuoteText = stripOuterQuoteDelimiters(
+    normalizeMultilineText(params.quoteText),
+  );
+  const partialMatch = displayedQuoteText.match(
+    TRAILING_PARTIAL_TOKEN_ELLIPSIS_PATTERN,
+  );
+  if (!partialMatch || partialMatch.index === undefined) return undefined;
+
+  const partialIndex = buildQuoteTextIndex(partialMatch[1] || "");
+  const partialToken = partialIndex.tokens[0];
+  if (!partialToken || partialIndex.tokens.length !== 1) return undefined;
+
+  const displayedPrefix = displayedQuoteText
+    .slice(0, partialMatch.index)
+    .trimEnd();
+  const prefixIndex = buildQuoteTextIndex(displayedPrefix);
+  if (prefixIndex.tokens.length < MIN_AUTO_TRUSTED_QUOTE_TOKENS) {
+    return undefined;
+  }
+
+  const candidates: Array<{
+    source: QuoteSourceIndexEntry;
+    sourceMatchText: string;
+    occurrenceIndex: number;
+  }> = [];
+  for (const { source } of filterQuoteAnchorSources({
+    sourceIndex: params.sourceIndex,
+  })) {
+    if (
+      source.sourceMatchSource !== "pdf-page-text" ||
+      !source.contextItemId ||
+      source.pageHintIndex === undefined
+    ) {
+      continue;
+    }
+    const sourceIndex =
+      source.textIndex || buildQuoteTextIndex(source.sourceText);
+    const spans = findQuoteSourceSpansAllowingLayoutArtifactsFromIndex(
+      sourceIndex,
+      prefixIndex,
+    );
+    for (const span of spans) {
+      const nextSourceToken = sourceIndex.tokens.find(
+        (token) => token.sourceStart >= span.sourceEnd,
+      );
+      if (
+        !nextSourceToken ||
+        nextSourceToken.text === partialToken.text ||
+        !nextSourceToken.text.startsWith(partialToken.text)
+      ) {
+        continue;
+      }
+      const sourceMatchText = normalizeText(span.text);
+      if (!sourceMatchText) continue;
+      candidates.push({
+        source,
+        sourceMatchText,
+        occurrenceIndex: span.occurrenceIndex,
+      });
+    }
+  }
+  if (candidates.length !== 1) return undefined;
+
+  const candidate = candidates[0];
+  return buildQuoteCitation({
+    quoteText: candidate.sourceMatchText,
+    displayQuoteText: `${candidate.sourceMatchText}\u2026`,
+    citationLabel: candidate.source.citationLabel,
+    sourceMatchText: candidate.sourceMatchText,
+    sourceMatchKind: "normalized-span",
+    sourceMatchSource: "pdf-page-text",
+    sourceSectionLabel: candidate.source.sectionLabel,
+    sourceChunkKind: candidate.source.chunkKind,
+    contextItemId: candidate.source.contextItemId,
+    itemId: candidate.source.itemId,
+    sourceFingerprint: candidate.source.sourceFingerprint,
+    sourceMatchPageOccurrence: candidate.occurrenceIndex,
+    pageHintIndex: candidate.source.pageHintIndex,
+    pageHintLabel: candidate.source.pageHintLabel,
+    allowShortQuoteText: true,
+  });
+}
+
 function hasCompleteDisplayedQuoteSourceMatch(params: {
   quoteText: string;
   sourceIndex: QuoteSourceIndex;
@@ -2824,6 +2913,13 @@ export function classifyDisplayedQuoteSource(params: {
   });
   if (quoteCitations.length) {
     return { kind: "matched", quoteCitations };
+  }
+  const trailingPartialCitation = resolveTrailingPartialTokenQuoteCitation({
+    quoteText,
+    sourceIndex: params.sourceIndex,
+  });
+  if (trailingPartialCitation) {
+    return { kind: "matched", quoteCitations: [trailingPartialCitation] };
   }
   const strongPartials = collectStrongPartialDisplayedQuoteSources({
     quoteText,

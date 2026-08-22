@@ -2781,6 +2781,111 @@ describe("quoteCitations", function () {
     assert.isEmpty(finalized.quoteCitations);
   });
 
+  it("authenticates a uniquely grounded trailing partial token by trimming it", function () {
+    const source =
+      "We first study drift in linear Hebbian/anti-Hebbian networks, which compress inputs into a lower dimensional principal subspace29. While";
+    const verifiedPrefix =
+      "We first study drift in linear Hebbian/anti-Hebbian networks, which compress inputs into a lower dimensional principal";
+
+    for (const ellipsis of ["...", "…"]) {
+      const quote = `${verifiedPrefix} subs${ellipsis}`;
+      const finalized = finalizeAssistantQuoteCitations({
+        markdown: `> ${quote}\n\n(Qin et al., 2023)`,
+        sourceIndex: buildQuoteSourceIndex({
+          sourceTexts: [
+            {
+              sourceText: source,
+              sourceLabel: "(Qin et al., 2023)",
+              sourceMatchSource: "pdf-page-text",
+              sourceFingerprint: "pdfworker:qin-page-34",
+              contextItemId: 230,
+              itemId: 61,
+              pageHintIndex: 33,
+              pageHintLabel: "34",
+            },
+          ],
+        }),
+        quoteSourceReview: { sourceEvidenceComplete: true },
+      });
+
+      assert.match(finalized.markdown, /\[\[quote:Q_[a-z0-9]+\]\]/);
+      assert.lengthOf(finalized.quoteCitations, 1);
+      const citation = finalized.quoteCitations[0];
+      assert.equal(citation.quoteText, verifiedPrefix);
+      assert.equal(citation.sourceMatchText, verifiedPrefix);
+      assert.equal(citation.displayQuoteText, `${verifiedPrefix}…`);
+      assert.notInclude(citation.quoteText, "subs");
+      assert.equal(citation.contextItemId, 230);
+      assert.equal(citation.itemId, 61);
+      assert.equal(citation.pageHintIndex, 33);
+      assert.equal(citation.pageHintLabel, "34");
+      assert.equal(citation.sourceFingerprint, "pdfworker:qin-page-34");
+    }
+  });
+
+  it("does not authenticate unsupported trailing-fragment shapes", function () {
+    const source =
+      "We first study drift in linear Hebbian networks which compress inputs into a lower dimensional principal subspace.";
+    const prefix =
+      "We first study drift in linear Hebbian networks which compress inputs into a lower dimensional principal";
+    const sourceIndex = buildQuoteSourceIndex({
+      sourceTexts: [
+        {
+          sourceText: source,
+          sourceLabel: "(Qin et al., 2023)",
+          sourceMatchSource: "pdf-page-text",
+          contextItemId: 230,
+          itemId: 61,
+          pageHintIndex: 33,
+        },
+      ],
+    });
+
+    for (const quote of [
+      `${prefix} subs`,
+      `${prefix} su...`,
+      `${prefix} subx...`,
+      `${prefix} subs... followed by invented prose`,
+    ]) {
+      const finalized = finalizeAssistantQuoteCitations({
+        markdown: `> ${quote}`,
+        sourceIndex,
+        quoteSourceReview: { sourceEvidenceComplete: true },
+      });
+      assert.isEmpty(finalized.quoteCitations, quote);
+    }
+  });
+
+  it("keeps trailing partial tokens unverified when their source location is ambiguous", function () {
+    const source =
+      "A sufficiently long unique-looking prefix describes the lower dimensional principal subspace.";
+    const quote =
+      "A sufficiently long unique-looking prefix describes the lower dimensional principal subs...";
+    const finalize = (
+      sourceTexts: Parameters<typeof buildQuoteSourceIndex>[0]["sourceTexts"],
+    ) =>
+      finalizeAssistantQuoteCitations({
+        markdown: `> ${quote}`,
+        sourceIndex: buildQuoteSourceIndex({ sourceTexts }),
+        quoteSourceReview: { sourceEvidenceComplete: true },
+      });
+    const page = (contextItemId: number, pageHintIndex: number) => ({
+      sourceText: source,
+      sourceLabel: `(Paper ${contextItemId}, 2026)`,
+      sourceMatchSource: "pdf-page-text" as const,
+      contextItemId,
+      itemId: contextItemId - 1,
+      pageHintIndex,
+    });
+
+    assert.isEmpty(
+      finalize([{ ...page(230, 33), sourceText: `${source} ${source}` }])
+        .quoteCitations,
+    );
+    assert.isEmpty(finalize([page(230, 33), page(230, 34)]).quoteCitations);
+    assert.isEmpty(finalize([page(230, 33), page(330, 33)]).quoteCitations);
+  });
+
   it("upgrades strong artifact-aware support with a unique PDF.js certificate", function () {
     const quote =
       "The paper defines low dimensional representations of neural activity using definitions of line and ring attractors which are intuitive concepts commonly applied in computational neuroscience models of memory dynamics";
