@@ -520,7 +520,7 @@ describe("LibraryIndexService", function () {
     assert.equal(fixture.getAllCalls(), 1);
   });
 
-  it("discards an in-flight group projection after a library rename", async function () {
+  it("reconciles a group rename without discarding the cold projection", async function () {
     const firstBuild = deferred<Zotero.Item[]>();
     const item: ItemSeed = {
       id: 1,
@@ -552,8 +552,8 @@ describe("LibraryIndexService", function () {
     const snapshot = await loading;
 
     assert.equal(snapshot.libraryName, "After rename");
-    assert.equal(buildCalls, 2);
-    assert.equal(index.getMetrics().staleBuildDiscards, 1);
+    assert.equal(buildCalls, 1);
+    assert.equal(index.getMetrics().staleBuildDiscards, 0);
   });
 
   it("canonicalizes collection membership after a move is fully reversed", async function () {
@@ -1322,13 +1322,13 @@ describe("LibraryIndexService", function () {
     assert.equal(index.getMetrics().staleBuildDiscards, 1);
   });
 
-  it("invalidates a cold build when a notifier arrives before installation", async function () {
+  it("reconciles a targeted notifier without restarting a cold build", async function () {
     const firstBuild = deferred<Zotero.Item[]>();
     const stale = makeItem({ id: 1, fields: { title: "Before notifier" } });
     const current = makeItem({ id: 1, fields: { title: "After notifier" } });
     let calls = 0;
     installFixture({
-      topLevel: [],
+      topLevel: [{ id: 1, fields: { title: "After notifier" } }],
       getAll: async () => {
         calls += 1;
         return calls === 1 ? firstBuild.promise : [current];
@@ -1347,12 +1347,12 @@ describe("LibraryIndexService", function () {
     firstBuild.resolve([stale]);
     const snapshot = await loading;
 
-    assert.equal(calls, 2);
+    assert.equal(calls, 1);
     assert.equal(snapshot.itemById.get(1)?.title, "After notifier");
-    assert.equal(index.getMetrics().staleBuildDiscards, 1);
+    assert.equal(index.getMetrics().staleBuildDiscards, 0);
   });
 
-  it("invalidates every possible in-flight owner when an erased ID has no library metadata", async function () {
+  it("reconciles every possible in-flight owner when an erased ID has no library metadata", async function () {
     const firstLibraryOne = deferred<Zotero.Item[]>();
     const firstLibraryTwo = deferred<Zotero.Item[]>();
     const calls = new Map<number, number>();
@@ -1403,9 +1403,68 @@ describe("LibraryIndexService", function () {
 
     assert.isFalse(libraryOne.itemById.has(42));
     assert.equal(libraryTwo.itemById.get(200)?.title, "Retained");
-    assert.equal(calls.get(1), 2);
-    assert.equal(calls.get(2), 2);
-    assert.equal(index.getMetrics().staleBuildDiscards, 2);
+    assert.equal(calls.get(1), 1);
+    assert.equal(calls.get(2), 1);
+    assert.equal(index.getMetrics().staleBuildDiscards, 0);
+  });
+
+  it("bounds broad cold invalidations to two scans and refreshes again in the background", async function () {
+    const firstBuild = deferred<Zotero.Item[]>();
+    const secondBuild = deferred<Zotero.Item[]>();
+    const thirdBuild = deferred<Zotero.Item[]>();
+    const secondStarted = deferred<void>();
+    const thirdStarted = deferred<void>();
+    let calls = 0;
+    installFixture({
+      topLevel: [],
+      getAll: async () => {
+        calls += 1;
+        if (calls === 1) return firstBuild.promise;
+        if (calls === 2) {
+          secondStarted.resolve(undefined);
+          return secondBuild.promise;
+        }
+        thirdStarted.resolve(undefined);
+        return thirdBuild.promise;
+      },
+    });
+    const index = service();
+    const refresh = () =>
+      index.handleChange({
+        event: "refresh",
+        type: "refresh",
+        ids: [],
+        extraData: { libraryID: 1 },
+        receivedAt: Date.now(),
+      });
+
+    const loading = index.getSnapshot(1);
+    await refresh();
+    firstBuild.resolve([makeItem({ id: 1, fields: { title: "First scan" } })]);
+    await secondStarted.promise;
+    await refresh();
+    secondBuild.resolve([
+      makeItem({ id: 2, fields: { title: "Second scan" } }),
+    ]);
+
+    const available = await loading;
+    assert.equal(calls, 2);
+    assert.equal(available.itemById.get(2)?.title, "Second scan");
+    assert.strictEqual(await index.getSnapshot(1), available);
+
+    await thirdStarted.promise;
+    assert.equal(index.peekSnapshot(1)?.itemById.get(2)?.title, "Second scan");
+    thirdBuild.resolve([
+      makeItem({ id: 3, fields: { title: "Background scan" } }),
+    ]);
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    assert.equal(
+      index.peekSnapshot(1)?.itemById.get(3)?.title,
+      "Background scan",
+    );
+    assert.equal(index.getMetrics().staleBuildDiscards, 1);
+    assert.equal(index.getMetrics().coalescedRebuilds, 1);
   });
 
   it("clears a failed load task so a later request can retry", async function () {
@@ -1431,6 +1490,40 @@ describe("LibraryIndexService", function () {
     assert.include(firstError, "temporary database failure");
     assert.equal(calls, 2);
     assert.equal(snapshot.itemById.get(9)?.title, "Recovered");
+  });
+
+  it("keeps a warm snapshot and lets a later request retry a failed background rebuild", async function () {
+    let calls = 0;
+    installFixture({
+      topLevel: [],
+      getAll: async () => {
+        calls += 1;
+        if (calls === 1) {
+          return [makeItem({ id: 1, fields: { title: "Available" } })];
+        }
+        if (calls === 2) throw new Error("temporary background failure");
+        return [makeItem({ id: 2, fields: { title: "Recovered" } })];
+      },
+    });
+    const index = service();
+    const available = await index.getSnapshot(1);
+
+    await index.handleChange({
+      event: "refresh",
+      type: "refresh",
+      ids: [],
+      extraData: { libraryID: 1 },
+      receivedAt: Date.now(),
+    });
+    await new Promise((resolve) => setTimeout(resolve, 160));
+
+    assert.strictEqual(index.peekSnapshot(1), available);
+    assert.equal(calls, 2);
+    assert.strictEqual(await index.getSnapshot(1), available);
+    await new Promise((resolve) => setTimeout(resolve, 160));
+
+    assert.equal(index.peekSnapshot(1)?.itemById.get(2)?.title, "Recovered");
+    assert.equal(calls, 3);
   });
 
   it("applies repeated patches without rebuilding or retaining overlays", async function () {

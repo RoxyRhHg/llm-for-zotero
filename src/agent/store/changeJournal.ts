@@ -74,6 +74,11 @@ export type JournalActionWithSteps = JournalAction & {
   steps: JournalStep[];
 };
 
+export type JournalUndoSelection = {
+  action?: JournalActionWithSteps;
+  newerIrreversible: JournalAction[];
+};
+
 type DbLike = {
   queryAsync: (sql: string, params?: unknown[]) => Promise<unknown>;
   executeTransaction?: (task: () => Promise<void>) => Promise<void>;
@@ -1073,6 +1078,7 @@ export async function compactRevertedJournalAction(
 }
 
 export async function listJournalActions(input: {
+  actionId?: string;
   conversationKey?: number;
   runId?: string;
   limit?: number;
@@ -1082,6 +1088,10 @@ export async function listJournalActions(input: {
   if (!db) return [];
   const clauses: string[] = [];
   const params: unknown[] = [];
+  if (input.actionId) {
+    clauses.push("action_id = ?");
+    params.push(input.actionId);
+  }
   if (input.conversationKey !== undefined) {
     clauses.push("conversation_key = ?");
     params.push(input.conversationKey);
@@ -1111,6 +1121,35 @@ export async function listJournalActions(input: {
       steps: await listJournalSteps(action.actionId),
     })),
   );
+}
+
+export async function selectUndoJournalAction(input: {
+  conversationKey: number;
+}): Promise<JournalUndoSelection> {
+  const db = getDb();
+  if (!db) return { newerIrreversible: [] };
+  const rows = (await db.queryAsync(
+    `SELECT * FROM ${JOURNAL_ACTIONS_TABLE}
+     WHERE conversation_key = ?
+       AND status NOT IN ('reverted','no_effect','failed')
+     ORDER BY created_at DESC, rowid DESC`,
+    [input.conversationKey],
+  )) as Array<Record<string, unknown>> | null;
+  const pending = Array.isArray(rows) ? rows.map(toAction) : [];
+  const targetIndex = pending.findIndex(
+    (action) => action.reversibility !== "none",
+  );
+  if (targetIndex < 0) {
+    return { newerIrreversible: pending };
+  }
+  const target = pending[targetIndex];
+  return {
+    action: {
+      ...target,
+      steps: await listJournalSteps(target.actionId),
+    },
+    newerIrreversible: pending.slice(0, targetIndex),
+  };
 }
 
 export async function deleteConversationJournal(

@@ -102,8 +102,16 @@ export function createLibrarySettingsTool(
       return ok<LibrarySettingsInput>({ action });
     },
 
-    // Reading settings changes nothing, so only a write needs approval.
-    shouldRequireConfirmation: (input) => input.action === "set",
+    // The registry applies the global safe/auto/yolo policy to concrete
+    // writes. This hook only keeps reads and already-satisfied sets out of the
+    // confirmation path when their mutation plan reports no effect.
+    shouldRequireConfirmation(input) {
+      if (input.action !== "set") return false;
+      const current = zoteroGateway
+        .listSettings()
+        .find((entry) => entry.key === input.key);
+      return !current || !Object.is(current.value, input.value);
+    },
 
     planMutation(input) {
       if (input.action !== "set") {

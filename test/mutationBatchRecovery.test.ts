@@ -156,6 +156,62 @@ describe("multi-operation durable mutation recovery", function () {
     }
   });
 
+  it("does not demote an applied multi-operation action because another step was a no-op", async function () {
+    const db = await installJournal();
+    const mutationService = {
+      planOperation: async (operation: { itemId: number }) => ({
+        effect: "write" as const,
+        reversibility: "full" as const,
+        description: `update ${operation.itemId}`,
+        inverseOperations: [inverseFor(operation.itemId)],
+      }),
+      executeOperation: async (operation: { itemId: number }) => {
+        const changed = operation.itemId === 1;
+        return {
+          result: {
+            operation: "update_metadata",
+            result: {
+              status: changed ? "updated" : "unchanged",
+              itemId: operation.itemId,
+            },
+          },
+          inverse: changed
+            ? {
+                description: `restore item ${operation.itemId}`,
+                inverseOperations: [inverseFor(operation.itemId)],
+              }
+            : undefined,
+          effect: changed ? ("applied" as const) : ("none" as const),
+          affectedCount: changed ? 1 : 0,
+        };
+      },
+      captureOperationState: async (operation: { itemId: number }) => ({
+        version: 1,
+        operation: "update_metadata",
+        items: [{ itemId: operation.itemId, title: "new" }],
+      }),
+    };
+
+    const outcome = await executeLibraryMutationAction({
+      service: mutationService as never,
+      operations: [
+        { type: "update_metadata", itemId: 1, metadata: { title: "new" } },
+        { type: "update_metadata", itemId: 2, metadata: { title: "old" } },
+      ],
+      context,
+      facadeToolName: "update_metadata",
+    });
+
+    assert.equal(outcome.effect, "applied");
+    assert.equal(outcome.affectedCount, 1);
+    assert.equal([...db.actions.values()][0].status, "applied");
+    assert.equal([...db.actions.values()][0].affected_count, 1);
+    assert.deepEqual(
+      [...db.steps.values()].map((step) => step.status),
+      ["applied", "no_effect"],
+    );
+  });
+
   it("retains an uncertain first operation's planned irreversible barrier", async function () {
     const db = await installJournal();
     const mutationService = {
@@ -505,7 +561,7 @@ describe("multi-operation durable mutation recovery", function () {
       facadeToolName: "update_metadata",
     });
 
-    assert.equal(outcome.effect, "partial");
+    assert.equal(outcome.effect, "applied");
     assert.equal(outcome.affectedCount, 1);
     const action = [...db.actions.values()][0];
     assert.equal(action.status, "irreversible");

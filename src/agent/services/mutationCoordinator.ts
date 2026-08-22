@@ -1,4 +1,5 @@
 import type {
+  AgentJournalStepOutcome,
   AgentToolContext,
   AgentToolEffect,
   AgentWriteToolOutput,
@@ -77,6 +78,28 @@ function combineEffects(values: AgentToolEffect[]): AgentToolEffect {
     return "none";
   }
   return values.every((value) => value === "applied") ? "applied" : "partial";
+}
+
+export function summarizeMutationOutcomes(
+  outcomes: ReadonlyArray<
+    Pick<AgentJournalStepOutcome, "effect" | "reversibility" | "affectedCount">
+  >,
+): {
+  effect: AgentToolEffect;
+  reversibility: JournalReversibility;
+  affectedCount: number;
+} {
+  const changed = outcomes.filter((outcome) => outcome.effect !== "none");
+  return {
+    effect: combineEffects(changed.map((outcome) => outcome.effect)),
+    reversibility: combineReversibility(
+      changed.map((outcome) => outcome.reversibility),
+    ),
+    affectedCount: changed.reduce(
+      (total, outcome) => total + Math.max(0, outcome.affectedCount),
+      0,
+    ),
+  };
 }
 
 type MutationStepPlan = {
@@ -385,37 +408,27 @@ export async function executeLibraryMutationAction(params: {
         affectedCount += executed.affectedCount;
       }
     }
-    const effect = combineEffects(
-      completedOutcomes.map((outcome) => outcome.effect),
-    );
+    const summary = summarizeMutationOutcomes(completedOutcomes);
+    const effect = summary.effect;
     if (actionId && ownsAction) {
-      const changedOutcomes = completedOutcomes.filter(
-        (outcome) => outcome.effect !== "none",
-      );
-      const changedEffect = combineEffects(
-        changedOutcomes.map((outcome) => outcome.effect),
-      );
-      const reversibility = combineReversibility(
-        changedOutcomes.map((outcome) => outcome.reversibility),
-      );
       await updateJournalAction({
         actionId,
         status:
           effect === "none"
             ? "no_effect"
-            : changedEffect === "partial"
+            : effect === "partial"
               ? "partially_applied"
-              : reversibility === "none"
+              : summary.reversibility === "none"
                 ? "irreversible"
                 : "applied",
-        reversibility,
-        affectedCount,
+        reversibility: summary.reversibility,
+        affectedCount: summary.affectedCount,
       });
     }
     return {
       actionId: actionId || undefined,
       effect,
-      affectedCount,
+      affectedCount: summary.affectedCount,
       results,
     };
   } catch (error) {

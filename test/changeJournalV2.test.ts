@@ -1509,7 +1509,7 @@ describe("durable change journal v2", function () {
     );
   });
 
-  it("does not skip an irreversible latest action to undo an older action", async function () {
+  it("offers the newest reversible action while disclosing newer irreversible entries", async function () {
     await prepareAction({
       id: "older-reversible",
       createdAt: 100,
@@ -1524,6 +1524,19 @@ describe("durable change journal v2", function () {
           },
         ],
       },
+      expectedPostcondition: {
+        version: 1,
+        operation: "remove_from_collection",
+        items: [
+          {
+            itemId: 4,
+            exists: true,
+            parentItemId: null,
+            deleted: false,
+            collectionIds: [9],
+          },
+        ],
+      },
     });
     await prepareAction({
       id: "newer-irreversible",
@@ -1532,24 +1545,166 @@ describe("durable change journal v2", function () {
       description: "Irreversible shell command",
     });
     const removed: number[] = [];
+    let collections = [9];
     const tool = createUndoLastActionTool({
+      getItem: (itemId: number) => ({
+        id: itemId,
+        parentID: false,
+        deleted: false,
+        getCollections: () => collections,
+      }),
       removeItemFromCollection: async ({ itemId }: { itemId: number }) => {
         removed.push(itemId);
+        collections = [];
+        return { removed: true };
+      },
+    } as never);
+    const undoInput: { actionId?: string } = {};
+    const pending = await tool.createPendingAction?.(undoInput, context);
+    const actionField = pending?.fields.find(
+      (field) => field.id === "actionId" && field.type === "select",
+    );
+    const blockerField = pending?.fields.find(
+      (field) =>
+        field.id === "newerIrreversible" && field.type === "review_table",
+    );
+    assert.equal(
+      actionField?.type === "select" ? actionField.value : undefined,
+      "older-reversible",
+    );
+    assert.equal(
+      blockerField?.type === "review_table"
+        ? blockerField.rows[0]?.label
+        : undefined,
+      "Irreversible shell command",
+    );
+    assert.equal(undoInput.actionId, "older-reversible");
+    const mismatched = tool.applyConfirmation?.(
+      undoInput,
+      { actionId: "newer-irreversible" },
+      context,
+    );
+    assert.isFalse(mismatched?.ok);
+
+    // The registry executes this same validated input when an approval carries
+    // no form payload, so the reviewed target must already be frozen here.
+    await tool.execute!(undoInput, context);
+
+    assert.deepEqual(removed, [4]);
+    assert.equal(db.actions.get("older-reversible")?.status, "reverted");
+    assert.equal(db.actions.get("newer-irreversible")?.status, "irreversible");
+  });
+
+  it("returns no effect when only irreversible actions remain", async function () {
+    await prepareAction({
+      id: "only-irreversible",
+      createdAt: 100,
+      reversibility: "none",
+      description: "Read-mode script",
+    });
+    const tool = createUndoLastActionTool({} as never);
+
+    assert.isFalse(await tool.shouldRequireConfirmation?.({}, context));
+    const execution = await tool.execute!({}, context);
+
+    assert.equal(execution.effect, "none");
+    assert.include(JSON.stringify(execution.content), "no durable inverse");
+    assert.equal(db.actions.get("only-irreversible")?.status, "irreversible");
+  });
+
+  it("refuses a confirmed undo target whose journal state changed", async function () {
+    await prepareAction({
+      id: "changed-after-confirmation",
+      createdAt: 100,
+      inverse: {
+        version: 1,
+        kind: "library_operations",
+        operations: [
+          {
+            type: "remove_from_collection",
+            itemIds: [4],
+            collectionId: 9,
+          },
+        ],
+      },
+    });
+    const tool = createUndoLastActionTool({} as never);
+    const undoInput: { actionId?: string } = {};
+    await tool.createPendingAction?.(undoInput, context);
+    const confirmed = tool.applyConfirmation?.(
+      undoInput,
+      { actionId: "changed-after-confirmation" },
+      context,
+    );
+    assert.isTrue(confirmed?.ok);
+    if (!confirmed?.ok) return;
+    await updateJournalAction({
+      actionId: "changed-after-confirmation",
+      status: "reverted",
+    });
+
+    let message = "";
+    try {
+      await tool.execute!(confirmed.value, context);
+    } catch (error) {
+      message = error instanceof Error ? error.message : String(error);
+    }
+
+    assert.include(message, "changed before undo could start");
+  });
+
+  it("offers partially reversible actions", async function () {
+    await prepareAction({
+      id: "partial-undo-target",
+      createdAt: 100,
+      reversibility: "partial",
+      recovery: "One external side effect may remain.",
+      inverse: {
+        version: 1,
+        kind: "library_operations",
+        operations: [
+          {
+            type: "remove_from_collection",
+            itemIds: [4],
+            collectionId: 9,
+          },
+        ],
+      },
+      expectedPostcondition: {
+        version: 1,
+        operation: "remove_from_collection",
+        items: [
+          {
+            itemId: 4,
+            exists: true,
+            parentItemId: null,
+            deleted: false,
+            collectionIds: [9],
+          },
+        ],
+      },
+    });
+    let collections = [9];
+    const tool = createUndoLastActionTool({
+      getItem: (itemId: number) => ({
+        id: itemId,
+        parentID: false,
+        deleted: false,
+        getCollections: () => collections,
+      }),
+      removeItemFromCollection: async () => {
+        collections = [];
         return { removed: true };
       },
     } as never);
 
-    let errorMessage = "";
-    try {
-      await tool.execute!({}, context);
-    } catch (error) {
-      errorMessage = error instanceof Error ? error.message : String(error);
-    }
+    const execution = await tool.execute!({}, context);
 
-    assert.include(errorMessage, "no inverse");
-    assert.deepEqual(removed, []);
-    assert.equal(db.actions.get("older-reversible")?.status, "applied");
-    assert.equal(db.actions.get("newer-irreversible")?.status, "irreversible");
+    assert.equal(execution.effect, "partial");
+    assert.equal(
+      (execution.content as { status?: string }).status,
+      "partially_undone",
+    );
   });
 
   it("always confirms undo execution because no redo action is created", async function () {
@@ -1921,6 +2076,179 @@ describe("durable change journal v2", function () {
     assert.deepEqual([...currentBytes], [...originalBytes]);
   });
 
+  it("rejects a malformed declarative inverse before later script mutations run", async function () {
+    let title = "Before";
+    const item = {
+      id: 91,
+      setField: (_field: string, value: string) => {
+        title = value;
+      },
+      saveTx: async () => undefined,
+    };
+    globalThis.Zotero = {
+      ...(globalThis.Zotero as unknown as Record<string, unknown>),
+      DB: db,
+      Libraries: { userLibraryID: 1 },
+      Items: { get: (id: number) => (id === 91 ? item : null) },
+      debug: () => undefined,
+    } as never;
+    const tool = createZoteroScriptTool({
+      allowUnsandboxedTestExecution: true,
+    });
+    const validated = tool.validate({
+      mode: "write",
+      description: "reject an invalid inverse before writing",
+      script: [
+        "env.addInverse({ version: 1, kind: 'unsupported' });",
+        "const item = Zotero.Items.get(91);",
+        "item.setField('title', 'After');",
+        "await item.saveTx();",
+      ].join("\n"),
+    });
+    assert.isTrue(validated.ok);
+    if (!validated.ok) return;
+
+    const execution = await tool.execute(validated.value, context);
+
+    assert.equal(title, "Before");
+    assert.include(JSON.stringify(execution.content), "payload is unsupported");
+  });
+
+  it("retains snapshots when a malformed inverse is declared after mutation", async function () {
+    let title = "Before";
+    const item = {
+      id: 92,
+      libraryID: 1,
+      parentID: false,
+      deleted: false,
+      itemTypeID: 1,
+      isNote: () => false,
+      getField: (field: string) => (field === "title" ? title : ""),
+      setField: (field: string, value: string) => {
+        if (field === "title") title = value;
+      },
+      getTags: () => [],
+      getCollections: () => [],
+      getCreatorsJSON: () => [],
+      setCreators: () => undefined,
+      toJSON: () => ({ title }),
+      fromJSON: (value: { title?: string }) => {
+        if (value.title !== undefined) title = value.title;
+      },
+      saveTx: async () => undefined,
+    } as unknown as Zotero.Item;
+    globalThis.Zotero = {
+      ...(globalThis.Zotero as unknown as Record<string, unknown>),
+      DB: db,
+      Libraries: { userLibraryID: 1 },
+      Items: { get: (id: number) => (id === 92 ? item : null) },
+      debug: () => undefined,
+    } as never;
+    const tool = createZoteroScriptTool({
+      allowUnsandboxedTestExecution: true,
+    });
+    const validated = tool.validate({
+      mode: "write",
+      description: "retain a snapshot after a bad inverse",
+      script: [
+        "const item = Zotero.Items.get(92);",
+        "env.snapshot(item);",
+        "item.setField('title', 'After');",
+        "await item.saveTx();",
+        "env.addInverse({ version: 1, kind: 'unsupported' });",
+      ].join("\n"),
+    });
+    assert.isTrue(validated.ok);
+    if (!validated.ok) return;
+
+    await tool.execute(validated.value, context);
+    const [action] = await listJournalActions({
+      conversationKey: 77,
+      pendingOnly: true,
+      limit: 1,
+    });
+
+    assert.equal(title, "After");
+    assert.equal(action.reversibility, "partial");
+    assert.include(action.steps[0].inverseJson || "", "script_snapshots");
+
+    const outcome = await revertActions({
+      actions: [action],
+      zoteroGateway: new ZoteroGateway(),
+      context,
+    });
+
+    assert.equal(outcome.partiallyReverted, 1);
+    assert.equal(title, "Before");
+  });
+
+  it("keeps snapshot recovery when a declarative inverse cannot be guarded", async function () {
+    let title = "Before";
+    const item = {
+      id: 93,
+      libraryID: 1,
+      parentID: false,
+      deleted: false,
+      itemTypeID: 1,
+      isNote: () => false,
+      getField: (field: string) => (field === "title" ? title : ""),
+      setField: (field: string, value: string) => {
+        if (field === "title") title = value;
+      },
+      getTags: () => [],
+      getCollections: () => [],
+      getCreatorsJSON: () => [],
+      setCreators: () => undefined,
+      toJSON: () => ({ title }),
+      saveTx: async () => undefined,
+    } as unknown as Zotero.Item;
+    globalThis.Zotero = {
+      ...(globalThis.Zotero as unknown as Record<string, unknown>),
+      DB: db,
+      Libraries: { userLibraryID: 1 },
+      Items: { get: (id: number) => (id === 93 ? item : null) },
+      debug: () => undefined,
+    } as never;
+    (globalThis as { IOUtils?: unknown }).IOUtils = {
+      exists: async () => true,
+    };
+    const tool = createZoteroScriptTool({
+      allowUnsandboxedTestExecution: true,
+    });
+    const validated = tool.validate({
+      mode: "write",
+      description: "retain a snapshot when a file guard fails",
+      script: [
+        "const item = Zotero.Items.get(93);",
+        "env.snapshot(item);",
+        "item.setField('title', 'After');",
+        "await item.saveTx();",
+        "env.addInverse({ version: 1, kind: 'file', operation: 'delete', path: '/tmp/unguarded-file' });",
+      ].join("\n"),
+    });
+    assert.isTrue(validated.ok);
+    if (!validated.ok) return;
+
+    const execution = await tool.execute(validated.value, context);
+    const [action] = await listJournalActions({
+      conversationKey: 77,
+      pendingOnly: true,
+      limit: 1,
+    });
+    const outer = JSON.parse(action.steps[0].inverseJson || "null") as {
+      payload?: { storage?: string; content?: string };
+    };
+    const bundle = JSON.parse(outer.payload?.content || "null") as {
+      snapshots?: unknown[];
+      declaredInverses?: unknown[];
+    };
+
+    assert.equal(title, "After");
+    assert.lengthOf(bundle.snapshots || [], 1);
+    assert.deepEqual(bundle.declaredInverses, []);
+    assert.include(JSON.stringify(execution.content), "could not be guarded");
+  });
+
   it("guards item targets named only by a Zotero script's declarative inverse", async function () {
     let tags = [{ tag: "Before" }];
     const item = {
@@ -1955,6 +2283,7 @@ describe("durable change journal v2", function () {
         "env.addInverse({ version: 1, kind: 'library_operations', operations: [{ type: 'set_item_tags', assignments: [{ itemId: 91, tags: ['Before'] }] }] });",
         "item.setTags([{ tag: 'Agent' }]);",
         "await item.saveTx();",
+        "env.addInverse({ version: 1, kind: 'unsupported' });",
       ].join("\n"),
     });
     assert.isTrue(validated.ok);

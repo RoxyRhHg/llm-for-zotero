@@ -126,12 +126,40 @@ type MutableMetrics = {
   -readonly [K in keyof LibraryIndexMetrics]: number;
 };
 
+type PendingIndexChanges = {
+  itemIds: Set<number>;
+  collectionIds: Set<number>;
+  libraryName: boolean;
+  fullRebuild: boolean;
+};
+
 type LibraryState = {
   epoch: number;
   snapshot?: LibraryIndexSnapshot;
   loadTask?: Promise<LibraryIndexSnapshot>;
+  backgroundRefreshTask?: Promise<void>;
+  pendingChanges?: PendingIndexChanges;
+  reconciling?: boolean;
   rebuildTimer?: ReturnType<typeof setTimeout>;
 };
+
+function pendingIndexChanges(): PendingIndexChanges {
+  return {
+    itemIds: new Set<number>(),
+    collectionIds: new Set<number>(),
+    libraryName: false,
+    fullRebuild: false,
+  };
+}
+
+function hasPendingIndexChanges(changes: PendingIndexChanges): boolean {
+  return Boolean(
+    changes.fullRebuild ||
+    changes.libraryName ||
+    changes.itemIds.size ||
+    changes.collectionIds.size,
+  );
+}
 
 type RawTag = string | { tag?: unknown; name?: unknown; type?: unknown };
 
@@ -927,6 +955,191 @@ export class LibraryIndexService {
     return this.states.get(Math.floor(libraryID))?.snapshot;
   }
 
+  private pendingChanges(state: LibraryState): PendingIndexChanges {
+    state.pendingChanges ||= pendingIndexChanges();
+    return state.pendingChanges;
+  }
+
+  private takePendingChanges(state: LibraryState): PendingIndexChanges {
+    const changes = state.pendingChanges || pendingIndexChanges();
+    state.pendingChanges = pendingIndexChanges();
+    return changes;
+  }
+
+  private requeueChanges(
+    state: LibraryState,
+    changes: PendingIndexChanges,
+  ): void {
+    const pending = this.pendingChanges(state);
+    changes.itemIds.forEach((id) => pending.itemIds.add(id));
+    changes.collectionIds.forEach((id) => pending.collectionIds.add(id));
+    pending.libraryName ||= changes.libraryName;
+    pending.fullRebuild ||= changes.fullRebuild;
+  }
+
+  private shouldQueueChanges(state: LibraryState): boolean {
+    return Boolean(
+      !state.snapshot ||
+      state.loadTask ||
+      state.reconciling ||
+      state.backgroundRefreshTask,
+    );
+  }
+
+  private queueItemChanges(state: LibraryState, ids: number[]): void {
+    const pending = this.pendingChanges(state);
+    ids.forEach((id) => pending.itemIds.add(id));
+  }
+
+  private queueCollectionChanges(state: LibraryState, ids: number[]): void {
+    const pending = this.pendingChanges(state);
+    ids.forEach((id) => pending.collectionIds.add(id));
+  }
+
+  private queueLibraryNameChange(state: LibraryState): void {
+    this.pendingChanges(state).libraryName = true;
+  }
+
+  private queueFullRebuild(state: LibraryState): void {
+    state.epoch += 1;
+    this.pendingChanges(state).fullRebuild = true;
+  }
+
+  private publishSnapshot(
+    state: LibraryState,
+    snapshot: LibraryIndexSnapshot,
+  ): void {
+    state.snapshot = Object.freeze({ ...snapshot, epoch: state.epoch });
+  }
+
+  private async reconcileChanges(
+    libraryID: number,
+    state: LibraryState,
+    changes: PendingIndexChanges,
+  ): Promise<void> {
+    state.reconciling = true;
+    try {
+      if (changes.libraryName) this.patchLibraryName(libraryID, true);
+      if (changes.collectionIds.size) {
+        await this.patchCollections(
+          libraryID,
+          [...changes.collectionIds],
+          true,
+        );
+      }
+      if (changes.itemIds.size) {
+        await this.patchItems(libraryID, [...changes.itemIds], true);
+      }
+    } finally {
+      state.reconciling = false;
+    }
+  }
+
+  private schedulePendingReconciliation(libraryID: number): void {
+    const state = this.states.get(libraryID);
+    if (!state?.snapshot) return;
+    if (state.rebuildTimer) clearTimeout(state.rebuildTimer);
+    state.rebuildTimer = setTimeout(() => {
+      state.rebuildTimer = undefined;
+      if (state.loadTask || state.backgroundRefreshTask || state.reconciling) {
+        this.schedulePendingReconciliation(libraryID);
+        return;
+      }
+      const changes = this.takePendingChanges(state);
+      if (!hasPendingIndexChanges(changes)) return;
+      if (changes.fullRebuild) {
+        this.startBackgroundRefresh(libraryID, state, changes);
+        return;
+      }
+      let failed = false;
+      void this.reconcileChanges(libraryID, state, changes)
+        .catch((error) => {
+          failed = true;
+          this.requeueChanges(state, changes);
+          globalThis.Zotero?.debug?.(
+            `[llm-for-zotero] Library index reconciliation failed: ${
+              error instanceof Error ? error.message : String(error)
+            }`,
+          );
+        })
+        .finally(() => {
+          if (!failed && hasPendingIndexChanges(this.pendingChanges(state))) {
+            this.schedulePendingReconciliation(libraryID);
+          }
+        });
+    }, 100);
+  }
+
+  private startBackgroundRefresh(
+    libraryID: number,
+    state: LibraryState,
+    coveredChanges: PendingIndexChanges,
+  ): void {
+    if (state.backgroundRefreshTask) {
+      this.requeueChanges(state, coveredChanges);
+      return;
+    }
+    this.metrics.coalescedRebuilds += 1;
+    let failed = false;
+    const task = (async () => {
+      const snapshot = await this.buildSnapshot(libraryID, state.epoch);
+      const trailing = this.takePendingChanges(state);
+      this.publishSnapshot(state, snapshot);
+      await this.reconcileChanges(libraryID, state, trailing);
+      const duringReconciliation = this.takePendingChanges(state);
+      if (trailing.fullRebuild) {
+        duringReconciliation.fullRebuild = true;
+      }
+      this.requeueChanges(state, duringReconciliation);
+    })()
+      .catch((error) => {
+        failed = true;
+        coveredChanges.fullRebuild = true;
+        this.requeueChanges(state, coveredChanges);
+        globalThis.Zotero?.debug?.(
+          `[llm-for-zotero] Library index rebuild failed: ${
+            error instanceof Error ? error.message : String(error)
+          }`,
+        );
+      })
+      .finally(() => {
+        if (state.backgroundRefreshTask === task) {
+          state.backgroundRefreshTask = undefined;
+        }
+        if (!failed && hasPendingIndexChanges(this.pendingChanges(state))) {
+          this.schedulePendingReconciliation(libraryID);
+        }
+      });
+    state.backgroundRefreshTask = task;
+  }
+
+  private async loadInitialSnapshot(
+    libraryID: number,
+    state: LibraryState,
+  ): Promise<LibraryIndexSnapshot> {
+    let snapshot = await this.buildSnapshot(libraryID, state.epoch);
+    let changes = this.takePendingChanges(state);
+    if (changes.fullRebuild) {
+      this.metrics.staleBuildDiscards += 1;
+      snapshot = await this.buildSnapshot(libraryID, state.epoch);
+      changes = this.takePendingChanges(state);
+    }
+    this.publishSnapshot(state, snapshot);
+    try {
+      await this.reconcileChanges(libraryID, state, changes);
+    } catch (error) {
+      state.snapshot = undefined;
+      throw error;
+    }
+    const trailing = this.takePendingChanges(state);
+    if (changes.fullRebuild) trailing.fullRebuild = true;
+    this.requeueChanges(state, trailing);
+    if (hasPendingIndexChanges(trailing)) {
+      this.schedulePendingReconciliation(libraryID);
+    }
+    return state.snapshot!;
+  }
+
   async getSnapshot(libraryID: number): Promise<LibraryIndexSnapshot> {
     const normalized = Math.floor(Number(libraryID));
     if (!Number.isFinite(normalized) || normalized <= 0) {
@@ -937,24 +1150,23 @@ export class LibraryIndexService {
       state = { epoch: 0 };
       this.states.set(normalized, state);
     }
-    if (state.snapshot) return state.snapshot;
+    if (state.snapshot) {
+      if (
+        state.pendingChanges &&
+        hasPendingIndexChanges(state.pendingChanges) &&
+        !state.rebuildTimer &&
+        !state.backgroundRefreshTask &&
+        !state.reconciling
+      ) {
+        this.schedulePendingReconciliation(normalized);
+      }
+      return state.snapshot;
+    }
     if (state.loadTask) return state.loadTask;
-    const buildEpoch = state.epoch;
-    const task = this.buildSnapshot(normalized, buildEpoch)
-      .then(async (snapshot) => {
-        const current = this.states.get(normalized);
-        if (!current || current.epoch !== buildEpoch) {
-          this.metrics.staleBuildDiscards += 1;
-          if (current) current.loadTask = undefined;
-          return this.getSnapshot(normalized);
-        }
-        current.snapshot = snapshot;
-        return snapshot;
-      })
-      .finally(() => {
-        const current = this.states.get(normalized);
-        if (current?.loadTask === task) current.loadTask = undefined;
-      });
+    const task = this.loadInitialSnapshot(normalized, state).finally(() => {
+      const current = this.states.get(normalized);
+      if (current?.loadTask === task) current.loadTask = undefined;
+    });
     state.loadTask = task;
     return task;
   }
@@ -963,12 +1175,21 @@ export class LibraryIndexService {
     if (Number.isFinite(libraryID) && Number(libraryID) > 0) {
       const id = Math.floor(Number(libraryID));
       const state = this.states.get(id) || { epoch: 0 };
+      if (state.loadTask || state.backgroundRefreshTask) {
+        this.queueFullRebuild(state);
+        this.states.set(id, state);
+        return;
+      }
       state.epoch += 1;
       state.snapshot = undefined;
       this.states.set(id, state);
       return;
     }
     for (const state of this.states.values()) {
+      if (state.loadTask || state.backgroundRefreshTask) {
+        this.queueFullRebuild(state);
+        continue;
+      }
       state.epoch += 1;
       state.snapshot = undefined;
     }
@@ -1166,32 +1387,37 @@ export class LibraryIndexService {
     return libraryIDs;
   }
 
-  private patchLibraryName(libraryID: number): void {
+  private patchLibraryName(libraryID: number, force = false): void {
     const state = this.states.get(libraryID);
     if (!state) return;
-    if (!state.snapshot) {
-      // Discard a cold projection that may have captured the old group name.
-      if (state.loadTask) state.epoch += 1;
+    if (!force && this.shouldQueueChanges(state)) {
+      this.queueLibraryNameChange(state);
+      return;
+    }
+    const snapshot = state.snapshot;
+    if (!snapshot) {
+      this.queueLibraryNameChange(state);
       return;
     }
     const libraryName = resolveLibraryName(libraryID);
-    if (libraryName === state.snapshot.libraryName) return;
+    if (libraryName === snapshot.libraryName) return;
     state.snapshot = Object.freeze({
-      ...state.snapshot,
+      ...snapshot,
       epoch: state.epoch,
       libraryName,
     });
   }
 
-  private async patchItems(libraryID: number, ids: number[]): Promise<void> {
+  private async patchItems(
+    libraryID: number,
+    ids: number[],
+    force = false,
+  ): Promise<void> {
     const state = this.states.get(libraryID);
     const snapshot = state?.snapshot;
     if (!state) return;
-    if (!snapshot) {
-      // A notifier can arrive after an item was projected but before the
-      // off-side cold build is installed. Advancing the epoch forces that
-      // build to be discarded and retried from current Zotero state.
-      if (state.loadTask) state.epoch += 1;
+    if (!snapshot || (!force && this.shouldQueueChanges(state))) {
+      this.queueItemChanges(state, ids);
       return;
     }
     const topLevelIds = new Set<number>();
@@ -1637,12 +1863,13 @@ export class LibraryIndexService {
   private async patchCollections(
     libraryID: number,
     ids: number[],
+    force = false,
   ): Promise<void> {
     const state = this.states.get(libraryID);
     const snapshot = state?.snapshot;
     if (!state) return;
-    if (!snapshot) {
-      if (state.loadTask) state.epoch += 1;
+    if (!snapshot || (!force && this.shouldQueueChanges(state))) {
+      this.queueCollectionChanges(state, ids);
       return;
     }
     const collectionUpdates = new Map<number, LibraryIndexCollection>();
@@ -1855,27 +2082,15 @@ export class LibraryIndexService {
     });
     this.metrics.incrementalCollectionUpdates += affected.size;
     if (membershipAffectedItemIds.size) {
-      await this.patchItems(libraryID, [...membershipAffectedItemIds]);
+      await this.patchItems(libraryID, [...membershipAffectedItemIds], force);
     }
   }
 
   private scheduleRebuild(libraryID: number): void {
     const state = this.states.get(libraryID);
     if (!state) return;
-    state.epoch += 1;
-    state.snapshot = undefined;
-    if (state.rebuildTimer) clearTimeout(state.rebuildTimer);
-    state.rebuildTimer = setTimeout(() => {
-      state.rebuildTimer = undefined;
-      this.metrics.coalescedRebuilds += 1;
-      void this.getSnapshot(libraryID).catch((error) => {
-        globalThis.Zotero?.debug?.(
-          `[llm-for-zotero] Library index rebuild failed: ${
-            error instanceof Error ? error.message : String(error)
-          }`,
-        );
-      });
-    }, 100);
+    this.queueFullRebuild(state);
+    if (state.snapshot) this.schedulePendingReconciliation(libraryID);
   }
 
   async handleChange(change: ZoteroChangeEvent): Promise<void> {
@@ -1956,10 +2171,12 @@ export class LibraryIndexService {
       // covers rename/delete, while Zotero's current membership covers a new
       // or merged tag. No full-library projection is needed.
       for (const [libraryID, state] of this.states) {
-        if (!state.snapshot) {
-          if (state.loadTask) state.epoch += 1;
+        if (this.shouldQueueChanges(state)) {
+          this.queueFullRebuild(state);
           continue;
         }
+        const snapshot = state.snapshot;
+        if (!snapshot) continue;
         const tagNames = Array.isArray(
           (change.extraData as { tagNames?: unknown }).tagNames,
         )
@@ -1973,9 +2190,9 @@ export class LibraryIndexService {
         }
         const affected = new Set<number>();
         for (const tagId of ids) {
-          const oldName = state.snapshot.normalizedTagNameByTagId.get(tagId);
+          const oldName = snapshot.normalizedTagNameByTagId.get(tagId);
           if (oldName) {
-            const oldTag = state.snapshot.tagByNormalizedName.get(oldName);
+            const oldTag = snapshot.tagByNormalizedName.get(oldName);
             for (const itemId of oldTag?.manualItemIds || [])
               affected.add(itemId);
             for (const itemId of oldTag?.automaticItemIds || []) {
@@ -1996,7 +2213,7 @@ export class LibraryIndexService {
         }
         for (const tagName of tagNames) {
           const normalizedName = normalizeLibraryIndexTagIdentity(tagName);
-          const oldTag = state.snapshot.tagByNormalizedName.get(normalizedName);
+          const oldTag = snapshot.tagByNormalizedName.get(normalizedName);
           for (const itemId of oldTag?.manualItemIds || [])
             affected.add(itemId);
           for (const itemId of oldTag?.automaticItemIds || []) {

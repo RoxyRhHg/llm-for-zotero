@@ -12,12 +12,7 @@ describe("modelReasoningController", function () {
       const apiBase = "https://api.deepseek.com/v1";
 
       assert.isFalse(
-        isScreenshotUnsupportedModel(
-          model,
-          protocol,
-          "api_key",
-          apiBase,
-        ),
+        isScreenshotUnsupportedModel(model, protocol, "api_key", apiBase),
       );
       assert.isTrue(
         isScreenshotUnsupportedModel(

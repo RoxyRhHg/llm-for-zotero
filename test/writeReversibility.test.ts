@@ -2,6 +2,7 @@ import { assert } from "chai";
 import { normalizeAgentLibraryWriteMode } from "../src/shared/agentLibraryWriteMode";
 import { initAgentChangeJournal } from "../src/agent/store/changeJournal";
 import { AgentToolRegistry } from "../src/agent/tools/registry";
+import { createLibrarySettingsTool } from "../src/agent/tools/write/librarySettings";
 import type {
   AgentMutationPlan,
   AgentToolContext,
@@ -119,6 +120,111 @@ describe("mutation-plan confirmation policy", function () {
       },
     });
     assert.equal(prepared.kind, "confirmation");
+  });
+
+  it("applies the global write mode to library settings", async function () {
+    for (const [mode, expectedKind] of [
+      ["safe", "confirmation"],
+      ["auto", "result"],
+      ["yolo", "result"],
+    ] as const) {
+      const db = new ChangeJournalTestDb();
+      globalThis.Zotero = {
+        DB: db,
+        Prefs: { get: () => mode },
+        Items: { get: () => null },
+        debug: () => undefined,
+      } as never;
+      await initAgentChangeJournal();
+      const registry = new AgentToolRegistry();
+      registry.register(
+        createLibrarySettingsTool({
+          listSettings: () => [
+            {
+              key: "automaticTags",
+              value: true,
+              description: "Automatically save tags",
+            },
+          ],
+          updateSetting: async () => ({
+            status: "updated",
+            key: "automaticTags",
+            previousValue: true,
+            value: false,
+          }),
+        } as never),
+      );
+
+      const prepared = await registry.prepareExecution(
+        {
+          id: `settings-${mode}`,
+          name: "library_settings",
+          arguments: {
+            action: "set",
+            key: "automaticTags",
+            value: false,
+          },
+        },
+        context,
+      );
+
+      assert.equal(prepared.kind, expectedKind, mode);
+      if (prepared.kind === "result") {
+        assert.isTrue(prepared.execution.result.ok, mode);
+      }
+    }
+  });
+
+  it("does not confirm a library setting that already has the requested value", async function () {
+    const db = new ChangeJournalTestDb();
+    globalThis.Zotero = {
+      DB: db,
+      Prefs: { get: () => "safe" },
+      Items: { get: () => null },
+      debug: () => undefined,
+    } as never;
+    await initAgentChangeJournal();
+    const registry = new AgentToolRegistry();
+    registry.register(
+      createLibrarySettingsTool({
+        listSettings: () => [
+          {
+            key: "automaticTags",
+            value: false,
+            description: "Automatically save tags",
+          },
+        ],
+        updateSetting: async () => ({
+          status: "unchanged",
+          key: "automaticTags",
+          value: false,
+        }),
+      } as never),
+    );
+
+    const prepared = await registry.prepareExecution(
+      {
+        id: "settings-no-op",
+        name: "library_settings",
+        arguments: {
+          action: "set",
+          key: "automaticTags",
+          value: false,
+        },
+      },
+      context,
+    );
+
+    assert.equal(prepared.kind, "result");
+    const read = await registry.prepareExecution(
+      {
+        id: "settings-read",
+        name: "library_settings",
+        arguments: { action: "list" },
+      },
+      context,
+    );
+    assert.equal(read.kind, "result");
   });
 
   it("refuses yolo writes when the durable journal is unavailable", async function () {

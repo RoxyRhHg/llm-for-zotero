@@ -190,24 +190,32 @@ describe("library_batch", function () {
           },
         ],
       }),
-      executeOperation: async (operation: { itemIds: number[] }) => ({
-        result: {
-          operation: "add_tags",
-          result: { status: "updated", itemId: operation.itemIds[0] },
-        },
-        inverse: {
-          description: `remove tag from ${operation.itemIds[0]}`,
-          inverseOperations: [
-            {
-              type: "remove_tags" as const,
-              itemIds: operation.itemIds,
-              tags: ["reviewed"],
+      executeOperation: async (operation: { itemIds: number[] }) => {
+        const changed = operation.itemIds[0] < 3;
+        return {
+          result: {
+            operation: "add_tags",
+            result: {
+              status: changed ? "updated" : "unchanged",
+              itemId: operation.itemIds[0],
             },
-          ],
-        },
-        effect: "applied" as const,
-        affectedCount: 1,
-      }),
+          },
+          inverse: changed
+            ? {
+                description: `remove tag from ${operation.itemIds[0]}`,
+                inverseOperations: [
+                  {
+                    type: "remove_tags" as const,
+                    itemIds: operation.itemIds,
+                    tags: ["reviewed"],
+                  },
+                ],
+              }
+            : undefined,
+          effect: changed ? ("applied" as const) : ("none" as const),
+          affectedCount: changed ? 1 : 0,
+        };
+      },
       captureOperationState: async (operation: { itemIds: number[] }) => ({
         version: 1,
         operation: "add_tags",
@@ -266,7 +274,13 @@ describe("library_batch", function () {
           actionContext as never,
           "page 2",
         );
-        return { ok: true, output: { tagged: 2, processed: 2 } };
+        await callTool(
+          "batch_test_write",
+          {},
+          actionContext as never,
+          "page 3 already satisfied",
+        );
+        return { ok: true, output: { tagged: 2, processed: 3 } };
       },
     } as never);
     const tool = createLibraryBatchTool({
@@ -287,7 +301,7 @@ describe("library_batch", function () {
 
     assert.equal(execution.effect, "applied");
     assert.equal(db.actions.size, 1);
-    assert.equal(db.steps.size, 2);
+    assert.equal(db.steps.size, 3);
     const action = [...db.actions.values()][0];
     assert.equal(action.run_id, "agent-run-9");
     assert.equal(action.tool_name, "library_batch");
@@ -295,7 +309,11 @@ describe("library_batch", function () {
     assert.equal(action.affected_count, 2);
     assert.deepEqual(
       [...db.steps.values()].map((step) => step.sequence_no),
-      [1, 2],
+      [1, 2, 3],
+    );
+    assert.deepEqual(
+      [...db.steps.values()].map((step) => step.status),
+      ["applied", "applied", "no_effect"],
     );
     assert.deepEqual(
       (await listJournalActions({ runId: "agent-run-9" })).map(

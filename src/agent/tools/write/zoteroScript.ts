@@ -82,6 +82,13 @@ type ScriptResult = {
   error?: string;
 };
 
+type CapturedDeclaredInverses = {
+  guards: unknown[];
+  itemIds: number[];
+  inverses: unknown[];
+  warnings: string[];
+};
+
 // ── Snapshot fields ─────────────────────────────────────────────────────────
 
 const SNAPSHOT_FIELDS = [
@@ -371,58 +378,78 @@ async function captureScriptFilePostcondition(path: string): Promise<{
 async function captureDeclaredInverseGuards(
   values: unknown[],
   context: AgentToolContext,
-): Promise<{ guards: unknown[]; itemIds: number[] }> {
+): Promise<CapturedDeclaredInverses> {
   const gateway = new ZoteroGateway();
   const service = new LibraryMutationService(gateway);
   const guards: unknown[] = [];
   const itemIds = new Set<number>();
-  for (const value of values) {
+  const inverses: unknown[] = [];
+  const warnings: string[] = [];
+  for (const [index, value] of values.entries()) {
     const inverse = parseInverseValue(value);
     if (!inverse || inverse.kind === "script_snapshots") {
-      throw new Error(
-        "env.addInverse recorded an unsupported declarative inverse",
+      warnings.push(
+        `Declarative inverse ${index + 1} was unsupported and was not journalled.`,
       );
+      continue;
     }
-    if (inverse.kind === "library_operations") {
-      for (const operation of inverse.operations) {
-        const state = await service.captureOperationState(operation, context);
-        for (const item of state.items || []) itemIds.add(item.itemId);
-        guards.push({ kind: "library_operation", operation, state });
+    const inverseGuards: unknown[] = [];
+    const inverseItemIds = new Set<number>();
+    try {
+      if (inverse.kind === "library_operations") {
+        for (const operation of inverse.operations) {
+          const state = await service.captureOperationState(operation, context);
+          for (const item of state.items || []) {
+            inverseItemIds.add(item.itemId);
+          }
+          inverseGuards.push({ kind: "library_operation", operation, state });
+        }
+      } else if (inverse.kind === "note_html") {
+        const item = gateway.getItem(inverse.noteId);
+        inverseItemIds.add(inverse.noteId);
+        inverseGuards.push({
+          kind: "note_html",
+          noteId: inverse.noteId,
+          checksum: await sha256Text(item?.getNote?.() || ""),
+        });
+      } else if (inverse.kind === "file") {
+        inverseGuards.push(await captureScriptFilePostcondition(inverse.path));
+      } else {
+        const setting = gateway
+          .listSettings()
+          .find((entry) => entry.key === inverse.key);
+        inverseGuards.push({
+          kind: "preference",
+          key: inverse.key,
+          existed: setting?.value !== undefined,
+          value: setting?.value,
+        });
       }
+    } catch (error) {
+      warnings.push(
+        `Declarative inverse ${index + 1} could not be guarded and was not journalled: ${
+          error instanceof Error ? error.message : String(error)
+        }`,
+      );
       continue;
     }
-    if (inverse.kind === "note_html") {
-      const item = gateway.getItem(inverse.noteId);
-      itemIds.add(inverse.noteId);
-      guards.push({
-        kind: "note_html",
-        noteId: inverse.noteId,
-        checksum: await sha256Text(item?.getNote?.() || ""),
-      });
-      continue;
-    }
-    if (inverse.kind === "file") {
-      guards.push(await captureScriptFilePostcondition(inverse.path));
-      continue;
-    }
-    const setting = gateway
-      .listSettings()
-      .find((entry) => entry.key === inverse.key);
-    guards.push({
-      kind: "preference",
-      key: inverse.key,
-      existed: setting?.value !== undefined,
-      value: setting?.value,
-    });
+    guards.push(...inverseGuards);
+    inverseItemIds.forEach((itemId) => itemIds.add(itemId));
+    inverses.push(inverse);
   }
-  return { guards, itemIds: [...itemIds] };
+  return { guards, itemIds: [...itemIds], inverses, warnings };
 }
 
 async function captureScriptPostcondition(
   itemIds: Iterable<number>,
   declarativeInverses: unknown[],
   context: AgentToolContext,
-): Promise<{ postcondition: unknown; guardedItemIds: number[] }> {
+): Promise<{
+  postcondition: unknown;
+  guardedItemIds: number[];
+  declaredInverses: unknown[];
+  warnings: string[];
+}> {
   const declared = await captureDeclaredInverseGuards(
     declarativeInverses,
     context,
@@ -437,6 +464,8 @@ async function captureScriptPostcondition(
       declared: declared.guards,
     },
     guardedItemIds,
+    declaredInverses: declared.inverses,
+    warnings: declared.warnings,
   };
 }
 
@@ -444,6 +473,7 @@ function scriptResultContent(
   input: ZoteroScriptInput,
   result: ScriptResult,
   uncoveredObservedIds: number[] = [],
+  recoveryWarnings: string[] = [],
 ): Record<string, unknown> {
   return {
     mode: input.mode,
@@ -459,6 +489,7 @@ function scriptResultContent(
     uncoveredObservedIds: uncoveredObservedIds.length
       ? uncoveredObservedIds
       : undefined,
+    recoveryWarnings: recoveryWarnings.length ? recoveryWarnings : undefined,
     error: result.error || undefined,
   };
 }
@@ -522,7 +553,12 @@ async function executeScript(params: {
         if (!serialized || serialized === "null") {
           throw new Error("inverse must be a serializable object");
         }
-        declarativeInverses.push(JSON.parse(serialized) as unknown);
+        const detached = JSON.parse(serialized) as unknown;
+        const parsed = parseInverseValue(detached);
+        if (!parsed || parsed.kind === "script_snapshots") {
+          throw new Error("inverse kind or payload is unsupported");
+        }
+        declarativeInverses.push(parsed);
       } catch (error) {
         throw new Error(
           `env.addInverse requires declarative JSON data: ${
@@ -1003,10 +1039,9 @@ export function createZoteroScriptTool(
           );
           const snapshots = [...result.snapshots.values()];
           const createdItemIds = [...result.createdItemIds];
+          const declaredInverses = capturedPostcondition.declaredInverses;
           const inverse =
-            snapshots.length ||
-            createdItemIds.length ||
-            result.declarativeInverses.length
+            snapshots.length || createdItemIds.length || declaredInverses.length
               ? {
                   version: 1,
                   kind: "script_snapshots",
@@ -1014,19 +1049,35 @@ export function createZoteroScriptTool(
                     JSON.stringify({
                       snapshots,
                       createdItemIds,
-                      declaredInverses: result.declarativeInverses,
+                      declaredInverses,
                     }),
                   ),
                 }
               : undefined;
           const reversibility = inverse ? "partial" : "none";
-          const reason = uncoveredObservedIds.length
-            ? `Notifier observations included uncovered item IDs: ${uncoveredObservedIds.join(", ")}.`
-            : result.error
-              ? `The script reported an error after execution began: ${result.error}`
-              : "Arbitrary script effects outside declared snapshots and inverses cannot be proven recoverable.";
+          const recoveryLimits = [
+            ...(uncoveredObservedIds.length
+              ? [
+                  `Notifier observations included uncovered item IDs: ${uncoveredObservedIds.join(", ")}.`,
+                ]
+              : []),
+            ...capturedPostcondition.warnings,
+            ...(result.error
+              ? [
+                  `The script reported an error after execution began: ${result.error}`,
+                ]
+              : []),
+          ];
+          const reason = recoveryLimits.length
+            ? recoveryLimits.join(" ")
+            : "Arbitrary script effects outside declared snapshots and inverses cannot be proven recoverable.";
           return {
-            result: scriptResultContent(input, result, uncoveredObservedIds),
+            result: scriptResultContent(
+              input,
+              result,
+              uncoveredObservedIds,
+              capturedPostcondition.warnings,
+            ),
             inverse,
             expectedPostcondition: inverse
               ? capturedPostcondition.postcondition

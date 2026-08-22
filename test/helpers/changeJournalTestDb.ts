@@ -687,6 +687,10 @@ export class ChangeJournalTestDb {
     if (statement.startsWith(`SELECT * FROM ${JOURNAL_ACTIONS_TABLE}`)) {
       let rows = asRows(this.actions.values());
       let parameterIndex = 0;
+      if (statement.includes("action_id = ?")) {
+        const value = params[parameterIndex++];
+        rows = rows.filter((row) => row.action_id === value);
+      }
       if (statement.includes("conversation_key = ?")) {
         const value = params[parameterIndex++];
         rows = rows.filter((row) => row.conversation_key === value);
@@ -701,14 +705,14 @@ export class ChangeJournalTestDb {
             !["reverted", "no_effect", "failed"].includes(String(row.status)),
         );
       }
+      const sorted = rows.sort(
+        (left, right) =>
+          Number(right.created_at) - Number(left.created_at) ||
+          Number(right._rowid) - Number(left._rowid),
+      );
+      if (!statement.includes("LIMIT ?")) return sorted;
       const limit = Number(params[params.length - 1]) || 50;
-      return rows
-        .sort(
-          (left, right) =>
-            Number(right.created_at) - Number(left.created_at) ||
-            Number(right._rowid) - Number(left._rowid),
-        )
-        .slice(0, limit);
+      return sorted.slice(0, limit);
     }
 
     if (

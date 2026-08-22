@@ -8,6 +8,7 @@ import type { ZoteroGateway } from "../../services/zoteroGateway";
 import type { ActionRegistry } from "../../actions";
 import type { ActionCheckpoint } from "../../actions/types";
 import { buildActionExecutionContext } from "../../actions/toolContextBridge";
+import { summarizeMutationOutcomes } from "../../services/mutationCoordinator";
 import { getAgentLibraryWriteMode } from "../../libraryWriteMode";
 import {
   advanceBatchJob,
@@ -23,7 +24,6 @@ import {
   isAgentChangeJournalAvailable,
   prepareJournalAction,
   updateJournalAction,
-  type JournalReversibility,
 } from "../../store/changeJournal";
 import { ok, fail, validateObject, normalizePositiveInt } from "../shared";
 
@@ -73,39 +73,6 @@ const DURABLE_BATCH_JOBS = new Set([
   "organize_unfiled",
   "audit_library",
 ]);
-
-function combineBatchReversibility(
-  outcomes: AgentJournalStepOutcome[],
-): JournalReversibility {
-  const changed = outcomes.filter((outcome) => outcome.status !== "no_effect");
-  if (
-    !changed.length ||
-    changed.every((outcome) => outcome.reversibility === "full")
-  ) {
-    return "full";
-  }
-  if (changed.every((outcome) => outcome.reversibility === "none")) {
-    return "none";
-  }
-  return "partial";
-}
-
-function batchAffectedCount(outcomes: AgentJournalStepOutcome[]): number {
-  return outcomes.reduce(
-    (total, outcome) => total + Math.max(0, outcome.affectedCount),
-    0,
-  );
-}
-
-function batchEffect(outcomes: AgentJournalStepOutcome[]) {
-  const effects = outcomes.map((outcome) => outcome.effect);
-  if (!effects.length || effects.every((effect) => effect === "none")) {
-    return "none" as const;
-  }
-  return effects.every((effect) => effect === "applied")
-    ? ("applied" as const)
-    : ("partial" as const);
-}
 
 /**
  * Runs and resumes durable library-wide jobs.
@@ -425,9 +392,8 @@ export function createLibraryBatchTool(deps: {
         error?: unknown,
       ): Promise<void> => {
         if (!journalActionId || journalFinalized) return;
-        const affectedCount = batchAffectedCount(journalOutcomes);
-        const effect = batchEffect(journalOutcomes);
-        const reversibility = combineBatchReversibility(journalOutcomes);
+        const summary = summarizeMutationOutcomes(journalOutcomes);
+        const { affectedCount, effect, reversibility } = summary;
         const uncertain = journalOutcomes.some(
           (outcome) => outcome.status === "uncertain",
         );
@@ -553,7 +519,7 @@ export function createLibraryBatchTool(deps: {
             output,
             progress: progress.slice(-20),
           },
-          effect: batchEffect(journalOutcomes),
+          effect: summarizeMutationOutcomes(journalOutcomes).effect,
         };
       } catch (error) {
         await finalizeJournal(true, error).catch(() => undefined);
