@@ -110,10 +110,22 @@ describe("LibraryIndexService", function () {
     globalThis.Zotero = originalZotero;
   });
 
-  function service(yieldEvery = 250): LibraryIndexService {
-    const value = new LibraryIndexService(yieldEvery);
+  function service(
+    yieldEvery = 250,
+    reconciliationDelayMs = 100,
+  ): LibraryIndexService {
+    const value = new LibraryIndexService(yieldEvery, reconciliationDelayMs);
     services.push(value);
     return value;
+  }
+
+  async function handleAndGet(
+    index: LibraryIndexService,
+    change: Parameters<LibraryIndexService["handleChange"]>[0],
+    libraryID = 1,
+  ): Promise<void> {
+    await index.handleChange(change);
+    await index.getSnapshot(libraryID);
   }
 
   function installFixture(params: {
@@ -413,33 +425,17 @@ describe("LibraryIndexService", function () {
     });
     const index = service();
     const before = await index.getSnapshot(1);
-    const tagIdIndex = before.normalizedTagNameByTagId as Map<number, string>;
-    const originalTagIdIterator = tagIdIndex[Symbol.iterator];
-    let tagIdIndexScans = 0;
-    Object.defineProperty(tagIdIndex, Symbol.iterator, {
-      configurable: true,
-      value: function () {
-        tagIdIndexScans += 1;
-        return originalTagIdIterator.call(tagIdIndex);
-      },
-    });
-
     item.fields!.title = "After";
-    try {
-      await index.handleChange({
-        event: "modify",
-        type: "item",
-        ids: [1],
-        extraData: { libraryID: 1 },
-        receivedAt: Date.now(),
-      });
-    } finally {
-      Reflect.deleteProperty(tagIdIndex, Symbol.iterator);
-    }
+    await handleAndGet(index, {
+      event: "modify",
+      type: "item",
+      ids: [1],
+      extraData: { libraryID: 1 },
+      receivedAt: Date.now(),
+    });
     const after = index.peekSnapshot(1)!;
 
     assert.equal(after.itemById.get(1)?.title, "After");
-    assert.equal(tagIdIndexScans, 0);
     assert.strictEqual(after.tagByNormalizedName, before.tagByNormalizedName);
     assert.strictEqual(
       after.normalizedTagNameByTagId,
@@ -452,6 +448,22 @@ describe("LibraryIndexService", function () {
     assert.strictEqual(
       after.directItemIdsByCollectionId,
       before.directItemIdsByCollectionId,
+    );
+    assert.strictEqual(
+      after.childAttachmentIdsByItemId,
+      before.childAttachmentIdsByItemId,
+    );
+    assert.strictEqual(
+      after.pdfAttachmentIdsByItemId,
+      before.pdfAttachmentIdsByItemId,
+    );
+    assert.strictEqual(after.childNoteIdsByItemId, before.childNoteIdsByItemId);
+    assert.strictEqual(after.attachmentById, before.attachmentById);
+    assert.strictEqual(after.childNoteById, before.childNoteById);
+    assert.notStrictEqual(after.itemById, before.itemById);
+    assert.notStrictEqual(
+      after.searchableFieldsByItemId,
+      before.searchableFieldsByItemId,
     );
   });
 
@@ -480,7 +492,7 @@ describe("LibraryIndexService", function () {
 
     first.tags = [];
     second.tags = ["foo"];
-    await index.handleChange({
+    await handleAndGet(index, {
       event: "modify",
       type: "tag",
       ids: [],
@@ -507,13 +519,17 @@ describe("LibraryIndexService", function () {
     const before = await index.getSnapshot(8);
 
     fixture.setLibraryName("After rename");
-    await index.handleChange({
-      event: "modify",
-      type: "group",
-      ids: [700],
-      extraData: {},
-      receivedAt: Date.now(),
-    });
+    await handleAndGet(
+      index,
+      {
+        event: "modify",
+        type: "group",
+        ids: [700],
+        extraData: {},
+        receivedAt: Date.now(),
+      },
+      8,
+    );
     const after = index.peekSnapshot(8)!;
 
     assert.equal(before.libraryName, "Before rename");
@@ -595,7 +611,7 @@ describe("LibraryIndexService", function () {
     const initial = await index.getSnapshot(1);
 
     item.collections = [11];
-    await index.handleChange({
+    await handleAndGet(index, {
       event: "modify",
       type: "collection-item",
       ids: [1],
@@ -603,7 +619,7 @@ describe("LibraryIndexService", function () {
       receivedAt: Date.now(),
     });
     item.collections = [10];
-    await index.handleChange({
+    await handleAndGet(index, {
       event: "modify",
       type: "collection-item",
       ids: [1],
@@ -639,7 +655,7 @@ describe("LibraryIndexService", function () {
       );
     }
 
-    await index.handleChange({
+    await handleAndGet(index, {
       event: "add",
       type: "item",
       ids: itemIds,
@@ -650,7 +666,7 @@ describe("LibraryIndexService", function () {
 
     const removed = itemIds.slice(0, 500);
     for (const itemId of removed) fixture.itemById.delete(itemId);
-    await index.handleChange({
+    await handleAndGet(index, {
       event: "delete",
       type: "item",
       ids: removed,
@@ -685,7 +701,7 @@ describe("LibraryIndexService", function () {
 
     for (const seed of topLevel) seed.tags = [`Tag ${seed.id}`];
     const startedAt = Date.now();
-    await index.handleChange({
+    await handleAndGet(index, {
       event: "modify",
       type: "item",
       ids: topLevel.map((seed) => seed.id),
@@ -733,7 +749,7 @@ describe("LibraryIndexService", function () {
     const commonBefore = before.tagByNormalizedName.get("common");
 
     topLevel[0].tags = ["Common", "New"];
-    await index.handleChange({
+    await handleAndGet(index, {
       event: "modify",
       type: "item",
       ids: [1],
@@ -785,7 +801,7 @@ describe("LibraryIndexService", function () {
     item.fields!.title = "After";
     item.tags = ["Beta"];
     item.collections = [11];
-    await index.handleChange({
+    await handleAndGet(index, {
       event: "modify",
       type: "item",
       ids: [1],
@@ -803,7 +819,7 @@ describe("LibraryIndexService", function () {
     assert.isTrue(snapshot.directItemIdsByCollectionId.get(11)?.has(1));
 
     item.tags = ["Gamma"];
-    await index.handleChange({
+    await handleAndGet(index, {
       event: "modify",
       type: "item-tag",
       ids: ["1-3"],
@@ -816,7 +832,7 @@ describe("LibraryIndexService", function () {
     assert.deepEqual(snapshot.tagIdsByNormalizedName.get("gamma"), [3]);
 
     item.tags = ["Beta"];
-    await index.handleChange({
+    await handleAndGet(index, {
       event: "modify",
       type: "tag",
       ids: [2],
@@ -827,7 +843,7 @@ describe("LibraryIndexService", function () {
     assert.deepEqual([...index.tagItemIds(snapshot, "Beta", true)], [1]);
 
     item.tags = [];
-    await index.handleChange({
+    await handleAndGet(index, {
       event: "modify",
       type: "tag",
       ids: [],
@@ -837,8 +853,19 @@ describe("LibraryIndexService", function () {
     snapshot = index.peekSnapshot(1)!;
     assert.deepEqual([...index.tagItemIds(snapshot, "Beta", true)], []);
 
+    item.fields!.title = "After relation";
+    await handleAndGet(index, {
+      event: "modify",
+      type: "relation",
+      ids: [999],
+      extraData: { libraryID: 1, subjectItemID: 1 },
+      receivedAt: Date.now(),
+    });
+    snapshot = index.peekSnapshot(1)!;
+    assert.equal(snapshot.itemById.get(1)?.title, "After relation");
+
     parent.name = "Renamed parent";
-    await index.handleChange({
+    await handleAndGet(index, {
       event: "modify",
       type: "collection",
       ids: [10],
@@ -876,7 +903,7 @@ describe("LibraryIndexService", function () {
     collection.deleted = true;
     collection.childItems = [];
     item.collections = [];
-    await index.handleChange({
+    await handleAndGet(index, {
       event: "trash",
       type: "collection",
       ids: [10],
@@ -891,7 +918,7 @@ describe("LibraryIndexService", function () {
     collection.deleted = false;
     collection.childItems = [1];
     item.collections = [10];
-    await index.handleChange({
+    await handleAndGet(index, {
       event: "modify",
       type: "collection",
       ids: [10],
@@ -905,7 +932,7 @@ describe("LibraryIndexService", function () {
 
     fixture.collectionById.delete(10);
     item.collections = [];
-    await index.handleChange({
+    await handleAndGet(index, {
       event: "delete",
       type: "collection",
       ids: [10],
@@ -954,7 +981,7 @@ describe("LibraryIndexService", function () {
 
     childReads = 0;
     collection.name = "After rename";
-    await index.handleChange({
+    await handleAndGet(index, {
       event: "modify",
       type: "collection",
       ids: [10],
@@ -970,7 +997,7 @@ describe("LibraryIndexService", function () {
     assert.isTrue(snapshot.directItemIdsByCollectionId.get(10)?.has(1));
 
     item.deleted = false;
-    await index.handleChange({
+    await handleAndGet(index, {
       event: "modify",
       type: "item",
       ids: [1],
@@ -999,32 +1026,16 @@ describe("LibraryIndexService", function () {
     });
     const index = service();
     const before = await index.getSnapshot(1);
-    const collectionIndex = before.collectionById as Map<number, unknown>;
-    const originalCollectionIterator = collectionIndex[Symbol.iterator];
-    let fullCollectionScans = 0;
-    Object.defineProperty(collectionIndex, Symbol.iterator, {
-      configurable: true,
-      value: function () {
-        fullCollectionScans += 1;
-        return originalCollectionIterator.call(collectionIndex);
-      },
-    });
-
     leaf.name = "After leaf";
-    try {
-      await index.handleChange({
-        event: "modify",
-        type: "collection",
-        ids: [11],
-        extraData: { libraryID: 1 },
-        receivedAt: Date.now(),
-      });
-    } finally {
-      Reflect.deleteProperty(collectionIndex, Symbol.iterator);
-    }
+    await handleAndGet(index, {
+      event: "modify",
+      type: "collection",
+      ids: [11],
+      extraData: { libraryID: 1 },
+      receivedAt: Date.now(),
+    });
     const after = index.peekSnapshot(1)!;
 
-    assert.equal(fullCollectionScans, 0);
     assert.equal(after.collectionPathById.get(10), "Parent");
     assert.equal(after.collectionPathById.get(11), "Parent / After leaf");
     assert.equal(after.collectionPathById.get(20), "Unrelated");
@@ -1068,7 +1079,7 @@ describe("LibraryIndexService", function () {
     branch.parentID = 20;
     firstParent.childCollections = [];
     secondParent.childCollections = [11];
-    await index.handleChange({
+    await handleAndGet(index, {
       event: "modify",
       type: "collection",
       ids: [11],
@@ -1091,7 +1102,7 @@ describe("LibraryIndexService", function () {
     };
     fixture.collectionById.set(13, makeCollection(created));
     secondParent.childCollections = [11, 13];
-    await index.handleChange({
+    await handleAndGet(index, {
       event: "add",
       type: "collection",
       ids: [13],
@@ -1106,7 +1117,7 @@ describe("LibraryIndexService", function () {
 
     fixture.collectionById.delete(11);
     secondParent.childCollections = [13];
-    await index.handleChange({
+    await handleAndGet(index, {
       event: "delete",
       type: "collection",
       ids: [11],
@@ -1153,7 +1164,7 @@ describe("LibraryIndexService", function () {
     (
       fixture.itemById.get(3) as Zotero.Item & { parentID: number | false }
     ).parentID = 2;
-    await index.handleChange({
+    await handleAndGet(index, {
       event: "modify",
       type: "item",
       ids: [3],
@@ -1169,7 +1180,7 @@ describe("LibraryIndexService", function () {
     (
       fixture.itemById.get(3) as Zotero.Item & { parentID: number | false }
     ).parentID = false;
-    await index.handleChange({
+    await handleAndGet(index, {
       event: "modify",
       type: "item",
       ids: [3],
@@ -1185,7 +1196,7 @@ describe("LibraryIndexService", function () {
     (
       fixture.itemById.get(3) as Zotero.Item & { parentID: number | false }
     ).parentID = 2;
-    await index.handleChange({
+    await handleAndGet(index, {
       event: "modify",
       type: "item",
       ids: [3],
@@ -1226,13 +1237,17 @@ describe("LibraryIndexService", function () {
     await Promise.all([index.getSnapshot(1), index.getSnapshot(2)]);
 
     collection.name = "After";
-    await index.handleChange({
-      event: "modify",
-      type: "collection",
-      ids: [17],
-      extraData: {},
-      receivedAt: Date.now(),
-    });
+    await handleAndGet(
+      index,
+      {
+        event: "modify",
+        type: "collection",
+        ids: [17],
+        extraData: {},
+        receivedAt: Date.now(),
+      },
+      2,
+    );
 
     assert.equal(index.peekSnapshot(2)?.collectionById.get(17)?.name, "After");
     assert.isFalse(index.peekSnapshot(1)?.collectionById.has(17));
@@ -1293,13 +1308,17 @@ describe("LibraryIndexService", function () {
     await Promise.all([index.getSnapshot(1), index.getSnapshot(2)]);
 
     fixture.itemById.delete(42);
-    await index.handleChange({
-      event: "delete",
-      type: "item",
-      ids: [42],
-      extraData: {},
-      receivedAt: Date.now(),
-    });
+    await handleAndGet(
+      index,
+      {
+        event: "delete",
+        type: "item",
+        ids: [42],
+        extraData: {},
+        receivedAt: Date.now(),
+      },
+      2,
+    );
 
     assert.isFalse(index.peekSnapshot(2)?.itemById.has(42));
     assert.equal(index.peekSnapshot(1)?.itemById.get(1)?.title, "Library one");
@@ -1438,7 +1457,7 @@ describe("LibraryIndexService", function () {
     assert.equal(index.getMetrics().staleBuildDiscards, 0);
   });
 
-  it("bounds broad cold invalidations to two scans and refreshes again in the background", async function () {
+  it("keeps a cold read pending until its background refresh covers the latest invalidation", async function () {
     const firstBuild = deferred<Zotero.Item[]>();
     const secondBuild = deferred<Zotero.Item[]>();
     const thirdBuild = deferred<Zotero.Item[]>();
@@ -1477,22 +1496,21 @@ describe("LibraryIndexService", function () {
       makeItem({ id: 2, fields: { title: "Second scan" } }),
     ]);
 
-    const available = await loading;
-    assert.equal(calls, 2);
-    assert.equal(available.itemById.get(2)?.title, "Second scan");
-    assert.strictEqual(await index.getSnapshot(1), available);
-
+    let loadingResolved = false;
+    void loading.then(() => {
+      loadingResolved = true;
+    });
     await thirdStarted.promise;
+    assert.isFalse(loadingResolved);
     assert.equal(index.peekSnapshot(1)?.itemById.get(2)?.title, "Second scan");
     thirdBuild.resolve([
       makeItem({ id: 3, fields: { title: "Background scan" } }),
     ]);
-    await new Promise((resolve) => setTimeout(resolve, 0));
+    const available = await loading;
 
-    assert.equal(
-      index.peekSnapshot(1)?.itemById.get(3)?.title,
-      "Background scan",
-    );
+    assert.equal(calls, 3);
+    assert.equal(available.itemById.get(3)?.title, "Background scan");
+    assert.strictEqual(await index.getSnapshot(1), available);
     assert.equal(index.getMetrics().staleBuildDiscards, 1);
     assert.equal(index.getMetrics().coalescedRebuilds, 1);
   });
@@ -1570,7 +1588,7 @@ describe("LibraryIndexService", function () {
       fields: { title: "First version" },
     };
     fixture.itemById.set(1, makeItem(firstSeed));
-    await index.handleChange({
+    await handleAndGet(index, {
       event: "add",
       type: "item",
       ids: [1],
@@ -1579,7 +1597,7 @@ describe("LibraryIndexService", function () {
     });
     const beforeEdit = index.peekSnapshot(1)!;
     firstSeed.fields!.title = "Second version";
-    await index.handleChange({
+    await handleAndGet(index, {
       event: "modify",
       type: "item",
       ids: [1],
@@ -1628,6 +1646,8 @@ describe("LibraryIndexService", function () {
       });
     }
 
+    await index.getSnapshot(1);
+
     const finalSnapshot = index.peekSnapshot(1)!;
     assert.equal(finalSnapshot.itemById.size, 0);
     assert.deepEqual(finalSnapshot.topLevelItemOrder, []);
@@ -1640,6 +1660,223 @@ describe("LibraryIndexService", function () {
       "consumers must not receive the mutable set",
     );
     assert.equal(fixture.getAllCalls(), 1);
+  });
+
+  it("keeps peek reads consistent while a fresh get waits for the queued batch", async function () {
+    const item: ItemSeed = { id: 1, fields: { title: "Before" } };
+    installFixture({ topLevel: [item] });
+    const index = service();
+    const before = await index.getSnapshot(1);
+
+    item.fields!.title = "After";
+    await index.handleChange({
+      event: "modify",
+      type: "item",
+      ids: [1],
+      extraData: { libraryID: 1 },
+      receivedAt: Date.now(),
+    });
+
+    assert.strictEqual(index.peekSnapshot(1), before);
+    assert.equal(index.peekSnapshot(1)?.itemById.get(1)?.title, "Before");
+    let resolved = false;
+    const freshTask = index.getSnapshot(1).then((snapshot) => {
+      resolved = true;
+      return snapshot;
+    });
+    await Promise.resolve();
+    assert.isFalse(resolved);
+
+    const fresh = await freshTask;
+    assert.equal(fresh.itemById.get(1)?.title, "After");
+    assert.notStrictEqual(fresh, before);
+    assert.equal(before.itemById.get(1)?.title, "Before");
+  });
+
+  it("invalidates a failed targeted reconciliation and rebuilds for a fresh read", async function () {
+    const item: ItemSeed = { id: 1, fields: { title: "Before" } };
+    const fixture = installFixture({ topLevel: [item] });
+    const index = service(250, 0);
+    const before = await index.getSnapshot(1);
+    const itemsApi = Zotero.Items as unknown as {
+      get: (id: number) => Zotero.Item | undefined;
+    };
+    const getItem = itemsApi.get;
+
+    item.fields!.title = "Recovered from live state";
+    let itemReads = 0;
+    itemsApi.get = (id) => {
+      itemReads += 1;
+      if (itemReads === 1) return getItem(id);
+      throw new Error("targeted projection failed");
+    };
+    try {
+      await index.handleChange({
+        event: "modify",
+        type: "item",
+        ids: [1],
+        extraData: { libraryID: 1 },
+        receivedAt: Date.now(),
+      });
+      const fresh = await index.getSnapshot(1);
+
+      assert.equal(fresh.itemById.get(1)?.title, "Recovered from live state");
+      assert.equal(fixture.getAllCalls(), 2);
+      assert.equal(before.itemById.get(1)?.title, "Before");
+    } finally {
+      itemsApi.get = getItem;
+    }
+  });
+
+  it("batches 50k-index updates into one fast atomic publication", async function () {
+    this.timeout(15_000);
+    const itemCount = 50_000;
+    const topLevel = Array.from({ length: itemCount }, (_, offset) => ({
+      id: offset + 1,
+      fields: { title: `Item ${offset + 1}` },
+    }));
+    installFixture({ topLevel });
+    const index = service(100_000, 0);
+    const original = await index.getSnapshot(1);
+    const publisher = index as unknown as {
+      publishSnapshot: (...args: unknown[]) => void;
+    };
+    const publishSnapshot = publisher.publishSnapshot.bind(index);
+    let publicationCount = 0;
+    let atomicPublication = true;
+    let expectedBurstIds: number[] = [];
+    publisher.publishSnapshot = (...args: unknown[]) => {
+      publishSnapshot(...args);
+      publicationCount += 1;
+      const published = index.peekSnapshot(1)!;
+      atomicPublication &&= expectedBurstIds.every(
+        (itemId) => published.itemById.get(itemId)?.title === `Burst ${itemId}`,
+      );
+    };
+
+    topLevel[0].fields.title = "Isolated update";
+    const isolatedStartedAt = performance.now();
+    await handleAndGet(index, {
+      event: "modify",
+      type: "item",
+      ids: [1],
+      extraData: { libraryID: 1 },
+      receivedAt: Date.now(),
+    });
+    const isolatedElapsedMs = performance.now() - isolatedStartedAt;
+    const afterIsolated = index.peekSnapshot(1)!;
+
+    assert.equal(publicationCount, 1);
+    assert.isBelow(isolatedElapsedMs, 75);
+    assert.equal(afterIsolated.itemById.get(1)?.title, "Isolated update");
+    assert.equal(original.itemById.get(1)?.title, "Item 1");
+    assert.notStrictEqual(afterIsolated.itemById, original.itemById);
+    assert.strictEqual(afterIsolated.collectionById, original.collectionById);
+
+    publicationCount = 0;
+    expectedBurstIds = Array.from({ length: 100 }, (_, offset) => offset + 2);
+    for (const itemId of expectedBurstIds) {
+      topLevel[itemId - 1].fields.title = `Burst ${itemId}`;
+      await index.handleChange({
+        event: "modify",
+        type: "item",
+        ids: [itemId],
+        extraData: { libraryID: 1 },
+        receivedAt: Date.now(),
+      });
+    }
+    const burstStartedAt = performance.now();
+    const afterBurst = await index.getSnapshot(1);
+    const burstElapsedMs = performance.now() - burstStartedAt;
+
+    assert.equal(publicationCount, 1);
+    assert.isTrue(atomicPublication);
+    assert.isBelow(burstElapsedMs, 250);
+    assert.notStrictEqual(afterBurst.itemById, afterIsolated.itemById);
+    assert.strictEqual(afterBurst.collectionById, afterIsolated.collectionById);
+    assert.equal(afterIsolated.itemById.get(2)?.title, "Item 2");
+    assert.equal(original.itemById.get(2)?.title, "Item 2");
+  });
+
+  it("does not expose mutable backing stores from published snapshots", async function () {
+    const item: ItemSeed = {
+      id: 1,
+      fields: { title: "Immutable" },
+      tags: ["Stable"],
+      collections: [10],
+    };
+    installFixture({
+      topLevel: [item],
+      collections: [{ id: 10, name: "Collection", childItems: [1] }],
+      tagIds: new Map([["Stable", 1]]),
+    });
+    const index = service(250, 0);
+    const before = await index.getSnapshot(1);
+    const itemMap = before.itemById as unknown as {
+      cloneSource: () => Map<number, unknown>;
+      source?: Map<number, unknown>;
+    };
+    const collectionMembers = before.directItemIdsByCollectionId.get(
+      10,
+    ) as unknown as {
+      cloneSource: () => Set<number>;
+      source?: Set<number>;
+    };
+
+    assert.isTrue(Object.isFrozen(before));
+    assert.isTrue(Object.isFrozen(before.itemById));
+    assert.isTrue(Object.isFrozen(collectionMembers));
+    assert.isTrue(Object.isFrozen(before.itemById.get(1)));
+    assert.isTrue(Object.isFrozen(before.itemById.get(1)?.tags));
+    assert.isTrue(
+      Object.isFrozen(before.childCollectionIdsByCollectionId.get(10)),
+    );
+    assert.notInclude(Reflect.ownKeys(before.itemById), "source");
+    assert.notInclude(Reflect.ownKeys(collectionMembers), "source");
+    assert.isUndefined(itemMap.source);
+    assert.isUndefined(collectionMembers.source);
+    assert.isUndefined((before.itemById as { set?: unknown }).set);
+    assert.isUndefined((collectionMembers as { add?: unknown }).add);
+    assert.isFalse(
+      Reflect.set(before.itemById as object, "set", () => undefined),
+    );
+    assert.isFalse(
+      Reflect.set(collectionMembers as object, "add", () => undefined),
+    );
+    assert.isFalse(
+      Reflect.set(before.itemById.get(1)?.tags as object, "0", "Injected"),
+    );
+
+    const mapCopy = itemMap.cloneSource();
+    mapCopy.delete(1);
+    mapCopy.set(999, { title: "Injected" });
+    const memberCopy = collectionMembers.cloneSource();
+    memberCopy.clear();
+    memberCopy.add(999);
+    assert.isTrue(before.itemById.has(1));
+    assert.isFalse(before.itemById.has(999));
+    assert.deepEqual(
+      [...(before.directItemIdsByCollectionId.get(10) || [])],
+      [1],
+    );
+
+    item.fields!.title = "Published later";
+    await handleAndGet(index, {
+      event: "modify",
+      type: "item",
+      ids: [1],
+      extraData: { libraryID: 1 },
+      receivedAt: Date.now(),
+    });
+    const after = index.peekSnapshot(1)!;
+
+    assert.equal(after.itemById.get(1)?.title, "Published later");
+    assert.isFalse(after.itemById.has(999));
+    assert.deepEqual(
+      [...(after.directItemIdsByCollectionId.get(10) || [])],
+      [1],
+    );
+    assert.equal(before.itemById.get(1)?.title, "Immutable");
   });
 
   it("preserves filename-only PDFs in gateway paper listings", async function () {

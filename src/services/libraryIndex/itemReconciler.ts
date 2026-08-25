@@ -13,11 +13,48 @@ import {
   sameStringMembers,
   searchable,
 } from "./projection";
+import type { SnapshotDelta } from "./snapshotDraft";
 
 export type ItemReconciliationPlan = Readonly<{
-  snapshot: LibraryIndexSnapshot;
+  delta: SnapshotDelta;
   affectedItemCount: number;
 }>;
+
+function sameOrderedValues<T>(
+  left: readonly T[] | undefined,
+  right: readonly T[],
+): boolean {
+  return Boolean(
+    left &&
+    left.length === right.length &&
+    left.every((value, index) => value === right[index]),
+  );
+}
+
+function sameProjectedRecord<T extends object>(
+  left: T | undefined,
+  right: T,
+): boolean {
+  if (!left) return false;
+  const leftRecord = left as Record<string, unknown>;
+  const rightRecord = right as Record<string, unknown>;
+  const leftKeys = Object.keys(leftRecord)
+    .filter((key) => leftRecord[key] !== undefined)
+    .sort();
+  const rightKeys = Object.keys(rightRecord)
+    .filter((key) => rightRecord[key] !== undefined)
+    .sort();
+  return (
+    sameOrderedValues(leftKeys, rightKeys) &&
+    leftKeys.every((key) => {
+      const leftValue = leftRecord[key];
+      const rightValue = rightRecord[key];
+      return Array.isArray(leftValue) && Array.isArray(rightValue)
+        ? sameOrderedValues(leftValue, rightValue)
+        : leftValue === rightValue;
+    })
+  );
+}
 
 export function reconcileItems(
   snapshot: LibraryIndexSnapshot,
@@ -75,52 +112,102 @@ export function reconcileItems(
   for (const id of topLevelIds) {
     const previous = previousItems.get(id);
     const projected = projections.get(id) || null;
-    for (const attachmentId of snapshot.childAttachmentIdsByItemId.get(id) ||
-      []) {
-      attachmentDeletes.add(attachmentId);
-      childParentDeletes.add(attachmentId);
-    }
-    for (const noteId of snapshot.childNoteIdsByItemId.get(id) || []) {
-      childNoteRecordDeletes.add(noteId);
-      childParentDeletes.add(noteId);
-    }
+    const previousAttachmentIds =
+      snapshot.childAttachmentIdsByItemId.get(id) || [];
+    const previousNoteIds = snapshot.childNoteIdsByItemId.get(id) || [];
     if (!projected) {
       itemDeletes.add(id);
       childAttachmentDeletes.add(id);
       pdfAttachmentDeletes.add(id);
       childNoteDeletes.add(id);
       searchableDeletes.add(id);
+      for (const attachmentId of previousAttachmentIds) {
+        attachmentDeletes.add(attachmentId);
+        childParentDeletes.add(attachmentId);
+      }
+      for (const noteId of previousNoteIds) {
+        childNoteRecordDeletes.add(noteId);
+        childParentDeletes.add(noteId);
+      }
       if (previous) orderDeletes.add(id);
       continue;
     }
-    itemUpdates.set(id, projected.item);
+    if (!sameProjectedRecord(previous, projected.item)) {
+      itemUpdates.set(id, projected.item);
+    }
     const attachmentIds = projected.attachments.map(
       (attachment) => attachment.attachmentId,
     );
-    childAttachmentUpdates.set(id, Object.freeze(attachmentIds));
-    pdfAttachmentUpdates.set(
-      id,
-      Object.freeze(
-        projected.attachments
-          .filter((attachment) => attachment.isContextEligiblePdf)
-          .map((attachment) => attachment.attachmentId),
-      ),
-    );
-    childNoteUpdates.set(id, Object.freeze([...projected.childNoteIds]));
+    if (!sameOrderedValues(previousAttachmentIds, attachmentIds)) {
+      childAttachmentUpdates.set(id, Object.freeze(attachmentIds));
+    }
+    const pdfAttachmentIds = projected.attachments
+      .filter((attachment) => attachment.isContextEligiblePdf)
+      .map((attachment) => attachment.attachmentId);
+    if (
+      !sameOrderedValues(
+        snapshot.pdfAttachmentIdsByItemId.get(id),
+        pdfAttachmentIds,
+      )
+    ) {
+      pdfAttachmentUpdates.set(id, Object.freeze(pdfAttachmentIds));
+    }
+    if (
+      !sameOrderedValues(
+        snapshot.childNoteIdsByItemId.get(id),
+        projected.childNoteIds,
+      )
+    ) {
+      childNoteUpdates.set(id, Object.freeze([...projected.childNoteIds]));
+    }
+    const nextAttachmentIds = new Set(attachmentIds);
+    const nextNoteIds = new Set(projected.childNoteIds);
+    for (const attachmentId of previousAttachmentIds) {
+      if (nextAttachmentIds.has(attachmentId)) continue;
+      attachmentDeletes.add(attachmentId);
+      childParentDeletes.add(attachmentId);
+    }
+    for (const noteId of previousNoteIds) {
+      if (nextNoteIds.has(noteId)) continue;
+      childNoteRecordDeletes.add(noteId);
+      childParentDeletes.add(noteId);
+    }
     for (const note of projected.childNotes) {
-      childNoteRecordUpdates.set(note.noteId, note);
-      childParentUpdates.set(note.noteId, id);
+      if (!sameProjectedRecord(snapshot.childNoteById.get(note.noteId), note)) {
+        childNoteRecordUpdates.set(note.noteId, note);
+      }
+      if (snapshot.parentItemIdByChildId.get(note.noteId) !== id) {
+        childParentUpdates.set(note.noteId, id);
+      }
     }
     for (const attachment of projected.attachments) {
-      attachmentUpdates.set(attachment.attachmentId, attachment);
-      if (attachment.parentItemId) {
+      if (
+        !sameProjectedRecord(
+          snapshot.attachmentById.get(attachment.attachmentId),
+          attachment,
+        )
+      ) {
+        attachmentUpdates.set(attachment.attachmentId, attachment);
+      }
+      if (
+        attachment.parentItemId &&
+        snapshot.parentItemIdByChildId.get(attachment.attachmentId) !== id
+      ) {
         childParentUpdates.set(attachment.attachmentId, id);
       }
     }
-    searchableUpdates.set(
-      id,
-      searchable(projected.item, projected.attachmentTitles),
+    const nextSearchable = searchable(
+      projected.item,
+      projected.attachmentTitles,
     );
+    if (
+      !sameProjectedRecord(
+        snapshot.searchableFieldsByItemId.get(id),
+        nextSearchable,
+      )
+    ) {
+      searchableUpdates.set(id, nextSearchable);
+    }
     if (!previous) orderAdds.push(id);
   }
 
@@ -386,9 +473,7 @@ export function reconcileItems(
     }
   }
 
-  const nextSnapshot = Object.freeze({
-    ...snapshot,
-    epoch: snapshot.epoch,
+  const delta: SnapshotDelta = Object.freeze({
     itemById,
     topLevelItemOrder: order,
     attachmentById: patchMap(
@@ -460,7 +545,7 @@ export function reconcileItems(
   });
 
   return {
-    snapshot: nextSnapshot,
+    delta,
     affectedItemCount: topLevelIds.size,
   };
 }

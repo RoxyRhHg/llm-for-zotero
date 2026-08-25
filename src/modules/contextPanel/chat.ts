@@ -3636,7 +3636,7 @@ function resolveEffectiveConversationSystem(params: {
   return "upstream";
 }
 
-function resolveEffectiveRequestConfig(params: {
+export function resolveEffectiveRequestConfig(params: {
   item: Zotero.Item;
   model?: string;
   apiBase?: string;
@@ -3653,6 +3653,20 @@ function resolveEffectiveRequestConfig(params: {
   reasoning?: LLMReasoningConfig;
   advanced?: AdvancedModelParams;
 }): EffectiveRequestConfig {
+  if (params.authMode === "webchat" || params.providerProtocol === "web_sync") {
+    return {
+      model: (params.model || "chatgpt.com").trim() || "chatgpt.com",
+      apiBase: "",
+      apiKey: "",
+      authMode: "webchat",
+      providerProtocol: "web_sync",
+      modelEntryId: params.modelEntryId,
+      modelProviderLabel: params.modelProviderLabel,
+      reasoning: undefined,
+      advanced: undefined,
+    };
+  }
+
   if (isCodexAppServerConversationRequest(params)) {
     const model =
       (params.model || getCodexRuntimeModelPref()).trim() || "gpt-5.4";
@@ -3737,23 +3751,27 @@ function resolveEffectiveRequestConfig(params: {
     params.providerProtocol ||
     explicitEntry?.providerProtocol ||
     fallbackEntry?.providerProtocol;
-  const advanced =
-    params.advanced || explicitEntry?.advanced || fallbackEntry?.advanced;
-  const reasoning =
-    params.reasoning ||
-    getSelectedReasoningForItem(
-      params.item.id,
-      model,
-      apiBase,
-      providerProtocol,
-      advanced?.profileOverride,
-    );
+  const webChatRequest =
+    authMode === "webchat" || providerProtocol === "web_sync";
+  const advanced = webChatRequest
+    ? undefined
+    : params.advanced || explicitEntry?.advanced || fallbackEntry?.advanced;
+  const reasoning = webChatRequest
+    ? undefined
+    : params.reasoning ||
+      getSelectedReasoningForItem(
+        params.item.id,
+        model,
+        apiBase,
+        providerProtocol,
+        advanced?.profileOverride,
+      );
   return {
     model,
-    apiBase,
-    apiKey,
-    authMode,
-    providerProtocol,
+    apiBase: webChatRequest ? "" : apiBase,
+    apiKey: webChatRequest ? "" : apiKey,
+    authMode: webChatRequest ? "webchat" : authMode,
+    providerProtocol: webChatRequest ? "web_sync" : providerProtocol,
     modelEntryId:
       params.modelEntryId || explicitEntry?.entryId || fallbackEntry?.entryId,
     modelProviderLabel:

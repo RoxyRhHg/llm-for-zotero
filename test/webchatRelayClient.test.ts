@@ -492,6 +492,15 @@ describe("webchat relay/client", function () {
       relayServer.relayGetStateSnapshot().query.delivery_contract_version,
       relayServer.ATTACHMENT_DELIVERY_CONTRACT_VERSION,
     );
+    assert.doesNotHaveAnyKeys(relayServer.relayGetStateSnapshot().query, [
+      "temperature",
+      "maxTokens",
+      "maxTokensExplicit",
+      "inputTokenCap",
+      "inputMode",
+      "providerProtocol",
+      "profileOverride",
+    ]);
   });
 
   it("rejects an incompatible extension before dispatching a real turn", async function () {

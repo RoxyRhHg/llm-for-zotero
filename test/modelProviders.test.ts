@@ -251,6 +251,155 @@ describe("modelProviders", function () {
     assert.equal(notifications, 1);
   });
 
+  it("normalizes WebChat as target-only persisted and runtime state", function () {
+    setModelProviderGroups([
+      {
+        id: "webchat-provider",
+        apiBase: "https://ignored.example/v1",
+        apiKey: "ignored-secret",
+        authMode: "webchat",
+        providerProtocol: "responses_api",
+        presetIdOverride: "customized",
+        models: [
+          {
+            id: "web-target",
+            model: "chatgpt.com",
+            temperature: 1.7,
+            maxTokens: 99_999,
+            maxTokensExplicit: true,
+            inputTokenCap: 123,
+            inputMode: "text_only",
+            providerProtocol: "responses_api",
+            profileOverride: { extraBody: { top_k: 10 } },
+          },
+        ],
+      } as unknown as ModelProviderGroup,
+    ]);
+
+    const [group] = getModelProviderGroups();
+    assert.equal(group.authMode, "webchat");
+    if (group.authMode !== "webchat") assert.fail("expected WebChat group");
+    assert.deepEqual(group, {
+      id: "webchat-provider",
+      authMode: "webchat",
+      providerProtocol: "web_sync",
+      models: [{ id: "web-target", model: "chatgpt.com" }],
+    });
+    const [entry] = getRuntimeModelEntries();
+    assert.equal(entry.authMode, "webchat");
+    assert.notProperty(entry, "advanced");
+
+    const stored = JSON.parse(
+      String(
+        globalThis.Zotero.Prefs.get(
+          `${config.prefsPrefix}.modelProviderGroups`,
+          true,
+        ),
+      ),
+    ) as Array<Record<string, unknown>>;
+    assert.deepEqual(stored, [group]);
+  });
+
+  it("migrates legacy WebChat targets and repairs an invalid selection", function () {
+    const prefs = globalThis.Zotero.Prefs as {
+      set: (key: string, value: unknown, global?: boolean) => void;
+      get: (key: string, global?: boolean) => unknown;
+    };
+    prefs.set(
+      `${config.prefsPrefix}.modelProviderGroups`,
+      JSON.stringify([
+        {
+          id: "webchat-provider",
+          apiBase: "https://ignored.example/v1",
+          apiKey: "ignored",
+          authMode: "webchat",
+          providerProtocol: "responses_api",
+          models: [
+            { id: "invalid-row", model: "gpt-5.4", temperature: 1.2 },
+            { id: "chatgpt-row", model: "CHATGPT.COM", maxTokens: 1 },
+            { id: "duplicate-row", model: "chatgpt.com" },
+            { id: "deepseek-row", model: "chat.deepseek.com" },
+          ],
+        },
+      ]),
+      true,
+    );
+    prefs.set(
+      `${config.prefsPrefix}.lastUsedModelEntryId`,
+      "invalid-row",
+      true,
+    );
+    prefs.set(
+      `${config.prefsPrefix}.modelProviderGroupsMigrationVersion`,
+      6,
+      true,
+    );
+
+    const [group] = getModelProviderGroups();
+    assert.equal(group.authMode, "webchat");
+    if (group.authMode !== "webchat") assert.fail("expected WebChat group");
+    assert.deepEqual(group.models, [
+      { id: "chatgpt-row", model: "chatgpt.com" },
+      { id: "deepseek-row", model: "chat.deepseek.com" },
+    ]);
+    assert.equal(getLastUsedModelEntryId(), "chatgpt-row");
+    const stored = String(
+      prefs.get(`${config.prefsPrefix}.modelProviderGroups`, true),
+    );
+    assert.notInclude(stored, "temperature");
+    assert.notInclude(stored, "maxTokens");
+    assert.notInclude(stored, "api.example");
+    assert.notInclude(stored, "apiBase");
+    assert.notInclude(stored, "apiKey");
+  });
+
+  it("preserves a selected WebChat target row that survives migration", function () {
+    const prefs = globalThis.Zotero.Prefs as {
+      set: (key: string, value: unknown, global?: boolean) => void;
+      get: (key: string, global?: boolean) => unknown;
+    };
+    prefs.set(
+      `${config.prefsPrefix}.modelProviderGroups`,
+      JSON.stringify([
+        {
+          id: "webchat-provider",
+          apiBase: "https://ignored.example/v1",
+          apiKey: "ignored",
+          authMode: "webchat",
+          models: [
+            { id: "chatgpt-row", model: "chatgpt.com" },
+            {
+              id: "deepseek-row",
+              model: "chat.deepseek.com",
+              temperature: 1.4,
+            },
+          ],
+        },
+      ]),
+      true,
+    );
+    prefs.set(
+      `${config.prefsPrefix}.lastUsedModelEntryId`,
+      "deepseek-row",
+      true,
+    );
+    prefs.set(
+      `${config.prefsPrefix}.modelProviderGroupsMigrationVersion`,
+      6,
+      true,
+    );
+
+    const [group] = getModelProviderGroups();
+    assert.equal(getLastUsedModelEntryId(), "deepseek-row");
+    assert.equal(group.models[1]?.id, "deepseek-row");
+    const stored = String(
+      prefs.get(`${config.prefsPrefix}.modelProviderGroups`, true),
+    );
+    assert.notInclude(stored, "temperature");
+    assert.notInclude(stored, "apiBase");
+    assert.notInclude(stored, "apiKey");
+  });
+
   it("infers Anthropic protocol for customized providers with default chat protocol", function () {
     const groups: ModelProviderGroup[] = [
       {

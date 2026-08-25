@@ -2865,6 +2865,109 @@ describe("durable change journal v2", function () {
     );
   });
 
+  it("recognizes a completed creator inverse regardless of object key order", async function () {
+    await prepareAction({
+      id: "completed-creator-inverse",
+      createdAt: 1_382.5,
+      status: "revert_failed",
+      operation: "update_metadata",
+      forward: {
+        type: "update_metadata",
+        itemId: 1,
+        metadata: {
+          creators: [
+            {
+              firstName: "Grace",
+              lastName: "Hopper",
+              creatorType: "author",
+            },
+          ],
+        },
+      },
+      inverse: {
+        version: 1,
+        kind: "library_operations",
+        operations: [
+          {
+            type: "update_metadata",
+            itemId: 1,
+            metadata: {
+              creators: [
+                {
+                  firstName: "Ada",
+                  lastName: "Lovelace",
+                  creatorType: "author",
+                },
+              ],
+            },
+          },
+        ],
+      },
+      expectedPostcondition: {
+        version: 1,
+        operation: "update_metadata",
+        items: [
+          {
+            itemId: 1,
+            exists: true,
+            parentItemId: null,
+            deleted: false,
+            fields: { title: "Paper" },
+            creators: [
+              {
+                firstName: "Grace",
+                lastName: "Hopper",
+                creatorType: "author",
+              },
+            ],
+          },
+        ],
+      },
+    });
+    let writes = 0;
+    const creators = [
+      {
+        creatorType: "author",
+        lastName: "Lovelace",
+        firstName: "Ada",
+      },
+    ];
+    const gateway = {
+      getItem: () => ({ id: 1, parentID: false, deleted: false }),
+      resolveMetadataItem: () => ({ id: 1, parentID: false, deleted: false }),
+      getEditableArticleMetadata: () => ({
+        itemId: 1,
+        title: "Paper",
+        fields: { title: "Paper" },
+        creators,
+      }),
+      updateArticleMetadata: async () => {
+        writes += 1;
+        return { status: "updated" };
+      },
+    } as never;
+    const actions = await listJournalActions({
+      conversationKey: 77,
+      pendingOnly: true,
+      limit: 10,
+    });
+
+    const outcome = await revertActions({
+      actions: actions.filter(
+        (action) => action.actionId === "completed-creator-inverse",
+      ),
+      zoteroGateway: gateway,
+      context,
+    });
+
+    assert.equal(outcome.reverted, 1);
+    assert.equal(writes, 0);
+    assert.equal(
+      db.actions.get("completed-creator-inverse")?.status,
+      "reverted",
+    );
+  });
+
   it("preserves a concurrent file edit after post-claim completion", async function () {
     const path = "/tmp/post-claim-concurrent-edit.txt";
     await prepareAction({

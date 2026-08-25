@@ -43,6 +43,12 @@ type PendingIndexChanges = {
   collectionIds: Set<number>;
   libraryName: boolean;
   fullRebuild: boolean;
+  completions: Set<PendingCompletion>;
+};
+
+type PendingCompletion = {
+  promise: Promise<void>;
+  resolve: () => void;
 };
 
 type LibraryState = {
@@ -52,15 +58,25 @@ type LibraryState = {
   backgroundRefreshTask?: Promise<void>;
   pendingChanges?: PendingIndexChanges;
   reconciling?: boolean;
+  reconciliationTask?: Promise<void>;
   rebuildTimer?: ReturnType<typeof setTimeout>;
 };
 
-function pendingIndexChanges(): PendingIndexChanges {
+function pendingCompletion(): PendingCompletion {
+  let resolve!: () => void;
+  const promise = new Promise<void>((accept) => {
+    resolve = accept;
+  });
+  return { promise, resolve };
+}
+
+function pendingIndexChanges(withCompletion = false): PendingIndexChanges {
   return {
     itemIds: new Set<number>(),
     collectionIds: new Set<number>(),
     libraryName: false,
     fullRebuild: false,
+    completions: withCompletion ? new Set([pendingCompletion()]) : new Set(),
   };
 }
 
@@ -115,6 +131,8 @@ function relationItemNotifierIds(
     }
     const record = value as Record<string, unknown>;
     add(record.itemID ?? record.itemId);
+    add(record.subjectItemID ?? record.subjectItemId);
+    add(record.objectItemID ?? record.objectItemId);
     for (const nested of Object.values(record)) visit(nested, depth + 1);
   };
   visit(extraData, 0);
@@ -133,7 +151,10 @@ export class LibraryIndexService {
     staleBuildDiscards: 0,
   };
 
-  constructor(private readonly yieldEvery = 250) {}
+  constructor(
+    private readonly yieldEvery = 250,
+    private readonly reconciliationDelayMs = 100,
+  ) {}
 
   getMetrics(): LibraryIndexMetrics {
     return Object.freeze({ ...this.metrics });
@@ -153,24 +174,42 @@ export class LibraryIndexService {
 
   private pendingChanges(state: LibraryState): PendingIndexChanges {
     state.pendingChanges ||= pendingIndexChanges();
+    if (!state.pendingChanges.completions.size) {
+      state.pendingChanges.completions.add(pendingCompletion());
+    }
     return state.pendingChanges;
   }
 
   private takePendingChanges(state: LibraryState): PendingIndexChanges {
     const changes = state.pendingChanges || pendingIndexChanges();
-    state.pendingChanges = pendingIndexChanges();
+    state.pendingChanges = undefined;
     return changes;
+  }
+
+  private mergeChanges(
+    pending: PendingIndexChanges,
+    changes: PendingIndexChanges,
+  ): void {
+    changes.itemIds.forEach((id) => pending.itemIds.add(id));
+    changes.collectionIds.forEach((id) => pending.collectionIds.add(id));
+    changes.completions.forEach((completion) =>
+      pending.completions.add(completion),
+    );
+    pending.libraryName ||= changes.libraryName;
+    pending.fullRebuild ||= changes.fullRebuild;
   }
 
   private requeueChanges(
     state: LibraryState,
     changes: PendingIndexChanges,
   ): void {
-    const pending = this.pendingChanges(state);
-    changes.itemIds.forEach((id) => pending.itemIds.add(id));
-    changes.collectionIds.forEach((id) => pending.collectionIds.add(id));
-    pending.libraryName ||= changes.libraryName;
-    pending.fullRebuild ||= changes.fullRebuild;
+    if (!hasPendingIndexChanges(changes) && !changes.completions.size) return;
+    const pending = (state.pendingChanges ||= pendingIndexChanges());
+    this.mergeChanges(pending, changes);
+  }
+
+  private completeChanges(changes: PendingIndexChanges): void {
+    for (const completion of changes.completions) completion.resolve();
   }
 
   private shouldQueueChanges(state: LibraryState): boolean {
@@ -221,32 +260,35 @@ export class LibraryIndexService {
       if (!baseSnapshot) return;
       const draft = new SnapshotDraft(baseSnapshot, state.epoch);
       if (changes.libraryName) {
-        draft.replace(this.patchLibraryName(libraryID, true, draft.snapshot));
+        const libraryName = resolveLibraryName(libraryID);
+        if (libraryName !== draft.snapshot.libraryName) {
+          draft.apply(Object.freeze({ libraryName }));
+        }
       }
+      const affectedItemIds = new Set(changes.itemIds);
       if (changes.collectionIds.size) {
-        draft.replace(
-          await this.patchCollections(
-            libraryID,
-            [...changes.collectionIds],
-            true,
-            draft.snapshot,
-          ),
+        const collectionPlan = reconcileCollections(draft.snapshot, libraryID, [
+          ...changes.collectionIds,
+        ]);
+        draft.apply(collectionPlan.delta);
+        collectionPlan.membershipAffectedItemIds.forEach((id) =>
+          affectedItemIds.add(id),
         );
+        this.metrics.incrementalCollectionUpdates +=
+          collectionPlan.affectedCollectionCount;
       }
-      if (changes.itemIds.size) {
-        draft.replace(
-          await this.patchItems(
-            libraryID,
-            [...changes.itemIds],
-            true,
-            draft.snapshot,
-          ),
-        );
+      if (affectedItemIds.size) {
+        const itemPlan = reconcileItems(draft.snapshot, libraryID, [
+          ...affectedItemIds,
+        ]);
+        draft.apply(itemPlan.delta);
+        this.metrics.incrementalItemUpdates += itemPlan.affectedItemCount;
       }
       if (state.snapshot !== installedSnapshot || state.epoch !== draft.epoch) {
         throw new Error("Library index changed during reconciliation");
       }
       this.publishSnapshot(state, draft.snapshot);
+      this.completeChanges(changes);
     } finally {
       state.reconciling = false;
     }
@@ -258,21 +300,29 @@ export class LibraryIndexService {
     if (state.rebuildTimer) clearTimeout(state.rebuildTimer);
     state.rebuildTimer = setTimeout(() => {
       state.rebuildTimer = undefined;
-      if (state.loadTask || state.backgroundRefreshTask || state.reconciling) {
+      if (
+        (state.loadTask && !state.snapshot) ||
+        state.backgroundRefreshTask ||
+        state.reconciling
+      ) {
         this.schedulePendingReconciliation(libraryID);
         return;
       }
       const changes = this.takePendingChanges(state);
-      if (!hasPendingIndexChanges(changes)) return;
+      if (!hasPendingIndexChanges(changes)) {
+        this.completeChanges(changes);
+        return;
+      }
       if (changes.fullRebuild) {
         this.startBackgroundRefresh(libraryID, state, changes);
         return;
       }
       let failed = false;
-      void this.reconcileChanges(libraryID, state, changes)
+      const task = this.reconcileChanges(libraryID, state, changes)
         .catch((error) => {
           failed = true;
-          this.requeueChanges(state, changes);
+          state.snapshot = undefined;
+          this.completeChanges(changes);
           globalThis.Zotero?.debug?.(
             `[llm-for-zotero] Library index reconciliation failed: ${
               error instanceof Error ? error.message : String(error)
@@ -280,11 +330,20 @@ export class LibraryIndexService {
           );
         })
         .finally(() => {
-          if (!failed && hasPendingIndexChanges(this.pendingChanges(state))) {
+          if (state.reconciliationTask === task) {
+            state.reconciliationTask = undefined;
+          }
+          if (
+            !failed &&
+            state.snapshot &&
+            state.pendingChanges &&
+            hasPendingIndexChanges(state.pendingChanges)
+          ) {
             this.schedulePendingReconciliation(libraryID);
           }
         });
-    }, 100);
+      state.reconciliationTask = task;
+    }, this.reconciliationDelayMs);
   }
 
   private startBackgroundRefresh(
@@ -299,12 +358,22 @@ export class LibraryIndexService {
     this.metrics.coalescedRebuilds += 1;
     let failed = false;
     const task = (async () => {
-      const snapshot = await this.buildSnapshot(libraryID, state.epoch);
+      const buildEpoch = state.epoch;
+      const snapshot = await this.buildSnapshot(libraryID, buildEpoch);
       const trailing = this.takePendingChanges(state);
+      if (state.epoch !== buildEpoch || trailing.fullRebuild) {
+        this.metrics.staleBuildDiscards += 1;
+        this.mergeChanges(trailing, coveredChanges);
+        trailing.fullRebuild = true;
+        this.requeueChanges(state, trailing);
+        return;
+      }
       if (hasPendingIndexChanges(trailing)) {
         await this.reconcileChanges(libraryID, state, trailing, snapshot);
+        this.completeChanges(coveredChanges);
       } else {
         this.publishSnapshot(state, snapshot);
+        this.completeChanges(coveredChanges);
       }
       const duringReconciliation = this.takePendingChanges(state);
       if (trailing.fullRebuild) {
@@ -314,8 +383,7 @@ export class LibraryIndexService {
     })()
       .catch((error) => {
         failed = true;
-        coveredChanges.fullRebuild = true;
-        this.requeueChanges(state, coveredChanges);
+        this.completeChanges(coveredChanges);
         // A snapshot that could not be refreshed must not keep serving
         // peek-only consumers indefinitely: drop it so reads fall back to
         // live Zotero data and the next getSnapshot rebuilds.
@@ -330,7 +398,11 @@ export class LibraryIndexService {
         if (state.backgroundRefreshTask === task) {
           state.backgroundRefreshTask = undefined;
         }
-        if (!failed && hasPendingIndexChanges(this.pendingChanges(state))) {
+        if (
+          !failed &&
+          state.pendingChanges &&
+          hasPendingIndexChanges(state.pendingChanges)
+        ) {
           this.schedulePendingReconciliation(libraryID);
         }
       });
@@ -345,24 +417,62 @@ export class LibraryIndexService {
     let changes = this.takePendingChanges(state);
     if (changes.fullRebuild) {
       this.metrics.staleBuildDiscards += 1;
+      const coveredCompletions = [...changes.completions];
       snapshot = await this.buildSnapshot(libraryID, state.epoch);
       changes = this.takePendingChanges(state);
+      coveredCompletions.forEach((completion) =>
+        changes.completions.add(completion),
+      );
     }
+    const needsBackgroundRefresh = changes.fullRebuild;
+    const appliedChanges = needsBackgroundRefresh
+      ? {
+          ...changes,
+          fullRebuild: false,
+          completions: new Set<PendingCompletion>(),
+        }
+      : changes;
     try {
-      if (hasPendingIndexChanges(changes)) {
-        await this.reconcileChanges(libraryID, state, changes, snapshot);
+      if (hasPendingIndexChanges(appliedChanges)) {
+        await this.reconcileChanges(libraryID, state, appliedChanges, snapshot);
       } else {
         this.publishSnapshot(state, snapshot);
+        this.completeChanges(appliedChanges);
       }
     } catch (error) {
       state.snapshot = undefined;
       throw error;
     }
     const trailing = this.takePendingChanges(state);
-    if (changes.fullRebuild) trailing.fullRebuild = true;
+    if (needsBackgroundRefresh) {
+      trailing.fullRebuild = true;
+      changes.completions.forEach((completion) =>
+        trailing.completions.add(completion),
+      );
+    }
     this.requeueChanges(state, trailing);
     if (hasPendingIndexChanges(trailing)) {
       this.schedulePendingReconciliation(libraryID);
+    }
+    if (needsBackgroundRefresh) {
+      await Promise.all(
+        [...changes.completions].map((completion) => completion.promise),
+      );
+      if (!state.snapshot) {
+        const recovery = await this.buildSnapshot(libraryID, state.epoch);
+        const recoveryChanges = this.takePendingChanges(state);
+        if (hasPendingIndexChanges(recoveryChanges)) {
+          await this.reconcileChanges(
+            libraryID,
+            state,
+            recoveryChanges,
+            recovery,
+          );
+        } else {
+          this.publishSnapshot(state, recovery);
+          this.completeChanges(recoveryChanges);
+        }
+      }
     }
     return state.snapshot!;
   }
@@ -386,6 +496,14 @@ export class LibraryIndexService {
         !state.reconciling
       ) {
         this.schedulePendingReconciliation(normalized);
+      }
+      const pendingTask = state.pendingChanges?.completions.values().next()
+        .value?.promise;
+      const activeTask =
+        state.reconciliationTask || state.backgroundRefreshTask || pendingTask;
+      if (activeTask) {
+        await activeTask;
+        return this.getSnapshot(normalized);
       }
       return state.snapshot;
     }
@@ -431,6 +549,7 @@ export class LibraryIndexService {
   clearForTests(): void {
     for (const state of this.states.values()) {
       if (state.rebuildTimer) clearTimeout(state.rebuildTimer);
+      if (state.pendingChanges) this.completeChanges(state.pendingChanges);
     }
     this.states.clear();
     this.resetMetricsForTests();
@@ -620,82 +739,6 @@ export class LibraryIndexService {
     return libraryIDs;
   }
 
-  private patchLibraryName(
-    libraryID: number,
-    force = false,
-    draft?: LibraryIndexSnapshot,
-  ): LibraryIndexSnapshot | undefined {
-    const state = this.states.get(libraryID);
-    if (!state) return undefined;
-    if (!draft && !force && this.shouldQueueChanges(state)) {
-      this.queueLibraryNameChange(state);
-      return undefined;
-    }
-    const snapshot = draft || state.snapshot;
-    if (!snapshot) {
-      this.queueLibraryNameChange(state);
-      return undefined;
-    }
-    const libraryName = resolveLibraryName(libraryID);
-    if (libraryName === snapshot.libraryName) return snapshot;
-    const nextSnapshot = Object.freeze({
-      ...snapshot,
-      epoch: state.epoch,
-      libraryName,
-    });
-    if (!draft) this.publishSnapshot(state, nextSnapshot);
-    return nextSnapshot;
-  }
-
-  private async patchItems(
-    libraryID: number,
-    ids: number[],
-    force = false,
-    draft?: LibraryIndexSnapshot,
-  ): Promise<LibraryIndexSnapshot | undefined> {
-    const state = this.states.get(libraryID);
-    const snapshot = draft || state?.snapshot;
-    if (!state) return undefined;
-    if (!snapshot || (!draft && !force && this.shouldQueueChanges(state))) {
-      this.queueItemChanges(state, ids);
-      return undefined;
-    }
-    const plan = reconcileItems(snapshot, libraryID, ids);
-    if (!draft) this.publishSnapshot(state, plan.snapshot);
-    this.metrics.incrementalItemUpdates += plan.affectedItemCount;
-    return plan.snapshot;
-  }
-
-  private async patchCollections(
-    libraryID: number,
-    ids: number[],
-    force = false,
-    draft?: LibraryIndexSnapshot,
-  ): Promise<LibraryIndexSnapshot | undefined> {
-    const state = this.states.get(libraryID);
-    const snapshot = draft || state?.snapshot;
-    if (!state) return undefined;
-    if (!snapshot || (!draft && !force && this.shouldQueueChanges(state))) {
-      this.queueCollectionChanges(state, ids);
-      return undefined;
-    }
-    const collectionPlan = reconcileCollections(snapshot, libraryID, ids);
-    let nextSnapshot = collectionPlan.snapshot;
-    this.metrics.incrementalCollectionUpdates +=
-      collectionPlan.affectedCollectionCount;
-    if (collectionPlan.membershipAffectedItemIds.size) {
-      nextSnapshot =
-        (await this.patchItems(
-          libraryID,
-          [...collectionPlan.membershipAffectedItemIds],
-          force,
-          nextSnapshot,
-        )) || nextSnapshot;
-    }
-    if (!draft) this.publishSnapshot(state, nextSnapshot);
-    return nextSnapshot;
-  }
-
   private scheduleRebuild(libraryID: number): void {
     const state = this.states.get(libraryID);
     if (!state) return;
@@ -738,7 +781,10 @@ export class LibraryIndexService {
         groupLibraryIDs.add(this.states.keys().next().value as number);
       }
       for (const libraryID of groupLibraryIDs) {
-        this.patchLibraryName(libraryID);
+        const state = this.states.get(libraryID);
+        if (!state) continue;
+        this.queueLibraryNameChange(state);
+        if (state.snapshot) this.schedulePendingReconciliation(libraryID);
       }
       return;
     }
@@ -751,28 +797,57 @@ export class LibraryIndexService {
       libraryIDs.add(this.states.keys().next().value as number);
     }
     if (change.type === "item" || change.type === "file") {
-      for (const libraryID of libraryIDs) await this.patchItems(libraryID, ids);
+      for (const libraryID of libraryIDs) {
+        const state = this.states.get(libraryID);
+        if (!state) continue;
+        this.queueItemChanges(state, ids);
+        if (state.snapshot) this.schedulePendingReconciliation(libraryID);
+      }
       return;
     }
     if (change.type === "collection") {
       for (const libraryID of libraryIDs.size
         ? libraryIDs
         : this.states.keys()) {
-        if (ids.length) await this.patchCollections(libraryID, ids);
-        else this.scheduleRebuild(libraryID);
+        if (!ids.length) {
+          this.scheduleRebuild(libraryID);
+          continue;
+        }
+        const state = this.states.get(libraryID);
+        if (!state) continue;
+        this.queueCollectionChanges(state, ids);
+        if (state.snapshot) this.schedulePendingReconciliation(libraryID);
       }
       return;
     }
-    if (change.type === "collection-item" || change.type === "item-tag") {
+    if (
+      change.type === "collection-item" ||
+      change.type === "item-tag" ||
+      change.type === "relation"
+    ) {
       const itemIds = relationItemNotifierIds(
         change.type,
         change.ids,
         change.extraData,
       );
+      if (!itemIds.length && change.type === "relation") {
+        const candidates =
+          explicitLibraryID > 0 ? [explicitLibraryID] : [...this.states.keys()];
+        for (const libraryID of candidates) {
+          const state = this.states.get(libraryID);
+          if (!state) continue;
+          this.queueFullRebuild(state);
+          if (state.snapshot) this.schedulePendingReconciliation(libraryID);
+        }
+        return;
+      }
       const relationLibraries = this.libraryIDsForItemIds(itemIds);
       if (explicitLibraryID > 0) relationLibraries.add(explicitLibraryID);
       for (const libraryID of relationLibraries) {
-        await this.patchItems(libraryID, itemIds);
+        const state = this.states.get(libraryID);
+        if (!state) continue;
+        this.queueItemChanges(state, itemIds);
+        if (state.snapshot) this.schedulePendingReconciliation(libraryID);
       }
       return;
     }
@@ -783,6 +858,7 @@ export class LibraryIndexService {
       for (const [libraryID, state] of this.states) {
         if (this.shouldQueueChanges(state)) {
           this.queueFullRebuild(state);
+          if (state.snapshot) this.schedulePendingReconciliation(libraryID);
           continue;
         }
         const snapshot = state.snapshot;
@@ -852,7 +928,8 @@ export class LibraryIndexService {
           }
         }
         if (affected.size) {
-          await this.patchItems(libraryID, [...affected]);
+          this.queueItemChanges(state, [...affected]);
+          this.schedulePendingReconciliation(libraryID);
         } else if (ids.length && !tagNames.length) {
           // An unresolvable tag event is rare and ambiguous. Coalesce it with
           // any sync storm rather than publishing a knowingly stale snapshot.

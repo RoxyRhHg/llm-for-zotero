@@ -1,9 +1,10 @@
 import type { LibraryIndexCollection, LibraryIndexSnapshot } from "./contracts";
-import { patchMap } from "./readonlyCollections";
+import { patchMap, readonlySet } from "./readonlyCollections";
 import { positiveIds, sameNumberMembers, text } from "./projection";
+import type { SnapshotDelta } from "./snapshotDraft";
 
 export type CollectionReconciliationPlan = Readonly<{
-  snapshot: LibraryIndexSnapshot;
+  delta: SnapshotDelta;
   affectedCollectionCount: number;
   membershipAffectedItemIds: ReadonlySet<number>;
 }>;
@@ -96,7 +97,9 @@ export function reconcileCollections(
     );
     const deletedChanged =
       Boolean(previousCollection) && previousCollection?.deleted !== deleted;
-    if (!previousCollection) directUpdates.set(id, new Set<number>());
+    if (!previousCollection) {
+      directUpdates.set(id, readonlySet(new Set<number>()));
+    }
     if (!previousCollection || deletedChanged) {
       // Incremental and cold projections both include trashed item records.
       // Ask Zotero for deleted children too, then refresh those item records
@@ -205,9 +208,7 @@ export function reconcileCollections(
     pathUpdates,
     pathDeletes,
   );
-  const nextSnapshot: LibraryIndexSnapshot = Object.freeze({
-    ...snapshot,
-    epoch: snapshot.epoch,
+  const delta: SnapshotDelta = Object.freeze({
     collectionById,
     directItemIdsByCollectionId: patchMap(
       snapshot.directItemIdsByCollectionId,
@@ -219,7 +220,7 @@ export function reconcileCollections(
   });
 
   return {
-    snapshot: nextSnapshot,
+    delta,
     affectedCollectionCount: affected.size,
     membershipAffectedItemIds,
   };

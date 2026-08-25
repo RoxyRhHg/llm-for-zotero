@@ -355,7 +355,7 @@ function resolveSeparateEmbeddingApiKey(embeddingProvider: string): string {
 
   const groups = getModelProviderGroups();
   for (const group of groups) {
-    if (!group.apiKey.trim() || group.authMode !== "api_key") continue;
+    if (group.authMode !== "api_key" || !group.apiKey.trim()) continue;
     if (detectProviderPreset(group.apiBase) === embeddingProvider) {
       return group.apiKey.trim();
     }

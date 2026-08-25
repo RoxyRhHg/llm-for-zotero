@@ -3,6 +3,7 @@ import {
   QUOTE_RENDER_OCCURRENCE_PATTERN,
   buildAssistantDisplayMarkdownForRender,
   buildRenderedMarkdownClipboardPayload,
+  resolveEffectiveRequestConfig,
   resolveRetryModelInputsForTests,
   type EffectiveRequestConfig,
 } from "../src/modules/contextPanel/chat";
@@ -22,6 +23,34 @@ describe("chat retry model inputs", function () {
     category: "pdf",
     storedPath: "/tmp/paper.pdf",
   };
+
+  it("discards API-provider controls before a WebChat request is resolved", function () {
+    const resolved = resolveEffectiveRequestConfig({
+      item: { id: 42 } as Zotero.Item,
+      model: "chat.deepseek.com",
+      apiBase: "https://must-not-be-consumed.example/v1",
+      apiKey: "must-not-be-consumed",
+      authMode: "webchat",
+      providerProtocol: "responses_api",
+      reasoning: { provider: "openai", level: "high" },
+      advanced: {
+        temperature: 1.7,
+        maxTokens: 99_999,
+        maxTokensExplicit: true,
+        inputTokenCap: 123,
+        inputMode: "text_only",
+        profileOverride: { extraBody: { top_k: 10 } },
+      },
+    });
+
+    assert.equal(resolved.model, "chat.deepseek.com");
+    assert.equal(resolved.authMode, "webchat");
+    assert.equal(resolved.providerProtocol, "web_sync");
+    assert.equal(resolved.apiBase, "");
+    assert.equal(resolved.apiKey, "");
+    assert.isUndefined(resolved.reasoning);
+    assert.isUndefined(resolved.advanced);
+  });
 
   it("converts known quote anchors into render occurrence markers for interactive assistant rendering", function () {
     const quoteCitation = buildQuoteCitation({

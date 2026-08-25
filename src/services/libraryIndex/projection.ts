@@ -422,7 +422,7 @@ function buildCollectionProjection(
 > {
   const collectionById = new Map<number, LibraryIndexCollection>();
   const directItemIdsByCollectionId = new Map<number, Set<number>>();
-  const childCollectionIdsByCollectionId = new Map<number, number[]>();
+  const childCollectionIdsByCollectionId = new Map<number, readonly number[]>();
   for (const collection of collectionsForLibrary(libraryID)) {
     const parent = Number(collection.parentID);
     collectionById.set(
@@ -444,7 +444,9 @@ function buildCollectionProjection(
     );
     childCollectionIdsByCollectionId.set(
       collection.id,
-      positiveIds(collection.getChildCollections?.(true, false) || []),
+      Object.freeze(
+        positiveIds(collection.getChildCollections?.(true, false) || []),
+      ),
     );
   }
   for (const item of items.values()) {

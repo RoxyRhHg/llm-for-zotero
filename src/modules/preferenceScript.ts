@@ -24,6 +24,7 @@ import {
   createCodexDirectModelRow,
   createEmptyProviderGroup,
   createProviderModelEntry,
+  createWebChatTargetRow,
   getFirstSelectableModelEntryId,
   getLastUsedModelEntryId,
   getModelProviderGroups,
@@ -33,6 +34,7 @@ import {
   type CodexDirectProviderGroup,
   type ModelProviderGroup,
   type ModelProviderModel,
+  type WebChatProviderGroup,
 } from "../utils/modelProviders";
 import {
   CUSTOMIZED_MODEL_OPTION_VALUE,
@@ -482,7 +484,7 @@ function registerLiveProfileEditor(entry: LiveProfileEditor) {
 function attachProviderModelSelect(args: {
   doc: Document;
   input: HTMLInputElement;
-  group: ModelProviderGroup;
+  group: Exclude<ModelProviderGroup, WebChatProviderGroup>;
   modelEntry: ModelProviderModel;
   onModelPicked: (modelId: string) => void;
 }): { container: HTMLElement; statusEl: HTMLElement; refresh: () => void } {
@@ -681,11 +683,15 @@ function attachProviderModelSelect(args: {
 // ── Data helpers ───────────────────────────────────────────────────
 
 function cloneGroups(groups: ModelProviderGroup[]): ModelProviderGroup[] {
-  return groups.map((group) =>
-    group.authMode === "codex_auth"
-      ? { ...group, models: group.models.map((model) => ({ ...model })) }
-      : { ...group, models: group.models.map((model) => ({ ...model })) },
-  );
+  return groups.map((group) => {
+    if (group.authMode === "codex_auth") {
+      return { ...group, models: group.models.map((model) => ({ ...model })) };
+    }
+    if (group.authMode === "webchat") {
+      return { ...group, models: group.models.map((model) => ({ ...model })) };
+    }
+    return { ...group, models: group.models.map((model) => ({ ...model })) };
+  });
 }
 
 function persistGroups(groups: ModelProviderGroup[]) {
@@ -693,7 +699,10 @@ function persistGroups(groups: ModelProviderGroup[]) {
 }
 
 function ensureModels(
-  group: Exclude<ModelProviderGroup, CodexDirectProviderGroup>,
+  group: Exclude<
+    ModelProviderGroup,
+    CodexDirectProviderGroup | WebChatProviderGroup
+  >,
   profile: ProviderProfile,
 ): ModelProviderModel[] {
   if (group.models.length > 0) return group.models.map((m) => ({ ...m }));
@@ -701,7 +710,9 @@ function ensureModels(
 }
 
 function isProviderEmpty(group: ModelProviderGroup): boolean {
-  if (group.authMode === "codex_auth") return false;
+  if (group.authMode === "codex_auth" || group.authMode === "webchat") {
+    return false;
+  }
   return (
     !group.apiBase.trim() &&
     !group.apiKey.trim() &&
@@ -1148,6 +1159,10 @@ export async function registerPrefsScripts(_window: Window | undefined | null) {
         if (!group.models.length) {
           group.models = [createCodexDirectModelRow()];
         }
+      } else if (group.authMode === "webchat") {
+        if (!group.models.length) {
+          group.models = [createWebChatTargetRow()];
+        }
       } else {
         group.models = ensureModels(group, profile);
       }
@@ -1255,7 +1270,8 @@ export async function registerPrefsScripts(_window: Window | undefined | null) {
       const selectedPresetId: ProviderPresetId =
         group.authMode === "codex_auth" ||
         group.authMode === "codex_app_server" ||
-        group.authMode === "copilot_auth"
+        group.authMode === "copilot_auth" ||
+        group.authMode === "webchat"
           ? "customized"
           : (group.presetIdOverride ?? detectProviderPreset(group.apiBase));
       const selectedPreset =
@@ -1382,7 +1398,7 @@ export async function registerPrefsScripts(_window: Window | undefined | null) {
           : group.authMode === "copilot_auth"
             ? DEFAULT_COPILOT_API_BASE
             : selectedPreset?.defaultApiBase || "https://api.openai.com/v1";
-      apiUrlInput.value = group.apiBase;
+      apiUrlInput.value = group.apiBase || "";
       apiUrlInput.readOnly =
         group.authMode !== "codex_app_server" &&
         group.authMode !== "copilot_auth" &&
@@ -1397,6 +1413,7 @@ export async function registerPrefsScripts(_window: Window | undefined | null) {
         ? t("Switch Provider to Customized to edit this URL manually.")
         : "";
       apiUrlInput.addEventListener("input", () => {
+        if (group.authMode === "webchat") return;
         group.apiBase = apiUrlInput.value;
         persistGroups(groups);
         syncAddProviderBtn();
@@ -1432,12 +1449,13 @@ export async function registerPrefsScripts(_window: Window | undefined | null) {
       apiKeyInput.placeholder = presetRequiresApiKey
         ? "sk-…"
         : t("Leave blank unless your server requires auth");
-      apiKeyInput.value = group.apiKey;
+      apiKeyInput.value = group.apiKey || "";
       // Model dropdowns register here so a freshly pasted key refetches their
       // catalogs without reopening the pane. Debounced to sit out keystrokes.
       const modelPickerRefreshers: Array<() => void> = [];
       let modelPickerRefreshTimer: ReturnType<typeof setTimeout> | null = null;
       apiKeyInput.addEventListener("input", () => {
+        if (group.authMode === "webchat") return;
         group.apiKey = apiKeyInput.value;
         persistGroups(groups);
         syncAddProviderBtn();
@@ -1445,7 +1463,7 @@ export async function registerPrefsScripts(_window: Window | undefined | null) {
           clearTimeout(modelPickerRefreshTimer);
         modelPickerRefreshTimer = setTimeout(() => {
           modelPickerRefreshTimer = null;
-          if (!group.apiKey.trim()) return;
+          if (!apiKeyInput.value.trim()) return;
           for (const refresh of modelPickerRefreshers) refresh();
         }, 800);
       });
@@ -1811,7 +1829,7 @@ export async function registerPrefsScripts(_window: Window | undefined | null) {
           let added = false;
           for (const target of allTargets) {
             if (!existing.has(target)) {
-              group.models.push(createProviderModelEntry(target));
+              group.models.push(createWebChatTargetRow(target));
               added = true;
             }
           }
@@ -1829,12 +1847,74 @@ export async function registerPrefsScripts(_window: Window | undefined | null) {
 
       addModelBtn.addEventListener("click", () => {
         if (addModelBtn.disabled) return;
+        if (group.authMode === "webchat") return;
         group.models.push(createProviderModelEntry(""));
         persistGroups(groups);
         rerender();
       });
 
       // ── Per-model rows ───────────────────────────────────────────
+      if (group.authMode === "webchat") {
+        group.models.forEach((modelEntry) => {
+          const {
+            row: rowWrap,
+            controls: mainRow,
+            testButton: testBtn,
+            status: statusLine,
+          } = createProviderModelRowBlueprint({
+            doc,
+            outlineButtonStyle: OUTLINE_BTN_STYLE,
+            testLabel: t("Test"),
+          });
+          testBtn.style.display = "none";
+          statusLine.style.display = "none";
+          const modelSelect = el(
+            doc,
+            "select",
+            PROVIDER_MODEL_CONTROL_STYLE,
+          ) as HTMLSelectElement;
+          for (const target of WEBCHAT_TARGETS) {
+            const option = doc.createElement("option");
+            option.value = target.modelName;
+            option.textContent = `${target.modelName} (${target.label})`;
+            option.selected = target.modelName === modelEntry.model;
+            modelSelect.appendChild(option);
+          }
+          modelSelect.addEventListener("change", () => {
+            modelEntry.model = modelSelect.value;
+            persistGroups(groups);
+          });
+          mainRow.append(modelSelect);
+          if (group.models.length > 1) {
+            const removeModelBtn = iconBtn(doc, "×", t("Remove model"));
+            removeModelBtn.addEventListener("click", () => {
+              const wasLastUsed = getLastUsedModelEntryId() === modelEntry.id;
+              group.models = group.models.filter(
+                (entry) => entry.id !== modelEntry.id,
+              );
+              if (!group.models.length) {
+                group.models = [createWebChatTargetRow()];
+              }
+              if (wasLastUsed) {
+                setLastUsedModelEntryId(getFirstSelectableModelEntryId(groups));
+              }
+              persistGroups(groups);
+              rerender();
+            });
+            mainRow.appendChild(removeModelBtn);
+          }
+          modelsWrap.appendChild(rowWrap);
+        });
+        cardBody.append(
+          authModeWrap,
+          createProviderCardSectionDivider(doc),
+          modelsWrap,
+        );
+        card.append(cardHeader, cardBody);
+        wrap.appendChild(card);
+        return;
+      }
+
       group.models.forEach((modelEntry, modelIndex) => {
         const {
           row: rowWrap,
@@ -1853,9 +1933,7 @@ export async function registerPrefsScripts(_window: Window | undefined | null) {
           PROVIDER_MODEL_CONTROL_STYLE,
         ) as HTMLInputElement;
         modelInput.type = "text";
-        if (group.authMode !== "webchat") {
-          modelInput.value = modelEntry.model;
-        }
+        modelInput.value = modelEntry.model;
         modelInput.placeholder =
           modelIndex === 0 ? profile.modelPlaceholder : "";
 
@@ -1864,37 +1942,7 @@ export async function registerPrefsScripts(_window: Window | undefined | null) {
         // Status line owned by the fetch-and-select model dropdown, when used.
         let pickerStatusEl: HTMLElement | null = null;
 
-        // [webchat] Replace text input with a dropdown for webchat model selection
-        if (group.authMode === "webchat") {
-          const validWebchatModels = WEBCHAT_TARGETS.map((wt) => ({
-            value: wt.modelName,
-            label: `${wt.modelName} (${wt.label})`,
-          }));
-          if (!validWebchatModels.some((m) => m.value === modelEntry.model)) {
-            modelEntry.model = "chatgpt.com";
-          }
-          modelInput.style.display = "none";
-          testBtn.style.display = "none";
-          advGearBtn.style.display = "none";
-
-          const modelSelect = el(
-            doc,
-            "select",
-            PROVIDER_MODEL_CONTROL_STYLE,
-          ) as HTMLSelectElement;
-          for (const opt of validWebchatModels) {
-            const option = doc.createElement("option");
-            option.value = opt.value;
-            option.textContent = opt.label;
-            if (opt.value === modelEntry.model) option.selected = true;
-            modelSelect.appendChild(option);
-          }
-          modelSelect.addEventListener("change", () => {
-            modelEntry.model = modelSelect.value;
-            persistGroups(groups);
-          });
-          mainRow.append(modelInput, modelSelect);
-        } else if (canFetchProviderModels(group)) {
+        if (canFetchProviderModels(group)) {
           const picker = attachProviderModelSelect({
             doc,
             input: modelInput,
@@ -2359,10 +2407,7 @@ export async function registerPrefsScripts(_window: Window | undefined | null) {
       });
 
       const divider = createProviderCardSectionDivider(doc);
-      if (group.authMode === "webchat") {
-        // [webchat] Minimal layout: only auth mode + model names (webchat target selector)
-        cardBody.append(authModeWrap, divider, modelsWrap);
-      } else if (group.authMode === "copilot_auth") {
+      if (group.authMode === "copilot_auth") {
         cardBody.append(
           authModeWrap,
           copilotLoginWrap,
@@ -3914,7 +3959,7 @@ export async function registerPrefsScripts(_window: Window | undefined | null) {
     const findProviderApiKey = (targetPresetId: string): string => {
       const groups = getModelProviderGroups();
       for (const group of groups) {
-        if (!group.apiKey.trim() || group.authMode !== "api_key") continue;
+        if (group.authMode !== "api_key" || !group.apiKey.trim()) continue;
         if (detectProviderPreset(group.apiBase) === targetPresetId) {
           return group.apiKey;
         }

@@ -5124,7 +5124,7 @@ export function setupHandlers(
               entry.providerProtocol,
               entry.authMode,
               entry.apiBase,
-              entry.advanced.inputMode,
+              entry.advanced?.inputMode,
             ),
             isClaudeCode: isClaudeConversationSystem(),
             isCodex: isCodexConversationSystem(),

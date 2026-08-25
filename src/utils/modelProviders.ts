@@ -25,6 +25,7 @@ import type {
 } from "../modelCapabilities";
 import { CODEX_DIRECT_RESPONSES_URL } from "../codexAuth/auth";
 import { getCodexDirectCatalogSnapshot } from "../codexAuth/modelCatalog";
+import { WEBCHAT_TARGETS } from "../webchat/types";
 
 export type LegacyModelSlotKey =
   | "primary"
@@ -61,11 +62,16 @@ export type ModelProviderAuthMode =
   | "copilot_auth"
   | "webchat"; // [webchat]
 
+export type ConfigurableModelProviderAuthMode = Exclude<
+  ModelProviderAuthMode,
+  "codex_auth" | "webchat"
+>;
+
 export type StandardModelProviderGroup = {
   id: string;
   apiBase: string;
   apiKey: string;
-  authMode: Exclude<ModelProviderAuthMode, "codex_auth">;
+  authMode: ConfigurableModelProviderAuthMode;
   providerProtocol: ProviderProtocol;
   models: ModelProviderModel[];
   /** When "customized", UI shows Customized and allows editing URL; when undefined, preset is derived from apiBase. */
@@ -75,6 +81,21 @@ export type StandardModelProviderGroup = {
 export type CodexDirectModelRow = {
   id: string;
   model: string;
+};
+
+export type WebChatTargetRow = {
+  id: string;
+  model: string;
+};
+
+export type WebChatProviderGroup = {
+  id: string;
+  apiBase?: undefined;
+  apiKey?: undefined;
+  authMode: "webchat";
+  providerProtocol: "web_sync";
+  models: WebChatTargetRow[];
+  presetIdOverride?: undefined;
 };
 
 export type CodexDirectProviderGroup = {
@@ -89,22 +110,34 @@ export type CodexDirectProviderGroup = {
 
 export type ModelProviderGroup =
   | StandardModelProviderGroup
-  | CodexDirectProviderGroup;
+  | CodexDirectProviderGroup
+  | WebChatProviderGroup;
 
-export type RuntimeModelEntry = {
+type RuntimeModelEntryBase = {
   entryId: string;
   groupId: string;
   model: string;
   apiBase: string;
   apiKey: string;
-  authMode: ModelProviderAuthMode;
   providerProtocol: ProviderProtocol;
   providerLabel: string;
   providerOrder: number;
   displayModelLabel: string;
-  advanced: AdvancedModelConfig;
   catalogAvailability?: "available" | "unverified" | "saved-unavailable";
 };
+
+export type RuntimeModelEntry = RuntimeModelEntryBase &
+  (
+    | {
+        authMode: Exclude<ModelProviderAuthMode, "webchat">;
+        advanced: AdvancedModelConfig;
+      }
+    | {
+        authMode: "webchat";
+        providerProtocol: "web_sync";
+        advanced?: never;
+      }
+  );
 
 export type LegacyModelSlot = AdvancedModelConfig & {
   key: LegacyModelSlotKey;
@@ -137,7 +170,7 @@ const MODEL_PROVIDER_GROUPS_MIGRATION_VERSION_PREF_KEY =
   "modelProviderGroupsMigrationVersion";
 const LAST_USED_MODEL_ENTRY_ID_PREF_KEY = "lastUsedModelEntryId";
 const LEGACY_LAST_MODEL_PROFILE_PREF_KEY = "lastUsedModelProfile";
-const MODEL_PROVIDER_GROUPS_MIGRATION_VERSION = 6;
+const MODEL_PROVIDER_GROUPS_MIGRATION_VERSION = 7;
 const modelProviderGroupListeners = new Set<() => void>();
 
 function getZoteroPrefs(): ZoteroPrefsAPI | null {
@@ -341,6 +374,36 @@ function dedupeCodexDirectModelRows(
   return result;
 }
 
+function normalizeWebChatTargetRows(models: unknown): WebChatTargetRow[] {
+  const supportedByName = new Map(
+    WEBCHAT_TARGETS.map((target) => [
+      target.modelName.toLowerCase(),
+      target.modelName,
+    ]),
+  );
+  const rawRows = Array.isArray(models) ? models : [];
+  const rows: WebChatTargetRow[] = [];
+  const seenIds = new Set<string>();
+  const seenTargets = new Set<string>();
+  let firstRowId = "";
+  for (const value of rawRows) {
+    if (!value || typeof value !== "object") continue;
+    const raw = value as { id?: unknown; model?: unknown };
+    const rawId = normalizeString(raw.id);
+    firstRowId ||= rawId;
+    const model = supportedByName.get(normalizeString(raw.model).toLowerCase());
+    if (!model || seenTargets.has(model)) continue;
+    const id = rawId && !seenIds.has(rawId) ? rawId : createId("model");
+    seenIds.add(id);
+    seenTargets.add(model);
+    rows.push({ id, model });
+  }
+  if (!rows.length) {
+    rows.push({ id: firstRowId || createId("model"), model: "chatgpt.com" });
+  }
+  return rows;
+}
+
 function normalizeGroup(group: unknown): ModelProviderGroup | null {
   if (!group || typeof group !== "object") return null;
   const rawGroup = group as RawProviderGroup;
@@ -377,6 +440,15 @@ function normalizeGroup(group: unknown): ModelProviderGroup | null {
       authMode: "codex_auth",
       providerProtocol: "codex_responses",
       models,
+    };
+  }
+
+  if (authMode === "webchat") {
+    return {
+      id,
+      authMode: "webchat",
+      providerProtocol: "web_sync",
+      models: normalizeWebChatTargetRows(rawGroup.models),
     };
   }
 
@@ -487,34 +559,36 @@ function normalizeAndCollapseModelProviderGroups(
       ...group.models,
     ]);
   }
-  if (!directGroup) return groups;
-
   const selectedModel = legacySelection.preferredModel;
-  if (
-    selectedModel &&
-    !directGroup.models.some(
-      (row) => row.model.toLowerCase() === selectedModel.toLowerCase(),
-    )
-  ) {
-    directGroup.models.push({ id: createId("model"), model: selectedModel });
+  if (directGroup) {
+    if (
+      selectedModel &&
+      !directGroup.models.some(
+        (row) => row.model.toLowerCase() === selectedModel.toLowerCase(),
+      )
+    ) {
+      directGroup.models.push({ id: createId("model"), model: selectedModel });
+    }
   }
   if (migrateStoredDirectGroups) {
     const lastUsedEntryId = getStringPref(LAST_USED_MODEL_ENTRY_ID_PREF_KEY);
-    const hasValidLastUsedEntry = hasSelectableModelEntryId(
-      groups,
-      lastUsedEntryId,
-    );
-    const selectedRow = directGroup.models.find(
+    const selectedRow = directGroup?.models.find(
       (row) =>
         row.model.toLowerCase() === selectedModel.toLowerCase() &&
         Boolean(row.model),
     );
     const shouldMigrateDirectSelection =
       legacySelection.lastUsedWasDirect ||
-      (!hasValidLastUsedEntry && Boolean(legacySelection.legacySelectedModel));
+      (!hasSelectableModelEntryId(groups, lastUsedEntryId) &&
+        Boolean(legacySelection.legacySelectedModel));
+    let migratedEntryId = lastUsedEntryId;
     if (selectedRow && shouldMigrateDirectSelection) {
-      setPref(LAST_USED_MODEL_ENTRY_ID_PREF_KEY, selectedRow.id);
+      migratedEntryId = selectedRow.id;
     }
+    if (!hasSelectableModelEntryId(groups, migratedEntryId)) {
+      migratedEntryId = getFirstSelectableModelEntryId(groups);
+    }
+    setPref(LAST_USED_MODEL_ENTRY_ID_PREF_KEY, migratedEntryId);
   }
   return groups;
 }
@@ -881,6 +955,12 @@ export function createCodexDirectModelRow(model = ""): CodexDirectModelRow {
   return { id: createId("model"), model: model.trim() };
 }
 
+export function createWebChatTargetRow(
+  model = "chatgpt.com",
+): WebChatTargetRow {
+  return { id: createId("model"), model: model.trim() };
+}
+
 export function getRuntimeModelEntries(): RuntimeModelEntry[] {
   const groups = getModelProviderGroups();
   const entries: RuntimeModelEntry[] = [];
@@ -905,7 +985,7 @@ export function getRuntimeModelEntries(): RuntimeModelEntry[] {
           model: modelName,
           apiBase: CODEX_DIRECT_RESPONSES_URL,
           apiKey: "",
-          authMode,
+          authMode: "codex_auth",
           providerProtocol: "codex_responses",
           providerLabel: "Codex Direct (Legacy)",
           providerOrder: groupIndex,
@@ -921,19 +1001,36 @@ export function getRuntimeModelEntries(): RuntimeModelEntry[] {
       }
       continue;
     }
+    if (group.authMode === "webchat") {
+      const providerLabel = `${deriveProviderLabel("", groupIndex + 1)} (web)`;
+      for (const modelEntry of group.models) {
+        const modelName = modelEntry.model.trim();
+        if (!modelName) continue;
+        entries.push({
+          entryId: modelEntry.id,
+          groupId: group.id,
+          model: modelName,
+          apiBase: "",
+          apiKey: "",
+          authMode: "webchat",
+          providerProtocol: "web_sync",
+          providerLabel,
+          providerOrder: groupIndex,
+          displayModelLabel: `web/${modelName}`,
+        });
+      }
+      continue;
+    }
     const baseProviderLabel = deriveProviderLabel(
       group.apiBase,
       groupIndex + 1,
     );
-    // [webchat] Use "ChatGPT Web" (or target label) as provider label
     const providerLabel =
-      authMode === "webchat"
-        ? `${baseProviderLabel} (web)`
-        : authMode === "codex_app_server"
-          ? `${baseProviderLabel} (app server)`
-          : authMode === "copilot_auth"
-            ? `${baseProviderLabel} (copilot auth)`
-            : baseProviderLabel;
+      authMode === "codex_app_server"
+        ? `${baseProviderLabel} (app server)`
+        : authMode === "copilot_auth"
+          ? `${baseProviderLabel} (copilot auth)`
+          : baseProviderLabel;
     const normalizedCounts = new Map<string, number>();
     for (const modelEntry of group.models) {
       const modelName = modelEntry.model.trim();
@@ -941,15 +1038,12 @@ export function getRuntimeModelEntries(): RuntimeModelEntry[] {
       const normalizedModel = modelName.toLowerCase();
       const duplicateCount = (normalizedCounts.get(normalizedModel) || 0) + 1;
       normalizedCounts.set(normalizedModel, duplicateCount);
-      // [webchat] Display as "web/chatgpt" etc.
       const baseModelLabel =
-        authMode === "webchat"
-          ? `web/${modelName}`
-          : authMode === "codex_app_server"
-            ? `codex-app/${modelName}`
-            : authMode === "copilot_auth"
-              ? `copilot/${modelName}`
-              : modelName;
+        authMode === "codex_app_server"
+          ? `codex-app/${modelName}`
+          : authMode === "copilot_auth"
+            ? `copilot/${modelName}`
+            : modelName;
       const providerProtocol = resolveRuntimeProviderProtocol(
         group,
         modelEntry,
@@ -960,7 +1054,7 @@ export function getRuntimeModelEntries(): RuntimeModelEntry[] {
         model: modelName,
         apiBase: normalizeApiBase(group.apiBase),
         apiKey: group.apiKey.trim(),
-        authMode,
+        authMode: group.authMode,
         providerProtocol,
         providerLabel,
         providerOrder: groupIndex,

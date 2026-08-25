@@ -14,11 +14,8 @@ import {
 } from "./providerPresets";
 import type { ProviderPresetId } from "./providerPresets";
 
-export type ProviderModelPickerGroup = Pick<
-  ModelProviderGroup,
-  "authMode" | "apiBase"
-> &
-  Partial<Pick<ModelProviderGroup, "presetIdOverride">>;
+export type ProviderModelPickerGroup = Pick<ModelProviderGroup, "authMode"> &
+  Partial<Pick<ModelProviderGroup, "apiBase" | "presetIdOverride">>;
 
 /**
  * Preset the picker should treat the group as. Non-API-key auth modes (codex,
@@ -29,7 +26,7 @@ export function resolveProviderPickerPresetId(
   group: ProviderModelPickerGroup,
 ): ProviderPresetId {
   if (group.authMode !== "api_key") return "customized";
-  return group.presetIdOverride ?? detectProviderPreset(group.apiBase);
+  return group.presetIdOverride ?? detectProviderPreset(group.apiBase || "");
 }
 
 /** Fetch-and-select is offered only for preset (non-customized) API-key providers. */

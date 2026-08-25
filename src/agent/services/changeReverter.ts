@@ -28,6 +28,8 @@ import {
   isRegisteredLibraryMutationOperation,
   mutationInverseIsSatisfied,
 } from "./libraryMutation/handlerRegistry";
+import { canonicalJson } from "./libraryMutation/canonicalJson";
+import { MutationStateView } from "./libraryMutation/stateView";
 
 type LibraryOperationsInverse = {
   version: number;
@@ -131,23 +133,7 @@ export type RevertOutcome = {
   conflicts: RevertConflict[];
 };
 
-function stable(value: unknown): string {
-  if (Array.isArray(value)) return `[${value.map(stable).join(",")}]`;
-  if (value && typeof value === "object") {
-    const record = value as Record<string, unknown>;
-    return `{${Object.keys(record)
-      // Journal payloads cross a JSON boundary, which omits undefined object
-      // properties. Apply the same rule to freshly captured state or an
-      // untouched object can look different solely because its live DTO still
-      // owns an optional property whose value is undefined.
-      .filter((key) => record[key] !== undefined)
-      .sort()
-      .map((key) => `${JSON.stringify(key)}:${stable(record[key])}`)
-      .join(",")}}`;
-  }
-  const encoded = JSON.stringify(value);
-  return encoded === undefined ? "undefined" : encoded;
-}
+const stable = canonicalJson;
 
 function parseJson(value: string | undefined): unknown {
   if (!value) return undefined;
@@ -653,11 +639,12 @@ async function classifyLibraryInverseOperation(params: {
       params.operation,
       params.context,
     );
+    const currentView = new MutationStateView(current);
     const precondition = parseJson(params.step.preconditionJson);
     if (
       params.allowCompleted &&
       (mutationStateMatchesReference(current, precondition) ||
-        mutationInverseIsSatisfied(params.operation, current))
+        mutationInverseIsSatisfied(params.operation, currentView))
     ) {
       return { kind: "completed" };
     }

@@ -5,6 +5,8 @@ import type {
 import type { AgentToolContext } from "../../types";
 import type { ZoteroGateway } from "../zoteroGateway";
 import { forwardExecutors, type ForwardExecution } from "./forwardExecutors";
+import { canonicalJsonEqual } from "./canonicalJson";
+import { asMutationStateView, MutationStateView } from "./stateView";
 
 export type LibraryMutationOperationType = LibraryMutationOperation["type"];
 export type LibraryMutationOperationOf<
@@ -33,14 +35,14 @@ export type LibraryMutationHandler<Type extends LibraryMutationOperationType> =
     deferredInverse: (operation: LibraryMutationOperationOf<Type>) => boolean;
     planInverse: (
       operation: LibraryMutationOperationOf<Type>,
-      state: LibraryMutationState,
+      state: MutationStateView,
     ) => Readonly<{
       inverseOperations?: LibraryMutationOperation[];
       reason?: string;
     }>;
     inverseSatisfied: (
       operation: LibraryMutationOperationOf<Type>,
-      state: LibraryMutationState,
+      state: MutationStateView,
     ) => boolean;
     execute: (
       operation: LibraryMutationOperationOf<Type>,
@@ -119,7 +121,7 @@ function defineHandler<Type extends LibraryMutationOperationType>(
   });
 }
 
-const restoreTagState = (state: LibraryMutationState) => ({
+const restoreTagState = (state: MutationStateView) => ({
   inverseOperations: [
     {
       type: "set_item_tags" as const,
@@ -130,7 +132,7 @@ const restoreTagState = (state: LibraryMutationState) => ({
   ],
 });
 
-const restoreCollectionState = (state: LibraryMutationState) => ({
+const restoreCollectionState = (state: MutationStateView) => ({
   inverseOperations: [
     {
       type: "set_item_collections" as const,
@@ -143,17 +145,6 @@ const restoreCollectionState = (state: LibraryMutationState) => ({
     },
   ],
 });
-
-const itemState = (state: LibraryMutationState, itemId: number) =>
-  state.items?.find((item) => item.itemId === itemId);
-
-const collectionState = (state: LibraryMutationState, collectionId: number) =>
-  state.collections?.find(
-    (collection) => collection.collectionId === collectionId,
-  );
-
-const searchState = (state: LibraryMutationState, savedSearchId: number) =>
-  state.savedSearches?.find((search) => search.savedSearchId === savedSearchId);
 
 const sameMembers = <T>(left: readonly T[], right: readonly T[]) => {
   const normalize = (values: readonly T[]) =>
@@ -183,11 +174,11 @@ export const libraryMutationHandlers = {
         : {};
     },
     inverseSatisfied: (operation, state) => {
-      const current = itemState(state, Number(operation.itemId));
+      const current = state.item(Number(operation.itemId));
       if (!current?.exists || !current.fields) return false;
       return Object.entries(operation.metadata).every(([field, value]) =>
         field === "creators"
-          ? JSON.stringify(current.creators) === JSON.stringify(value)
+          ? canonicalJsonEqual(current.creators, value)
           : current.fields?.[field] === value,
       );
     },
@@ -204,7 +195,7 @@ export const libraryMutationHandlers = {
             tags: operation.tags || [],
           }));
       return assignments.every((assignment) => {
-        const current = itemState(state, assignment.itemId);
+        const current = state.item(assignment.itemId);
         const tags = new Set(current?.tags || []);
         return Boolean(
           current?.exists && assignment.tags.every((tag) => tags.has(tag)),
@@ -235,7 +226,7 @@ export const libraryMutationHandlers = {
     planInverse: (_operation, state) => restoreTagState(state),
     inverseSatisfied: (operation, state) =>
       operation.itemIds.every((itemId) => {
-        const current = itemState(state, itemId);
+        const current = state.item(itemId);
         const tags = new Set(current?.tags || []);
         return Boolean(
           current?.exists && operation.tags.every((tag) => !tags.has(tag)),
@@ -277,7 +268,7 @@ export const libraryMutationHandlers = {
     planInverse: (_operation, state) => restoreCollectionState(state),
     inverseSatisfied: (operation, state) =>
       operation.itemIds.every((itemId) => {
-        const current = itemState(state, itemId);
+        const current = state.item(itemId);
         return Boolean(
           current?.exists &&
           current.collectionIds &&
@@ -302,7 +293,7 @@ export const libraryMutationHandlers = {
     planInverse: (_operation, state) => restoreCollectionState(state),
     inverseSatisfied: (operation, state) =>
       operation.assignments.every((assignment) => {
-        const current = itemState(state, assignment.itemId);
+        const current = state.item(assignment.itemId);
         return Boolean(
           current?.exists &&
           current.collectionIds &&
@@ -356,7 +347,7 @@ export const libraryMutationHandlers = {
             ],
           },
     inverseSatisfied: (operation, state) => {
-      const current = searchState(state, operation.savedSearchId);
+      const current = state.savedSearch(operation.savedSearchId);
       return operation.permanent
         ? current?.exists === false
         : Boolean(current?.exists && current.deleted === true);
@@ -384,7 +375,7 @@ export const libraryMutationHandlers = {
         : {};
     },
     inverseSatisfied: (operation, state) => {
-      const current = collectionState(state, operation.collectionId);
+      const current = state.collection(operation.collectionId);
       return Boolean(
         current?.exists &&
         (operation.name === undefined || current.name === operation.name) &&
@@ -435,7 +426,7 @@ export const libraryMutationHandlers = {
     planInverse: (_operation, state) => restoreTagState(state),
     inverseSatisfied: (operation, state) =>
       operation.assignments.every((assignment) => {
-        const current = itemState(state, assignment.itemId);
+        const current = state.item(assignment.itemId);
         return Boolean(
           current?.exists &&
           current.tags &&
@@ -482,7 +473,7 @@ export const libraryMutationHandlers = {
     }),
     inverseSatisfied: (operation, state) =>
       operation.assignments.every((assignment) => {
-        const current = itemState(state, assignment.itemId);
+        const current = state.item(assignment.itemId);
         return Boolean(
           current?.exists &&
           (current.parentItemId ?? null) === assignment.parentItemId,
@@ -538,7 +529,7 @@ export const libraryMutationHandlers = {
             ],
           },
     inverseSatisfied: (operation, state) => {
-      const current = collectionState(state, operation.collectionId);
+      const current = state.collection(operation.collectionId);
       return operation.permanent
         ? current?.exists === false
         : Boolean(current?.exists && current.deleted === true);
@@ -575,7 +566,7 @@ export const libraryMutationHandlers = {
     }),
     inverseSatisfied: (operation, state) =>
       operation.itemIds.every((itemId) => {
-        const current = itemState(state, itemId);
+        const current = state.item(itemId);
         return Boolean(current?.exists && current.deleted === true);
       }),
     targetCount: (operation) => operation.itemIds.length,
@@ -603,15 +594,15 @@ export const libraryMutationHandlers = {
     }),
     inverseSatisfied: (operation, state) =>
       (operation.itemIds || []).every((itemId) => {
-        const current = itemState(state, itemId);
+        const current = state.item(itemId);
         return Boolean(current?.exists && current.deleted === false);
       }) &&
       (operation.collectionIds || []).every((collectionId) => {
-        const current = collectionState(state, collectionId);
+        const current = state.collection(collectionId);
         return Boolean(current?.exists && current.deleted === false);
       }) &&
       (operation.savedSearchIds || []).every((savedSearchId) => {
-        const current = searchState(state, savedSearchId);
+        const current = state.savedSearch(savedSearchId);
         return Boolean(current?.exists && current.deleted === false);
       }),
     targetCount: (operation) =>
@@ -681,7 +672,7 @@ export const libraryMutationHandlers = {
         : {};
     },
     inverseSatisfied: (operation, state) => {
-      const current = itemState(state, operation.attachmentId);
+      const current = state.item(operation.attachmentId);
       return Boolean(
         current?.exists && current.attachmentTitle === operation.newName,
       );
@@ -707,7 +698,7 @@ export const libraryMutationHandlers = {
         : { reason: "The attachment had no resolvable previous path." };
     },
     inverseSatisfied: (operation, state) => {
-      const current = itemState(state, operation.attachmentId);
+      const current = state.item(operation.attachmentId);
       return Boolean(
         current?.exists && current.attachmentPath === operation.newPath,
       );
@@ -769,24 +760,24 @@ export function mutationUsesDeferredInverse(
 
 export function planMutationInverseFromHandler(
   operation: LibraryMutationOperation,
-  state: LibraryMutationState,
+  state: LibraryMutationState | MutationStateView,
 ): Readonly<{
   inverseOperations?: LibraryMutationOperation[];
   reason?: string;
 }> {
   return libraryMutationHandlers[operation.type].planInverse(
     operation as never,
-    state,
+    asMutationStateView(state),
   );
 }
 
 export function mutationInverseIsSatisfied(
   operation: LibraryMutationOperation,
-  state: LibraryMutationState,
+  state: LibraryMutationState | MutationStateView,
 ): boolean {
   return libraryMutationHandlers[operation.type].inverseSatisfied(
     operation as never,
-    state,
+    asMutationStateView(state),
   );
 }
 
@@ -807,7 +798,10 @@ export function isRegisteredLibraryMutationOperation(
 ): value is LibraryMutationOperation {
   if (!value || typeof value !== "object") return false;
   const type = (value as { type?: unknown }).type;
-  if (typeof type !== "string" || !(type in libraryMutationHandlers))
+  if (
+    typeof type !== "string" ||
+    !Object.prototype.hasOwnProperty.call(libraryMutationHandlers, type)
+  )
     return false;
   return libraryMutationHandlers[type as LibraryMutationOperationType].validate(
     value,

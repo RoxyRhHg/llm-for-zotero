@@ -5,9 +5,12 @@ import {
   createProviderModelEntry,
   migrateApiBaseForAuthModeChange,
   type CodexDirectProviderGroup,
+  type ConfigurableModelProviderAuthMode,
   type ModelProviderAuthMode,
   type ModelProviderGroup,
+  type ModelProviderModel,
   type StandardModelProviderGroup,
+  type WebChatProviderGroup,
 } from "../../utils/modelProviders";
 import {
   detectProviderPreset,
@@ -24,16 +27,40 @@ function directRows(group: ModelProviderGroup) {
   return rows.length ? rows : [createCodexDirectModelRow()];
 }
 
-function standardRows(group: ModelProviderGroup) {
-  const rows = group.models.map((row) => ({
-    ...createProviderModelEntry(row.model),
-    id: row.id,
-  }));
+function configurableRows(group: ModelProviderGroup): ModelProviderModel[] {
+  const rows =
+    group.authMode === "api_key" ||
+    group.authMode === "codex_app_server" ||
+    group.authMode === "copilot_auth"
+      ? group.models.map((row) => ({ ...row }))
+      : group.models.map((row) => ({
+          ...createProviderModelEntry(row.model),
+          id: row.id,
+        }));
   return rows.length ? rows : [createProviderModelEntry()];
 }
 
+function webChatRows(group: ModelProviderGroup) {
+  if (group.authMode === "webchat") {
+    return group.models.map((row) => ({ ...row }));
+  }
+  const validModels = new Set<string>(
+    WEBCHAT_TARGETS.map((target) => target.modelName),
+  );
+  const selected = group.models.find((row) => validModels.has(row.model));
+  const source = selected || group.models[0];
+  return [
+    {
+      id: source?.id || createProviderModelEntry().id,
+      model: selected?.model || "chatgpt.com",
+    },
+  ];
+}
+
 function defaultApiKeyProtocol(group: ModelProviderGroup) {
-  if (group.authMode === "codex_auth") return "openai_chat_compat" as const;
+  if (group.authMode === "codex_auth" || group.authMode === "webchat") {
+    return "openai_chat_compat" as const;
+  }
   const presetId =
     group.presetIdOverride ?? detectProviderPreset(group.apiBase);
   return presetId === "customized"
@@ -57,42 +84,43 @@ export function transitionProviderAuthMode(
     return next;
   }
 
+  if (nextAuthMode === "webchat") {
+    const next: WebChatProviderGroup = {
+      id: group.id,
+      authMode: "webchat",
+      providerProtocol: "web_sync",
+      models: webChatRows(group),
+    };
+    return next;
+  }
+
+  const configurableAuthMode: ConfigurableModelProviderAuthMode = nextAuthMode;
   const apiBase = migrateApiBaseForAuthModeChange(
     group.authMode,
-    nextAuthMode,
-    group.apiBase,
+    configurableAuthMode,
+    group.authMode === "webchat" ? "" : group.apiBase,
   );
   const next: StandardModelProviderGroup = {
     id: group.id,
     apiBase,
-    apiKey: group.authMode === "codex_auth" ? "" : group.apiKey,
-    authMode: nextAuthMode,
+    apiKey:
+      group.authMode === "codex_auth" || group.authMode === "webchat"
+        ? ""
+        : group.apiKey,
+    authMode: configurableAuthMode,
     providerProtocol:
-      nextAuthMode === "webchat"
-        ? "web_sync"
-        : nextAuthMode === "codex_app_server"
-          ? "codex_responses"
-          : nextAuthMode === "copilot_auth"
-            ? "openai_chat_compat"
-            : defaultApiKeyProtocol(group),
-    models: standardRows(group),
-    ...(group.authMode === "codex_auth"
+      configurableAuthMode === "codex_app_server"
+        ? "codex_responses"
+        : configurableAuthMode === "copilot_auth"
+          ? "openai_chat_compat"
+          : defaultApiKeyProtocol(group),
+    models: configurableRows(group),
+    ...(group.authMode === "codex_auth" || group.authMode === "webchat"
       ? {}
       : { presetIdOverride: group.presetIdOverride }),
   };
 
-  if (nextAuthMode === "webchat") {
-    const validModels = new Set<string>(
-      WEBCHAT_TARGETS.map((target) => target.modelName),
-    );
-    const first = next.models[0] || createProviderModelEntry();
-    next.models = [
-      {
-        ...first,
-        model: validModels.has(first.model) ? first.model : "chatgpt.com",
-      },
-    ];
-  } else if (nextAuthMode === "copilot_auth" && !next.apiBase.trim()) {
+  if (configurableAuthMode === "copilot_auth" && !next.apiBase.trim()) {
     next.apiBase = DEFAULT_COPILOT_API_BASE;
   }
 
