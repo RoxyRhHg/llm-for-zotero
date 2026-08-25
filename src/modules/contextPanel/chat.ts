@@ -205,7 +205,6 @@ import {
   loadedConversationKeys,
   loadingConversationTasks,
   webChatIsolatedConversationKeys,
-  selectedModelCache,
   selectedReasoningCache,
   selectedReasoningProviderCache,
   selectedImageCache,
@@ -288,7 +287,7 @@ import {
   getLastReasoningExpanded,
   getLastUsedReasoningLevel,
   getLastUsedReasoningLevelForProvider,
-  getSelectedModelEntryForItem,
+  getSelectedModelEntry,
   getBoolPref,
   getStringPref,
   setLastReasoningExpanded,
@@ -3681,7 +3680,7 @@ function resolveEffectiveRequestConfig(params: {
   );
   const fallbackEntry = hasExplicitProviderMetadata
     ? null
-    : getSelectedModelEntryForItem(params.item.id);
+    : getSelectedModelEntry();
   const explicitEntry =
     hasExplicitProviderMetadata && params.modelProviderLabel === "Claude Code"
       ? {

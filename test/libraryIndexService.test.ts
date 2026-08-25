@@ -489,6 +489,8 @@ describe("LibraryIndexService", function () {
     });
     const after = index.peekSnapshot(1)!;
 
+    assert.deepEqual([...index.tagItemIds(before, "foo", false)], [1]);
+    assert.deepEqual(before.tagIdsByNormalizedName.get("foo"), [1]);
     assert.deepEqual([...index.tagItemIds(after, "foo", false)], [2]);
     assert.isFalse(after.normalizedTagNameByTagId.has(1));
     assert.equal(after.normalizedTagNameByTagId.get(2), "foo");
@@ -514,6 +516,7 @@ describe("LibraryIndexService", function () {
     });
     const after = index.peekSnapshot(8)!;
 
+    assert.equal(before.libraryName, "Before rename");
     assert.equal(after.libraryName, "After rename");
     assert.strictEqual(after.itemById, before.itemById);
     assert.strictEqual(after.collectionById, before.collectionById);
@@ -538,6 +541,22 @@ describe("LibraryIndexService", function () {
       },
     });
     const index = service();
+    const publisher = index as unknown as {
+      publishSnapshot: (...args: unknown[]) => void;
+    };
+    const publishSnapshot = publisher.publishSnapshot.bind(index);
+    const publications: Array<{
+      libraryName: string;
+      itemTitle?: string;
+    }> = [];
+    publisher.publishSnapshot = (...args: unknown[]) => {
+      publishSnapshot(...args);
+      const published = index.peekSnapshot(8)!;
+      publications.push({
+        libraryName: published.libraryName,
+        itemTitle: published.itemById.get(1)?.title,
+      });
+    };
     const loading = index.getSnapshot(8);
 
     fixture.setLibraryName("After rename");
@@ -552,6 +571,9 @@ describe("LibraryIndexService", function () {
     const snapshot = await loading;
 
     assert.equal(snapshot.libraryName, "After rename");
+    assert.deepEqual(publications, [
+      { libraryName: "After rename", itemTitle: "Group paper" },
+    ]);
     assert.equal(buildCalls, 1);
     assert.equal(index.getMetrics().staleBuildDiscards, 0);
   });
@@ -590,9 +612,17 @@ describe("LibraryIndexService", function () {
     });
 
     const restored = index.peekSnapshot(1)!;
-    assert.strictEqual(
+    assert.notStrictEqual(
       restored.directItemIdsByCollectionId,
       initial.directItemIdsByCollectionId,
+    );
+    assert.deepEqual(
+      [...(initial.directItemIdsByCollectionId.get(10) || [])],
+      [1],
+    );
+    assert.deepEqual(
+      [...(restored.directItemIdsByCollectionId.get(10) || [])],
+      [1],
     );
   });
 
@@ -1529,7 +1559,7 @@ describe("LibraryIndexService", function () {
     assert.equal(index.peekSnapshot(1)?.itemById.get(2)?.title, "Recovered");
   });
 
-  it("applies repeated patches without rebuilding or retaining overlays", async function () {
+  it("applies repeated patches without rebuilding or mutating old snapshots", async function () {
     this.timeout(10_000);
     const fixture = installFixture({ topLevel: [] });
     const index = service();
@@ -1556,11 +1586,12 @@ describe("LibraryIndexService", function () {
       extraData: { libraryID: 1 },
       receivedAt: Date.now(),
     });
-    assert.strictEqual(
+    assert.notStrictEqual(
       beforeEdit.itemById,
       index.peekSnapshot(1)?.itemById,
-      "incremental publication should reuse the service-owned map",
+      "a changed structure must receive a new immutable identity",
     );
+    assert.equal(beforeEdit.itemById.get(1)?.title, "First version");
     assert.equal(
       index.peekSnapshot(1)?.itemById.get(1)?.title,
       "Second version",

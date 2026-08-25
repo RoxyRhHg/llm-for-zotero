@@ -84,8 +84,6 @@ export type CodexDirectProviderGroup = {
   authMode: "codex_auth";
   providerProtocol: "codex_responses";
   models: CodexDirectModelRow[];
-  /** The single application-wide Codex Direct selection. */
-  selectedModel: string;
   presetIdOverride?: undefined;
 };
 
@@ -139,7 +137,7 @@ const MODEL_PROVIDER_GROUPS_MIGRATION_VERSION_PREF_KEY =
   "modelProviderGroupsMigrationVersion";
 const LAST_USED_MODEL_ENTRY_ID_PREF_KEY = "lastUsedModelEntryId";
 const LEGACY_LAST_MODEL_PROFILE_PREF_KEY = "lastUsedModelProfile";
-const MODEL_PROVIDER_GROUPS_MIGRATION_VERSION = 5;
+const MODEL_PROVIDER_GROUPS_MIGRATION_VERSION = 6;
 const modelProviderGroupListeners = new Set<() => void>();
 
 function getZoteroPrefs(): ZoteroPrefsAPI | null {
@@ -379,7 +377,6 @@ function normalizeGroup(group: unknown): ModelProviderGroup | null {
       authMode: "codex_auth",
       providerProtocol: "codex_responses",
       models,
-      selectedModel,
     };
   }
 
@@ -404,8 +401,9 @@ function normalizeGroup(group: unknown): ModelProviderGroup | null {
   };
 }
 
-function resolvePreferredCodexDirectModel(raw: unknown[]): {
-  model: string;
+function resolveLegacyCodexDirectSelection(raw: unknown[]): {
+  preferredModel: string;
+  legacySelectedModel: string;
   lastUsedWasDirect: boolean;
 } {
   const lastUsedEntryId = getStringPref(LAST_USED_MODEL_ENTRY_ID_PREF_KEY);
@@ -429,7 +427,11 @@ function resolvePreferredCodexDirectModel(raw: unknown[]): {
 
     const rowMatch = rows.find((row) => row.id === lastUsedEntryId);
     if (rowMatch) {
-      return { model: rowMatch.model, lastUsedWasDirect: true };
+      return {
+        preferredModel: rowMatch.model,
+        legacySelectedModel: firstSavedSelection,
+        lastUsedWasDirect: true,
+      };
     }
     const syntheticPrefix = `${groupId}::codex-direct::`;
     if (groupId && lastUsedEntryId.startsWith(syntheticPrefix)) {
@@ -437,20 +439,35 @@ function resolvePreferredCodexDirectModel(raw: unknown[]): {
       const model =
         rows.find((row) => row.model.toLowerCase() === encodedModel)?.model ||
         (selected.toLowerCase() === encodedModel ? selected : encodedModel);
-      return { model, lastUsedWasDirect: true };
+      return {
+        preferredModel: model,
+        legacySelectedModel: firstSavedSelection,
+        lastUsedWasDirect: true,
+      };
     }
   }
   return {
-    model: firstSavedSelection || firstMigratedRow,
+    preferredModel: firstSavedSelection || firstMigratedRow,
+    legacySelectedModel: firstSavedSelection,
     lastUsedWasDirect: false,
   };
+}
+
+function hasSelectableModelEntryId(
+  groups: ModelProviderGroup[],
+  entryId: string,
+): boolean {
+  if (!entryId) return false;
+  return groups.some((group) =>
+    group.models.some((row) => row.id === entryId && Boolean(row.model.trim())),
+  );
 }
 
 function normalizeAndCollapseModelProviderGroups(
   raw: unknown[],
   migrateStoredDirectGroups: boolean,
 ): ModelProviderGroup[] {
-  const preferred = resolvePreferredCodexDirectModel(raw);
+  const legacySelection = resolveLegacyCodexDirectSelection(raw);
   const groups: ModelProviderGroup[] = [];
   let directGroup: CodexDirectProviderGroup | null = null;
   for (const value of raw) {
@@ -469,11 +486,10 @@ function normalizeAndCollapseModelProviderGroups(
       ...directGroup.models,
       ...group.models,
     ]);
-    directGroup.selectedModel ||= group.selectedModel;
   }
   if (!directGroup) return groups;
 
-  const selectedModel = preferred.model || directGroup.selectedModel;
+  const selectedModel = legacySelection.preferredModel;
   if (
     selectedModel &&
     !directGroup.models.some(
@@ -482,19 +498,23 @@ function normalizeAndCollapseModelProviderGroups(
   ) {
     directGroup.models.push({ id: createId("model"), model: selectedModel });
   }
-  directGroup.selectedModel =
-    directGroup.models.find(
-      (row) => row.model.toLowerCase() === selectedModel.toLowerCase(),
-    )?.model ||
-    directGroup.models.find((row) => row.model)?.model ||
-    "";
-
-  if (migrateStoredDirectGroups && preferred.lastUsedWasDirect) {
+  if (migrateStoredDirectGroups) {
+    const lastUsedEntryId = getStringPref(LAST_USED_MODEL_ENTRY_ID_PREF_KEY);
+    const hasValidLastUsedEntry = hasSelectableModelEntryId(
+      groups,
+      lastUsedEntryId,
+    );
     const selectedRow = directGroup.models.find(
       (row) =>
-        row.model.toLowerCase() === directGroup.selectedModel.toLowerCase(),
+        row.model.toLowerCase() === selectedModel.toLowerCase() &&
+        Boolean(row.model),
     );
-    if (selectedRow) setPref(LAST_USED_MODEL_ENTRY_ID_PREF_KEY, selectedRow.id);
+    const shouldMigrateDirectSelection =
+      legacySelection.lastUsedWasDirect ||
+      (!hasValidLastUsedEntry && Boolean(legacySelection.legacySelectedModel));
+    if (selectedRow && shouldMigrateDirectSelection) {
+      setPref(LAST_USED_MODEL_ENTRY_ID_PREF_KEY, selectedRow.id);
+    }
   }
   return groups;
 }
@@ -1017,6 +1037,16 @@ export function getDefaultProviderGroup(): ModelProviderGroup | null {
   return groups[0] || null;
 }
 
+export function getFirstSelectableModelEntryId(
+  groups: readonly ModelProviderGroup[],
+): string {
+  for (const group of groups) {
+    const entry = group.models.find((model) => model.model.trim());
+    if (entry) return entry.id;
+  }
+  return "";
+}
+
 export function getLastUsedModelEntryId(): string {
   return getStringPref(LAST_USED_MODEL_ENTRY_ID_PREF_KEY).trim();
 }
@@ -1032,27 +1062,6 @@ export function getCodexDirectProviderGroup(): CodexDirectProviderGroup | null {
         group.authMode === "codex_auth",
     ) || null
   );
-}
-
-export function setCodexDirectSelectedModel(model: string): void {
-  const normalizedModel = model.trim();
-  if (!normalizedModel) return;
-  const groups = getModelProviderGroups();
-  const group = groups.find(
-    (candidate): candidate is CodexDirectProviderGroup =>
-      candidate.authMode === "codex_auth",
-  );
-  if (
-    !group ||
-    group.selectedModel === normalizedModel ||
-    !group.models.some(
-      (row) => row.model.toLowerCase() === normalizedModel.toLowerCase(),
-    )
-  ) {
-    return;
-  }
-  group.selectedModel = normalizedModel;
-  setModelProviderGroups(groups);
 }
 
 export function getModelProviderGroupsPrefKey(): string {

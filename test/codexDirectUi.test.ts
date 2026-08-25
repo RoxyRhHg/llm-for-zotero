@@ -23,6 +23,7 @@ import {
   createProviderModelRowBlueprint,
   createProviderModelSectionBlueprint,
 } from "../src/utils/providerCardModelSection";
+import { createCodexDirectProviderCardController } from "../src/modules/preferences/providerCards/codexDirectProviderCardController";
 
 function directGroup(): CodexDirectProviderGroup {
   return {
@@ -31,7 +32,6 @@ function directGroup(): CodexDirectProviderGroup {
     apiKey: "",
     authMode: "codex_auth",
     providerProtocol: "codex_responses",
-    selectedModel: "gpt-a",
     models: [
       { id: "row-a", model: "gpt-a" },
       { id: "row-b", model: "saved-missing" },
@@ -54,12 +54,15 @@ class FakeSelect {
 }
 
 class FakeElement {
+  private readonly listeners = new Map<string, Array<() => void>>();
   readonly children: FakeElement[] = [];
   readonly attributes = new Map<string, string>();
   readonly style: Record<string, string> = {};
   textContent = "";
   title = "";
   type = "";
+  value = "";
+  disabled = false;
 
   constructor(readonly tagName: string) {}
 
@@ -75,9 +78,21 @@ class FakeElement {
   append(...children: FakeElement[]): void {
     this.children.push(...children);
   }
+
+  addEventListener(type: string, listener: () => void): void {
+    const listeners = this.listeners.get(type) || [];
+    listeners.push(listener);
+    this.listeners.set(type, listeners);
+  }
+
+  dispatch(type: string): void {
+    for (const listener of this.listeners.get(type) || []) listener();
+  }
 }
 
 class FakeDocument {
+  activeElement: FakeElement | null = null;
+
   createElementNS(_namespace: string, tagName: string): FakeElement {
     return new FakeElement(tagName);
   }
@@ -229,23 +244,45 @@ describe("Codex Direct provider-card behavior", function () {
     assert.equal(refreshCount, 2);
   });
 
-  it("adds, updates, deduplicates, and removes rows with selection fallback", function () {
+  it("renders Direct behavior through a disposable card controller", function () {
+    const doc = new FakeDocument() as unknown as Document;
+    let updated: CodexDirectProviderGroup | null = null;
+    const controller = createCodexDirectProviderCardController({
+      doc,
+      group: directGroup(),
+      sectionLabelStyle: "section-label",
+      outlineButtonStyle: "outline-button",
+      helperStyle: "helper",
+      onGroupChange: (group) => {
+        updated = group;
+      },
+      getFetch: () => undefined,
+    });
+    const section = controller.element as unknown as FakeElement;
+    const header = section.children[0];
+    const addButton = header.children[1];
+
+    addButton.dispatch("click");
+
+    assert.lengthOf(updated?.models || [], 3);
+    assert.equal(updated?.models[2].model, "");
+    controller.dispose();
+  });
+
+  it("adds, updates, deduplicates, and removes model rows", function () {
     const group = directGroup();
     assert.isNull(updateCodexDirectModelRow(group, "row-b", "GPT-A"));
 
     const updated = updateCodexDirectModelRow(group, "row-a", "gpt-c");
     assert.isNotNull(updated);
-    assert.equal(updated?.selectedModel, "gpt-c");
     assert.equal(updated?.models[0].model, "gpt-c");
 
-    const selectedSecond = directGroup();
-    selectedSecond.selectedModel = "saved-missing";
     const changedSecond = updateCodexDirectModelRow(
-      selectedSecond,
+      directGroup(),
       "row-b",
       "gpt-b",
     );
-    assert.equal(changedSecond?.selectedModel, "gpt-a");
+    assert.equal(changedSecond?.models[1].model, "gpt-b");
 
     const added = addCodexDirectModelRow(updated as CodexDirectProviderGroup);
     assert.lengthOf(added?.models || [], 3);
@@ -258,7 +295,6 @@ describe("Codex Direct provider-card behavior", function () {
     assert.deepEqual(removed?.models, [
       { id: "row-b", model: "saved-missing" },
     ]);
-    assert.equal(removed?.selectedModel, "saved-missing");
     assert.isNull(
       removeCodexDirectModelRow(removed as CodexDirectProviderGroup, "row-b"),
     );

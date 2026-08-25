@@ -23,6 +23,11 @@ import {
   type RecoveryPayload,
 } from "../store/journalRecoveryBlobStore";
 import { withActiveJournalAction } from "./mutationCoordinator";
+import {
+  atomizeMutationOperationFromHandler,
+  isRegisteredLibraryMutationOperation,
+  mutationInverseIsSatisfied,
+} from "./libraryMutation/handlerRegistry";
 
 type LibraryOperationsInverse = {
   version: number;
@@ -152,41 +157,7 @@ function parseJson(value: string | undefined): unknown {
 export function isMutationOperation(
   value: unknown,
 ): value is LibraryMutationOperation {
-  const types = new Set<LibraryMutationOperation["type"]>([
-    "apply_tags",
-    "create_collection",
-    "create_items",
-    "delete_attachment",
-    "delete_collection",
-    "delete_saved_search",
-    "import_identifiers",
-    "import_local_files",
-    "merge_items",
-    "move_to_collection",
-    "relate_items",
-    "relink_attachment",
-    "remove_from_collection",
-    "remove_tags",
-    "rename_attachment",
-    "reparent_items",
-    "restore_from_trash",
-    "save_note",
-    "save_notes_batch",
-    "save_saved_search",
-    "set_item_collections",
-    "set_item_tags",
-    "trash_items",
-    "update_collection",
-    "update_library_tag",
-    "update_metadata",
-  ]);
-  return Boolean(
-    value &&
-    typeof value === "object" &&
-    types.has(
-      (value as { type?: unknown }).type as LibraryMutationOperation["type"],
-    ),
-  );
+  return isRegisteredLibraryMutationOperation(value);
 }
 
 function isRecoveryPayload(value: unknown): value is RecoveryPayload {
@@ -580,146 +551,10 @@ async function conflictForStep(params: {
   }
 }
 
-function atomizeLibraryOperation(
-  operation: LibraryMutationOperation,
-): LibraryMutationOperation[] {
-  const onePer = <T>(
-    values: readonly T[] | undefined,
-    build: (value: T) => LibraryMutationOperation,
-  ): LibraryMutationOperation[] | null =>
-    values && values.length > 1 ? values.map(build) : null;
-  switch (operation.type) {
-    case "apply_tags":
-      return (
-        onePer(operation.assignments, (assignment) => ({
-          ...operation,
-          assignments: [assignment],
-        })) ||
-        onePer(operation.itemIds, (itemId) => ({
-          ...operation,
-          itemIds: [itemId],
-        })) || [operation]
-      );
-    case "remove_tags":
-      return (
-        onePer(operation.itemIds, (itemId) => ({
-          ...operation,
-          itemIds: [itemId],
-        })) || [operation]
-      );
-    case "move_to_collection":
-      return (
-        onePer(operation.assignments, (assignment) => ({
-          ...operation,
-          assignments: [assignment],
-        })) ||
-        onePer(operation.itemIds, (itemId) => ({
-          ...operation,
-          itemIds: [itemId],
-        })) || [operation]
-      );
-    case "remove_from_collection":
-      return (
-        onePer(operation.itemIds, (itemId) => ({
-          ...operation,
-          itemIds: [itemId],
-        })) || [operation]
-      );
-    case "set_item_collections":
-      return (
-        onePer(operation.assignments, (assignment) => ({
-          ...operation,
-          assignments: [assignment],
-        })) || [operation]
-      );
-    case "set_item_tags":
-      return (
-        onePer(operation.assignments, (assignment) => ({
-          ...operation,
-          assignments: [assignment],
-        })) || [operation]
-      );
-    case "save_notes_batch":
-      return (
-        onePer(operation.notes, (note) => ({
-          ...operation,
-          notes: [note],
-        })) || [operation]
-      );
-    case "create_items":
-      return (
-        onePer(operation.items, (item) => ({
-          ...operation,
-          items: [item],
-        })) || [operation]
-      );
-    case "reparent_items":
-      return (
-        onePer(operation.assignments, (assignment) => ({
-          ...operation,
-          assignments: [assignment],
-        })) || [operation]
-      );
-    case "relate_items":
-      return (
-        onePer(operation.relatedItemIds, (relatedItemId) => ({
-          ...operation,
-          relatedItemIds: [relatedItemId],
-        })) || [operation]
-      );
-    case "trash_items":
-      return (
-        onePer(operation.itemIds, (itemId) => ({
-          ...operation,
-          itemIds: [itemId],
-        })) || [operation]
-      );
-    case "restore_from_trash": {
-      const units: LibraryMutationOperation[] = [
-        ...(operation.itemIds || []).map((itemId) => ({
-          ...operation,
-          itemIds: [itemId],
-          collectionIds: undefined,
-          savedSearchIds: undefined,
-        })),
-        ...(operation.collectionIds || []).map((collectionId) => ({
-          ...operation,
-          itemIds: undefined,
-          collectionIds: [collectionId],
-          savedSearchIds: undefined,
-        })),
-        ...(operation.savedSearchIds || []).map((savedSearchId) => ({
-          ...operation,
-          itemIds: undefined,
-          collectionIds: undefined,
-          savedSearchIds: [savedSearchId],
-        })),
-      ];
-      return units.length > 1 ? units : [operation];
-    }
-    case "import_identifiers":
-      return (
-        onePer(operation.identifiers, (identifier) => ({
-          ...operation,
-          identifiers: [identifier],
-        })) || [operation]
-      );
-    case "import_local_files":
-      return (
-        onePer(operation.filePaths, (filePath) => ({
-          ...operation,
-          filePaths: [filePath],
-        })) || [operation]
-      );
-    default:
-      return [operation];
-  }
-}
-
 function atomizeLibraryOperations(
   operations: LibraryMutationOperation[],
 ): LibraryMutationOperation[] {
-  return operations.flatMap(atomizeLibraryOperation);
+  return operations.flatMap(atomizeMutationOperationFromHandler);
 }
 
 const MUTATION_STATE_SECTIONS = [
@@ -801,177 +636,6 @@ function mutationStateMatchesReference(
   return comparedRows > 0;
 }
 
-function sameStringSet(
-  left: readonly string[],
-  right: readonly string[],
-): boolean {
-  const normalize = (values: readonly string[]) =>
-    [...new Set(values.map(String))].sort((a, b) => a.localeCompare(b));
-  return stable(normalize(left)) === stable(normalize(right));
-}
-
-function sameNumberSet(
-  left: readonly number[],
-  right: readonly number[],
-): boolean {
-  const normalize = (values: readonly number[]) =>
-    [...new Set(values.map(Number))].sort((a, b) => a - b);
-  return stable(normalize(left)) === stable(normalize(right));
-}
-
-function inverseOperationIsSatisfied(
-  operation: LibraryMutationOperation,
-  state: LibraryMutationState,
-): boolean {
-  const itemById = new Map(
-    (state.items || []).map((item) => [item.itemId, item]),
-  );
-  const collectionById = new Map(
-    (state.collections || []).map((collection) => [
-      collection.collectionId,
-      collection,
-    ]),
-  );
-  const searchById = new Map(
-    (state.savedSearches || []).map((search) => [search.savedSearchId, search]),
-  );
-  switch (operation.type) {
-    case "set_item_tags":
-      return operation.assignments.every((assignment) => {
-        const current = itemById.get(assignment.itemId);
-        return Boolean(
-          current?.exists &&
-          current.tags &&
-          sameStringSet(current.tags, assignment.tags),
-        );
-      });
-    case "apply_tags": {
-      const assignments = operation.assignments?.length
-        ? operation.assignments
-        : (operation.itemIds || []).map((itemId) => ({
-            itemId,
-            tags: operation.tags || [],
-          }));
-      return assignments.every((assignment) => {
-        const current = itemById.get(assignment.itemId);
-        const tags = new Set(current?.tags || []);
-        return Boolean(
-          current?.exists && assignment.tags.every((tag) => tags.has(tag)),
-        );
-      });
-    }
-    case "remove_tags":
-      return operation.itemIds.every((itemId) => {
-        const current = itemById.get(itemId);
-        const tags = new Set(current?.tags || []);
-        return Boolean(
-          current?.exists && operation.tags.every((tag) => !tags.has(tag)),
-        );
-      });
-    case "set_item_collections":
-      return operation.assignments.every((assignment) => {
-        const current = itemById.get(assignment.itemId);
-        return Boolean(
-          current?.exists &&
-          current.collectionIds &&
-          sameNumberSet(current.collectionIds, assignment.collectionIds),
-        );
-      });
-    case "remove_from_collection":
-      return operation.itemIds.every((itemId) => {
-        const current = itemById.get(itemId);
-        return Boolean(
-          current?.exists &&
-          current.collectionIds &&
-          !current.collectionIds.includes(operation.collectionId),
-        );
-      });
-    case "reparent_items":
-      return operation.assignments.every((assignment) => {
-        const current = itemById.get(assignment.itemId);
-        return Boolean(
-          current?.exists &&
-          (current.parentItemId ?? null) === assignment.parentItemId,
-        );
-      });
-    case "trash_items":
-      return operation.itemIds.every((itemId) => {
-        const current = itemById.get(itemId);
-        return Boolean(current?.exists && current.deleted === true);
-      });
-    case "restore_from_trash":
-      return (
-        (operation.itemIds || []).every((itemId) => {
-          const current = itemById.get(itemId);
-          return Boolean(current?.exists && current.deleted === false);
-        }) &&
-        (operation.collectionIds || []).every((collectionId) => {
-          const current = collectionById.get(collectionId);
-          return Boolean(current?.exists && current.deleted === false);
-        }) &&
-        (operation.savedSearchIds || []).every((savedSearchId) => {
-          const current = searchById.get(savedSearchId);
-          return Boolean(current?.exists && current.deleted === false);
-        })
-      );
-    case "delete_collection": {
-      const current = collectionById.get(operation.collectionId);
-      return operation.permanent
-        ? current?.exists === false
-        : Boolean(current?.exists && current.deleted === true);
-    }
-    case "delete_saved_search": {
-      const current = searchById.get(operation.savedSearchId);
-      return operation.permanent
-        ? current?.exists === false
-        : Boolean(current?.exists && current.deleted === true);
-    }
-    case "update_collection": {
-      const current = collectionById.get(operation.collectionId);
-      return Boolean(
-        current?.exists &&
-        (operation.name === undefined || current.name === operation.name) &&
-        (operation.parentCollectionId === undefined ||
-          (current.parentCollectionId ?? null) ===
-            operation.parentCollectionId),
-      );
-    }
-    case "rename_attachment": {
-      const current = itemById.get(operation.attachmentId);
-      return Boolean(
-        current?.exists && current.attachmentTitle === operation.newName,
-      );
-    }
-    case "relink_attachment": {
-      const current = itemById.get(operation.attachmentId);
-      return Boolean(
-        current?.exists && current.attachmentPath === operation.newPath,
-      );
-    }
-    case "relate_items":
-      return (state.relations || []).every((relation) =>
-        operation.action === "add"
-          ? relation.related && relation.reciprocal
-          : !relation.related && !relation.reciprocal,
-      );
-    case "update_metadata": {
-      const itemId = Number(operation.itemId);
-      const current = itemById.get(itemId);
-      if (!current?.exists || !current.fields) return false;
-      for (const [field, value] of Object.entries(operation.metadata)) {
-        if (field === "creators") {
-          if (stable(current.creators) !== stable(value)) return false;
-        } else if (current.fields[field] !== value) {
-          return false;
-        }
-      }
-      return true;
-    }
-    default:
-      return false;
-  }
-}
-
 type LibraryReplayClassification =
   | { kind: "pending" }
   | { kind: "completed" }
@@ -993,7 +657,7 @@ async function classifyLibraryInverseOperation(params: {
     if (
       params.allowCompleted &&
       (mutationStateMatchesReference(current, precondition) ||
-        inverseOperationIsSatisfied(params.operation, current))
+        mutationInverseIsSatisfied(params.operation, current))
     ) {
       return { kind: "completed" };
     }
@@ -1516,7 +1180,7 @@ async function buildScriptReplayPlan(
       for (const operation of declared.operations) {
         const guard = declaredGuards[guardIndex++];
         const operationCoverageGroup = coverageGroup++;
-        for (const atom of atomizeLibraryOperation(operation)) {
+        for (const atom of atomizeMutationOperationFromHandler(operation)) {
           units.push({
             inverse: {
               version: declared.version,

@@ -54,7 +54,6 @@ import {
 } from "./quoteValidationActivity";
 import { createContextIcon } from "./contextIcons";
 import {
-  selectedModelCache,
   selectedReasoningCache,
   selectedReasoningProviderCache,
   selectedRuntimeModeCache,
@@ -138,10 +137,10 @@ import {
   getStringPref,
   getAgentModeEnabled,
   getClaudeCodeModeEnabled,
-  getSelectedModelEntryForItem,
+  getSelectedModelEntry,
   applyPanelFontScale,
   getAdvancedModelParamsForEntry,
-  setSelectedModelEntryForItem,
+  setSelectedModelEntry,
   getLastUsedReasoningLevel,
   getLastUsedReasoningLevelForProvider,
   getLastUsedRuntimeMode,
@@ -550,21 +549,11 @@ import {
   createCodexGlobalPortalItem,
   createCodexPaperPortalItem,
 } from "../../codexAppServer/portal";
+import type { CodexReasoningChoice } from "../../codex/catalogSelection";
 import {
-  getCodexDirectCatalogSnapshot,
-  getCodexDirectReasoningChoices,
-  loadCodexDirectCatalog,
-  reconcileCodexDirectReasoningChoice,
-  subscribeToCodexDirectCatalog,
-} from "../../codexAuth/modelCatalog";
-import {
-  getCodexDirectReasoningSelection,
-  setCodexDirectReasoningSelection,
-} from "../../codexAuth/reasoningPrefs";
-import {
-  buildCodexReasoningConfig,
-  type CodexReasoningChoice,
-} from "../../codex/catalogSelection";
+  createCodexDirectModelReasoningController,
+  type CodexDirectModelReasoningController,
+} from "./setupHandlers/controllers/codexDirectModelReasoningController";
 
 type ActionMenuTrigger = "/" | "$";
 type ActiveActionToken = PaperSearchSlashToken & {
@@ -1724,7 +1713,7 @@ export function setupHandlers(
   let cleanupPrefObservers: (() => void) | null = null;
   let cleanupMineruPaperSourceObservers: (() => void) | null = null;
   let cleanupModelCapabilitySubscription: (() => void) | null = null;
-  let cleanupCodexDirectCatalogSubscription: (() => void) | null = null;
+  let codexDirectController: CodexDirectModelReasoningController | null = null;
   {
     const agentPrefKey = `${config.prefsPrefix}.enableAgentMode`;
     const claudeModePrefKey = `${config.prefsPrefix}.enableClaudeCodeMode`;
@@ -4790,7 +4779,7 @@ export function setupHandlers(
       : isCodexConversationSystem()
         ? getSelectedCodexRuntimeEntry()
         : item
-          ? getSelectedModelEntryForItem(item.id)
+          ? getSelectedModelEntry()
           : null;
     const currentModel =
       selectedEntry?.model ||
@@ -4959,51 +4948,6 @@ export function setupHandlers(
     });
   };
 
-  const hasConfiguredCodexDirectProvider = () =>
-    getModelProviderGroups().some(
-      (group) =>
-        group.authMode === "codex_auth" &&
-        group.models.some((model) => model.model.trim()),
-    );
-
-  const appendCodexDirectCatalogStatus = (menu: HTMLDivElement) => {
-    if (isRuntimeConversationSystem() || !hasConfiguredCodexDirectProvider()) {
-      return;
-    }
-    const snapshot = getCodexDirectCatalogSnapshot();
-    const selected = item ? getSelectedModelEntryForItem(item.id) : null;
-    const hasSavedModel = selected?.authMode === "codex_auth";
-    const statusHandled = appendModelCatalogStatus({
-      menu,
-      status: snapshot.status,
-      modelCount: snapshot.models.length,
-      loadingMessage: hasSavedModel
-        ? t("Loading Codex Direct models. Current model is unverified.")
-        : t("Loading Codex Direct models…"),
-      errorMessage: hasSavedModel
-        ? t("Could not load Codex Direct models. Current model is unverified.")
-        : t("Could not load Codex Direct models."),
-      errorTitle: snapshot.error,
-      emptyMessage: t("Codex Direct did not return any available models."),
-      retryLabel: t("Retry loading Codex Direct models"),
-      onRetry: (event) => {
-        if (!isPrimaryPointerEvent(event)) return;
-        event.preventDefault();
-        event.stopPropagation();
-        void loadCodexDirectCatalog({ force: true }).catch(() => undefined);
-      },
-    });
-    if (statusHandled) return;
-    if (selected?.catalogAvailability === "saved-unavailable") {
-      appendModelMenuEmptyState(
-        menu,
-        t(
-          "The saved Codex Direct model is no longer available. Select another model before sending.",
-        ),
-      );
-    }
-  };
-
   const appendClaudeModelCatalogStatus = (menu: HTMLDivElement) => {
     if (!isClaudeConversationSystem()) return;
     const statusHandled = appendModelCatalogStatus({
@@ -5073,7 +5017,12 @@ export function setupHandlers(
     );
     appendClaudeModelCatalogStatus(modelMenu);
     appendCodexModelCatalogStatus(modelMenu);
-    appendCodexDirectCatalogStatus(modelMenu);
+    codexDirectController?.appendCatalogStatus({
+      menu: modelMenu,
+      renderStatus: appendModelCatalogStatus,
+      appendEmptyState: appendModelMenuEmptyState,
+      isPrimaryPointerEvent,
+    });
     if (!groupedChoices.length) {
       appendModelMenuEmptyState(modelMenu, t("No models configured yet."));
       return;
@@ -5141,7 +5090,7 @@ export function setupHandlers(
             previousNonWebchatModelId = selectedEntryId || null;
           }
 
-          setSelectedModelEntryForItem(item.id, entry.entryId);
+          setSelectedModelEntry(entry.entryId);
           setFloatingMenuOpen(modelMenu, MODEL_MENU_OPEN_CLASS, false);
           setFloatingMenuOpen(reasoningMenu, REASONING_MENU_OPEN_CLASS, false);
 
@@ -5349,12 +5298,7 @@ export function setupHandlers(
           closeRetryModelMenu();
           const retryReasoning =
             entry.authMode === "codex_auth"
-              ? buildCodexReasoningConfig(
-                  reconcileCodexDirectReasoningChoice(
-                    entry.model,
-                    getCodexDirectReasoningSelection(entry.model),
-                  ),
-                )
+              ? codexDirectController?.getRetryReasoning(entry)
               : getSelectedReasoningForItem(
                   item.id,
                   entry.model,
@@ -5477,26 +5421,6 @@ export function setupHandlers(
     }
   };
 
-  const getSelectedCodexDirectEntry = (): RuntimeModelEntry | null => {
-    if (!item || isRuntimeConversationSystem()) return null;
-    const selected = getSelectedModelEntryForItem(item.id);
-    return selected?.authMode === "codex_auth" ? selected : null;
-  };
-
-  const resolveCurrentCodexDirectReasoningSelection = () => {
-    const selected = getSelectedCodexDirectEntry();
-    if (!selected) {
-      return { mode: "auto", choices: [] as CodexReasoningChoice[] };
-    }
-    const stored = getCodexDirectReasoningSelection(selected.model);
-    const choices = getCodexDirectReasoningChoices(selected.model);
-    const mode = reconcileCodexDirectReasoningChoice(selected.model, stored);
-    if (getCodexDirectCatalogSnapshot().status === "ready" && mode !== stored) {
-      setCodexDirectReasoningSelection(selected.model, mode);
-    }
-    return { mode, choices };
-  };
-
   const getReasoningState = () => {
     if (!item) {
       return {
@@ -5555,7 +5479,11 @@ export function setupHandlers(
             : (selectedMode as ReasoningLevelSelection),
       };
     }
-    const directSelection = resolveCurrentCodexDirectReasoningSelection();
+    const directSelection =
+      codexDirectController?.resolveReasoningSelection() || {
+        mode: "auto",
+        choices: [] as CodexReasoningChoice[],
+      };
     if (directSelection.choices.length) {
       const options: ReasoningOption[] = directSelection.choices
         .filter((choice) => choice.value !== "auto")
@@ -5575,7 +5503,7 @@ export function setupHandlers(
             : (directSelection.mode as ReasoningLevelSelection),
       };
     }
-    const selectedProfile = getSelectedModelEntryForItem(item.id);
+    const selectedProfile = getSelectedModelEntry();
     const provider = detectReasoningProvider(
       currentModel,
       selectedProfile?.apiBase,
@@ -5782,7 +5710,11 @@ export function setupHandlers(
 
       const { provider, currentModel, options, enabledLevels, selectedLevel } =
         getReasoningState();
-      const directSelection = resolveCurrentCodexDirectReasoningSelection();
+      const directSelection =
+        codexDirectController?.resolveReasoningSelection() || {
+          mode: "auto",
+          choices: [] as CodexReasoningChoice[],
+        };
       const available =
         directSelection.choices.length > 0 || enabledLevels.length > 0;
       const resolvedReasoningLabel = isClaudeConversationSystem()
@@ -5985,19 +5917,15 @@ export function setupHandlers(
       });
       return;
     }
-    const directEntry = getSelectedCodexDirectEntry();
-    if (directEntry) {
-      const directSelection = resolveCurrentCodexDirectReasoningSelection();
-      appendReasoningChoiceButtons({
+    if (
+      codexDirectController?.appendReasoningChoices({
         menu: reasoningMenu,
-        choices: directSelection.choices,
-        currentValue: directSelection.mode,
-        onSelect: (value) => {
-          setCodexDirectReasoningSelection(directEntry.model, value);
+        renderChoices: appendReasoningChoiceButtons,
+        closeMenu: () => {
           setFloatingMenuOpen(reasoningMenu, REASONING_MENU_OPEN_CLASS, false);
-          updateReasoningButton();
         },
-      });
+      })
+    ) {
       return;
     }
     if (!enabledLevels.length) {
@@ -6130,12 +6058,11 @@ export function setupHandlers(
     if (setupHandlersCleaned) return;
     syncModelFromPrefs();
   });
-  cleanupCodexDirectCatalogSubscription = subscribeToCodexDirectCatalog(() =>
-    syncModelFromPrefs(),
-  );
-  if (hasConfiguredCodexDirectProvider()) {
-    void loadCodexDirectCatalog().catch(() => undefined);
-  }
+  codexDirectController = createCodexDirectModelReasoningController({
+    getSelectedEntry: () => (item ? getSelectedModelEntry() : null),
+    isRuntimeConversationSystem,
+    onStateChange: syncModelFromPrefs,
+  });
 
   (body as any).__llmRefreshContextSourceForCurrentItem = () => {
     withScrollGuard(chatBox, conversationKey, () => {
@@ -6446,7 +6373,7 @@ export function setupHandlers(
       ? getSelectedClaudeRuntimeEntry()
       : isCodexConversationSystem()
         ? getSelectedCodexRuntimeEntry()
-        : getSelectedModelEntryForItem(item.id);
+        : getSelectedModelEntry();
     if (!selected) return null;
     return {
       ...selected,
@@ -6483,16 +6410,9 @@ export function setupHandlers(
           : getCodexReasoningModePref();
       return buildCodexAppServerReasoningConfig(mode);
     }
-    const directEntry = getSelectedCodexDirectEntry();
+    const directEntry = codexDirectController?.getSelectedEntry();
     if (directEntry) {
-      if (directEntry.catalogAvailability === "saved-unavailable") {
-        throw new Error(
-          "The saved Codex Direct model is unavailable. Select a model from the current catalog before sending.",
-        );
-      }
-      return buildCodexReasoningConfig(
-        resolveCurrentCodexDirectReasoningSelection().mode,
-      );
+      return codexDirectController?.getSendReasoning();
     }
     const { provider, enabledLevels, selectedLevel } = getReasoningState();
     if (provider === "unsupported" || selectedLevel === "none")
@@ -7670,8 +7590,8 @@ export function setupHandlers(
       // changes, so a user-initiated open must revalidate. Non-blocking — the
       // menu opens on the cached list and live-updates when the fetch lands.
       void ensureClaudeModelCatalogLoaded(true);
-    } else if (hasConfiguredCodexDirectProvider()) {
-      void loadCodexDirectCatalog().catch(() => undefined);
+    } else if (codexDirectController?.hasConfiguredProvider()) {
+      codexDirectController.ensureCatalog();
     }
     updateModelButton();
     flushResponsiveLayoutSyncNow();
@@ -7699,8 +7619,8 @@ export function setupHandlers(
     closeHistoryMenu();
     if (isCodexConversationSystem()) {
       void ensureCodexModelCatalogLoaded();
-    } else if (getSelectedCodexDirectEntry()) {
-      void loadCodexDirectCatalog().catch(() => undefined);
+    } else if (codexDirectController?.getSelectedEntry()) {
+      codexDirectController.ensureCatalog();
     }
     updateReasoningButton();
     flushResponsiveLayoutSyncNow();
@@ -7967,7 +7887,7 @@ export function setupHandlers(
             ?.entryId ||
           null;
         if (restoreId) {
-          setSelectedModelEntryForItem(item.id, restoreId);
+          setSelectedModelEntry(restoreId);
         }
         previousNonWebchatModelId = null;
         // Refresh UI back to normal mode
@@ -8017,8 +7937,8 @@ export function setupHandlers(
     cleanupMineruPaperSourceObservers?.();
     cleanupModelCapabilitySubscription?.();
     cleanupModelCapabilitySubscription = null;
-    cleanupCodexDirectCatalogSubscription?.();
-    cleanupCodexDirectCatalogSubscription = null;
+    codexDirectController?.dispose();
+    codexDirectController = null;
     body.removeEventListener(
       QUOTE_PROVENANCE_REVALIDATION_REQUEST_EVENT,
       handleQuoteProvenanceRevalidationRequest,

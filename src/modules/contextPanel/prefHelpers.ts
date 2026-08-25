@@ -26,7 +26,6 @@ import type {
   ReasoningLevelSelection,
 } from "./types";
 import {
-  selectedModelCache,
   panelFontScalePercent,
   messageLineSpacingPercent,
   messageParagraphSpacingPx,
@@ -41,7 +40,6 @@ import {
   getModelEntryById,
   getModelProviderGroups,
   getRuntimeModelEntries,
-  setCodexDirectSelectedModel,
   setLastUsedModelEntryId,
   type ModelProviderGroup,
   type RuntimeModelEntry,
@@ -495,41 +493,22 @@ export function getAvailableModelEntries(): RuntimeModelEntry[] {
   return getRuntimeModelEntries();
 }
 
-export function getSelectedModelEntryForItem(
-  itemId: number,
-): RuntimeModelEntry | null {
+export function getSelectedModelEntry(): RuntimeModelEntry | null {
   const entries = getRuntimeModelEntries();
-  if (!entries.length) {
-    selectedModelCache.delete(itemId);
-    return null;
-  }
+  if (!entries.length) return null;
 
-  const preferredId =
-    getLastUsedModelEntryId() || selectedModelCache.get(itemId) || "";
-  const selected =
+  const preferredId = getLastUsedModelEntryId();
+  return (
     entries.find((entry) => entry.entryId === preferredId) ||
     getDefaultModelEntry() ||
     entries[0] ||
-    null;
-  if (!selected) {
-    selectedModelCache.delete(itemId);
-    return null;
-  }
-
-  selectedModelCache.set(itemId, selected.entryId);
-  return selected;
+    null
+  );
 }
 
-export function setSelectedModelEntryForItem(
-  itemId: number,
-  entryId: string,
-): void {
+export function setSelectedModelEntry(entryId: string): void {
   const selected = getModelEntryById(entryId);
   if (!selected) return;
-  if (selected.authMode === "codex_auth") {
-    setCodexDirectSelectedModel(selected.model);
-  }
-  selectedModelCache.set(itemId, selected.entryId);
   setLastUsedModelEntryId(selected.entryId);
 }
 

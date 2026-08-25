@@ -24,9 +24,9 @@ import {
   createCodexDirectModelRow,
   createEmptyProviderGroup,
   createProviderModelEntry,
+  getFirstSelectableModelEntryId,
   getLastUsedModelEntryId,
   getModelProviderGroups,
-  migrateApiBaseForAuthModeChange,
   setModelProviderGroups,
   setLastUsedModelEntryId,
   type ModelProviderAuthMode,
@@ -45,12 +45,8 @@ import {
   runAfterSelectChangeDispatch,
 } from "../utils/providerModelPicker";
 import {
-  addCodexDirectModelRow,
   attachCodexDirectCatalogInteractions,
-  buildCodexDirectModelOptions,
   canOfferCodexDirectAuthMode,
-  removeCodexDirectModelRow,
-  updateCodexDirectModelRow,
 } from "../utils/codexDirectProviderCard";
 import {
   PROVIDER_MODEL_CONTROL_STYLE,
@@ -84,13 +80,7 @@ import {
   runProviderConnectionTest,
   runProviderSettingsChecks,
   runCodexAppServerConnectionTest,
-  runCodexDirectConnectionTest,
 } from "../utils/providerConnectionTest";
-import { CODEX_DIRECT_RESPONSES_URL } from "../codexAuth/auth";
-import {
-  getCodexDirectCatalogSnapshot,
-  loadCodexDirectCatalog,
-} from "../codexAuth/modelCatalog";
 import { normalizeAgentPermissionMode } from "../shared/agentPermissionMode";
 import { normalizeAgentLibraryWriteMode } from "../shared/agentLibraryWriteMode";
 import {
@@ -106,6 +96,15 @@ import {
 } from "../utils/llmClient";
 import { resetEmbeddingFailedFlags } from "./contextPanel/pdfContext";
 import { clearRetrievalCandidateCache } from "./contextPanel/multiContextPlanner";
+import {
+  DEFAULT_COPILOT_API_BASE,
+  transitionProviderAuthMode,
+} from "./preferences/providerAuthModeTransition";
+import {
+  createCodexDirectProviderCardController,
+  type CodexDirectProviderCardController,
+} from "./preferences/providerCards/codexDirectProviderCardController";
+import { createProviderCardModeSpec } from "./preferences/providerCards/providerCardFactory";
 import {
   FONT_SCALE_DEFAULT_PERCENT,
   FONT_SCALE_MAX_PERCENT,
@@ -308,7 +307,6 @@ const LEGACY_CODEX_AUTH_PROTOCOL_HELPER_TEXT =
   "Uses Codex responses with the legacy direct backend transport.";
 const COPILOT_API_HELPER_TEXT =
   "GitHub Copilot uses device-based login. Click Login to authenticate via GitHub.";
-const DEFAULT_COPILOT_API_BASE = "https://api.githubcopilot.com";
 const MAX_PROVIDER_COUNT = 10;
 const INITIAL_PROVIDER_COUNT = 4;
 
@@ -678,137 +676,6 @@ function attachProviderModelSelect(args: {
     statusEl,
     refresh: () => void refreshCatalog(),
   };
-}
-
-function attachCodexDirectModelSelect(args: {
-  doc: Document;
-  group: CodexDirectProviderGroup;
-  rowId: string;
-  onModelPicked: (model: string) => void;
-}): { container: HTMLElement; statusEl: HTMLElement } {
-  const { doc, group, rowId } = args;
-  const container = el(
-    doc,
-    "div",
-    "flex: 1; min-width: 0; display: flex; align-items: center; gap: 5px;",
-  );
-  const select = el(
-    doc,
-    "select",
-    PROVIDER_MODEL_CONTROL_STYLE,
-  ) as HTMLSelectElement;
-  const statusEl = el(doc, "span", HELPER_STYLE);
-  statusEl.style.display = "none";
-  container.appendChild(select);
-
-  let loading = false;
-  let fetchToken = 0;
-  let renderedSignature = "";
-  const getRow = () => group.models.find((row) => row.id === rowId);
-
-  const rewriteOptions = () => {
-    const savedModel = getRow()?.model.trim() || "";
-    const snapshot = getCodexDirectCatalogSnapshot();
-    const options =
-      snapshot.status === "ready"
-        ? buildCodexDirectModelOptions({
-            group,
-            rowId,
-            catalog: snapshot.models,
-          })
-        : [];
-    const signature = JSON.stringify({
-      savedModel,
-      status: snapshot.status,
-      models: options.map((option) => [option.model, option.availability]),
-    });
-    if (signature === renderedSignature) return;
-    renderedSignature = signature;
-    select.textContent = "";
-    if (!savedModel) {
-      const placeholder = el(doc, "option") as HTMLOptionElement;
-      placeholder.value = "";
-      placeholder.textContent = t("Select a Codex Direct model…");
-      placeholder.disabled = true;
-      placeholder.selected = true;
-      select.appendChild(placeholder);
-    } else if (
-      !options.some(
-        (option) => option.model.toLowerCase() === savedModel.toLowerCase(),
-      )
-    ) {
-      const saved = el(doc, "option") as HTMLOptionElement;
-      saved.value = savedModel;
-      saved.textContent = savedModel;
-      select.appendChild(saved);
-    }
-    for (const model of options) {
-      const option = el(doc, "option") as HTMLOptionElement;
-      option.value = model.model;
-      option.textContent =
-        model.availability === "saved-unavailable"
-          ? `${model.label} (${t("Unavailable")})`
-          : model.label;
-      select.appendChild(option);
-    }
-    select.value =
-      options.find(
-        (option) => option.model.toLowerCase() === savedModel.toLowerCase(),
-      )?.model || savedModel;
-  };
-  const rebuildGate = createSelectRebuildGate(rewriteOptions);
-
-  const updateStatus = () => {
-    const snapshot = getCodexDirectCatalogSnapshot();
-    if (loading || snapshot.status === "loading") {
-      statusEl.textContent = t("Fetching Codex Direct models…");
-      statusEl.style.color = "var(--fill-secondary, #888)";
-      statusEl.style.display = "block";
-      return;
-    }
-    if (snapshot.status === "error") {
-      statusEl.textContent = `${t("Couldn't fetch Codex Direct models:")} ${snapshot.error || ""}`;
-      statusEl.style.color = "darkorange";
-      statusEl.style.display = "block";
-      return;
-    }
-    statusEl.style.display = "none";
-  };
-
-  const refreshCatalog = async () => {
-    const token = ++fetchToken;
-    loading = true;
-    updateStatus();
-    try {
-      await loadCodexDirectCatalog();
-    } catch (_error) {
-      // The status snapshot carries the user-facing error and remains retryable.
-    } finally {
-      if (token === fetchToken) {
-        loading = false;
-        rebuildGate.requestRebuild();
-        updateStatus();
-      }
-    }
-  };
-
-  attachCodexDirectCatalogInteractions({
-    target: select,
-    popupMayOpen: () => rebuildGate.popupMayOpen(),
-    refreshCatalog: () => void refreshCatalog(),
-  });
-  select.addEventListener("blur", () => rebuildGate.popupClosed());
-  select.addEventListener("change", () => {
-    const model = select.value;
-    rebuildGate.popupClosed();
-    runAfterSelectChangeDispatch(() => {
-      if (model) args.onModelPicked(model);
-    });
-  });
-
-  rewriteOptions();
-  updateStatus();
-  return { container, statusEl };
 }
 
 // ── Data helpers ───────────────────────────────────────────────────
@@ -1227,10 +1094,19 @@ export async function registerPrefsScripts(_window: Window | undefined | null) {
   // Mutable reference so input listeners inside rerender can update the
   // "Add Provider" button state without triggering a full rerender.
   let syncAddProviderBtn: () => void = () => undefined;
+  let directCardControllers: CodexDirectProviderCardController[] = [];
+  const disposeDirectCardControllers = () => {
+    directCardControllers.forEach((controller) => controller.dispose());
+    directCardControllers = [];
+  };
+  _window.addEventListener("unload", disposeDirectCardControllers, {
+    once: true,
+  });
 
   // ── Render ────────────────────────────────────────────────────────
 
   const rerender = () => {
+    disposeDirectCardControllers();
     modelSections.innerHTML = "";
 
     const wrap = el(
@@ -1267,6 +1143,7 @@ export async function registerPrefsScripts(_window: Window | undefined | null) {
 
     groups.forEach((group, groupIndex) => {
       const profile = getProviderProfile(groupIndex);
+      const cardMode = createProviderCardModeSpec(group.authMode);
       if (group.authMode === "codex_auth") {
         if (!group.models.length) {
           group.models = [createCodexDirectModelRow()];
@@ -1284,10 +1161,12 @@ export async function registerPrefsScripts(_window: Window | undefined | null) {
       );
       const removeProvBtn = iconBtn(doc, "×", t("Remove provider"));
       removeProvBtn.addEventListener("click", () => {
-        if (
-          group.models.some((model) => model.id === getLastUsedModelEntryId())
-        ) {
-          setLastUsedModelEntryId("");
+        const removesSelectedModel = group.models.some(
+          (model) => model.id === getLastUsedModelEntryId(),
+        );
+        const nextGroups = groups.filter((_, index) => index !== groupIndex);
+        if (removesSelectedModel) {
+          setLastUsedModelEntryId(getFirstSelectableModelEntryId(nextGroups));
         }
         groups.splice(groupIndex, 1);
         persistGroups(groups);
@@ -1347,101 +1226,8 @@ export async function registerPrefsScripts(_window: Window | undefined | null) {
       }
       authModeSelect.append(copilotOption, webchatOption);
       authModeSelect.addEventListener("change", () => {
-        const previousAuthMode = group.authMode;
         const nextAuthMode = normalizeAuthMode(authModeSelect.value);
-        if (nextAuthMode === "codex_auth") {
-          groups[groupIndex] = {
-            id: group.id,
-            apiBase: CODEX_DIRECT_RESPONSES_URL,
-            apiKey: "",
-            authMode: "codex_auth",
-            providerProtocol: "codex_responses",
-            models: [createCodexDirectModelRow()],
-            selectedModel: "",
-          };
-          persistGroups(groups);
-          setTimeout(() => rerender(), 0);
-          return;
-        }
-        if (group.authMode === "codex_auth") {
-          const standardAuthMode = nextAuthMode as Exclude<
-            ModelProviderAuthMode,
-            "codex_auth"
-          >;
-          const models = group.models.map((row) => ({
-            ...createProviderModelEntry(row.model),
-            id: row.id,
-          }));
-          const replacement: Exclude<
-            ModelProviderGroup,
-            CodexDirectProviderGroup
-          > = {
-            id: group.id,
-            apiBase: migrateApiBaseForAuthModeChange(
-              previousAuthMode,
-              standardAuthMode,
-              group.apiBase,
-            ),
-            apiKey: "",
-            authMode: standardAuthMode,
-            providerProtocol:
-              standardAuthMode === "webchat"
-                ? "web_sync"
-                : standardAuthMode === "copilot_auth"
-                  ? "openai_chat_compat"
-                  : "openai_chat_compat",
-            models,
-          };
-          if (standardAuthMode === "webchat") {
-            replacement.models = [
-              {
-                ...createProviderModelEntry("chatgpt.com"),
-                id: models[0]?.id || createProviderModelEntry().id,
-              },
-            ];
-          } else if (
-            standardAuthMode === "copilot_auth" &&
-            !replacement.apiBase.trim()
-          ) {
-            replacement.apiBase = DEFAULT_COPILOT_API_BASE;
-          }
-          groups[groupIndex] = replacement;
-          persistGroups(groups);
-          setTimeout(() => rerender(), 0);
-          return;
-        }
-        group.authMode = nextAuthMode;
-        group.apiBase = migrateApiBaseForAuthModeChange(
-          previousAuthMode,
-          nextAuthMode,
-          group.apiBase,
-        );
-        if (nextAuthMode === "webchat") {
-          group.providerProtocol = "web_sync";
-          // Set default webchat model to chatgpt.com (user can change it)
-          const webchatModelNames: string[] = WEBCHAT_TARGETS.map(
-            (wt) => wt.modelName,
-          );
-          if (
-            !group.models[0]?.model ||
-            !webchatModelNames.includes(group.models[0].model)
-          ) {
-            group.models = [{ ...group.models[0], model: "chatgpt.com" }];
-          }
-        } else if (nextAuthMode === "codex_app_server") {
-          group.providerProtocol = "codex_responses";
-        } else if (nextAuthMode === "copilot_auth") {
-          group.providerProtocol = "openai_chat_compat";
-        } else if (
-          group.providerProtocol === "codex_responses" ||
-          group.providerProtocol === "web_sync"
-        ) {
-          group.providerProtocol =
-            selectedPreset?.defaultProtocol || "openai_chat_compat";
-        }
-        if (nextAuthMode === "copilot_auth" && !group.apiBase.trim()) {
-          group.apiBase = DEFAULT_COPILOT_API_BASE;
-        }
+        groups[groupIndex] = transitionProviderAuthMode(group, nextAuthMode);
         persistGroups(groups);
         setTimeout(() => rerender(), 0);
       });
@@ -1489,105 +1275,26 @@ export async function registerPrefsScripts(_window: Window | undefined | null) {
       group.providerProtocol = resolveSelectedProtocol(group, selectedPresetId);
 
       if (group.authMode === "codex_auth") {
-        const { section: modelsWrap, addButton: addModelBtn } =
-          createProviderModelSectionBlueprint({
-            doc,
-            sectionLabelStyle: SECTION_LABEL_STYLE,
-            title: t("Model names"),
-            addTitle: t("Add model"),
-          });
-        const syncAddModelBtn = () =>
-          syncProviderAddModelButton(addModelBtn, group);
-        syncAddModelBtn();
-        addModelBtn.addEventListener("click", () => {
-          if (addModelBtn.disabled) return;
-          const next = addCodexDirectModelRow(group);
-          if (!next) return;
-          groups[groupIndex] = next;
-          persistGroups(groups);
-          rerender();
+        const controller = createCodexDirectProviderCardController({
+          doc,
+          group,
+          sectionLabelStyle: SECTION_LABEL_STYLE,
+          outlineButtonStyle: OUTLINE_BTN_STYLE,
+          helperStyle: HELPER_STYLE,
+          onGroupChange: (next) => {
+            groups[groupIndex] = next;
+            persistGroups(groups);
+            rerender();
+          },
+          getFetch: () =>
+            ztoolkit.getGlobal("fetch") as typeof fetch | undefined,
         });
-
-        for (const row of group.models) {
-          const {
-            row: rowWrap,
-            controls: mainRow,
-            testButton: testBtn,
-            status: statusLine,
-          } = createProviderModelRowBlueprint({
-            doc,
-            outlineButtonStyle: OUTLINE_BTN_STYLE,
-            testLabel: t("Test"),
-          });
-          const picker = attachCodexDirectModelSelect({
-            doc,
-            group,
-            rowId: row.id,
-            onModelPicked: (model) => {
-              const next = updateCodexDirectModelRow(group, row.id, model);
-              if (!next) return;
-              groups[groupIndex] = next;
-              persistGroups(groups);
-              rerender();
-            },
-          });
-          mainRow.append(picker.container, testBtn);
-          if (group.models.length > 1) {
-            const removeModelBtn = iconBtn(doc, "×", t("Remove model"));
-            removeModelBtn.addEventListener("click", () => {
-              const wasLastUsed = getLastUsedModelEntryId() === row.id;
-              const next = removeCodexDirectModelRow(group, row.id);
-              if (!next) return;
-              groups[groupIndex] = next;
-              if (wasLastUsed) {
-                setLastUsedModelEntryId(next.models[0]?.id || "");
-              }
-              persistGroups(groups);
-              rerender();
-            });
-            mainRow.appendChild(removeModelBtn);
-          }
-          testBtn.disabled = !row.model.trim();
-          const runTest = async () => {
-            testBtn.disabled = true;
-            statusLine.style.display = "block";
-            statusLine.textContent = t("Fetching Codex model catalog…");
-            statusLine.style.color = "var(--fill-secondary, #888)";
-            try {
-              const fetchFn = ztoolkit.getGlobal("fetch") as
-                | typeof fetch
-                | undefined;
-              const result = await runCodexDirectConnectionTest({
-                fetchFn,
-                modelName: row.model,
-              });
-              const catalogLine = `✓ ${t("Catalog:")} ${result.catalogCount} ${t("models; test model:")} ${result.modelName}`;
-              if (result.inferenceError) {
-                statusLine.textContent = `${catalogLine}\n✗ ${t("Inference:")} ${t(result.inferenceError)}`;
-                statusLine.style.color = "darkorange";
-              } else {
-                statusLine.textContent = `${catalogLine}\n✓ ${t("Inference:")} "${result.reply}"`;
-                statusLine.style.color = "green";
-              }
-            } catch (error) {
-              statusLine.textContent = `✗ ${t("Catalog:")} ${
-                error instanceof Error ? error.message : String(error)
-              }\n${t("Inference was not run.")}`;
-              statusLine.style.color = "red";
-            } finally {
-              testBtn.disabled = !row.model.trim();
-            }
-          };
-          testBtn.addEventListener("click", () => void runTest());
-          testBtn.addEventListener("command", () => void runTest());
-          rowWrap.append(picker.statusEl, statusLine);
-          modelsWrap.appendChild(rowWrap);
-        }
+        directCardControllers.push(controller);
 
         cardBody.append(
           authModeWrap,
           createProviderCardSectionDivider(doc),
-          modelsWrap,
+          controller.element,
         );
         card.append(cardHeader, cardBody);
         wrap.appendChild(card);
@@ -1600,10 +1307,7 @@ export async function registerPrefsScripts(_window: Window | undefined | null) {
         "div",
         "display: flex; flex-direction: column;",
       );
-      if (
-        group.authMode !== "codex_app_server" &&
-        group.authMode !== "copilot_auth"
-      ) {
+      if (cardMode.showProviderPreset) {
         const providerPresetLabel = el(
           doc,
           "label",
@@ -2216,9 +1920,13 @@ export async function registerPrefsScripts(_window: Window | undefined | null) {
         if (group.models.length > 1) {
           const removeModelBtn = iconBtn(doc, "×", t("Remove model"));
           removeModelBtn.addEventListener("click", () => {
+            const wasLastUsed = getLastUsedModelEntryId() === modelEntry.id;
             group.models = group.models.filter((e) => e.id !== modelEntry.id);
             if (!group.models.length) {
               group.models = [createProviderModelEntry(profile.defaultModel)];
+            }
+            if (wasLastUsed) {
+              setLastUsedModelEntryId(getFirstSelectableModelEntryId(groups));
             }
             persistGroups(groups);
             rerender();

@@ -45,7 +45,6 @@ export const loadedConversationKeys = new Set<number>();
 export const loadingConversationTasks = new Map<number, Promise<void>>();
 export const webChatIsolatedConversationKeys = new Set<number>();
 const webChatForceNewChatConversationKeys = new Set<number>();
-export const selectedModelCache = new Map<number, string>();
 export const selectedReasoningCache = new Map<
   number,
   ReasoningLevelSelection
@@ -581,7 +580,6 @@ export function clearAllState(): void {
   loadedConversationKeys.clear();
   loadingConversationTasks.clear();
   webChatForceNewChatConversationKeys.clear();
-  selectedModelCache.clear();
   selectedReasoningCache.clear();
   selectedReasoningProviderCache.clear();
   selectedRuntimeModeCache.clear();

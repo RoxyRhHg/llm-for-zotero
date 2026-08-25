@@ -104,15 +104,7 @@ export function updateCodexDirectModelRow(
   ) {
     return null;
   }
-  const previousModel = row.model;
   row.model = normalizedModel;
-  if (
-    !next.selectedModel ||
-    next.selectedModel.toLowerCase() === previousModel.toLowerCase()
-  ) {
-    next.selectedModel =
-      next.models.find((candidate) => candidate.model.trim())?.model || "";
-  }
   return next;
 }
 
@@ -131,12 +123,7 @@ export function removeCodexDirectModelRow(
 ): CodexDirectProviderGroup | null {
   if (group.models.length <= 1) return null;
   const next = cloneGroup(group);
-  const removed = next.models.find((row) => row.id === rowId);
-  if (!removed) return null;
+  if (!next.models.some((row) => row.id === rowId)) return null;
   next.models = next.models.filter((row) => row.id !== rowId);
-  if (next.selectedModel.toLowerCase() === removed.model.toLowerCase()) {
-    next.selectedModel =
-      next.models.find((row) => row.model.trim())?.model || "";
-  }
   return next;
 }

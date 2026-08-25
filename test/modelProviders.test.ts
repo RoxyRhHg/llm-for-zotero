@@ -4,12 +4,12 @@ import {
   buildModelProviderGroupsFromLegacySlots,
   buildProviderCatalogIdentity,
   deriveProviderLabel,
+  getLastUsedModelEntryId,
   getModelProviderGroups,
   getRuntimeModelEntries,
   migrateApiBaseForAuthModeChange,
   normalizeModelProviderGroups,
   refreshConfiguredProviderModelCatalogs,
-  setCodexDirectSelectedModel,
   setModelProviderGroups,
   subscribeModelProviderGroups,
   type LegacyModelSlot,
@@ -26,6 +26,10 @@ import {
   resetCodexDirectCatalogForTests,
 } from "../src/codexAuth/modelCatalog";
 import { resolveModelInputTokenLimit } from "../src/utils/modelInputCap";
+import {
+  getSelectedModelEntry,
+  setSelectedModelEntry,
+} from "../src/modules/contextPanel/prefHelpers";
 
 let originalZotero: typeof Zotero | undefined;
 
@@ -646,7 +650,7 @@ describe("modelProviders", function () {
     const group = groups[0];
     assert.equal(group.authMode, "codex_auth");
     if (group.authMode !== "codex_auth") assert.fail("expected Direct group");
-    assert.equal(group.selectedModel, "selected-model");
+    assert.notProperty(group, "selectedModel");
     assert.equal(
       group.apiBase,
       "https://chatgpt.com/backend-api/codex/responses",
@@ -665,6 +669,16 @@ describe("modelProviders", function () {
       ),
       "m2",
     );
+    const stored = JSON.parse(
+      String(
+        globalThis.Zotero.Prefs.get(
+          `${config.prefsPrefix}.modelProviderGroups`,
+          true,
+        ),
+      ),
+    ) as Array<Record<string, unknown>>;
+    assert.notProperty(stored[0], "selectedModel");
+    assert.notProperty(stored[0], "codexDirectModel");
   });
 
   it("normalizes an empty Direct card to exactly one model row", function () {
@@ -683,7 +697,7 @@ describe("modelProviders", function () {
     assert.equal(group.models[0].model, "");
   });
 
-  it("prefers a saved Direct selection over an earlier migrated row", function () {
+  it("retains a legacy Direct selection as a row but drops the field", function () {
     const groups = normalizeModelProviderGroups([
       {
         id: "first-direct",
@@ -701,7 +715,81 @@ describe("modelProviders", function () {
     const group = groups[0];
     assert.equal(group.authMode, "codex_auth");
     if (group.authMode !== "codex_auth") assert.fail("expected Direct group");
-    assert.equal(group.selectedModel, "saved-selection");
+    assert.notProperty(group, "selectedModel");
+    assert.deepEqual(
+      group.models.map((row) => row.model),
+      ["first-model", "saved-selection"],
+    );
+  });
+
+  it("migrates a legacy Direct model string to its stable row ID", function () {
+    const prefs = globalThis.Zotero.Prefs as {
+      set: (key: string, value: unknown, global?: boolean) => void;
+      get: (key: string, global?: boolean) => unknown;
+    };
+    prefs.set(
+      `${config.prefsPrefix}.modelProviderGroups`,
+      JSON.stringify([
+        {
+          id: "direct",
+          authMode: "codex_auth",
+          selectedModel: "saved-selection",
+          models: [{ id: "saved-row", model: "saved-selection" }],
+        },
+      ]),
+      true,
+    );
+    prefs.set(
+      `${config.prefsPrefix}.modelProviderGroupsMigrationVersion`,
+      5,
+      true,
+    );
+
+    getModelProviderGroups();
+
+    assert.equal(getLastUsedModelEntryId(), "saved-row");
+    const stored = JSON.parse(
+      String(prefs.get(`${config.prefsPrefix}.modelProviderGroups`, true)),
+    ) as Array<Record<string, unknown>>;
+    assert.notProperty(stored[0], "selectedModel");
+  });
+
+  it("does not replace a valid non-Direct selection during Direct migration", function () {
+    const prefs = globalThis.Zotero.Prefs as {
+      set: (key: string, value: unknown, global?: boolean) => void;
+    };
+    prefs.set(
+      `${config.prefsPrefix}.modelProviderGroups`,
+      JSON.stringify([
+        {
+          id: "standard",
+          authMode: "api_key",
+          apiBase: "https://api.openai.com/v1",
+          models: [{ id: "standard-row", model: "gpt-standard" }],
+        },
+        {
+          id: "direct",
+          authMode: "codex_auth",
+          selectedModel: "saved-selection",
+          models: [{ id: "saved-row", model: "saved-selection" }],
+        },
+      ]),
+      true,
+    );
+    prefs.set(
+      `${config.prefsPrefix}.lastUsedModelEntryId`,
+      "standard-row",
+      true,
+    );
+    prefs.set(
+      `${config.prefsPrefix}.modelProviderGroupsMigrationVersion`,
+      5,
+      true,
+    );
+
+    getModelProviderGroups();
+
+    assert.equal(getLastUsedModelEntryId(), "standard-row");
   });
 
   it("exposes only configured Direct rows and publishes live context limits", async function () {
@@ -712,7 +800,6 @@ describe("modelProviders", function () {
         apiKey: "",
         authMode: "codex_auth",
         providerProtocol: "codex_responses",
-        selectedModel: "saved-missing",
         models: [
           { id: "saved-row", model: "saved-missing" },
           { id: "catalog-row", model: "catalog-first" },
@@ -784,12 +871,44 @@ describe("modelProviders", function () {
       }).limitTokens,
       128000,
     );
+  });
 
-    setCodexDirectSelectedModel("catalog-first");
-    const group = getModelProviderGroups()[0];
-    assert.equal(group.authMode, "codex_auth");
-    if (group.authMode !== "codex_auth") assert.fail("expected Direct group");
-    assert.equal(group.selectedModel, "catalog-first");
+  it("changes Direct selection through one stable ID without provider notifications", function () {
+    setModelProviderGroups([
+      {
+        id: "provider-direct",
+        apiBase: "https://chatgpt.com/backend-api/codex/responses",
+        apiKey: "",
+        authMode: "codex_auth",
+        providerProtocol: "codex_responses",
+        models: [
+          { id: "first-row", model: "first-model" },
+          { id: "second-row", model: "second-model" },
+        ],
+      },
+    ]);
+    const storedBefore = globalThis.Zotero.Prefs.get(
+      `${config.prefsPrefix}.modelProviderGroups`,
+      true,
+    );
+    let providerNotifications = 0;
+    const unsubscribe = subscribeModelProviderGroups(() => {
+      providerNotifications += 1;
+    });
+
+    setSelectedModelEntry("second-row");
+
+    assert.equal(getLastUsedModelEntryId(), "second-row");
+    assert.equal(getSelectedModelEntry()?.entryId, "second-row");
+    assert.equal(providerNotifications, 0);
+    assert.equal(
+      globalThis.Zotero.Prefs.get(
+        `${config.prefsPrefix}.modelProviderGroups`,
+        true,
+      ),
+      storedBefore,
+    );
+    unsubscribe();
   });
 
   it("keeps codex app server entries labeled separately", function () {
