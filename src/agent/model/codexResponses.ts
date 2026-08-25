@@ -26,6 +26,11 @@ import {
   buildResponsesFunctionTools,
   getToolContinuationMessages,
 } from "./shared";
+import { CODEX_DIRECT_RESPONSES_URL } from "../../codexAuth/auth";
+import {
+  assertCodexDirectModelAvailable,
+  sanitizeCodexDirectReasoningConfig,
+} from "../../codexAuth/modelCatalog";
 
 function isCodexAuthRequest(request: AgentRuntimeRequest): boolean {
   return (
@@ -99,23 +104,42 @@ export class CodexResponsesAgentAdapter implements AgentModelAdapter {
     const inputItems = this.conversationItems
       ? [...this.conversationItems, ...followupInput]
       : initialInput.input;
-    const url = resolveProviderTransportEndpoint({
-      protocol: "codex_responses",
-      apiBase: request.apiBase || "",
-    });
+    const isCodexDirect = request.authMode === "codex_auth";
+    if (isCodexDirect) {
+      assertCodexDirectModelAvailable(request.model || "");
+    }
+    const url = isCodexDirect
+      ? CODEX_DIRECT_RESPONSES_URL
+      : resolveProviderTransportEndpoint({
+          protocol: "codex_responses",
+          apiBase: request.apiBase || "",
+        });
+    const initialReasoning = isCodexDirect
+      ? sanitizeCodexDirectReasoningConfig(
+          request.model || "",
+          request.reasoning,
+        )
+      : request.reasoning;
     const response = await postWithReasoningFallback({
       url,
       auth,
       modelName: request.model,
-      initialReasoning: request.reasoning,
+      initialReasoning,
       buildPayload: (reasoningOverride) => {
         const reasoningPayload = buildReasoningPayload(
-          reasoningOverride,
+          isCodexDirect
+            ? sanitizeCodexDirectReasoningConfig(
+                request.model || "",
+                reasoningOverride,
+              )
+            : reasoningOverride,
           true,
           request.model,
           request.apiBase,
           "codex_responses",
-          { profileOverride: request.advanced?.profileOverride },
+          isCodexDirect
+            ? undefined
+            : { profileOverride: request.advanced?.profileOverride },
         );
         return {
           model: request.model,
@@ -128,7 +152,7 @@ export class CodexResponsesAgentAdapter implements AgentModelAdapter {
           store: false,
           stream: true,
           ...reasoningPayload.extra,
-          ...(reasoningPayload.omitTemperature
+          ...(isCodexDirect || reasoningPayload.omitTemperature
             ? {}
             : {
                 temperature: normalizeTemperature(

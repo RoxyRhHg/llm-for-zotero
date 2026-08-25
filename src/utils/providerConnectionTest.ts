@@ -25,6 +25,12 @@ import {
   resolveCodexAppServerBinaryPath,
   waitForCodexAppServerTurnCompletion,
 } from "./codexAppServerProcess";
+import {
+  CODEX_DIRECT_RESPONSES_URL,
+  fetchWithCodexAuth,
+  type CodexAuthDependencies,
+} from "../codexAuth/auth";
+import { loadCodexDirectCatalog } from "../codexAuth/modelCatalog";
 
 function extractTextFromCodexSSE(raw: string): string {
   const lines = raw.split(/\r?\n/);
@@ -332,6 +338,60 @@ export async function runCodexAppServerConnectionTest(params: {
     return { reply: reply.trim() || "OK", capabilityLabel };
   } finally {
     destroyCachedCodexAppServerProcess(processKey, undefined, processOptions);
+  }
+}
+
+export async function runCodexDirectConnectionTest(
+  params: CodexAuthDependencies = {},
+): Promise<{
+  catalogCount: number;
+  modelName: string;
+  reply?: string;
+  inferenceError?: string;
+}> {
+  const catalog = await loadCodexDirectCatalog({
+    force: true,
+    ...params,
+  });
+  const modelName = catalog.models[0]?.model || "";
+  if (!modelName)
+    throw new Error("Codex Direct returned an empty model catalog");
+  try {
+    const response = await fetchWithCodexAuth(
+      CODEX_DIRECT_RESPONSES_URL,
+      {
+        method: "POST",
+        headers: {
+          Accept: "text/event-stream",
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          model: modelName,
+          instructions: "You are a concise assistant. Reply with OK.",
+          input: [
+            {
+              type: "message",
+              role: "user",
+              content: [{ type: "input_text", text: "Say OK" }],
+            },
+          ],
+          store: false,
+          stream: true,
+        }),
+      },
+      params,
+    );
+    if (!response.ok) {
+      throw new Error(`HTTP ${response.status}: ${await response.text()}`);
+    }
+    const reply = extractTextFromCodexSSE(await response.text()) || "OK";
+    return { catalogCount: catalog.models.length, modelName, reply };
+  } catch (error) {
+    return {
+      catalogCount: catalog.models.length,
+      modelName,
+      inferenceError: error instanceof Error ? error.message : String(error),
+    };
   }
 }
 

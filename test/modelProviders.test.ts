@@ -4,9 +4,11 @@ import {
   buildModelProviderGroupsFromLegacySlots,
   buildProviderCatalogIdentity,
   deriveProviderLabel,
+  getModelProviderGroups,
   getRuntimeModelEntries,
   migrateApiBaseForAuthModeChange,
   refreshConfiguredProviderModelCatalogs,
+  setCodexDirectModelForGroup,
   setModelProviderGroups,
   subscribeModelProviderGroups,
   type LegacyModelSlot,
@@ -18,6 +20,10 @@ import {
   refreshModelCatalog,
   resetModelCapabilityStateForTests,
 } from "../src/modelCapabilities";
+import {
+  loadCodexDirectCatalog,
+  resetCodexDirectCatalogForTests,
+} from "../src/codexAuth/modelCatalog";
 
 let originalZotero: typeof Zotero | undefined;
 
@@ -27,6 +33,7 @@ describe("modelProviders", function () {
   });
 
   beforeEach(function () {
+    resetCodexDirectCatalogForTests();
     const prefStore = new Map<string, unknown>();
     (globalThis as typeof globalThis & { Zotero: typeof Zotero }).Zotero = {
       Prefs: {
@@ -41,6 +48,10 @@ describe("modelProviders", function () {
   after(function () {
     (globalThis as typeof globalThis & { Zotero?: typeof Zotero }).Zotero =
       originalZotero;
+  });
+
+  afterEach(function () {
+    resetCodexDirectCatalogForTests();
   });
 
   it("derives provider labels from known hosts and falls back to hostname", function () {
@@ -574,8 +585,130 @@ describe("modelProviders", function () {
     assert.lengthOf(entries, 1);
     assert.equal(entries[0].authMode, "codex_auth");
     assert.equal(entries[0].providerProtocol, "codex_responses");
-    assert.equal(entries[0].providerLabel, "OpenAI (codex auth, legacy)");
-    assert.equal(entries[0].displayModelLabel, "codex/gpt-5.4");
+    assert.equal(entries[0].providerLabel, "Codex Direct (Legacy)");
+    assert.equal(entries[0].displayModelLabel, "gpt-5.4");
+    assert.equal(
+      entries[0].apiBase,
+      "https://chatgpt.com/backend-api/codex/responses",
+    );
+    assert.equal(entries[0].catalogAvailability, "unverified");
+  });
+
+  it("migrates the selected legacy Codex row into codexDirectModel", function () {
+    const prefs = globalThis.Zotero.Prefs as {
+      set: (key: string, value: unknown, global?: boolean) => void;
+    };
+    prefs.set(
+      `${config.prefsPrefix}.modelProviderGroups`,
+      JSON.stringify([
+        {
+          id: "provider-codex-migration",
+          apiBase: "https://custom.example/codex",
+          apiKey: "dormant",
+          authMode: "codex_auth",
+          providerProtocol: "gemini_native",
+          models: [
+            { id: "m1", model: "first-model", temperature: 0.3, maxTokens: 1 },
+            {
+              id: "m2",
+              model: "selected-model",
+              temperature: 1.2,
+              maxTokens: 2,
+            },
+          ],
+        },
+      ]),
+      true,
+    );
+    prefs.set(`${config.prefsPrefix}.lastUsedModelEntryId`, "m2", true);
+    prefs.set(
+      `${config.prefsPrefix}.modelProviderGroupsMigrationVersion`,
+      3,
+      true,
+    );
+
+    const group = getModelProviderGroups()[0];
+    assert.equal(group.codexDirectModel, "selected-model");
+    assert.equal(
+      group.apiBase,
+      "https://chatgpt.com/backend-api/codex/responses",
+    );
+    assert.equal(group.providerProtocol, "codex_responses");
+    assert.lengthOf(group.models, 2);
+    assert.equal(group.models[1].temperature, 1.2);
+  });
+
+  it("inserts direct catalog models through runtime entries and keeps a missing saved model first", async function () {
+    setModelProviderGroups([
+      {
+        id: "provider-direct",
+        apiBase: "https://malicious.example/v1/responses",
+        apiKey: "dormant-key",
+        authMode: "codex_auth",
+        providerProtocol: "gemini_native",
+        codexDirectModel: "saved-missing",
+        models: [
+          {
+            id: "dormant-row",
+            model: "ordinary-api-model",
+            temperature: 1.9,
+            maxTokens: 99,
+            inputTokenCap: 123,
+          },
+        ],
+      },
+    ]);
+    await loadCodexDirectCatalog({
+      authPath: "/test/codex/auth.json",
+      readText: async () =>
+        JSON.stringify({
+          tokens: { access_token: "test", refresh_token: "refresh" },
+        }),
+      fetchFn: (async () =>
+        new Response(
+          JSON.stringify({
+            models: [
+              {
+                slug: "catalog-first",
+                display_name: "Catalog First",
+                visibility: "list",
+                priority: 10,
+                supported_reasoning_levels: [],
+              },
+              {
+                slug: "catalog-second",
+                display_name: "Catalog Second",
+                visibility: "list",
+                priority: 5,
+                supported_reasoning_levels: [],
+              },
+            ],
+          }),
+          { status: 200, headers: { "Content-Type": "application/json" } },
+        )) as typeof fetch,
+    });
+
+    const entries = getRuntimeModelEntries();
+    assert.deepEqual(
+      entries.map((entry) => entry.model),
+      ["saved-missing", "catalog-first", "catalog-second"],
+    );
+    assert.equal(entries[0].catalogAvailability, "saved-unavailable");
+    assert.equal(entries[1].catalogAvailability, "available");
+    assert.equal(entries[1].providerLabel, "Codex Direct (Legacy)");
+    assert.equal(entries[1].advanced.temperature, 0.3);
+    assert.equal(entries[1].advanced.maxTokens, 4096);
+    assert.isUndefined(entries[1].advanced.inputTokenCap);
+    assert.notInclude(
+      entries.map((entry) => entry.model),
+      "ordinary-api-model",
+    );
+
+    setCodexDirectModelForGroup("provider-direct", "catalog-second");
+    assert.equal(
+      getModelProviderGroups()[0].codexDirectModel,
+      "catalog-second",
+    );
   });
 
   it("keeps codex app server entries labeled separately", function () {
@@ -699,14 +832,14 @@ describe("modelProviders", function () {
       );
     });
 
-    it("clears local paths when leaving codex_app_server for a URL-based mode", function () {
+    it("uses the fixed endpoint when leaving codex_app_server for Codex Direct", function () {
       assert.equal(
         migrateApiBaseForAuthModeChange(
           "codex_app_server",
           "codex_auth",
           "C:\\nvm4w\\nodejs\\codex.cmd",
         ),
-        "",
+        "https://chatgpt.com/backend-api/codex/responses",
       );
       assert.equal(
         migrateApiBaseForAuthModeChange(
@@ -729,7 +862,7 @@ describe("modelProviders", function () {
       );
     });
 
-    it("leaves apiBase alone for non-app-server transitions", function () {
+    it("uses the fixed endpoint when entering Codex Direct", function () {
       assert.equal(
         migrateApiBaseForAuthModeChange(
           "api_key",
@@ -740,7 +873,7 @@ describe("modelProviders", function () {
       );
       assert.equal(
         migrateApiBaseForAuthModeChange("api_key", "codex_auth", ""),
-        "",
+        "https://chatgpt.com/backend-api/codex/responses",
       );
     });
   });

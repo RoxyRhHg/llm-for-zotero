@@ -66,7 +66,9 @@ import {
   runProviderConnectionTest,
   runProviderSettingsChecks,
   runCodexAppServerConnectionTest,
+  runCodexDirectConnectionTest,
 } from "../utils/providerConnectionTest";
+import { CODEX_DIRECT_RESPONSES_URL } from "../codexAuth/auth";
 import { normalizeAgentPermissionMode } from "../shared/agentPermissionMode";
 import { normalizeAgentLibraryWriteMode } from "../shared/agentLibraryWriteMode";
 import {
@@ -257,11 +259,9 @@ const setPref = (key: PrefKey, value: string) =>
 const CUSTOMIZED_API_HELPER_TEXT =
   "Choose a preset above, or switch to Customized to enter a full base URL or endpoint manually.";
 const LEGACY_CODEX_AUTH_HELPER_TEXT =
-  "Legacy direct ChatGPT/Codex backend mode. Existing users can keep using it in this release. New users should use Codex App Server. Planned for deprecation in a future release after app-server validation.";
+  "Uses credentials from `codex login` to call the Codex backend directly through the llm-for-zotero harness. This convenient legacy mode does not provide App Server sessions, MCP or runtime management, sandbox controls, approvals, or permission settings. Use Codex App Server for the full Codex runtime experience.";
 const CODEX_APP_SERVER_HELPER_TEXT =
   "Recommended official Codex integration. Runs the local `codex app-server` CLI as the native Codex runtime. Run `codex login` first.";
-const LEGACY_CODEX_API_HELPER_TEXT =
-  "Legacy direct backend URL. Usually uses https://chatgpt.com/backend-api/codex/responses. Existing users can keep it in this release, but new users should use Codex App Server. Planned for deprecation in a future release after app-server validation.";
 const CODEX_APP_SERVER_PROTOCOL_HELPER_TEXT =
   "Uses Codex responses with the local codex app-server transport.";
 const CODEX_APP_SERVER_PATH_HELPER_TEXT_WINDOWS =
@@ -284,8 +284,6 @@ const COPILOT_API_HELPER_TEXT =
 const DEFAULT_COPILOT_API_BASE = "https://api.githubcopilot.com";
 const MAX_PROVIDER_COUNT = 10;
 const INITIAL_PROVIDER_COUNT = 4;
-const DEFAULT_CODEX_API_BASE =
-  "https://chatgpt.com/backend-api/codex/responses";
 
 type ProviderProfile = {
   label: string;
@@ -677,6 +675,7 @@ function ensureModels(
 }
 
 function isProviderEmpty(group: ModelProviderGroup): boolean {
+  if (group.authMode === "codex_auth") return false;
   return (
     !group.apiBase.trim() &&
     !group.apiKey.trim() &&
@@ -694,102 +693,6 @@ function normalizeAuthMode(value: unknown): ModelProviderAuthMode {
   if (value === "codex_app_server") return "codex_app_server";
   if (value === "copilot_auth") return "copilot_auth";
   return "api_key";
-}
-
-type ProcessLike = { env?: Record<string, string | undefined> };
-type PathUtilsLike = {
-  homeDir?: string;
-  join?: (...parts: string[]) => string;
-};
-type ServicesLike = {
-  dirsvc?: {
-    get?: (key: string, iface?: unknown) => { path?: string } | undefined;
-  };
-};
-type OSLike = {
-  Constants?: {
-    Path?: {
-      homeDir?: string;
-    };
-  };
-};
-
-function getProcess(): ProcessLike | undefined {
-  const fromGlobal = (globalThis as { process?: ProcessLike }).process;
-  if (fromGlobal?.env) return fromGlobal;
-  const fromToolkit = ztoolkit.getGlobal("process") as ProcessLike | undefined;
-  return fromToolkit?.env ? fromToolkit : undefined;
-}
-
-function getPathUtils(): PathUtilsLike | undefined {
-  const fromGlobal = (globalThis as { PathUtils?: PathUtilsLike }).PathUtils;
-  if (fromGlobal?.homeDir || fromGlobal?.join) return fromGlobal;
-  return ztoolkit.getGlobal("PathUtils") as PathUtilsLike | undefined;
-}
-
-function getServices(): ServicesLike | undefined {
-  const fromGlobal = (globalThis as { Services?: ServicesLike }).Services;
-  if (fromGlobal?.dirsvc?.get) return fromGlobal;
-  return ztoolkit.getGlobal("Services") as ServicesLike | undefined;
-}
-
-function getOS(): OSLike | undefined {
-  const fromGlobal = (globalThis as { OS?: OSLike }).OS;
-  if (fromGlobal?.Constants?.Path?.homeDir) return fromGlobal;
-  return ztoolkit.getGlobal("OS") as OSLike | undefined;
-}
-
-function getNsIFile(): unknown {
-  const ci = (globalThis as { Ci?: { nsIFile?: unknown } }).Ci;
-  if (ci?.nsIFile) return ci.nsIFile;
-  const components = (
-    globalThis as {
-      Components?: { interfaces?: { nsIFile?: unknown } };
-    }
-  ).Components;
-  return components?.interfaces?.nsIFile;
-}
-
-function resolveCodexAuthPath(): string {
-  const env = getProcess()?.env;
-  const codexHome = env?.CODEX_HOME?.trim();
-  if (codexHome) return joinLocalPath(codexHome, "auth.json");
-  const home =
-    env?.HOME?.trim() ||
-    env?.USERPROFILE?.trim() ||
-    getPathUtils()?.homeDir?.trim() ||
-    getOS()?.Constants?.Path?.homeDir?.trim() ||
-    getServices()?.dirsvc?.get?.("Home", getNsIFile())?.path?.trim() ||
-    (Zotero as unknown as { Profile?: { dir?: string } }).Profile?.dir?.trim();
-  if (!home) throw new Error("Unable to resolve home directory for codex auth");
-  return joinLocalPath(home, ".codex", "auth.json");
-}
-
-async function readCodexAccessToken(): Promise<string> {
-  const authPath = resolveCodexAuthPath();
-  const io = ztoolkit.getGlobal("IOUtils") as
-    | {
-        read?: (
-          path: string,
-        ) => Promise<Uint8Array<ArrayBufferLike> | ArrayBuffer>;
-      }
-    | undefined;
-  if (!io?.read) {
-    throw new Error("IOUtils is unavailable; cannot read Codex auth file");
-  }
-  const data = await io.read(authPath);
-  const bytes = data instanceof Uint8Array ? data : new Uint8Array(data);
-  const raw = new TextDecoder("utf-8").decode(bytes);
-  const parsed = JSON.parse(raw) as {
-    tokens?: { access_token?: string };
-  };
-  const token = parsed?.tokens?.access_token?.trim() || "";
-  if (!token) {
-    throw new Error(
-      "No access token found in ~/.codex/auth.json. Run `codex login` first.",
-    );
-  }
-  return token;
 }
 
 // ── Style tokens ───────────────────────────────────────────────────
@@ -1240,7 +1143,7 @@ export async function registerPrefsScripts(_window: Window | undefined | null) {
       codexAppServerOption.selected = group.authMode === "codex_app_server";
       const codexOption = el(doc, "option") as HTMLOptionElement;
       codexOption.value = "codex_auth";
-      codexOption.textContent = t("Codex Auth (Legacy)");
+      codexOption.textContent = t("Codex Direct (Legacy)");
       codexOption.selected = group.authMode === "codex_auth";
       const copilotOption = el(doc, "option") as HTMLOptionElement;
       copilotOption.value = "copilot_auth";
@@ -1291,9 +1194,6 @@ export async function registerPrefsScripts(_window: Window | undefined | null) {
           group.providerProtocol =
             selectedPreset?.defaultProtocol || "openai_chat_compat";
         }
-        if (nextAuthMode === "codex_auth" && !group.apiBase.trim()) {
-          group.apiBase = DEFAULT_CODEX_API_BASE;
-        }
         if (nextAuthMode === "copilot_auth" && !group.apiBase.trim()) {
           group.apiBase = DEFAULT_COPILOT_API_BASE;
         }
@@ -1343,6 +1243,68 @@ export async function registerPrefsScripts(_window: Window | undefined | null) {
         providerPresetRequiresApiKey(selectedPresetId);
       group.providerProtocol = resolveSelectedProtocol(group, selectedPresetId);
 
+      if (group.authMode === "codex_auth") {
+        group.apiBase = CODEX_DIRECT_RESPONSES_URL;
+        group.providerProtocol = "codex_responses";
+        const testWrap = el(
+          doc,
+          "div",
+          "display: flex; flex-direction: column; gap: 6px;",
+        );
+        const testBtn = el(
+          doc,
+          "button",
+          PRIMARY_BTN_STYLE + " align-self: flex-start; font-size: 12.5px;",
+          t("Test connection"),
+        ) as HTMLButtonElement;
+        testBtn.type = "button";
+        const statusLine = el(
+          doc,
+          "span",
+          HELPER_STYLE + " white-space: pre-wrap;",
+          group.codexDirectModel
+            ? `${t("Selected chat model: ")}${group.codexDirectModel}`
+            : t("The model catalog will load automatically in chat."),
+        );
+        const runTest = async () => {
+          testBtn.disabled = true;
+          statusLine.textContent = t("Fetching Codex model catalog…");
+          statusLine.style.color = "var(--fill-secondary, #888)";
+          try {
+            const fetchFn = ztoolkit.getGlobal("fetch") as
+              | typeof fetch
+              | undefined;
+            const result = await runCodexDirectConnectionTest({ fetchFn });
+            if (!group.codexDirectModel) {
+              group.codexDirectModel = result.modelName;
+              persistGroups(groups);
+            }
+            const catalogLine = `✓ ${t("Catalog:")} ${result.catalogCount} ${t("models; test model:")} ${result.modelName}`;
+            if (result.inferenceError) {
+              statusLine.textContent = `${catalogLine}\n✗ ${t("Inference:")} ${result.inferenceError}`;
+              statusLine.style.color = "darkorange";
+            } else {
+              statusLine.textContent = `${catalogLine}\n✓ ${t("Inference:")} "${result.reply || "OK"}"`;
+              statusLine.style.color = "green";
+            }
+          } catch (error) {
+            statusLine.textContent = `✗ ${t("Catalog:")} ${
+              error instanceof Error ? error.message : String(error)
+            }\n${t("Inference was not run.")}`;
+            statusLine.style.color = "red";
+          } finally {
+            testBtn.disabled = false;
+          }
+        };
+        testBtn.addEventListener("click", () => void runTest());
+        testBtn.addEventListener("command", () => void runTest());
+        testWrap.append(testBtn, statusLine);
+        cardBody.append(authModeWrap, testWrap);
+        card.append(cardHeader, cardBody);
+        wrap.appendChild(card);
+        return;
+      }
+
       // ── Provider preset ─────────────────────────────────────────
       const providerPresetWrap = el(
         doc,
@@ -1350,7 +1312,6 @@ export async function registerPrefsScripts(_window: Window | undefined | null) {
         "display: flex; flex-direction: column;",
       );
       if (
-        group.authMode !== "codex_auth" &&
         group.authMode !== "codex_app_server" &&
         group.authMode !== "copilot_auth"
       ) {
@@ -1423,16 +1384,13 @@ export async function registerPrefsScripts(_window: Window | undefined | null) {
       apiUrlLabel.setAttribute("for", apiUrlInput.id);
       apiUrlInput.type = "text";
       apiUrlInput.placeholder =
-        group.authMode === "codex_auth"
-          ? DEFAULT_CODEX_API_BASE
-          : group.authMode === "codex_app_server"
-            ? t("Optional absolute path to codex executable")
-            : group.authMode === "copilot_auth"
-              ? DEFAULT_COPILOT_API_BASE
-              : selectedPreset?.defaultApiBase || "https://api.openai.com/v1";
+        group.authMode === "codex_app_server"
+          ? t("Optional absolute path to codex executable")
+          : group.authMode === "copilot_auth"
+            ? DEFAULT_COPILOT_API_BASE
+            : selectedPreset?.defaultApiBase || "https://api.openai.com/v1";
       apiUrlInput.value = group.apiBase;
       apiUrlInput.readOnly =
-        group.authMode !== "codex_auth" &&
         group.authMode !== "codex_app_server" &&
         group.authMode !== "copilot_auth" &&
         !isCustomizedPreset &&
@@ -1454,13 +1412,11 @@ export async function registerPrefsScripts(_window: Window | undefined | null) {
         doc,
         "span",
         HELPER_STYLE,
-        group.authMode === "codex_auth"
-          ? t(LEGACY_CODEX_API_HELPER_TEXT)
-          : group.authMode === "codex_app_server"
-            ? t(getCodexAppServerPathHelperText())
-            : group.authMode === "copilot_auth"
-              ? t(COPILOT_API_HELPER_TEXT)
-              : getPresetSelectHelperText(selectedPresetId),
+        group.authMode === "codex_app_server"
+          ? t(getCodexAppServerPathHelperText())
+          : group.authMode === "copilot_auth"
+            ? t(COPILOT_API_HELPER_TEXT)
+            : getPresetSelectHelperText(selectedPresetId),
       );
       apiUrlWrap.append(apiUrlLabel, apiUrlInput, apiUrlHelper);
 
@@ -1502,7 +1458,6 @@ export async function registerPrefsScripts(_window: Window | undefined | null) {
       });
       apiKeyWrap.append(apiKeyLabel, apiKeyInput);
       if (
-        group.authMode === "codex_auth" ||
         group.authMode === "codex_app_server" ||
         group.authMode === "copilot_auth"
       ) {
@@ -2320,11 +2275,7 @@ export async function registerPrefsScripts(_window: Window | undefined | null) {
             const authMode = normalizeAuthMode(group.authMode);
             const apiBase = (
               group.apiBase.trim() ||
-              (authMode === "codex_auth"
-                ? DEFAULT_CODEX_API_BASE
-                : authMode === "copilot_auth"
-                  ? DEFAULT_COPILOT_API_BASE
-                  : "")
+              (authMode === "copilot_auth" ? DEFAULT_COPILOT_API_BASE : "")
             ).replace(/\/$/, "");
             if (authMode === "codex_app_server") {
               const modelName = (
@@ -2343,13 +2294,11 @@ export async function registerPrefsScripts(_window: Window | undefined | null) {
               return;
             }
             const apiKey =
-              authMode === "codex_auth"
-                ? await readCodexAccessToken()
-                : authMode === "copilot_auth"
-                  ? await resolveCopilotAccessToken({
-                      githubToken: group.apiKey.trim(),
-                    })
-                  : group.apiKey.trim();
+              authMode === "copilot_auth"
+                ? await resolveCopilotAccessToken({
+                    githubToken: group.apiKey.trim(),
+                  })
+                : group.apiKey.trim();
             const modelName = (
               modelEntry.model ||
               profile.defaultModel ||
@@ -2364,11 +2313,9 @@ export async function registerPrefsScripts(_window: Window | undefined | null) {
             if (!apiBase) throw new Error(t("API URL is required"));
             if (!apiKey && presetRequiresApiKey) {
               throw new Error(
-                authMode === "codex_auth"
-                  ? t("codex token missing. Run `codex login` first.")
-                  : authMode === "copilot_auth"
-                    ? t("Copilot token missing. Click Login first.")
-                    : t("API Key is required"),
+                authMode === "copilot_auth"
+                  ? t("Copilot token missing. Click Login first.")
+                  : t("API Key is required"),
               );
             }
 
@@ -2456,14 +2403,6 @@ export async function registerPrefsScripts(_window: Window | undefined | null) {
         );
       } else if (group.authMode === "codex_app_server") {
         cardBody.append(authModeWrap, apiUrlWrap, divider, modelsWrap);
-      } else if (group.authMode === "codex_auth") {
-        cardBody.append(
-          authModeWrap,
-          apiUrlWrap,
-          apiKeyWrap,
-          divider,
-          modelsWrap,
-        );
       } else {
         cardBody.append(
           authModeWrap,

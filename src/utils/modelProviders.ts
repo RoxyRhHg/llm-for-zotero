@@ -23,6 +23,9 @@ import type {
   ModelCatalogIdentity,
   ModelProfileOverride,
 } from "../modelCapabilities";
+import { buildCodexRuntimeModelCandidates } from "../codex/catalogSelection";
+import { CODEX_DIRECT_RESPONSES_URL } from "../codexAuth/auth";
+import { getCodexDirectCatalogSnapshot } from "../codexAuth/modelCatalog";
 
 export type LegacyModelSlotKey =
   | "primary"
@@ -66,6 +69,8 @@ export type ModelProviderGroup = {
   authMode: ModelProviderAuthMode;
   providerProtocol: ProviderProtocol;
   models: ModelProviderModel[];
+  /** Last model selected for the catalog-backed Codex Direct transport. */
+  codexDirectModel?: string;
   /** When "customized", UI shows Customized and allows editing URL; when undefined, preset is derived from apiBase. */
   presetIdOverride?: ProviderPresetId;
 };
@@ -82,6 +87,8 @@ export type RuntimeModelEntry = {
   providerOrder: number;
   displayModelLabel: string;
   advanced: AdvancedModelConfig;
+  catalogAvailability?: "available" | "unverified" | "saved-unavailable";
+  contextWindow?: number;
 };
 
 export type LegacyModelSlot = AdvancedModelConfig & {
@@ -115,7 +122,7 @@ const MODEL_PROVIDER_GROUPS_MIGRATION_VERSION_PREF_KEY =
   "modelProviderGroupsMigrationVersion";
 const LAST_USED_MODEL_ENTRY_ID_PREF_KEY = "lastUsedModelEntryId";
 const LEGACY_LAST_MODEL_PROFILE_PREF_KEY = "lastUsedModelProfile";
-const MODEL_PROVIDER_GROUPS_MIGRATION_VERSION = 3;
+const MODEL_PROVIDER_GROUPS_MIGRATION_VERSION = 4;
 const modelProviderGroupListeners = new Set<() => void>();
 
 function getZoteroPrefs(): ZoteroPrefsAPI | null {
@@ -270,7 +277,10 @@ function extractProviderHost(apiBase: string): string {
   }
 }
 
-function normalizeGroup(group: unknown): ModelProviderGroup | null {
+function normalizeGroup(
+  group: unknown,
+  migrateLegacyCodexDirectModel = false,
+): ModelProviderGroup | null {
   if (!group || typeof group !== "object") return null;
   const rawGroup = group as {
     id?: unknown;
@@ -279,6 +289,7 @@ function normalizeGroup(group: unknown): ModelProviderGroup | null {
     authMode?: unknown;
     providerProtocol?: unknown;
     models?: unknown;
+    codexDirectModel?: unknown;
     presetIdOverride?: unknown;
   };
 
@@ -289,7 +300,21 @@ function normalizeGroup(group: unknown): ModelProviderGroup | null {
         .filter((entry): entry is ModelProviderModel => Boolean(entry))
     : [];
 
-  const apiBase = normalizeApiBase(normalizeString(rawGroup.apiBase));
+  const storedApiBase = normalizeApiBase(normalizeString(rawGroup.apiBase));
+  const apiBase =
+    authMode === "codex_auth" ? CODEX_DIRECT_RESPONSES_URL : storedApiBase;
+  const selectedLegacyModelId = getStringPref(
+    LAST_USED_MODEL_ENTRY_ID_PREF_KEY,
+  );
+  const codexDirectModel =
+    authMode === "codex_auth"
+      ? normalizeString(rawGroup.codexDirectModel) ||
+        (migrateLegacyCodexDirectModel
+          ? models.find((model) => model.id === selectedLegacyModelId)?.model ||
+            models.find((model) => model.model)?.model
+          : "") ||
+        ""
+      : "";
   return {
     id:
       typeof rawGroup.id === "string" && rawGroup.id.trim()
@@ -304,6 +329,7 @@ function normalizeGroup(group: unknown): ModelProviderGroup | null {
       apiBase,
     }),
     models,
+    ...(codexDirectModel ? { codexDirectModel } : {}),
     presetIdOverride: normalizePresetIdOverride(rawGroup.presetIdOverride),
   };
 }
@@ -414,14 +440,20 @@ export function normalizeModelProviderGroups(
 ): ModelProviderGroup[] {
   if (!Array.isArray(raw)) return [];
   return raw
-    .map((group) => normalizeGroup(group))
+    .map((group) => normalizeGroup(group, false))
     .filter((group): group is ModelProviderGroup => Boolean(group));
 }
 
 function parseStoredModelProviderGroups(raw: string): ModelProviderGroup[] {
   if (!raw.trim()) return [];
   try {
-    return normalizeModelProviderGroups(JSON.parse(raw));
+    const parsed = JSON.parse(raw) as unknown;
+    if (!Array.isArray(parsed)) return [];
+    const shouldMigrateCodexDirectModel =
+      getMigrationVersion() < MODEL_PROVIDER_GROUPS_MIGRATION_VERSION;
+    return parsed
+      .map((group) => normalizeGroup(group, shouldMigrateCodexDirectModel))
+      .filter((group): group is ModelProviderGroup => Boolean(group));
   } catch (_err) {
     return [];
   }
@@ -613,6 +645,10 @@ export function migrateApiBaseForAuthModeChange(
   nextAuthMode: ModelProviderAuthMode,
   apiBase: string,
 ): string {
+  if (nextAuthMode === "codex_auth") return CODEX_DIRECT_RESPONSES_URL;
+  if (previousAuthMode === "codex_auth") {
+    return "";
+  }
   const trimmed = apiBase.trim();
   if (!trimmed) return apiBase;
   const looksLikeUrl = /^https?:\/\//i.test(trimmed);
@@ -663,6 +699,52 @@ export function getRuntimeModelEntries(): RuntimeModelEntry[] {
 
   for (const [groupIndex, group] of groups.entries()) {
     const authMode = normalizeProviderAuthMode(group.authMode);
+    if (authMode === "codex_auth") {
+      const snapshot = getCodexDirectCatalogSnapshot();
+      const catalogModels =
+        snapshot.status === "ready"
+          ? snapshot.models.map((model) => ({
+              model: model.model,
+              displayName: model.displayName,
+            }))
+          : [];
+      const candidates = buildCodexRuntimeModelCandidates({
+        catalogModels,
+        selectedModel: group.codexDirectModel || "",
+      });
+      for (const candidate of candidates) {
+        const catalogModel =
+          snapshot.status === "ready"
+            ? snapshot.models.find(
+                (model) =>
+                  model.model.toLowerCase() === candidate.model.toLowerCase(),
+              )
+            : undefined;
+        entries.push({
+          entryId: `${group.id}::codex-direct::${candidate.model.toLowerCase()}`,
+          groupId: group.id,
+          model: candidate.model,
+          apiBase: CODEX_DIRECT_RESPONSES_URL,
+          apiKey: "",
+          authMode,
+          providerProtocol: "codex_responses",
+          providerLabel: "Codex Direct (Legacy)",
+          providerOrder: groupIndex,
+          displayModelLabel: candidate.displayName,
+          advanced: normalizeAdvancedModelConfig(undefined, authMode),
+          catalogAvailability:
+            candidate.source === "catalog"
+              ? "available"
+              : snapshot.status === "ready"
+                ? "saved-unavailable"
+                : "unverified",
+          ...(catalogModel?.contextWindow
+            ? { contextWindow: catalogModel.contextWindow }
+            : {}),
+        });
+      }
+      continue;
+    }
     const baseProviderLabel = deriveProviderLabel(
       group.apiBase,
       groupIndex + 1,
@@ -671,13 +753,11 @@ export function getRuntimeModelEntries(): RuntimeModelEntry[] {
     const providerLabel =
       authMode === "webchat"
         ? `${baseProviderLabel} (web)`
-        : authMode === "codex_auth"
-          ? `${baseProviderLabel} (codex auth, legacy)`
-          : authMode === "codex_app_server"
-            ? `${baseProviderLabel} (app server)`
-            : authMode === "copilot_auth"
-              ? `${baseProviderLabel} (copilot auth)`
-              : baseProviderLabel;
+        : authMode === "codex_app_server"
+          ? `${baseProviderLabel} (app server)`
+          : authMode === "copilot_auth"
+            ? `${baseProviderLabel} (copilot auth)`
+            : baseProviderLabel;
     const normalizedCounts = new Map<string, number>();
     for (const modelEntry of group.models) {
       const modelName = modelEntry.model.trim();
@@ -689,13 +769,11 @@ export function getRuntimeModelEntries(): RuntimeModelEntry[] {
       const baseModelLabel =
         authMode === "webchat"
           ? `web/${modelName}`
-          : authMode === "codex_auth"
-            ? `codex/${modelName}`
-            : authMode === "codex_app_server"
-              ? `codex-app/${modelName}`
-              : authMode === "copilot_auth"
-                ? `copilot/${modelName}`
-                : modelName;
+          : authMode === "codex_app_server"
+            ? `codex-app/${modelName}`
+            : authMode === "copilot_auth"
+              ? `copilot/${modelName}`
+              : modelName;
       const providerProtocol = resolveRuntimeProviderProtocol(
         group,
         modelEntry,
@@ -789,6 +867,23 @@ export function getLastUsedModelEntryId(): string {
 
 export function setLastUsedModelEntryId(entryId: string): void {
   setPref(LAST_USED_MODEL_ENTRY_ID_PREF_KEY, entryId.trim());
+}
+
+export function setCodexDirectModelForGroup(
+  groupId: string,
+  model: string,
+): void {
+  const normalizedGroupId = groupId.trim();
+  const normalizedModel = model.trim();
+  if (!normalizedGroupId || !normalizedModel) return;
+  const groups = getModelProviderGroups();
+  const group = groups.find(
+    (candidate) =>
+      candidate.id === normalizedGroupId && candidate.authMode === "codex_auth",
+  );
+  if (!group || group.codexDirectModel === normalizedModel) return;
+  group.codexDirectModel = normalizedModel;
+  setModelProviderGroups(groups);
 }
 
 export function getModelProviderGroupsPrefKey(): string {

@@ -7,6 +7,11 @@ import {
 } from "../src/agent/model/codexResponses";
 import { OpenAIResponsesAgentAdapter } from "../src/agent/model/openaiResponses";
 import type { AgentRuntimeRequest } from "../src/agent/types";
+import {
+  loadCodexDirectCatalog,
+  resetCodexDirectCatalogForTests,
+} from "../src/codexAuth/modelCatalog";
+import { CODEX_DIRECT_RESPONSES_URL } from "../src/codexAuth/auth";
 
 describe("CodexResponsesAgentAdapter", function () {
   const originalToolkit = (
@@ -30,10 +35,46 @@ describe("CodexResponsesAgentAdapter", function () {
   }
 
   afterEach(function () {
+    resetCodexDirectCatalogForTests();
     (
       globalThis as typeof globalThis & { ztoolkit?: typeof originalToolkit }
     ).ztoolkit = originalToolkit;
   });
+
+  async function loadDirectCatalog(): Promise<void> {
+    await loadCodexDirectCatalog({
+      authPath: "/test/codex/auth.json",
+      readText: async () =>
+        JSON.stringify({
+          tokens: {
+            access_token: "catalog-token",
+            refresh_token: "catalog-refresh",
+          },
+        }),
+      fetchFn: (async () =>
+        new Response(
+          JSON.stringify({
+            models: [
+              {
+                slug: "gpt-codex",
+                display_name: "GPT Codex",
+                visibility: "list",
+                priority: 1,
+                supported_reasoning_levels: [
+                  { effort: "low" },
+                  { effort: "medium" },
+                  { effort: "high" },
+                  { effort: "xhigh" },
+                  { effort: "max" },
+                  { effort: "ultra" },
+                ],
+              },
+            ],
+          }),
+          { status: 200, headers: { "Content-Type": "application/json" } },
+        )) as typeof fetch,
+    });
+  }
 
   it("supports tool calling for codex auth requests", function () {
     assert.isTrue(adapter.supportsTools(makeRequest()));
@@ -211,6 +252,161 @@ describe("CodexResponsesAgentAdapter", function () {
       ),
     );
     assert.deepEqual(capturedBody?.include, ["reasoning.encrypted_content"]);
+  });
+
+  it("sends exact catalog effort and ignores direct advanced settings", async function () {
+    await loadDirectCatalog();
+    const freshAdapter = new CodexResponsesAgentAdapter();
+    let capturedUrl = "";
+    let capturedBody: Record<string, unknown> = {};
+    let capturedHeaders = new Headers();
+    (
+      globalThis as typeof globalThis & {
+        ztoolkit: {
+          getGlobal: (name: string) => unknown;
+          log: () => void;
+        };
+      }
+    ).ztoolkit = {
+      getGlobal: (name: string) => {
+        if (name === "process") return { env: { HOME: "/home/tester" } };
+        if (name === "IOUtils") {
+          return {
+            read: async () =>
+              new TextEncoder().encode(
+                JSON.stringify({
+                  tokens: {
+                    access_token: "direct-token",
+                    refresh_token: "direct-refresh",
+                    account_id: "account-456",
+                  },
+                }),
+              ),
+          };
+        }
+        if (name !== "fetch") return undefined;
+        return async (url: string, init?: RequestInit) => {
+          capturedUrl = url;
+          capturedBody = JSON.parse(String(init?.body || "{}")) as Record<
+            string,
+            unknown
+          >;
+          capturedHeaders = new Headers(init?.headers);
+          return {
+            ok: true,
+            status: 200,
+            statusText: "OK",
+            body: undefined,
+            json: async () => ({ output_text: "OK", output: [] }),
+            text: async () => "",
+          };
+        };
+      },
+      log: () => undefined,
+    };
+
+    await freshAdapter.runStep({
+      request: makeRequest({
+        model: "gpt-codex",
+        apiBase: "https://malicious.example/v1/responses",
+        reasoning: {
+          provider: "openai",
+          level: "default",
+          effort: "max",
+        },
+        advanced: {
+          temperature: 1.7,
+          maxTokens: 123,
+          profileOverride: {
+            forModel: "gpt-codex",
+            extraBody: { custom_advanced_value: true },
+          },
+        },
+      }),
+      messages: [{ role: "user", content: "Hello" }],
+      tools: [],
+    });
+
+    assert.equal(capturedUrl, CODEX_DIRECT_RESPONSES_URL);
+    assert.deepEqual(capturedBody.reasoning, {
+      effort: "max",
+      summary: "detailed",
+    });
+    assert.notProperty(capturedBody, "temperature");
+    assert.notProperty(capturedBody, "max_output_tokens");
+    assert.notProperty(capturedBody, "custom_advanced_value");
+    assert.equal(capturedHeaders.get("Authorization"), "Bearer direct-token");
+    assert.equal(capturedHeaders.get("ChatGPT-Account-ID"), "account-456");
+    for (const effort of ["low", "medium", "high", "xhigh", "max"]) {
+      const effortAdapter = new CodexResponsesAgentAdapter();
+      await effortAdapter.runStep({
+        request: makeRequest({
+          model: "gpt-codex",
+          reasoning: { provider: "openai", level: "default", effort },
+        }),
+        messages: [{ role: "user", content: "Hello" }],
+        tools: [],
+      });
+      assert.equal(
+        (capturedBody.reasoning as { effort?: string } | undefined)?.effort,
+        effort,
+      );
+    }
+  });
+
+  it("omits Ultra and stale direct efforts", async function () {
+    await loadDirectCatalog();
+    for (const effort of ["ultra", "stale-effort"]) {
+      const freshAdapter = new CodexResponsesAgentAdapter();
+      let capturedBody: Record<string, unknown> = {};
+      (
+        globalThis as typeof globalThis & {
+          ztoolkit: { getGlobal: (name: string) => unknown; log: () => void };
+        }
+      ).ztoolkit = {
+        getGlobal: (name: string) => {
+          if (name === "process") return { env: { HOME: "/home/tester" } };
+          if (name === "IOUtils") {
+            return {
+              read: async () =>
+                new TextEncoder().encode(
+                  JSON.stringify({
+                    tokens: {
+                      access_token: "direct-token",
+                      refresh_token: "direct-refresh",
+                    },
+                  }),
+                ),
+            };
+          }
+          if (name !== "fetch") return undefined;
+          return async (_url: string, init?: RequestInit) => {
+            capturedBody = JSON.parse(String(init?.body || "{}")) as Record<
+              string,
+              unknown
+            >;
+            return {
+              ok: true,
+              status: 200,
+              statusText: "OK",
+              body: undefined,
+              json: async () => ({ output_text: "OK", output: [] }),
+              text: async () => "",
+            };
+          };
+        },
+        log: () => undefined,
+      };
+      await freshAdapter.runStep({
+        request: makeRequest({
+          model: "gpt-codex",
+          reasoning: { provider: "openai", level: "default", effort },
+        }),
+        messages: [{ role: "user", content: "Hello" }],
+        tools: [],
+      });
+      assert.notProperty(capturedBody, "reasoning", effort);
+    }
   });
 
   it("preserves reusable transcript tool results as safe input evidence", async function () {

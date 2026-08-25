@@ -9,6 +9,8 @@ import type { ConversationSystem } from "../../shared/types";
 import {
   getLastUsedModelEntryId,
   getModelEntryById,
+  getModelProviderGroups,
+  setCodexDirectModelForGroup,
 } from "../../utils/modelProviders";
 import {
   buildQueuedFollowUpThreadKey,
@@ -549,6 +551,21 @@ import {
   createCodexGlobalPortalItem,
   createCodexPaperPortalItem,
 } from "../../codexAppServer/portal";
+import {
+  getCodexDirectCatalogSnapshot,
+  getCodexDirectReasoningChoices,
+  loadCodexDirectCatalog,
+  reconcileCodexDirectReasoningChoice,
+  subscribeToCodexDirectCatalog,
+} from "../../codexAuth/modelCatalog";
+import {
+  getCodexDirectReasoningSelection,
+  setCodexDirectReasoningSelection,
+} from "../../codexAuth/reasoningPrefs";
+import {
+  buildCodexReasoningConfig,
+  type CodexReasoningChoice,
+} from "../../codex/catalogSelection";
 
 type ActionMenuTrigger = "/" | "$";
 type ActiveActionToken = PaperSearchSlashToken & {
@@ -1708,6 +1725,7 @@ export function setupHandlers(
   let cleanupPrefObservers: (() => void) | null = null;
   let cleanupMineruPaperSourceObservers: (() => void) | null = null;
   let cleanupModelCapabilitySubscription: (() => void) | null = null;
+  let cleanupCodexDirectCatalogSubscription: (() => void) | null = null;
   {
     const agentPrefKey = `${config.prefsPrefix}.enableAgentMode`;
     const claudeModePrefKey = `${config.prefsPrefix}.enableClaudeCodeMode`;
@@ -4887,76 +4905,125 @@ export function setupHandlers(
     menu.appendChild(action);
   };
 
+  const appendModelCatalogStatus = (params: {
+    menu: HTMLDivElement;
+    status: "idle" | "loading" | "ready" | "error";
+    modelCount: number;
+    loadingMessage: string;
+    errorMessage: string;
+    errorTitle?: string;
+    emptyMessage: string;
+    retryLabel: string;
+    onRetry: (event: Event) => void;
+  }): boolean => {
+    if (params.status === "loading") {
+      appendModelMenuEmptyState(params.menu, params.loadingMessage);
+      return true;
+    }
+    if (params.status === "error") {
+      const message = appendModelMenuEmptyState(
+        params.menu,
+        params.errorMessage,
+      );
+      if (params.errorTitle) message.title = params.errorTitle;
+      appendModelMenuAction(params.menu, params.retryLabel, params.onRetry);
+      return true;
+    }
+    if (params.status === "ready" && params.modelCount === 0) {
+      appendModelMenuEmptyState(params.menu, params.emptyMessage);
+      return true;
+    }
+    return false;
+  };
+
   const appendCodexModelCatalogStatus = (menu: HTMLDivElement) => {
     if (!isCodexConversationSystem()) return;
-    if (codexModelCatalogStatus === "loading") {
-      appendModelMenuEmptyState(menu, t("Loading Codex models…"));
-      return;
-    }
-    if (codexModelCatalogStatus === "error") {
-      const message = appendModelMenuEmptyState(
-        menu,
-        t("Could not load Codex models. Showing current model only."),
-      );
-      if (codexModelCatalogError) message.title = codexModelCatalogError;
-      appendModelMenuAction(menu, t("Retry loading Codex models"), (event) => {
+    appendModelCatalogStatus({
+      menu,
+      status: codexModelCatalogStatus,
+      modelCount: codexModelCatalogModels.length,
+      loadingMessage: t("Loading Codex models…"),
+      errorMessage: t(
+        "Could not load Codex models. Showing current model only.",
+      ),
+      errorTitle: codexModelCatalogError,
+      emptyMessage: t("Codex did not return any available models."),
+      retryLabel: t("Retry loading Codex models"),
+      onRetry: (event) => {
         if (!isPrimaryPointerEvent(event)) return;
         event.preventDefault();
         event.stopPropagation();
         codexModelCatalogStatus = "idle";
         codexModelCatalogError = "";
         void ensureCodexModelCatalogLoaded();
-      });
+      },
+    });
+  };
+
+  const hasConfiguredCodexDirectProvider = () =>
+    getModelProviderGroups().some((group) => group.authMode === "codex_auth");
+
+  const appendCodexDirectCatalogStatus = (menu: HTMLDivElement) => {
+    if (isRuntimeConversationSystem() || !hasConfiguredCodexDirectProvider()) {
       return;
     }
-    if (
-      codexModelCatalogStatus === "ready" &&
-      !codexModelCatalogModels.length
-    ) {
+    const snapshot = getCodexDirectCatalogSnapshot();
+    const selected = item ? getSelectedModelEntryForItem(item.id) : null;
+    const hasSavedModel = selected?.authMode === "codex_auth";
+    const statusHandled = appendModelCatalogStatus({
+      menu,
+      status: snapshot.status,
+      modelCount: snapshot.models.length,
+      loadingMessage: hasSavedModel
+        ? t("Loading Codex Direct models. Current model is unverified.")
+        : t("Loading Codex Direct models…"),
+      errorMessage: hasSavedModel
+        ? t("Could not load Codex Direct models. Current model is unverified.")
+        : t("Could not load Codex Direct models."),
+      errorTitle: snapshot.error,
+      emptyMessage: t("Codex Direct did not return any available models."),
+      retryLabel: t("Retry loading Codex Direct models"),
+      onRetry: (event) => {
+        if (!isPrimaryPointerEvent(event)) return;
+        event.preventDefault();
+        event.stopPropagation();
+        void loadCodexDirectCatalog({ force: true }).catch(() => undefined);
+      },
+    });
+    if (statusHandled) return;
+    if (selected?.catalogAvailability === "saved-unavailable") {
       appendModelMenuEmptyState(
         menu,
-        t("Codex did not return any available models."),
+        t(
+          "The saved Codex Direct model is no longer available. Select another model before sending.",
+        ),
       );
     }
   };
 
   const appendClaudeModelCatalogStatus = (menu: HTMLDivElement) => {
     if (!isClaudeConversationSystem()) return;
-    if (claudeModelCatalogStatus === "loading") {
-      appendModelMenuEmptyState(
-        menu,
-        claudeModelCatalogModels.length
-          ? t("Refreshing Claude models…")
-          : t("Loading Claude models…"),
-      );
-      return;
-    }
-    if (claudeModelCatalogStatus === "error") {
-      const message = appendModelMenuEmptyState(
-        menu,
-        claudeModelCatalogModels.length
-          ? t("Could not refresh Claude models. Showing the last known list.")
-          : t("Could not load Claude models. Showing the current model only."),
-      );
-      if (claudeModelCatalogError) message.title = claudeModelCatalogError;
-      appendModelMenuAction(menu, t("Retry loading Claude models"), (event) => {
+    const statusHandled = appendModelCatalogStatus({
+      menu,
+      status: claudeModelCatalogStatus,
+      modelCount: claudeModelCatalogModels.length,
+      loadingMessage: claudeModelCatalogModels.length
+        ? t("Refreshing Claude models…")
+        : t("Loading Claude models…"),
+      errorMessage: claudeModelCatalogModels.length
+        ? t("Could not refresh Claude models. Showing the last known list.")
+        : t("Could not load Claude models. Showing the current model only."),
+      errorTitle: claudeModelCatalogError,
+      emptyMessage: t("Claude Code did not return any available models."),
+      retryLabel: t("Retry loading Claude models"),
+      onRetry: (event) => {
         if (!isPrimaryPointerEvent(event)) return;
         event.preventDefault();
         event.stopPropagation();
         void ensureClaudeModelCatalogLoaded(true);
-      });
-      return;
-    }
-    if (
-      claudeModelCatalogStatus === "ready" &&
-      !claudeModelCatalogModels.length
-    ) {
-      appendModelMenuEmptyState(
-        menu,
-        t("Claude Code did not return any available models."),
-      );
-      return;
-    }
+      },
+    });
+    if (statusHandled) return;
     if (claudeModelCatalogStatus === "ready" && claudeModelCatalogLegacy) {
       appendModelMenuEmptyState(
         menu,
@@ -5003,6 +5070,7 @@ export function setupHandlers(
     );
     appendClaudeModelCatalogStatus(modelMenu);
     appendCodexModelCatalogStatus(modelMenu);
+    appendCodexDirectCatalogStatus(modelMenu);
     if (!groupedChoices.length) {
       appendModelMenuEmptyState(modelMenu, t("No models configured yet."));
       return;
@@ -5024,8 +5092,16 @@ export function setupHandlers(
             title: getModelOptionTitle(entry),
           },
         );
+        if (entry.catalogAvailability === "saved-unavailable") {
+          option.disabled = true;
+          option.classList.add("llm-model-option-disabled");
+          option.title = t(
+            "This saved model is not present in the current Codex Direct catalog.",
+          );
+        }
         const applyModelSelection = (e: Event) => {
           if (!isPrimaryPointerEvent(e)) return;
+          if (entry.catalogAvailability === "saved-unavailable") return;
           e.preventDefault();
           e.stopPropagation();
           if (!item) return;
@@ -5257,19 +5333,35 @@ export function setupHandlers(
             title: getModelOptionTitle(entry),
           },
         );
+        if (entry.catalogAvailability === "saved-unavailable") {
+          option.disabled = true;
+          option.classList.add("llm-model-option-disabled");
+        }
         const runRetry = async (e: Event) => {
           if (!isPrimaryPointerEvent(e)) return;
+          if (entry.catalogAvailability === "saved-unavailable") return;
           e.preventDefault();
           e.stopPropagation();
           if (!item) return;
           closeRetryModelMenu();
-          const retryReasoning = getSelectedReasoningForItem(
-            item.id,
-            entry.model,
-            entry.apiBase,
-            entry.providerProtocol,
-            entry.advanced?.profileOverride,
-          );
+          const retryReasoning =
+            entry.authMode === "codex_auth"
+              ? buildCodexReasoningConfig(
+                  reconcileCodexDirectReasoningChoice(
+                    entry.model,
+                    getCodexDirectReasoningSelection(
+                      entry.groupId,
+                      entry.model,
+                    ),
+                  ),
+                )
+              : getSelectedReasoningForItem(
+                  item.id,
+                  entry.model,
+                  entry.apiBase,
+                  entry.providerProtocol,
+                  entry.advanced?.profileOverride,
+                );
           const retryAdvanced = getAdvancedModelParams(entry.entryId);
           await retryLatestAssistantResponse(
             body,
@@ -5385,6 +5477,29 @@ export function setupHandlers(
     }
   };
 
+  const getSelectedCodexDirectEntry = (): RuntimeModelEntry | null => {
+    if (!item || isRuntimeConversationSystem()) return null;
+    const selected = getSelectedModelEntryForItem(item.id);
+    return selected?.authMode === "codex_auth" ? selected : null;
+  };
+
+  const resolveCurrentCodexDirectReasoningSelection = () => {
+    const selected = getSelectedCodexDirectEntry();
+    if (!selected) {
+      return { mode: "auto", choices: [] as CodexReasoningChoice[] };
+    }
+    const stored = getCodexDirectReasoningSelection(
+      selected.groupId,
+      selected.model,
+    );
+    const choices = getCodexDirectReasoningChoices(selected.model);
+    const mode = reconcileCodexDirectReasoningChoice(selected.model, stored);
+    if (getCodexDirectCatalogSnapshot().status === "ready" && mode !== stored) {
+      setCodexDirectReasoningSelection(selected.groupId, selected.model, mode);
+    }
+    return { mode, choices };
+  };
+
   const getReasoningState = () => {
     if (!item) {
       return {
@@ -5441,6 +5556,26 @@ export function setupHandlers(
           selectedMode === "auto"
             ? "none"
             : (selectedMode as ReasoningLevelSelection),
+      };
+    }
+    const directSelection = resolveCurrentCodexDirectReasoningSelection();
+    if (directSelection.choices.length) {
+      const options: ReasoningOption[] = directSelection.choices
+        .filter((choice) => choice.value !== "auto")
+        .map((choice) => ({
+          level: choice.value as LLMReasoningLevel,
+          enabled: true,
+          label: choice.label,
+        }));
+      return {
+        provider: "openai" as const,
+        currentModel,
+        options,
+        enabledLevels: options.map((option) => option.level),
+        selectedLevel:
+          directSelection.mode === "auto"
+            ? "none"
+            : (directSelection.mode as ReasoningLevelSelection),
       };
     }
     const selectedProfile = getSelectedModelEntryForItem(item.id);
@@ -5650,7 +5785,9 @@ export function setupHandlers(
 
       const { provider, currentModel, options, enabledLevels, selectedLevel } =
         getReasoningState();
-      const available = enabledLevels.length > 0;
+      const directSelection = resolveCurrentCodexDirectReasoningSelection();
+      const available =
+        directSelection.choices.length > 0 || enabledLevels.length > 0;
       const resolvedReasoningLabel = isClaudeConversationSystem()
         ? (() => {
             return getClaudeReasoningDisplayLabel(
@@ -5666,16 +5803,22 @@ export function setupHandlers(
                 )?.label || "Auto"
               );
             })()
-          : selectedLevel === "none"
-            ? "off"
-            : available
-              ? getReasoningLevelDisplayLabel(
-                  selectedLevel as LLMReasoningLevel,
-                  provider,
-                  currentModel,
-                  options,
-                )
-              : "off";
+          : directSelection.choices.length
+            ? directSelection.choices.find(
+                (choice) =>
+                  choice.value.toLowerCase() ===
+                  directSelection.mode.toLowerCase(),
+              )?.label || "Auto"
+            : selectedLevel === "none"
+              ? "off"
+              : available
+                ? getReasoningLevelDisplayLabel(
+                    selectedLevel as LLMReasoningLevel,
+                    provider,
+                    currentModel,
+                    options,
+                  )
+                : "off";
       const active =
         available && isReasoningDisplayLabelActive(resolvedReasoningLabel);
       const reasoningLabel = resolvedReasoningLabel;
@@ -5693,6 +5836,44 @@ export function setupHandlers(
       reasoningBtn.dataset.reasoningHint = reasoningHint;
       scheduleResponsiveLayoutSync();
     });
+  };
+
+  const appendReasoningChoiceButtons = (params: {
+    menu: HTMLDivElement;
+    choices: CodexReasoningChoice[];
+    currentValue: string;
+    onSelect: (value: string) => void;
+    disabled?: boolean;
+  }) => {
+    for (const choice of params.choices) {
+      const option = createElement(
+        body.ownerDocument as Document,
+        "button",
+        "llm-response-menu-item llm-reasoning-option",
+        {
+          type: "button",
+          textContent:
+            params.currentValue.toLowerCase() === choice.value.toLowerCase()
+              ? `\u2713 ${choice.label}`
+              : choice.label,
+          title: choice.description || choice.label,
+        },
+      );
+      const applySelection = (event: Event) => {
+        if (!isPrimaryPointerEvent(event) || params.disabled) return;
+        event.preventDefault();
+        event.stopPropagation();
+        params.onSelect(choice.value);
+      };
+      if (params.disabled) {
+        option.disabled = true;
+        option.classList.add("llm-reasoning-option-disabled");
+      } else {
+        option.addEventListener("pointerdown", applySelection);
+        option.addEventListener("click", applySelection);
+      }
+      params.menu.appendChild(option);
+    }
   };
 
   const rebuildReasoningMenu = () => {
@@ -5795,29 +5976,35 @@ export function setupHandlers(
     if (isCodexConversationSystem()) {
       const codexModes = getCodexReasoningChoices();
       const currentMode = getCodexReasoningModePref();
-      for (const mode of codexModes) {
-        const option = createElement(
-          body.ownerDocument as Document,
-          "button",
-          "llm-response-menu-item llm-reasoning-option",
-          {
-            type: "button",
-            textContent:
-              currentMode === mode.value ? `\u2713 ${mode.label}` : mode.label,
-          },
-        );
-        const applyCodexSelection = (e: Event) => {
-          if (!isPrimaryPointerEvent(e)) return;
-          e.preventDefault();
-          e.stopPropagation();
-          setCodexReasoningModePref(mode.value);
+      appendReasoningChoiceButtons({
+        menu: reasoningMenu,
+        choices: codexModes,
+        currentValue: currentMode,
+        onSelect: (value) => {
+          setCodexReasoningModePref(value);
           setFloatingMenuOpen(reasoningMenu, REASONING_MENU_OPEN_CLASS, false);
           updateReasoningButton();
-        };
-        option.addEventListener("pointerdown", applyCodexSelection);
-        option.addEventListener("click", applyCodexSelection);
-        reasoningMenu.appendChild(option);
-      }
+        },
+      });
+      return;
+    }
+    const directEntry = getSelectedCodexDirectEntry();
+    if (directEntry) {
+      const directSelection = resolveCurrentCodexDirectReasoningSelection();
+      appendReasoningChoiceButtons({
+        menu: reasoningMenu,
+        choices: directSelection.choices,
+        currentValue: directSelection.mode,
+        onSelect: (value) => {
+          setCodexDirectReasoningSelection(
+            directEntry.groupId,
+            directEntry.model,
+            value,
+          );
+          setFloatingMenuOpen(reasoningMenu, REASONING_MENU_OPEN_CLASS, false);
+          updateReasoningButton();
+        },
+      });
       return;
     }
     if (!enabledLevels.length) {
@@ -5950,6 +6137,21 @@ export function setupHandlers(
     if (setupHandlersCleaned) return;
     syncModelFromPrefs();
   });
+  cleanupCodexDirectCatalogSubscription = subscribeToCodexDirectCatalog(
+    (snapshot) => {
+      if (snapshot.status === "ready" && snapshot.models[0]) {
+        for (const group of getModelProviderGroups()) {
+          if (group.authMode === "codex_auth" && !group.codexDirectModel) {
+            setCodexDirectModelForGroup(group.id, snapshot.models[0].model);
+          }
+        }
+      }
+      syncModelFromPrefs();
+    },
+  );
+  if (hasConfiguredCodexDirectProvider()) {
+    void loadCodexDirectCatalog().catch(() => undefined);
+  }
 
   (body as any).__llmRefreshContextSourceForCurrentItem = () => {
     withScrollGuard(chatBox, conversationKey, () => {
@@ -6296,6 +6498,17 @@ export function setupHandlers(
           ? reconcileSelectedCodexReasoningMode()
           : getCodexReasoningModePref();
       return buildCodexAppServerReasoningConfig(mode);
+    }
+    const directEntry = getSelectedCodexDirectEntry();
+    if (directEntry) {
+      if (directEntry.catalogAvailability === "saved-unavailable") {
+        throw new Error(
+          "The saved Codex Direct model is unavailable. Select a model from the current catalog before sending.",
+        );
+      }
+      return buildCodexReasoningConfig(
+        resolveCurrentCodexDirectReasoningSelection().mode,
+      );
     }
     const { provider, enabledLevels, selectedLevel } = getReasoningState();
     if (provider === "unsupported" || selectedLevel === "none")
@@ -7473,6 +7686,8 @@ export function setupHandlers(
       // changes, so a user-initiated open must revalidate. Non-blocking — the
       // menu opens on the cached list and live-updates when the fetch lands.
       void ensureClaudeModelCatalogLoaded(true);
+    } else if (hasConfiguredCodexDirectProvider()) {
+      void loadCodexDirectCatalog().catch(() => undefined);
     }
     updateModelButton();
     flushResponsiveLayoutSyncNow();
@@ -7500,6 +7715,8 @@ export function setupHandlers(
     closeHistoryMenu();
     if (isCodexConversationSystem()) {
       void ensureCodexModelCatalogLoaded();
+    } else if (getSelectedCodexDirectEntry()) {
+      void loadCodexDirectCatalog().catch(() => undefined);
     }
     updateReasoningButton();
     flushResponsiveLayoutSyncNow();
@@ -7816,6 +8033,8 @@ export function setupHandlers(
     cleanupMineruPaperSourceObservers?.();
     cleanupModelCapabilitySubscription?.();
     cleanupModelCapabilitySubscription = null;
+    cleanupCodexDirectCatalogSubscription?.();
+    cleanupCodexDirectCatalogSubscription = null;
     body.removeEventListener(
       QUOTE_PROVENANCE_REVALIDATION_REQUEST_EVENT,
       handleQuoteProvenanceRevalidationRequest,

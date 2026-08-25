@@ -508,7 +508,7 @@ const zhCN: Record<string, string> = {
   "API Key": "API 密钥",
   "codex auth": "codex 认证",
   "Codex Auth": "Codex 认证",
-  "Codex Auth (Legacy)": "Codex 认证（旧版）",
+  "Codex Direct (Legacy)": "Codex 直连（旧版）",
   "Codex App Server": "Codex App Server",
   "Transport is handled by the codex subprocess; no API URL is needed.":
     "传输由 codex 子进程处理，不需要 API URL。",
