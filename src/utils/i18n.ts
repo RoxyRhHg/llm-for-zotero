@@ -703,6 +703,11 @@ const zhCN: Record<string, string> = {
     "已禁用原生 Codex 和 Claude Code 回合中的 Zotero MCP 工具。",
   "Configuring Zotero MCP tools…": "正在配置 Zotero MCP 工具…",
   "Zotero MCP connected with %n tools.": "Zotero MCP 已连接 %n 个工具。",
+  "Zotero MCP connection verified through Codex.":
+    "已通过 Codex 验证 Zotero MCP 连接。",
+  "Zotero MCP connection: ": "Zotero MCP 连接：",
+  "Model connection: ": "模型连接：",
+  "Model connection was not tested.": "未测试模型连接。",
   "Zotero MCP config written. Codex is reloading tools.":
     "Zotero MCP 配置已写入。Codex 正在重新加载工具。",
   "Zotero MCP setup failed: ": "Zotero MCP 设置失败：",
@@ -712,6 +717,13 @@ const zhCN: Record<string, string> = {
   "Zotero MCP tools enabled but not configured yet.":
     "Zotero MCP 工具已启用，但尚未配置。",
   "Could not read Codex MCP status: ": "无法读取 Codex MCP 状态：",
+  "Codex could not reach Zotero's local MCP server because a proxy or VPN likely intercepted the loopback request (HTTP 502). LLM for Zotero already requested a direct localhost connection. In your proxy app, route localhost, 127.0.0.1, and ::1 directly, fully restart Zotero, and retry. External OpenAI traffic can remain proxied.":
+    "Codex 无法连接 Zotero 的本地 MCP 服务器，因为代理或 VPN 可能拦截了回环请求（HTTP 502）。LLM for Zotero 已要求 localhost 直连。如果问题仍然存在，请在代理应用中将 localhost、127.0.0.1 和 ::1 设为直连，完全重启 Zotero 后重试。外部 OpenAI 流量仍可继续使用代理。",
+  "Codex could not reach Zotero's local MCP server. Keep Zotero open, make sure its local HTTP server is available, and retry.":
+    "Codex 无法连接 Zotero 的本地 MCP 服务器。请保持 Zotero 运行，确认其本地 HTTP 服务器可用，然后重试。",
+  "Codex reached Zotero's local MCP server, but authorization failed. Click Install/update Zotero MCP config, then retry.":
+    "Codex 已连接 Zotero 的本地 MCP 服务器，但授权失败。请点击“安装/更新 Zotero MCP 配置”，然后重试。",
+  "Zotero MCP connection failed: ": "Zotero MCP 连接失败：",
   "Native Codex approvals": "原生 Codex 授权",
   "Lets Zotero surface native Codex command, file-change, and permission approval requests as per-request review cards. This does not grant shell or filesystem access by default.":
     "允许 Zotero 将原生 Codex 的命令、文件变更和权限请求显示为逐次审核卡片。默认不会授予 shell 或文件系统访问权限。",

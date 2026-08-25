@@ -63,6 +63,21 @@ describe("runtime preference UI", function () {
     assert.include(preferenceScript, "shouldPreserveClaudeCustomModelDraft");
   });
 
+  it("wraps multi-sentence Codex and Zotero MCP connection errors", function () {
+    const preferences = source("addon/content/preferences.xhtml");
+    for (const id of [
+      "__addonRef__-codex-app-server-status",
+      "__addonRef__-codex-app-server-mcp-status",
+    ]) {
+      const statusElement =
+        preferences.match(
+          new RegExp(`id="${id}"[\\s\\S]*?<\\/html:span>`),
+        )?.[0] || "";
+      assert.include(statusElement, "overflow-wrap: anywhere");
+      assert.include(statusElement, "min-width: 0");
+    }
+  });
+
   it("uses the same dynamic Claude catalog path for embedded and standalone panels", function () {
     const setupHandlers = source("src/modules/contextPanel/setupHandlers.ts");
     const embeddedPanel = source("src/modules/contextPanel/index.ts");

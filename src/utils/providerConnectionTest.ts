@@ -25,12 +25,23 @@ import {
   resolveCodexAppServerBinaryPath,
   waitForCodexAppServerTurnCompletion,
 } from "./codexAppServerProcess";
+import { probeCodexZoteroMcpThroughAppServer } from "../codexAppServer/mcpSetup";
 import {
   CODEX_DIRECT_RESPONSES_URL,
   fetchWithCodexAuth,
   type CodexAuthDependencies,
 } from "../codexAuth/auth";
 import { loadCodexDirectCatalog } from "../codexAuth/modelCatalog";
+
+class CodexAppServerConnectionTestError extends Error {
+  readonly mcpConnected: boolean;
+
+  constructor(error: unknown, mcpConnected: boolean) {
+    super(error instanceof Error ? error.message : String(error));
+    this.name = "CodexAppServerConnectionTestError";
+    this.mcpConnected = mcpConnected;
+  }
+}
 
 function extractTextFromCodexSSE(raw: string): string {
   const lines = raw.split(/\r?\n/);
@@ -280,7 +291,12 @@ export function getProviderConnectionCapabilityLabel(params: {
 export async function runCodexAppServerConnectionTest(params: {
   modelName: string;
   codexPath?: string;
-}): Promise<{ reply: string; capabilityLabel: string }> {
+  testZoteroMcp?: boolean;
+}): Promise<{
+  reply: string;
+  capabilityLabel: string;
+  mcpConnected: boolean;
+}> {
   const processKey = `codex_app_server_connection_test_${Date.now()}_${Math.random()
     .toString(16)
     .slice(2)}`;
@@ -292,33 +308,45 @@ export async function runCodexAppServerConnectionTest(params: {
     processOptions,
   );
   try {
-    const reply = await proc.runTurnExclusive(async () => {
-      const threadResp = await proc.sendRequest("thread/start", {
-        model: params.modelName || undefined,
-        ephemeral: true,
-        approvalPolicy: "never",
-      });
-      const threadId = extractCodexAppServerThreadId(threadResp);
-      if (!threadId) {
-        throw new Error("Codex app-server did not return a thread ID");
-      }
-
-      const turnResp = await proc.sendRequest("turn/start", {
-        threadId,
-        input: [{ type: "text", text: "Say OK" }],
-      });
-      const turnId = extractCodexAppServerTurnId(turnResp);
-      if (!turnId) {
-        throw new Error("Codex app-server did not return a turn ID");
-      }
-
-      return waitForCodexAppServerTurnCompletion({
+    let mcpConnected = false;
+    if (params.testZoteroMcp) {
+      await probeCodexZoteroMcpThroughAppServer({
         proc,
-        turnId,
-        cacheKey: processKey,
-        processOptions,
       });
-    });
+      mcpConnected = true;
+    }
+    let reply: string;
+    try {
+      reply = await proc.runTurnExclusive(async () => {
+        const threadResp = await proc.sendRequest("thread/start", {
+          model: params.modelName || undefined,
+          ephemeral: true,
+          approvalPolicy: "never",
+        });
+        const threadId = extractCodexAppServerThreadId(threadResp);
+        if (!threadId) {
+          throw new Error("Codex app-server did not return a thread ID");
+        }
+
+        const turnResp = await proc.sendRequest("turn/start", {
+          threadId,
+          input: [{ type: "text", text: "Say OK" }],
+        });
+        const turnId = extractCodexAppServerTurnId(turnResp);
+        if (!turnId) {
+          throw new Error("Codex app-server did not return a turn ID");
+        }
+
+        return waitForCodexAppServerTurnCompletion({
+          proc,
+          turnId,
+          cacheKey: processKey,
+          processOptions,
+        });
+      });
+    } catch (error) {
+      throw new CodexAppServerConnectionTestError(error, mcpConnected);
+    }
 
     const request = {
       conversationKey: 0,
@@ -335,7 +363,11 @@ export async function runCodexAppServerConnectionTest(params: {
         fileInputs: capabilities.fileInputs,
       }),
     );
-    return { reply: reply.trim() || "OK", capabilityLabel };
+    return {
+      reply: reply.trim() || "OK",
+      capabilityLabel,
+      mcpConnected,
+    };
   } finally {
     destroyCachedCodexAppServerProcess(processKey, undefined, processOptions);
   }

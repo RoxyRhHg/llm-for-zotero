@@ -231,8 +231,13 @@ import {
 } from "../codexAppServer/modelCatalog";
 import {
   installOrUpdateCodexZoteroMcpConfig,
+  probeCodexZoteroMcpThroughAppServer,
   readCodexNativeMcpSetupStatus,
 } from "../codexAppServer/mcpSetup";
+import {
+  describeCodexZoteroMcpFailure,
+  formatCodexZoteroMcpError,
+} from "../codexAppServer/mcpErrors";
 import {
   getClaudeRuntimeRootDir,
   getClaudeUserHomeDir,
@@ -1970,7 +1975,7 @@ export async function registerPrefsScripts(_window: Window | undefined | null) {
         const statusLine = el(
           doc,
           "span",
-          "font-size: 11.5px; display: none; margin-top: 3px; white-space: pre-wrap; word-break: break-all;",
+          "font-size: 11.5px; display: none; margin-top: 3px; line-height: 1.45; white-space: pre-wrap; overflow-wrap: anywhere; word-break: normal;",
         );
 
         // ── Advanced section (hidden by default) ──────────────────
@@ -2286,10 +2291,14 @@ export async function registerPrefsScripts(_window: Window | undefined | null) {
               const result = await runCodexAppServerConnectionTest({
                 modelName,
                 codexPath: group.apiBase.trim(),
+                testZoteroMcp: isNativeZoteroMcpToolsEnabled(),
               });
               statusLine.textContent =
-                `${t("✓ Success — model says: ")}"${result.reply}"\n` +
-                `${t("Agent capability: ")}${result.capabilityLabel}`;
+                `${t("Model connection: ")}✓ "${result.reply}"\n` +
+                `${t("Agent capability: ")}${result.capabilityLabel}` +
+                (result.mcpConnected
+                  ? `\n${t("Zotero MCP connection verified through Codex.")}`
+                  : "");
               statusLine.style.color = "green";
               return;
             }
@@ -2369,7 +2378,16 @@ export async function registerPrefsScripts(_window: Window | undefined | null) {
               statusLine.style.color = settingsFailed ? "darkorange" : "green";
             }
           } catch (error) {
-            statusLine.textContent = `✗ ${(error as Error).message}`;
+            const mcpFailure = describeCodexZoteroMcpFailure(error);
+            const mcpConnectedBeforeModelFailure =
+              (error as { mcpConnected?: unknown })?.mcpConnected === true;
+            statusLine.textContent = mcpConnectedBeforeModelFailure
+              ? `${t("Zotero MCP connection verified through Codex.")}\n${t("Model connection: ")}✗ ${error instanceof Error ? error.message : String(error)}`
+              : group.authMode === "codex_app_server" &&
+                  isNativeZoteroMcpToolsEnabled() &&
+                  mcpFailure
+                ? `${t("Zotero MCP connection: ")}✗ ${formatCodexZoteroMcpError(error, "Codex provider connection test failed")}\n${t("Model connection was not tested.")}`
+                : `✗ ${error instanceof Error ? error.message : String(error)}`;
             statusLine.style.color = "red";
           } finally {
             testBtn.disabled = false;
@@ -2943,13 +2961,23 @@ export async function registerPrefsScripts(_window: Window | undefined | null) {
             modelName:
               codexAppServerModelInput?.value || getCodexRuntimeModelPref(),
             codexPath: getConfiguredCodexAppServerBinaryPath(),
+            testZoteroMcp: isNativeZoteroMcpToolsEnabled(),
           });
-          codexAppServerStatus.textContent = `${t("✓ Success — model says: ")}"${result.reply}"`;
+          codexAppServerStatus.textContent =
+            `${t("Model connection: ")}✓ "${result.reply}"` +
+            (result.mcpConnected
+              ? `\n${t("Zotero MCP connection verified through Codex.")}`
+              : "");
           codexAppServerStatus.style.color = "green";
         } catch (err) {
-          codexAppServerStatus.textContent = `${t("Test failed: ")}${
-            err instanceof Error ? err.message : String(err)
-          }`;
+          const mcpFailure = describeCodexZoteroMcpFailure(err);
+          const mcpConnectedBeforeModelFailure =
+            (err as { mcpConnected?: unknown })?.mcpConnected === true;
+          codexAppServerStatus.textContent = mcpConnectedBeforeModelFailure
+            ? `${t("Zotero MCP connection verified through Codex.")}\n${t("Model connection: ")}✗ ${err instanceof Error ? err.message : String(err)}`
+            : isNativeZoteroMcpToolsEnabled() && mcpFailure
+              ? `${t("Zotero MCP connection: ")}✗ ${formatCodexZoteroMcpError(err, "Codex connection test failed")}\n${t("Model connection was not tested.")}`
+              : `${t("Test failed: ")}${err instanceof Error ? err.message : String(err)}`;
           codexAppServerStatus.style.color = "red";
         } finally {
           codexAppServerTestBtn.disabled = false;
@@ -3044,14 +3072,12 @@ export async function registerPrefsScripts(_window: Window | undefined | null) {
                   "%n",
                   String(toolCount),
                 )
-              : t("Zotero MCP config written. Codex is reloading tools."),
+              : t("Zotero MCP connection verified through Codex."),
             "green",
           );
         } catch (error) {
           renderCodexMcpStatus(
-            `${t("Zotero MCP setup failed: ")}${
-              error instanceof Error ? error.message : String(error)
-            }`,
+            `${t("Zotero MCP setup failed: ")}${formatCodexZoteroMcpError(error, "Zotero MCP setup failed")}`,
             "red",
           );
         } finally {
@@ -3070,24 +3096,27 @@ export async function registerPrefsScripts(_window: Window | undefined | null) {
     void readCodexNativeMcpSetupStatus({
       codexPath: getConfiguredCodexAppServerBinaryPath(),
     })
-      .then((status) => {
+      .then(async (status) => {
+        if (status.configured) {
+          await probeCodexZoteroMcpThroughAppServer({
+            codexPath: getConfiguredCodexAppServerBinaryPath(),
+          });
+        }
         renderCodexMcpStatus(
-          status.connected === true
-            ? t("Zotero MCP connected with %n tools.").replace(
-                "%n",
-                String(status.toolNames.length),
-              )
-            : status.configured
-              ? t("Zotero MCP configured. Use setup if tools do not appear.")
-              : t("Zotero MCP tools enabled but not configured yet."),
-          status.connected === true ? "green" : "var(--fill-secondary, #888)",
+          status.configured
+            ? status.toolNames.length > 0
+              ? t("Zotero MCP connected with %n tools.").replace(
+                  "%n",
+                  String(status.toolNames.length),
+                )
+              : t("Zotero MCP connection verified through Codex.")
+            : t("Zotero MCP tools enabled but not configured yet."),
+          status.configured ? "green" : "var(--fill-secondary, #888)",
         );
       })
       .catch((error) => {
         renderCodexMcpStatus(
-          `${t("Could not read Codex MCP status: ")}${
-            error instanceof Error ? error.message : String(error)
-          }`,
+          `${t("Could not read Codex MCP status: ")}${formatCodexZoteroMcpError(error, "Could not verify Codex MCP status")}`,
           "red",
         );
       });

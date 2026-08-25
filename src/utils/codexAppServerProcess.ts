@@ -35,7 +35,10 @@ const CODEX_ENV_KEYS = [
   "NVM_DIR",
   "PATH",
   "Path",
+  "NO_PROXY",
+  "no_proxy",
 ];
+const CODEX_LOOPBACK_NO_PROXY_ENTRIES = ["localhost", "127.0.0.1", "::1"];
 
 type PendingRequest = {
   resolve: (value: unknown) => void;
@@ -200,6 +203,7 @@ export class CodexAppServerProcess {
       args = invocation.args;
       environment = invocation.environment;
     }
+    environment = buildCodexLaunchEnvironment(environment);
     let proc: any;
     try {
       proc = await Subprocess.call({
@@ -1644,6 +1648,39 @@ function getCodexRuntimeEnv(): Record<string, string | undefined> {
     env[key] = getRuntimeEnvValue(key);
   }
   return env;
+}
+
+export function mergeCodexNoProxyValues(
+  ...values: Array<string | undefined>
+): string {
+  const entries: string[] = [];
+  const seen = new Set<string>();
+  for (const value of [...values, CODEX_LOOPBACK_NO_PROXY_ENTRIES.join(",")]) {
+    for (const rawEntry of String(value || "").split(",")) {
+      const entry = rawEntry.trim();
+      if (!entry) continue;
+      const key = entry.toLowerCase();
+      if (seen.has(key)) continue;
+      seen.add(key);
+      entries.push(entry);
+    }
+  }
+  return entries.join(",");
+}
+
+function buildCodexLaunchEnvironment(
+  invocationEnvironment?: Record<string, string>,
+): Record<string, string> {
+  const runtimeEnv = getCodexRuntimeEnv();
+  const noProxy = mergeCodexNoProxyValues(
+    runtimeEnv.NO_PROXY,
+    runtimeEnv.no_proxy,
+  );
+  return {
+    ...invocationEnvironment,
+    NO_PROXY: noProxy,
+    no_proxy: noProxy,
+  };
 }
 
 function joinRuntimePath(
