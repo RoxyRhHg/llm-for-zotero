@@ -3643,6 +3643,7 @@ async function setWorkflowModelInputCap(
   getPanel(panelId);
   const groups = getModelProviderGroups();
   const model = groups
+    .filter((group) => group.authMode !== "codex_auth")
     .flatMap((group) => group.models)
     .find((entry) => entry.id === entryId);
   if (!model) throw new Error(`Unknown workflow model entry ${entryId}`);

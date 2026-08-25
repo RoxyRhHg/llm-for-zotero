@@ -1,49 +1,310 @@
-import { readFileSync } from "node:fs";
 import { assert } from "chai";
+import { config } from "../package.json";
+import {
+  addCodexDirectModelRow,
+  attachCodexDirectCatalogInteractions,
+  buildCodexDirectModelOptions,
+  canOfferCodexDirectAuthMode,
+  removeCodexDirectModelRow,
+  updateCodexDirectModelRow,
+} from "../src/utils/codexDirectProviderCard";
+import type {
+  CodexDirectProviderGroup,
+  ModelProviderGroup,
+} from "../src/utils/modelProviders";
+import {
+  getCodexDirectReasoningSelection,
+  setCodexDirectReasoningSelection,
+} from "../src/codexAuth/reasoningPrefs";
+import { initI18n, t } from "../src/utils/i18n";
+import {
+  PROVIDER_MODEL_CONTROL_STYLE,
+  createProviderCardSectionDivider,
+  createProviderModelRowBlueprint,
+  createProviderModelSectionBlueprint,
+} from "../src/utils/providerCardModelSection";
 
-describe("Codex Direct UI integration", function () {
-  const preferenceScript = readFileSync(
-    "src/modules/preferenceScript.ts",
-    "utf8",
-  );
-  const setupHandlers = readFileSync(
-    "src/modules/contextPanel/setupHandlers.ts",
-    "utf8",
-  );
+function directGroup(): CodexDirectProviderGroup {
+  return {
+    id: "direct",
+    apiBase: "https://chatgpt.com/backend-api/codex/responses",
+    apiKey: "",
+    authMode: "codex_auth",
+    providerProtocol: "codex_responses",
+    selectedModel: "gpt-a",
+    models: [
+      { id: "row-a", model: "gpt-a" },
+      { id: "row-b", model: "saved-missing" },
+    ],
+  };
+}
 
-  it("renders a dedicated minimal settings card before generic model controls", function () {
-    const start = preferenceScript.indexOf(
-      'if (group.authMode === "codex_auth") {\n        group.apiBase = CODEX_DIRECT_RESPONSES_URL;',
+class FakeSelect {
+  private readonly listeners = new Map<string, Array<() => void>>();
+
+  addEventListener(type: string, listener: () => void): void {
+    const listeners = this.listeners.get(type) || [];
+    listeners.push(listener);
+    this.listeners.set(type, listeners);
+  }
+
+  dispatch(type: string): void {
+    for (const listener of this.listeners.get(type) || []) listener();
+  }
+}
+
+class FakeElement {
+  readonly children: FakeElement[] = [];
+  readonly attributes = new Map<string, string>();
+  readonly style: Record<string, string> = {};
+  textContent = "";
+  title = "";
+  type = "";
+
+  constructor(readonly tagName: string) {}
+
+  setAttribute(name: string, value: string): void {
+    this.attributes.set(name, value);
+  }
+
+  appendChild(child: FakeElement): FakeElement {
+    this.children.push(child);
+    return child;
+  }
+
+  append(...children: FakeElement[]): void {
+    this.children.push(...children);
+  }
+}
+
+class FakeDocument {
+  createElementNS(_namespace: string, tagName: string): FakeElement {
+    return new FakeElement(tagName);
+  }
+}
+
+describe("Codex Direct provider-card behavior", function () {
+  const globals = globalThis as typeof globalThis & { Zotero?: typeof Zotero };
+  let originalZotero: typeof Zotero | undefined;
+  let prefs: Map<string, unknown>;
+
+  before(function () {
+    originalZotero = globals.Zotero;
+  });
+
+  beforeEach(function () {
+    prefs = new Map<string, unknown>();
+    globals.Zotero = {
+      locale: "zh-CN",
+      Prefs: {
+        get: (key: string) => prefs.get(key),
+        set: (key: string, value: unknown) => prefs.set(key, value),
+      },
+    } as typeof Zotero;
+    initI18n();
+  });
+
+  after(function () {
+    if (originalZotero) globals.Zotero = originalZotero;
+    else delete globals.Zotero;
+    initI18n();
+  });
+
+  it("offers the Direct auth mode only when no other Direct card exists", function () {
+    const standard: ModelProviderGroup = {
+      id: "standard",
+      apiBase: "https://api.openai.com/v1",
+      apiKey: "key",
+      authMode: "api_key",
+      providerProtocol: "openai_chat_compat",
+      models: [],
+    };
+    const groups = [standard, directGroup()];
+    assert.isFalse(canOfferCodexDirectAuthMode(groups, standard.id));
+    assert.isTrue(canOfferCodexDirectAuthMode(groups, "direct"));
+    assert.isTrue(canOfferCodexDirectAuthMode([standard], standard.id));
+  });
+
+  it("builds Direct and generic rows from the shared provider-card blueprint", function () {
+    const doc = new FakeDocument() as unknown as Document;
+    const section = createProviderModelSectionBlueprint({
+      doc,
+      sectionLabelStyle: "section-label",
+      title: "Model names",
+      addTitle: "Add model",
+    });
+    const directRow = createProviderModelRowBlueprint({
+      doc,
+      outlineButtonStyle: "outline-button",
+      testLabel: "Test",
+    });
+    const genericRow = createProviderModelRowBlueprint({
+      doc,
+      outlineButtonStyle: "outline-button",
+      testLabel: "Test",
+    });
+    const divider = createProviderCardSectionDivider(doc);
+
+    const fakeSection = section.section as unknown as FakeElement;
+    const fakeHeader = section.header as unknown as FakeElement;
+    const fakeAddButton = section.addButton as unknown as FakeElement;
+    const fakeRow = directRow.row as unknown as FakeElement;
+    const fakeTestButton = directRow.testButton as unknown as FakeElement;
+    const fakeStatus = directRow.status as unknown as FakeElement;
+    const fakeGenericRow = genericRow.row as unknown as FakeElement;
+
+    assert.strictEqual(fakeSection.children[0], fakeHeader);
+    assert.equal(fakeHeader.children[0].textContent, "Model names");
+    assert.equal(fakeHeader.children[1].textContent, "+");
+    assert.equal(fakeAddButton.title, "Add model");
+    assert.strictEqual(
+      fakeRow.children[0],
+      directRow.controls as unknown as FakeElement,
     );
-    const end = preferenceScript.indexOf("// ── Provider preset", start);
-    assert.isAtLeast(start, 0);
-    assert.isAbove(end, start);
-    const directCard = preferenceScript.slice(start, end);
-    assert.include(directCard, 't("Test connection")');
-    assert.include(directCard, "runCodexDirectConnectionTest");
-    assert.include(directCard, "cardBody.append(authModeWrap, testWrap)");
-    assert.notInclude(directCard, "providerPresetWrap");
-    assert.notInclude(directCard, "apiUrlWrap");
-    assert.notInclude(directCard, "modelsWrap");
-    assert.notInclude(directCard, "advGearBtn");
-  });
-
-  it("describes the direct mode without implying App Server controls", function () {
-    assert.include(preferenceScript, 't("Codex Direct (Legacy)")');
-    assert.include(preferenceScript, "credentials from `codex login`");
-    assert.include(preferenceScript, "does not provide App Server sessions");
-    assert.include(preferenceScript, "sandbox controls, approvals");
-  });
-
-  it("uses the generic model loop and shared reasoning button renderer", function () {
-    assert.include(setupHandlers, "getAvailableModelEntries()");
-    assert.include(setupHandlers, "for (const group of groupedChoices)");
-    assert.include(setupHandlers, "for (const entry of group.entries)");
-    assert.include(setupHandlers, "appendCodexDirectCatalogStatus(modelMenu)");
-    assert.include(setupHandlers, "subscribeToCodexDirectCatalog");
     assert.equal(
-      setupHandlers.split("appendReasoningChoiceButtons({").length - 1,
-      2,
+      fakeRow.attributes.get("style"),
+      fakeGenericRow.attributes.get("style"),
     );
+    assert.equal(
+      (directRow.controls as unknown as FakeElement).attributes.get("style"),
+      (genericRow.controls as unknown as FakeElement).attributes.get("style"),
+    );
+    assert.equal(fakeTestButton.textContent, "Test");
+    assert.equal(fakeTestButton.attributes.get("style"), "outline-button");
+    assert.include(fakeStatus.attributes.get("style") || "", "display: none");
+    assert.include(PROVIDER_MODEL_CONTROL_STYLE, "flex: 1; min-width: 0");
+    assert.equal((divider as unknown as FakeElement).tagName, "hr");
+  });
+
+  it("builds a picker that excludes catalog models used by other rows", function () {
+    const options = buildCodexDirectModelOptions({
+      group: directGroup(),
+      rowId: "row-b",
+      catalog: [
+        {
+          model: "gpt-a",
+          displayName: "GPT A",
+          description: "",
+          priority: 2,
+          supportedReasoningEfforts: [],
+        },
+        {
+          model: "gpt-b",
+          displayName: "GPT B",
+          description: "",
+          priority: 1,
+          supportedReasoningEfforts: [],
+        },
+      ],
+    });
+    assert.deepEqual(options, [
+      {
+        model: "saved-missing",
+        label: "saved-missing",
+        availability: "saved-unavailable",
+      },
+      { model: "gpt-b", label: "GPT B", availability: "available" },
+    ]);
+  });
+
+  it("loads the catalog when the fake-DOM picker opens or receives focus", function () {
+    const select = new FakeSelect();
+    let popupOpenCount = 0;
+    let refreshCount = 0;
+    attachCodexDirectCatalogInteractions({
+      target: select,
+      popupMayOpen: () => popupOpenCount++,
+      refreshCatalog: () => refreshCount++,
+    });
+
+    select.dispatch("mousedown");
+    assert.equal(popupOpenCount, 1);
+    assert.equal(refreshCount, 1);
+
+    select.dispatch("focus");
+    assert.equal(refreshCount, 2);
+
+    select.dispatch("keydown");
+    assert.equal(popupOpenCount, 2);
+    assert.equal(refreshCount, 2);
+  });
+
+  it("adds, updates, deduplicates, and removes rows with selection fallback", function () {
+    const group = directGroup();
+    assert.isNull(updateCodexDirectModelRow(group, "row-b", "GPT-A"));
+
+    const updated = updateCodexDirectModelRow(group, "row-a", "gpt-c");
+    assert.isNotNull(updated);
+    assert.equal(updated?.selectedModel, "gpt-c");
+    assert.equal(updated?.models[0].model, "gpt-c");
+
+    const selectedSecond = directGroup();
+    selectedSecond.selectedModel = "saved-missing";
+    const changedSecond = updateCodexDirectModelRow(
+      selectedSecond,
+      "row-b",
+      "gpt-b",
+    );
+    assert.equal(changedSecond?.selectedModel, "gpt-a");
+
+    const added = addCodexDirectModelRow(updated as CodexDirectProviderGroup);
+    assert.lengthOf(added?.models || [], 3);
+    assert.isNull(addCodexDirectModelRow(added as CodexDirectProviderGroup));
+
+    const removed = removeCodexDirectModelRow(
+      updated as CodexDirectProviderGroup,
+      "row-a",
+    );
+    assert.deepEqual(removed?.models, [
+      { id: "row-b", model: "saved-missing" },
+    ]);
+    assert.equal(removed?.selectedModel, "saved-missing");
+    assert.isNull(
+      removeCodexDirectModelRow(removed as CodexDirectProviderGroup, "row-b"),
+    );
+  });
+
+  it("migrates group-scoped reasoning choices to model-scoped preferences", function () {
+    const key = `${config.prefsPrefix}.codexDirectReasoningSelections`;
+    prefs.set(
+      key,
+      JSON.stringify({
+        ["legacy-group\u0000gpt-a"]: "high",
+        ["other-group\u0000gpt-b"]: "low",
+      }),
+    );
+
+    assert.equal(getCodexDirectReasoningSelection("gpt-a"), "high");
+    setCodexDirectReasoningSelection("gpt-a", "medium");
+    assert.deepEqual(JSON.parse(String(prefs.get(key))), {
+      "gpt-a": "medium",
+      "gpt-b": "low",
+    });
+  });
+
+  it("translates the complete Direct preference and catalog status set", function () {
+    const strings = [
+      "Select a Codex Direct model…",
+      "Unavailable",
+      "Fetching Codex Direct models…",
+      "Couldn't fetch Codex Direct models:",
+      "Fetching Codex model catalog…",
+      "Catalog:",
+      "models; test model:",
+      "Inference:",
+      "Inference was not run.",
+      "The server returned no model output.",
+      "The selected Codex Direct model is not available in the current catalog.",
+      "Loading Codex Direct models. Current model is unverified.",
+      "Loading Codex Direct models…",
+      "Could not load Codex Direct models. Current model is unverified.",
+      "Could not load Codex Direct models.",
+      "Codex Direct did not return any available models.",
+      "Retry loading Codex Direct models",
+      "The saved Codex Direct model is no longer available. Select another model before sending.",
+      "This saved model is not present in the current Codex Direct catalog.",
+      "The saved Codex Direct model is unavailable. Select a model from the current catalog before sending.",
+    ];
+    for (const value of strings) assert.notEqual(t(value), value, value);
   });
 });

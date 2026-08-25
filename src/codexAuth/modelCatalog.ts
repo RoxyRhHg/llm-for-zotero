@@ -7,6 +7,11 @@ import {
 } from "../codex/catalogSelection";
 import type { ReasoningConfig } from "../shared/llm";
 import {
+  MODEL_CAPABILITY_MAX_TOKEN_LIMIT,
+  publishModelCapabilityCatalog,
+} from "../modelCapabilities";
+import {
+  CODEX_DIRECT_RESPONSES_URL,
   CODEX_DIRECT_MODELS_URL,
   fetchWithCodexAuth,
   type CodexAuthDependencies,
@@ -14,6 +19,13 @@ import {
 
 const CATALOG_TTL_MS = 60_000;
 const CATALOG_TIMEOUT_MS = 5_000;
+const CODEX_DIRECT_CAPABILITY_IDENTITY = {
+  provider: "openai",
+  model: "",
+  apiBase: CODEX_DIRECT_RESPONSES_URL,
+  protocol: "codex_responses",
+  authMode: "codex_auth",
+} as const;
 
 export type CodexDirectCatalogModel = {
   model: string;
@@ -110,7 +122,10 @@ function normalizeCatalogModel(
     supportedReasoningEfforts: normalizeReasoningEfforts(
       record.supported_reasoning_levels,
     ),
-    ...(contextWindow !== undefined && contextWindow > 0
+    ...(contextWindow !== undefined &&
+    Number.isSafeInteger(contextWindow) &&
+    contextWindow > 0 &&
+    contextWindow <= MODEL_CAPABILITY_MAX_TOKEN_LIMIT
       ? { contextWindow }
       : {}),
     ...(defaultReasoningEffort ? { defaultReasoningEffort } : {}),
@@ -223,6 +238,17 @@ export async function loadCodexDirectCatalog(
     options.timeoutMs ?? CATALOG_TIMEOUT_MS,
   )
     .then((models) => {
+      publishModelCapabilityCatalog(
+        CODEX_DIRECT_CAPABILITY_IDENTITY,
+        models.map((model) => ({
+          id: model.model,
+          displayName: model.displayName,
+          source: "live" as const,
+          ...(model.contextWindow
+            ? { limits: { contextWindowTokens: model.contextWindow } }
+            : {}),
+        })),
+      );
       const snapshot: CodexDirectCatalogSnapshot = {
         status: "ready",
         models,
@@ -307,5 +333,6 @@ export function sanitizeCodexDirectReasoningConfig(
 
 export function resetCodexDirectCatalogForTests(): void {
   catalogRequest = null;
+  publishModelCapabilityCatalog(CODEX_DIRECT_CAPABILITY_IDENTITY, []);
   publishCatalogSnapshot(EMPTY_SNAPSHOT);
 }

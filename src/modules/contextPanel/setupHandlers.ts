@@ -10,7 +10,6 @@ import {
   getLastUsedModelEntryId,
   getModelEntryById,
   getModelProviderGroups,
-  setCodexDirectModelForGroup,
 } from "../../utils/modelProviders";
 import {
   buildQueuedFollowUpThreadKey,
@@ -4961,7 +4960,11 @@ export function setupHandlers(
   };
 
   const hasConfiguredCodexDirectProvider = () =>
-    getModelProviderGroups().some((group) => group.authMode === "codex_auth");
+    getModelProviderGroups().some(
+      (group) =>
+        group.authMode === "codex_auth" &&
+        group.models.some((model) => model.model.trim()),
+    );
 
   const appendCodexDirectCatalogStatus = (menu: HTMLDivElement) => {
     if (isRuntimeConversationSystem() || !hasConfiguredCodexDirectProvider()) {
@@ -5349,10 +5352,7 @@ export function setupHandlers(
               ? buildCodexReasoningConfig(
                   reconcileCodexDirectReasoningChoice(
                     entry.model,
-                    getCodexDirectReasoningSelection(
-                      entry.groupId,
-                      entry.model,
-                    ),
+                    getCodexDirectReasoningSelection(entry.model),
                   ),
                 )
               : getSelectedReasoningForItem(
@@ -5488,14 +5488,11 @@ export function setupHandlers(
     if (!selected) {
       return { mode: "auto", choices: [] as CodexReasoningChoice[] };
     }
-    const stored = getCodexDirectReasoningSelection(
-      selected.groupId,
-      selected.model,
-    );
+    const stored = getCodexDirectReasoningSelection(selected.model);
     const choices = getCodexDirectReasoningChoices(selected.model);
     const mode = reconcileCodexDirectReasoningChoice(selected.model, stored);
     if (getCodexDirectCatalogSnapshot().status === "ready" && mode !== stored) {
-      setCodexDirectReasoningSelection(selected.groupId, selected.model, mode);
+      setCodexDirectReasoningSelection(selected.model, mode);
     }
     return { mode, choices };
   };
@@ -5996,11 +5993,7 @@ export function setupHandlers(
         choices: directSelection.choices,
         currentValue: directSelection.mode,
         onSelect: (value) => {
-          setCodexDirectReasoningSelection(
-            directEntry.groupId,
-            directEntry.model,
-            value,
-          );
+          setCodexDirectReasoningSelection(directEntry.model, value);
           setFloatingMenuOpen(reasoningMenu, REASONING_MENU_OPEN_CLASS, false);
           updateReasoningButton();
         },
@@ -6137,17 +6130,8 @@ export function setupHandlers(
     if (setupHandlersCleaned) return;
     syncModelFromPrefs();
   });
-  cleanupCodexDirectCatalogSubscription = subscribeToCodexDirectCatalog(
-    (snapshot) => {
-      if (snapshot.status === "ready" && snapshot.models[0]) {
-        for (const group of getModelProviderGroups()) {
-          if (group.authMode === "codex_auth" && !group.codexDirectModel) {
-            setCodexDirectModelForGroup(group.id, snapshot.models[0].model);
-          }
-        }
-      }
-      syncModelFromPrefs();
-    },
+  cleanupCodexDirectCatalogSubscription = subscribeToCodexDirectCatalog(() =>
+    syncModelFromPrefs(),
   );
   if (hasConfiguredCodexDirectProvider()) {
     void loadCodexDirectCatalog().catch(() => undefined);

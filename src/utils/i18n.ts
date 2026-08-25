@@ -509,6 +509,35 @@ const zhCN: Record<string, string> = {
   "codex auth": "codex 认证",
   "Codex Auth": "Codex 认证",
   "Codex Direct (Legacy)": "Codex 直连（旧版）",
+  "Uses credentials from `codex login` to call the Codex backend directly through the llm-for-zotero harness. This convenient legacy mode does not provide App Server sessions, MCP or runtime management, sandbox controls, approvals, or permission settings. Use Codex App Server for the full Codex runtime experience.":
+    "使用 `codex login` 的凭据，通过 llm-for-zotero 直接调用 Codex 后端。此便捷的旧版模式不提供 App Server 会话、MCP、运行时管理、沙箱控制、审批或权限设置。若需完整的 Codex 运行时体验，请使用 Codex App Server。",
+  "Select a Codex Direct model…": "选择一个 Codex 直连模型…",
+  Unavailable: "不可用",
+  "Fetching Codex Direct models…": "正在获取 Codex 直连模型…",
+  "Couldn't fetch Codex Direct models:": "无法获取 Codex 直连模型：",
+  "Fetching Codex model catalog…": "正在获取 Codex 模型目录…",
+  "Catalog:": "模型目录：",
+  "models; test model:": "个模型；测试模型：",
+  "Inference:": "推理：",
+  "Inference was not run.": "未运行推理测试。",
+  "The server returned no model output.": "服务器未返回任何模型输出。",
+  "The selected Codex Direct model is not available in the current catalog.":
+    "所选的 Codex 直连模型不在当前模型目录中。",
+  "Loading Codex Direct models. Current model is unverified.":
+    "正在加载 Codex 直连模型。当前模型尚未验证。",
+  "Loading Codex Direct models…": "正在加载 Codex 直连模型…",
+  "Could not load Codex Direct models. Current model is unverified.":
+    "无法加载 Codex 直连模型。当前模型尚未验证。",
+  "Could not load Codex Direct models.": "无法加载 Codex 直连模型。",
+  "Codex Direct did not return any available models.":
+    "Codex 直连未返回任何可用模型。",
+  "Retry loading Codex Direct models": "重新加载 Codex 直连模型",
+  "The saved Codex Direct model is no longer available. Select another model before sending.":
+    "已保存的 Codex 直连模型已不可用。请在发送前选择其他模型。",
+  "This saved model is not present in the current Codex Direct catalog.":
+    "当前 Codex 直连模型目录中不存在此已保存模型。",
+  "The saved Codex Direct model is unavailable. Select a model from the current catalog before sending.":
+    "已保存的 Codex 直连模型不可用。请在发送前从当前模型目录中选择一个模型。",
   "Codex App Server": "Codex App Server",
   "Transport is handled by the codex subprocess; no API URL is needed.":
     "传输由 codex 子进程处理，不需要 API URL。",

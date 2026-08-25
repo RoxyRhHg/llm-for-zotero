@@ -41,7 +41,7 @@ import {
   getModelEntryById,
   getModelProviderGroups,
   getRuntimeModelEntries,
-  setCodexDirectModelForGroup,
+  setCodexDirectSelectedModel,
   setLastUsedModelEntryId,
   type ModelProviderGroup,
   type RuntimeModelEntry,
@@ -527,7 +527,7 @@ export function setSelectedModelEntryForItem(
   const selected = getModelEntryById(entryId);
   if (!selected) return;
   if (selected.authMode === "codex_auth") {
-    setCodexDirectModelForGroup(selected.groupId, selected.model);
+    setCodexDirectSelectedModel(selected.model);
   }
   selectedModelCache.set(itemId, selected.entryId);
   setLastUsedModelEntryId(selected.entryId);

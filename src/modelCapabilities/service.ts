@@ -147,6 +147,12 @@ function providerFromIdentity(
   if (explicit && explicit !== "customized" && explicit !== "unknown") {
     return explicit as ModelCapabilityProvider;
   }
+  if (
+    normalize(identity.authMode) === "codex_auth" &&
+    normalize(identity.protocol) === "codex_responses"
+  ) {
+    return "openai";
+  }
   return (
     inferProviderFromApiBase(normalize(identity.apiBase)) ??
     // Relays and unrecognized hosts still serve recognizable models; the
@@ -679,6 +685,19 @@ export function getModelOutputTokenLimit(
 export function subscribeModelCapabilities(listener: () => void): () => void {
   capabilityListeners.add(listener);
   return () => capabilityListeners.delete(listener);
+}
+
+/** Publish model metadata obtained through a trusted provider-specific catalog. */
+export function publishModelCapabilityCatalog(
+  identity: ModelCapabilityIdentity,
+  models: DiscoveredModel[],
+): void {
+  catalogSnapshots.set(buildCatalogKey(identity), {
+    models: clone(models),
+    fetchedAt: now(),
+    stale: false,
+  });
+  notify();
 }
 
 function getRegistryFetchedAt(): number {

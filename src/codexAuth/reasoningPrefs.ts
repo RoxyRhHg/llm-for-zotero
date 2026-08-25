@@ -11,8 +11,8 @@ function getPrefs(): ZoteroPrefsAPI | undefined {
   return (Zotero as unknown as { Prefs?: ZoteroPrefsAPI } | undefined)?.Prefs;
 }
 
-function selectionKey(groupId: string, model: string): string {
-  return `${groupId.trim()}\u0000${model.trim().toLowerCase()}`;
+function selectionKey(model: string): string {
+  return model.trim().toLowerCase();
 }
 
 function readSelections(): Record<string, string> {
@@ -21,11 +21,35 @@ function readSelections(): Record<string, string> {
   try {
     const parsed = JSON.parse(raw) as unknown;
     if (!parsed || typeof parsed !== "object") return {};
+    const entries = Object.entries(parsed);
     const selections: Record<string, string> = {};
-    for (const [key, value] of Object.entries(parsed)) {
+    let migrated = false;
+    for (const [key, value] of entries) {
+      if (key.includes("\u0000")) continue;
       if (typeof value === "string" && value.trim()) {
-        selections[key] = value.trim();
+        selections[selectionKey(key)] = value.trim();
       }
+    }
+    for (const [key, value] of entries) {
+      const separator = key.indexOf("\u0000");
+      if (separator < 0) continue;
+      migrated = true;
+      const modelKey = selectionKey(key.slice(separator + 1));
+      if (
+        modelKey &&
+        selections[modelKey] === undefined &&
+        typeof value === "string" &&
+        value.trim()
+      ) {
+        selections[modelKey] = value.trim();
+      }
+    }
+    if (migrated) {
+      getPrefs()?.set?.(
+        CODEX_DIRECT_REASONING_PREF_KEY,
+        JSON.stringify(selections),
+        true,
+      );
     }
     return selections;
   } catch (_error) {
@@ -33,19 +57,15 @@ function readSelections(): Record<string, string> {
   }
 }
 
-export function getCodexDirectReasoningSelection(
-  groupId: string,
-  model: string,
-): string {
-  return readSelections()[selectionKey(groupId, model)] || "auto";
+export function getCodexDirectReasoningSelection(model: string): string {
+  return readSelections()[selectionKey(model)] || "auto";
 }
 
 export function setCodexDirectReasoningSelection(
-  groupId: string,
   model: string,
   selection: string,
 ): void {
-  const key = selectionKey(groupId, model);
+  const key = selectionKey(model);
   const value = selection.trim() || "auto";
   const selections = readSelections();
   if (selections[key] === value) return;

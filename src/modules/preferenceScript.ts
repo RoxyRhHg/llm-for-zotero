@@ -21,12 +21,16 @@ import {
 } from "../utils/modelInputMode";
 import {
   buildProviderCatalogIdentity,
+  createCodexDirectModelRow,
   createEmptyProviderGroup,
   createProviderModelEntry,
+  getLastUsedModelEntryId,
   getModelProviderGroups,
   migrateApiBaseForAuthModeChange,
   setModelProviderGroups,
+  setLastUsedModelEntryId,
   type ModelProviderAuthMode,
+  type CodexDirectProviderGroup,
   type ModelProviderGroup,
   type ModelProviderModel,
 } from "../utils/modelProviders";
@@ -40,6 +44,20 @@ import {
   resolveProviderModelFetchStatus,
   runAfterSelectChangeDispatch,
 } from "../utils/providerModelPicker";
+import {
+  addCodexDirectModelRow,
+  attachCodexDirectCatalogInteractions,
+  buildCodexDirectModelOptions,
+  canOfferCodexDirectAuthMode,
+  removeCodexDirectModelRow,
+  updateCodexDirectModelRow,
+} from "../utils/codexDirectProviderCard";
+import {
+  PROVIDER_MODEL_CONTROL_STYLE,
+  createProviderCardSectionDivider,
+  createProviderModelRowBlueprint,
+  createProviderModelSectionBlueprint,
+} from "../utils/providerCardModelSection";
 import {
   getModelCapabilities,
   getModelCatalogStatus,
@@ -69,6 +87,10 @@ import {
   runCodexDirectConnectionTest,
 } from "../utils/providerConnectionTest";
 import { CODEX_DIRECT_RESPONSES_URL } from "../codexAuth/auth";
+import {
+  getCodexDirectCatalogSnapshot,
+  loadCodexDirectCatalog,
+} from "../codexAuth/modelCatalog";
 import { normalizeAgentPermissionMode } from "../shared/agentPermissionMode";
 import { normalizeAgentLibraryWriteMode } from "../shared/agentLibraryWriteMode";
 import {
@@ -476,9 +498,7 @@ function attachProviderModelSelect(args: {
   const select = el(
     doc,
     "select",
-    "flex: 1; min-width: 0; padding: 6px 10px; font-size: 13px;" +
-      " border: 1px solid var(--stroke-secondary, #c8c8c8); border-radius: 6px;" +
-      " box-sizing: border-box; background: Field; color: FieldText;",
+    PROVIDER_MODEL_CONTROL_STYLE,
   ) as HTMLSelectElement;
   container.append(select, input);
 
@@ -605,12 +625,11 @@ function attachProviderModelSelect(args: {
   // picks up an API key the user pasted since the card rendered. Both
   // handlers run before the popup opens, so the gate can still flush a
   // pending rebuild into the popup the user is about to see.
-  select.addEventListener("mousedown", () => {
-    rebuildGate.popupMayOpen();
-    void refreshCatalog();
+  attachCodexDirectCatalogInteractions({
+    target: select,
+    popupMayOpen: () => rebuildGate.popupMayOpen(),
+    refreshCatalog: () => void refreshCatalog(),
   });
-  select.addEventListener("keydown", () => rebuildGate.popupMayOpen());
-  select.addEventListener("focus", () => void refreshCatalog());
   select.addEventListener("blur", () => rebuildGate.popupClosed());
   const applyModelChoice = (chosenValue: string) => {
     rebuildGate.popupClosed();
@@ -661,10 +680,145 @@ function attachProviderModelSelect(args: {
   };
 }
 
+function attachCodexDirectModelSelect(args: {
+  doc: Document;
+  group: CodexDirectProviderGroup;
+  rowId: string;
+  onModelPicked: (model: string) => void;
+}): { container: HTMLElement; statusEl: HTMLElement } {
+  const { doc, group, rowId } = args;
+  const container = el(
+    doc,
+    "div",
+    "flex: 1; min-width: 0; display: flex; align-items: center; gap: 5px;",
+  );
+  const select = el(
+    doc,
+    "select",
+    PROVIDER_MODEL_CONTROL_STYLE,
+  ) as HTMLSelectElement;
+  const statusEl = el(doc, "span", HELPER_STYLE);
+  statusEl.style.display = "none";
+  container.appendChild(select);
+
+  let loading = false;
+  let fetchToken = 0;
+  let renderedSignature = "";
+  const getRow = () => group.models.find((row) => row.id === rowId);
+
+  const rewriteOptions = () => {
+    const savedModel = getRow()?.model.trim() || "";
+    const snapshot = getCodexDirectCatalogSnapshot();
+    const options =
+      snapshot.status === "ready"
+        ? buildCodexDirectModelOptions({
+            group,
+            rowId,
+            catalog: snapshot.models,
+          })
+        : [];
+    const signature = JSON.stringify({
+      savedModel,
+      status: snapshot.status,
+      models: options.map((option) => [option.model, option.availability]),
+    });
+    if (signature === renderedSignature) return;
+    renderedSignature = signature;
+    select.textContent = "";
+    if (!savedModel) {
+      const placeholder = el(doc, "option") as HTMLOptionElement;
+      placeholder.value = "";
+      placeholder.textContent = t("Select a Codex Direct model…");
+      placeholder.disabled = true;
+      placeholder.selected = true;
+      select.appendChild(placeholder);
+    } else if (
+      !options.some(
+        (option) => option.model.toLowerCase() === savedModel.toLowerCase(),
+      )
+    ) {
+      const saved = el(doc, "option") as HTMLOptionElement;
+      saved.value = savedModel;
+      saved.textContent = savedModel;
+      select.appendChild(saved);
+    }
+    for (const model of options) {
+      const option = el(doc, "option") as HTMLOptionElement;
+      option.value = model.model;
+      option.textContent =
+        model.availability === "saved-unavailable"
+          ? `${model.label} (${t("Unavailable")})`
+          : model.label;
+      select.appendChild(option);
+    }
+    select.value =
+      options.find(
+        (option) => option.model.toLowerCase() === savedModel.toLowerCase(),
+      )?.model || savedModel;
+  };
+  const rebuildGate = createSelectRebuildGate(rewriteOptions);
+
+  const updateStatus = () => {
+    const snapshot = getCodexDirectCatalogSnapshot();
+    if (loading || snapshot.status === "loading") {
+      statusEl.textContent = t("Fetching Codex Direct models…");
+      statusEl.style.color = "var(--fill-secondary, #888)";
+      statusEl.style.display = "block";
+      return;
+    }
+    if (snapshot.status === "error") {
+      statusEl.textContent = `${t("Couldn't fetch Codex Direct models:")} ${snapshot.error || ""}`;
+      statusEl.style.color = "darkorange";
+      statusEl.style.display = "block";
+      return;
+    }
+    statusEl.style.display = "none";
+  };
+
+  const refreshCatalog = async () => {
+    const token = ++fetchToken;
+    loading = true;
+    updateStatus();
+    try {
+      await loadCodexDirectCatalog();
+    } catch (_error) {
+      // The status snapshot carries the user-facing error and remains retryable.
+    } finally {
+      if (token === fetchToken) {
+        loading = false;
+        rebuildGate.requestRebuild();
+        updateStatus();
+      }
+    }
+  };
+
+  attachCodexDirectCatalogInteractions({
+    target: select,
+    popupMayOpen: () => rebuildGate.popupMayOpen(),
+    refreshCatalog: () => void refreshCatalog(),
+  });
+  select.addEventListener("blur", () => rebuildGate.popupClosed());
+  select.addEventListener("change", () => {
+    const model = select.value;
+    rebuildGate.popupClosed();
+    runAfterSelectChangeDispatch(() => {
+      if (model) args.onModelPicked(model);
+    });
+  });
+
+  rewriteOptions();
+  updateStatus();
+  return { container, statusEl };
+}
+
 // ── Data helpers ───────────────────────────────────────────────────
 
 function cloneGroups(groups: ModelProviderGroup[]): ModelProviderGroup[] {
-  return groups.map((g) => ({ ...g, models: g.models.map((m) => ({ ...m })) }));
+  return groups.map((group) =>
+    group.authMode === "codex_auth"
+      ? { ...group, models: group.models.map((model) => ({ ...model })) }
+      : { ...group, models: group.models.map((model) => ({ ...model })) },
+  );
 }
 
 function persistGroups(groups: ModelProviderGroup[]) {
@@ -672,7 +826,7 @@ function persistGroups(groups: ModelProviderGroup[]) {
 }
 
 function ensureModels(
-  group: ModelProviderGroup,
+  group: Exclude<ModelProviderGroup, CodexDirectProviderGroup>,
   profile: ProviderProfile,
 ): ModelProviderModel[] {
   if (group.models.length > 0) return group.models.map((m) => ({ ...m }));
@@ -690,6 +844,18 @@ function isProviderEmpty(group: ModelProviderGroup): boolean {
 
 function hasEmptyModel(group: ModelProviderGroup): boolean {
   return group.models.some((m) => !m.model.trim());
+}
+
+function syncProviderAddModelButton(
+  button: HTMLButtonElement,
+  group: ModelProviderGroup,
+): void {
+  const canAdd = !hasEmptyModel(group);
+  button.disabled = !canAdd;
+  button.style.opacity = canAdd ? "1" : "0.35";
+  button.title = canAdd
+    ? t("Add model")
+    : t("Fill in the current model name first");
 }
 
 function normalizeAuthMode(value: unknown): ModelProviderAuthMode {
@@ -1101,8 +1267,13 @@ export async function registerPrefsScripts(_window: Window | undefined | null) {
 
     groups.forEach((group, groupIndex) => {
       const profile = getProviderProfile(groupIndex);
-      group.authMode = normalizeAuthMode(group.authMode);
-      group.models = ensureModels(group, profile);
+      if (group.authMode === "codex_auth") {
+        if (!group.models.length) {
+          group.models = [createCodexDirectModelRow()];
+        }
+      } else {
+        group.models = ensureModels(group, profile);
+      }
 
       const card = el(doc, "div", CARD_STYLE);
 
@@ -1113,6 +1284,11 @@ export async function registerPrefsScripts(_window: Window | undefined | null) {
       );
       const removeProvBtn = iconBtn(doc, "×", t("Remove provider"));
       removeProvBtn.addEventListener("click", () => {
+        if (
+          group.models.some((model) => model.id === getLastUsedModelEntryId())
+        ) {
+          setLastUsedModelEntryId("");
+        }
         groups.splice(groupIndex, 1);
         persistGroups(groups);
         rerender();
@@ -1163,10 +1339,77 @@ export async function registerPrefsScripts(_window: Window | undefined | null) {
       if (group.authMode === "codex_app_server") {
         authModeSelect.append(codexAppServerOption);
       }
-      authModeSelect.append(codexOption, copilotOption, webchatOption);
+      if (
+        group.authMode === "codex_auth" ||
+        canOfferCodexDirectAuthMode(groups, group.id)
+      ) {
+        authModeSelect.append(codexOption);
+      }
+      authModeSelect.append(copilotOption, webchatOption);
       authModeSelect.addEventListener("change", () => {
         const previousAuthMode = group.authMode;
         const nextAuthMode = normalizeAuthMode(authModeSelect.value);
+        if (nextAuthMode === "codex_auth") {
+          groups[groupIndex] = {
+            id: group.id,
+            apiBase: CODEX_DIRECT_RESPONSES_URL,
+            apiKey: "",
+            authMode: "codex_auth",
+            providerProtocol: "codex_responses",
+            models: [createCodexDirectModelRow()],
+            selectedModel: "",
+          };
+          persistGroups(groups);
+          setTimeout(() => rerender(), 0);
+          return;
+        }
+        if (group.authMode === "codex_auth") {
+          const standardAuthMode = nextAuthMode as Exclude<
+            ModelProviderAuthMode,
+            "codex_auth"
+          >;
+          const models = group.models.map((row) => ({
+            ...createProviderModelEntry(row.model),
+            id: row.id,
+          }));
+          const replacement: Exclude<
+            ModelProviderGroup,
+            CodexDirectProviderGroup
+          > = {
+            id: group.id,
+            apiBase: migrateApiBaseForAuthModeChange(
+              previousAuthMode,
+              standardAuthMode,
+              group.apiBase,
+            ),
+            apiKey: "",
+            authMode: standardAuthMode,
+            providerProtocol:
+              standardAuthMode === "webchat"
+                ? "web_sync"
+                : standardAuthMode === "copilot_auth"
+                  ? "openai_chat_compat"
+                  : "openai_chat_compat",
+            models,
+          };
+          if (standardAuthMode === "webchat") {
+            replacement.models = [
+              {
+                ...createProviderModelEntry("chatgpt.com"),
+                id: models[0]?.id || createProviderModelEntry().id,
+              },
+            ];
+          } else if (
+            standardAuthMode === "copilot_auth" &&
+            !replacement.apiBase.trim()
+          ) {
+            replacement.apiBase = DEFAULT_COPILOT_API_BASE;
+          }
+          groups[groupIndex] = replacement;
+          persistGroups(groups);
+          setTimeout(() => rerender(), 0);
+          return;
+        }
         group.authMode = nextAuthMode;
         group.apiBase = migrateApiBaseForAuthModeChange(
           previousAuthMode,
@@ -1185,10 +1428,7 @@ export async function registerPrefsScripts(_window: Window | undefined | null) {
           ) {
             group.models = [{ ...group.models[0], model: "chatgpt.com" }];
           }
-        } else if (
-          nextAuthMode === "codex_auth" ||
-          nextAuthMode === "codex_app_server"
-        ) {
+        } else if (nextAuthMode === "codex_app_server") {
           group.providerProtocol = "codex_responses";
         } else if (nextAuthMode === "copilot_auth") {
           group.providerProtocol = "openai_chat_compat";
@@ -1249,62 +1489,106 @@ export async function registerPrefsScripts(_window: Window | undefined | null) {
       group.providerProtocol = resolveSelectedProtocol(group, selectedPresetId);
 
       if (group.authMode === "codex_auth") {
-        group.apiBase = CODEX_DIRECT_RESPONSES_URL;
-        group.providerProtocol = "codex_responses";
-        const testWrap = el(
-          doc,
-          "div",
-          "display: flex; flex-direction: column; gap: 6px;",
-        );
-        const testBtn = el(
-          doc,
-          "button",
-          PRIMARY_BTN_STYLE + " align-self: flex-start; font-size: 12.5px;",
-          t("Test connection"),
-        ) as HTMLButtonElement;
-        testBtn.type = "button";
-        const statusLine = el(
-          doc,
-          "span",
-          HELPER_STYLE + " white-space: pre-wrap;",
-          group.codexDirectModel
-            ? `${t("Selected chat model: ")}${group.codexDirectModel}`
-            : t("The model catalog will load automatically in chat."),
-        );
-        const runTest = async () => {
-          testBtn.disabled = true;
-          statusLine.textContent = t("Fetching Codex model catalog…");
-          statusLine.style.color = "var(--fill-secondary, #888)";
-          try {
-            const fetchFn = ztoolkit.getGlobal("fetch") as
-              | typeof fetch
-              | undefined;
-            const result = await runCodexDirectConnectionTest({ fetchFn });
-            if (!group.codexDirectModel) {
-              group.codexDirectModel = result.modelName;
+        const { section: modelsWrap, addButton: addModelBtn } =
+          createProviderModelSectionBlueprint({
+            doc,
+            sectionLabelStyle: SECTION_LABEL_STYLE,
+            title: t("Model names"),
+            addTitle: t("Add model"),
+          });
+        const syncAddModelBtn = () =>
+          syncProviderAddModelButton(addModelBtn, group);
+        syncAddModelBtn();
+        addModelBtn.addEventListener("click", () => {
+          if (addModelBtn.disabled) return;
+          const next = addCodexDirectModelRow(group);
+          if (!next) return;
+          groups[groupIndex] = next;
+          persistGroups(groups);
+          rerender();
+        });
+
+        for (const row of group.models) {
+          const {
+            row: rowWrap,
+            controls: mainRow,
+            testButton: testBtn,
+            status: statusLine,
+          } = createProviderModelRowBlueprint({
+            doc,
+            outlineButtonStyle: OUTLINE_BTN_STYLE,
+            testLabel: t("Test"),
+          });
+          const picker = attachCodexDirectModelSelect({
+            doc,
+            group,
+            rowId: row.id,
+            onModelPicked: (model) => {
+              const next = updateCodexDirectModelRow(group, row.id, model);
+              if (!next) return;
+              groups[groupIndex] = next;
               persistGroups(groups);
-            }
-            const catalogLine = `✓ ${t("Catalog:")} ${result.catalogCount} ${t("models; test model:")} ${result.modelName}`;
-            if (result.inferenceError) {
-              statusLine.textContent = `${catalogLine}\n✗ ${t("Inference:")} ${result.inferenceError}`;
-              statusLine.style.color = "darkorange";
-            } else {
-              statusLine.textContent = `${catalogLine}\n✓ ${t("Inference:")} "${result.reply || "OK"}"`;
-              statusLine.style.color = "green";
-            }
-          } catch (error) {
-            statusLine.textContent = `✗ ${t("Catalog:")} ${
-              error instanceof Error ? error.message : String(error)
-            }\n${t("Inference was not run.")}`;
-            statusLine.style.color = "red";
-          } finally {
-            testBtn.disabled = false;
+              rerender();
+            },
+          });
+          mainRow.append(picker.container, testBtn);
+          if (group.models.length > 1) {
+            const removeModelBtn = iconBtn(doc, "×", t("Remove model"));
+            removeModelBtn.addEventListener("click", () => {
+              const wasLastUsed = getLastUsedModelEntryId() === row.id;
+              const next = removeCodexDirectModelRow(group, row.id);
+              if (!next) return;
+              groups[groupIndex] = next;
+              if (wasLastUsed) {
+                setLastUsedModelEntryId(next.models[0]?.id || "");
+              }
+              persistGroups(groups);
+              rerender();
+            });
+            mainRow.appendChild(removeModelBtn);
           }
-        };
-        testBtn.addEventListener("click", () => void runTest());
-        testBtn.addEventListener("command", () => void runTest());
-        testWrap.append(testBtn, statusLine);
-        cardBody.append(authModeWrap, testWrap);
+          testBtn.disabled = !row.model.trim();
+          const runTest = async () => {
+            testBtn.disabled = true;
+            statusLine.style.display = "block";
+            statusLine.textContent = t("Fetching Codex model catalog…");
+            statusLine.style.color = "var(--fill-secondary, #888)";
+            try {
+              const fetchFn = ztoolkit.getGlobal("fetch") as
+                | typeof fetch
+                | undefined;
+              const result = await runCodexDirectConnectionTest({
+                fetchFn,
+                modelName: row.model,
+              });
+              const catalogLine = `✓ ${t("Catalog:")} ${result.catalogCount} ${t("models; test model:")} ${result.modelName}`;
+              if (result.inferenceError) {
+                statusLine.textContent = `${catalogLine}\n✗ ${t("Inference:")} ${t(result.inferenceError)}`;
+                statusLine.style.color = "darkorange";
+              } else {
+                statusLine.textContent = `${catalogLine}\n✓ ${t("Inference:")} "${result.reply}"`;
+                statusLine.style.color = "green";
+              }
+            } catch (error) {
+              statusLine.textContent = `✗ ${t("Catalog:")} ${
+                error instanceof Error ? error.message : String(error)
+              }\n${t("Inference was not run.")}`;
+              statusLine.style.color = "red";
+            } finally {
+              testBtn.disabled = !row.model.trim();
+            }
+          };
+          testBtn.addEventListener("click", () => void runTest());
+          testBtn.addEventListener("command", () => void runTest());
+          rowWrap.append(picker.statusEl, statusLine);
+          modelsWrap.appendChild(rowWrap);
+        }
+
+        cardBody.append(
+          authModeWrap,
+          createProviderCardSectionDivider(doc),
+          modelsWrap,
+        );
         card.append(cardHeader, cardBody);
         wrap.appendChild(card);
         return;
@@ -1793,23 +2077,16 @@ export async function registerPrefsScripts(_window: Window | undefined | null) {
       }
 
       // ── Models list ──────────────────────────────────────────────
-      const modelsWrap = el(
+      const {
+        section: modelsWrap,
+        header: modelsHeaderRow,
+        addButton: addModelBtn,
+      } = createProviderModelSectionBlueprint({
         doc,
-        "div",
-        "display: flex; flex-direction: column; gap: 6px;",
-      );
-
-      const modelsHeaderRow = el(
-        doc,
-        "div",
-        "display: flex; align-items: center; justify-content: space-between; margin-bottom: 2px;",
-      );
-      modelsHeaderRow.appendChild(
-        el(doc, "span", SECTION_LABEL_STYLE, t("Model names")),
-      );
-
-      const addModelBtn = iconBtn(doc, "+", t("Add model"));
-      addModelBtn.style.color = "var(--color-accent, #2563eb)";
+        sectionLabelStyle: SECTION_LABEL_STYLE,
+        title: t("Model names"),
+        addTitle: t("Add model"),
+      });
       if (group.authMode === "webchat") {
         // [webchat] Replace "+" with a "Fetch Models" button that adds all webchat targets
         addModelBtn.style.display = "none";
@@ -1839,19 +2116,11 @@ export async function registerPrefsScripts(_window: Window | undefined | null) {
             rerender();
           }
         });
-        modelsHeaderRow.appendChild(fetchModelsBtn);
+        modelsHeaderRow.insertBefore(fetchModelsBtn, addModelBtn);
       }
-      modelsHeaderRow.appendChild(addModelBtn);
-      modelsWrap.appendChild(modelsHeaderRow);
 
-      const syncAddModelBtn = () => {
-        const canAdd = !hasEmptyModel(group);
-        addModelBtn.disabled = !canAdd;
-        addModelBtn.style.opacity = canAdd ? "1" : "0.35";
-        addModelBtn.title = canAdd
-          ? t("Add model")
-          : t("Fill in the current model name first");
-      };
+      const syncAddModelBtn = () =>
+        syncProviderAddModelButton(addModelBtn, group);
       syncAddModelBtn();
 
       addModelBtn.addEventListener("click", () => {
@@ -1863,25 +2132,21 @@ export async function registerPrefsScripts(_window: Window | undefined | null) {
 
       // ── Per-model rows ───────────────────────────────────────────
       group.models.forEach((modelEntry, modelIndex) => {
-        const rowWrap = el(
+        const {
+          row: rowWrap,
+          controls: mainRow,
+          testButton: testBtn,
+          status: statusLine,
+        } = createProviderModelRowBlueprint({
           doc,
-          "div",
-          "display: flex; flex-direction: column; gap: 0;",
-        );
-
-        // Main row: [model input] [Test] [⚙] [×?]
-        const mainRow = el(
-          doc,
-          "div",
-          "display: flex; align-items: center; gap: 5px;",
-        );
+          outlineButtonStyle: OUTLINE_BTN_STYLE,
+          testLabel: t("Test"),
+        });
 
         const modelInput = el(
           doc,
           "input",
-          "flex: 1; min-width: 0; padding: 6px 10px; font-size: 13px;" +
-            " border: 1px solid var(--stroke-secondary, #c8c8c8); border-radius: 6px;" +
-            " box-sizing: border-box; background: Field; color: FieldText;",
+          PROVIDER_MODEL_CONTROL_STYLE,
         ) as HTMLInputElement;
         modelInput.type = "text";
         if (group.authMode !== "webchat") {
@@ -1889,14 +2154,6 @@ export async function registerPrefsScripts(_window: Window | undefined | null) {
         }
         modelInput.placeholder =
           modelIndex === 0 ? profile.modelPlaceholder : "";
-
-        const testBtn = el(
-          doc,
-          "button",
-          OUTLINE_BTN_STYLE,
-          t("Test"),
-        ) as HTMLButtonElement;
-        testBtn.type = "button";
 
         const advGearBtn = iconBtn(doc, "⚙", t("Advanced options"));
 
@@ -1919,9 +2176,7 @@ export async function registerPrefsScripts(_window: Window | undefined | null) {
           const modelSelect = el(
             doc,
             "select",
-            "flex: 1; min-width: 0; padding: 6px 10px; font-size: 13px;" +
-              " border: 1px solid var(--stroke-secondary, #c8c8c8); border-radius: 6px;" +
-              " box-sizing: border-box; background: Field; color: FieldText;",
+            PROVIDER_MODEL_CONTROL_STYLE,
           ) as HTMLSelectElement;
           for (const opt of validWebchatModels) {
             const option = doc.createElement("option");
@@ -1970,13 +2225,6 @@ export async function registerPrefsScripts(_window: Window | undefined | null) {
           });
           mainRow.appendChild(removeModelBtn);
         }
-
-        // Status line (hidden until test runs)
-        const statusLine = el(
-          doc,
-          "span",
-          "font-size: 11.5px; display: none; margin-top: 3px; line-height: 1.45; white-space: pre-wrap; overflow-wrap: anywhere; word-break: normal;",
-        );
 
         // ── Advanced section (hidden by default) ──────────────────
         const advRow = el(doc, "div", ADV_ROW_STYLE);
@@ -2397,17 +2645,12 @@ export async function registerPrefsScripts(_window: Window | undefined | null) {
         testBtn.addEventListener("click", () => void runTest());
         testBtn.addEventListener("command", () => void runTest());
 
-        rowWrap.append(mainRow);
         if (pickerStatusEl) rowWrap.append(pickerStatusEl);
         rowWrap.append(statusLine, advRow);
         modelsWrap.appendChild(rowWrap);
       });
 
-      const divider = el(
-        doc,
-        "hr",
-        "border: none; border-top: 1px solid var(--stroke-secondary, #c8c8c8); margin: 0;",
-      );
+      const divider = createProviderCardSectionDivider(doc);
       if (group.authMode === "webchat") {
         // [webchat] Minimal layout: only auth mode + model names (webchat target selector)
         cardBody.append(authModeWrap, divider, modelsWrap);

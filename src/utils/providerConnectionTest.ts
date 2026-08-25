@@ -212,7 +212,7 @@ function extractConnectionReply(params: {
   jsonData?: unknown;
 }): string {
   if (params.protocol === "codex_responses") {
-    return extractTextFromCodexSSE(params.rawText) || "OK";
+    return extractTextFromCodexSSE(params.rawText);
   }
   if (params.protocol === "responses_api") {
     const data = params.jsonData as {
@@ -374,20 +374,43 @@ export async function runCodexAppServerConnectionTest(params: {
 }
 
 export async function runCodexDirectConnectionTest(
-  params: CodexAuthDependencies = {},
-): Promise<{
-  catalogCount: number;
-  modelName: string;
-  reply?: string;
-  inferenceError?: string;
-}> {
+  params: CodexAuthDependencies & { modelName?: string } = {},
+): Promise<
+  | {
+      catalogCount: number;
+      modelName: string;
+      reply: string;
+      inferenceError?: never;
+    }
+  | {
+      catalogCount: number;
+      modelName: string;
+      reply?: never;
+      inferenceError: string;
+    }
+> {
+  const { modelName: requestedModelName = "", ...authDependencies } = params;
   const catalog = await loadCodexDirectCatalog({
     force: true,
-    ...params,
+    ...authDependencies,
   });
-  const modelName = catalog.models[0]?.model || "";
+  const requestedModel = requestedModelName.trim();
+  const catalogModel = requestedModel
+    ? catalog.models.find(
+        (model) => model.model.toLowerCase() === requestedModel.toLowerCase(),
+      )
+    : catalog.models[0];
+  const modelName = catalogModel?.model || requestedModel;
   if (!modelName)
     throw new Error("Codex Direct returned an empty model catalog");
+  if (!catalogModel) {
+    return {
+      catalogCount: catalog.models.length,
+      modelName,
+      inferenceError:
+        "The selected Codex Direct model is not available in the current catalog.",
+    };
+  }
   try {
     const response = await fetchWithCodexAuth(
       CODEX_DIRECT_RESPONSES_URL,
@@ -411,12 +434,13 @@ export async function runCodexDirectConnectionTest(
           stream: true,
         }),
       },
-      params,
+      authDependencies,
     );
     if (!response.ok) {
       throw new Error(`HTTP ${response.status}: ${await response.text()}`);
     }
-    const reply = extractTextFromCodexSSE(await response.text()) || "OK";
+    const reply = extractTextFromCodexSSE(await response.text()).trim();
+    if (!reply) throw new Error("The server returned no model output.");
     return { catalogCount: catalog.models.length, modelName, reply };
   } catch (error) {
     return {
@@ -460,11 +484,13 @@ export async function runProviderConnectionTest(params: {
   }
   if (expectsSse) {
     const rawText = await response.text();
+    const reply = extractConnectionReply({
+      protocol: params.protocol,
+      rawText,
+    }).trim();
+    if (!reply) throw new Error("The server returned no model output.");
     return {
-      reply: extractConnectionReply({
-        protocol: params.protocol,
-        rawText,
-      }),
+      reply,
       capabilityLabel: getProviderConnectionCapabilityLabel(params),
     };
   }

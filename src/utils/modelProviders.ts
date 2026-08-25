@@ -23,7 +23,6 @@ import type {
   ModelCatalogIdentity,
   ModelProfileOverride,
 } from "../modelCapabilities";
-import { buildCodexRuntimeModelCandidates } from "../codex/catalogSelection";
 import { CODEX_DIRECT_RESPONSES_URL } from "../codexAuth/auth";
 import { getCodexDirectCatalogSnapshot } from "../codexAuth/modelCatalog";
 
@@ -62,18 +61,37 @@ export type ModelProviderAuthMode =
   | "copilot_auth"
   | "webchat"; // [webchat]
 
-export type ModelProviderGroup = {
+export type StandardModelProviderGroup = {
   id: string;
   apiBase: string;
   apiKey: string;
-  authMode: ModelProviderAuthMode;
+  authMode: Exclude<ModelProviderAuthMode, "codex_auth">;
   providerProtocol: ProviderProtocol;
   models: ModelProviderModel[];
-  /** Last model selected for the catalog-backed Codex Direct transport. */
-  codexDirectModel?: string;
   /** When "customized", UI shows Customized and allows editing URL; when undefined, preset is derived from apiBase. */
   presetIdOverride?: ProviderPresetId;
 };
+
+export type CodexDirectModelRow = {
+  id: string;
+  model: string;
+};
+
+export type CodexDirectProviderGroup = {
+  id: string;
+  apiBase: typeof CODEX_DIRECT_RESPONSES_URL;
+  apiKey: "";
+  authMode: "codex_auth";
+  providerProtocol: "codex_responses";
+  models: CodexDirectModelRow[];
+  /** The single application-wide Codex Direct selection. */
+  selectedModel: string;
+  presetIdOverride?: undefined;
+};
+
+export type ModelProviderGroup =
+  | StandardModelProviderGroup
+  | CodexDirectProviderGroup;
 
 export type RuntimeModelEntry = {
   entryId: string;
@@ -88,7 +106,6 @@ export type RuntimeModelEntry = {
   displayModelLabel: string;
   advanced: AdvancedModelConfig;
   catalogAvailability?: "available" | "unverified" | "saved-unavailable";
-  contextWindow?: number;
 };
 
 export type LegacyModelSlot = AdvancedModelConfig & {
@@ -122,7 +139,7 @@ const MODEL_PROVIDER_GROUPS_MIGRATION_VERSION_PREF_KEY =
   "modelProviderGroupsMigrationVersion";
 const LAST_USED_MODEL_ENTRY_ID_PREF_KEY = "lastUsedModelEntryId";
 const LEGACY_LAST_MODEL_PROFILE_PREF_KEY = "lastUsedModelProfile";
-const MODEL_PROVIDER_GROUPS_MIGRATION_VERSION = 4;
+const MODEL_PROVIDER_GROUPS_MIGRATION_VERSION = 5;
 const modelProviderGroupListeners = new Set<() => void>();
 
 function getZoteroPrefs(): ZoteroPrefsAPI | null {
@@ -277,49 +294,103 @@ function extractProviderHost(apiBase: string): string {
   }
 }
 
-function normalizeGroup(
-  group: unknown,
-  migrateLegacyCodexDirectModel = false,
-): ModelProviderGroup | null {
-  if (!group || typeof group !== "object") return null;
-  const rawGroup = group as {
-    id?: unknown;
-    apiBase?: unknown;
-    apiKey?: unknown;
-    authMode?: unknown;
-    providerProtocol?: unknown;
-    models?: unknown;
-    codexDirectModel?: unknown;
-    presetIdOverride?: unknown;
+type RawProviderGroup = {
+  id?: unknown;
+  apiBase?: unknown;
+  apiKey?: unknown;
+  authMode?: unknown;
+  providerProtocol?: unknown;
+  models?: unknown;
+  codexDirectModel?: unknown;
+  selectedModel?: unknown;
+  presetIdOverride?: unknown;
+};
+
+function normalizeCodexDirectModelRow(
+  model: unknown,
+): CodexDirectModelRow | null {
+  if (!model || typeof model !== "object") return null;
+  const rawModel = model as { id?: unknown; model?: unknown };
+  return {
+    id:
+      typeof rawModel.id === "string" && rawModel.id.trim()
+        ? rawModel.id.trim()
+        : createId("model"),
+    model: normalizeString(rawModel.model),
   };
+}
+
+function dedupeCodexDirectModelRows(
+  rows: CodexDirectModelRow[],
+): CodexDirectModelRow[] {
+  const seenModels = new Set<string>();
+  const seenIds = new Set<string>();
+  const result: CodexDirectModelRow[] = [];
+  let hasEmptyRow = false;
+  for (const row of rows) {
+    const modelKey = row.model.toLowerCase();
+    if (modelKey && seenModels.has(modelKey)) continue;
+    if (!modelKey && hasEmptyRow) continue;
+    const id = seenIds.has(row.id) ? createId("model") : row.id;
+    seenIds.add(id);
+    if (modelKey) {
+      seenModels.add(modelKey);
+    } else {
+      hasEmptyRow = true;
+    }
+    result.push({ id, model: row.model });
+  }
+  return result;
+}
+
+function normalizeGroup(group: unknown): ModelProviderGroup | null {
+  if (!group || typeof group !== "object") return null;
+  const rawGroup = group as RawProviderGroup;
 
   const authMode = normalizeProviderAuthMode(rawGroup.authMode);
+  const id =
+    typeof rawGroup.id === "string" && rawGroup.id.trim()
+      ? rawGroup.id.trim()
+      : createId("provider");
+  if (authMode === "codex_auth") {
+    const models = dedupeCodexDirectModelRows(
+      Array.isArray(rawGroup.models)
+        ? rawGroup.models
+            .map(normalizeCodexDirectModelRow)
+            .filter((entry): entry is CodexDirectModelRow => Boolean(entry))
+        : [],
+    );
+    const selectedModel =
+      normalizeString(rawGroup.selectedModel) ||
+      normalizeString(rawGroup.codexDirectModel);
+    if (
+      selectedModel &&
+      !models.some(
+        (row) => row.model.toLowerCase() === selectedModel.toLowerCase(),
+      )
+    ) {
+      models.push({ id: createId("model"), model: selectedModel });
+    }
+    if (!models.length) models.push({ id: createId("model"), model: "" });
+    return {
+      id,
+      apiBase: CODEX_DIRECT_RESPONSES_URL,
+      apiKey: "",
+      authMode: "codex_auth",
+      providerProtocol: "codex_responses",
+      models,
+      selectedModel,
+    };
+  }
+
   const models = Array.isArray(rawGroup.models)
     ? rawGroup.models
         .map((entry) => normalizeGroupModel(entry, authMode))
         .filter((entry): entry is ModelProviderModel => Boolean(entry))
     : [];
-
-  const storedApiBase = normalizeApiBase(normalizeString(rawGroup.apiBase));
-  const apiBase =
-    authMode === "codex_auth" ? CODEX_DIRECT_RESPONSES_URL : storedApiBase;
-  const selectedLegacyModelId = getStringPref(
-    LAST_USED_MODEL_ENTRY_ID_PREF_KEY,
-  );
-  const codexDirectModel =
-    authMode === "codex_auth"
-      ? normalizeString(rawGroup.codexDirectModel) ||
-        (migrateLegacyCodexDirectModel
-          ? models.find((model) => model.id === selectedLegacyModelId)?.model ||
-            models.find((model) => model.model)?.model
-          : "") ||
-        ""
-      : "";
+  const apiBase = normalizeApiBase(normalizeString(rawGroup.apiBase));
   return {
-    id:
-      typeof rawGroup.id === "string" && rawGroup.id.trim()
-        ? rawGroup.id.trim()
-        : createId("provider"),
+    id,
     apiBase,
     apiKey: normalizeString(rawGroup.apiKey),
     authMode,
@@ -329,9 +400,103 @@ function normalizeGroup(
       apiBase,
     }),
     models,
-    ...(codexDirectModel ? { codexDirectModel } : {}),
     presetIdOverride: normalizePresetIdOverride(rawGroup.presetIdOverride),
   };
+}
+
+function resolvePreferredCodexDirectModel(raw: unknown[]): {
+  model: string;
+  lastUsedWasDirect: boolean;
+} {
+  const lastUsedEntryId = getStringPref(LAST_USED_MODEL_ENTRY_ID_PREF_KEY);
+  let firstSavedSelection = "";
+  let firstMigratedRow = "";
+  for (const value of raw) {
+    if (!value || typeof value !== "object") continue;
+    const group = value as RawProviderGroup;
+    if (normalizeProviderAuthMode(group.authMode) !== "codex_auth") continue;
+    const groupId = normalizeString(group.id);
+    const rows = Array.isArray(group.models)
+      ? group.models
+          .map(normalizeCodexDirectModelRow)
+          .filter((row): row is CodexDirectModelRow => Boolean(row))
+      : [];
+    const selected =
+      normalizeString(group.selectedModel) ||
+      normalizeString(group.codexDirectModel);
+    firstSavedSelection ||= selected;
+    firstMigratedRow ||= rows.find((row) => row.model)?.model || "";
+
+    const rowMatch = rows.find((row) => row.id === lastUsedEntryId);
+    if (rowMatch) {
+      return { model: rowMatch.model, lastUsedWasDirect: true };
+    }
+    const syntheticPrefix = `${groupId}::codex-direct::`;
+    if (groupId && lastUsedEntryId.startsWith(syntheticPrefix)) {
+      const encodedModel = lastUsedEntryId.slice(syntheticPrefix.length);
+      const model =
+        rows.find((row) => row.model.toLowerCase() === encodedModel)?.model ||
+        (selected.toLowerCase() === encodedModel ? selected : encodedModel);
+      return { model, lastUsedWasDirect: true };
+    }
+  }
+  return {
+    model: firstSavedSelection || firstMigratedRow,
+    lastUsedWasDirect: false,
+  };
+}
+
+function normalizeAndCollapseModelProviderGroups(
+  raw: unknown[],
+  migrateStoredDirectGroups: boolean,
+): ModelProviderGroup[] {
+  const preferred = resolvePreferredCodexDirectModel(raw);
+  const groups: ModelProviderGroup[] = [];
+  let directGroup: CodexDirectProviderGroup | null = null;
+  for (const value of raw) {
+    const group = normalizeGroup(value);
+    if (!group) continue;
+    if (group.authMode !== "codex_auth") {
+      groups.push(group);
+      continue;
+    }
+    if (!directGroup) {
+      directGroup = group;
+      groups.push(group);
+      continue;
+    }
+    directGroup.models = dedupeCodexDirectModelRows([
+      ...directGroup.models,
+      ...group.models,
+    ]);
+    directGroup.selectedModel ||= group.selectedModel;
+  }
+  if (!directGroup) return groups;
+
+  const selectedModel = preferred.model || directGroup.selectedModel;
+  if (
+    selectedModel &&
+    !directGroup.models.some(
+      (row) => row.model.toLowerCase() === selectedModel.toLowerCase(),
+    )
+  ) {
+    directGroup.models.push({ id: createId("model"), model: selectedModel });
+  }
+  directGroup.selectedModel =
+    directGroup.models.find(
+      (row) => row.model.toLowerCase() === selectedModel.toLowerCase(),
+    )?.model ||
+    directGroup.models.find((row) => row.model)?.model ||
+    "";
+
+  if (migrateStoredDirectGroups && preferred.lastUsedWasDirect) {
+    const selectedRow = directGroup.models.find(
+      (row) =>
+        row.model.toLowerCase() === directGroup.selectedModel.toLowerCase(),
+    );
+    if (selectedRow) setPref(LAST_USED_MODEL_ENTRY_ID_PREF_KEY, selectedRow.id);
+  }
+  return groups;
 }
 function normalizePresetIdOverride(
   value: unknown,
@@ -439,9 +604,7 @@ export function normalizeModelProviderGroups(
   raw: unknown,
 ): ModelProviderGroup[] {
   if (!Array.isArray(raw)) return [];
-  return raw
-    .map((group) => normalizeGroup(group, false))
-    .filter((group): group is ModelProviderGroup => Boolean(group));
+  return normalizeAndCollapseModelProviderGroups(raw, false);
 }
 
 function parseStoredModelProviderGroups(raw: string): ModelProviderGroup[] {
@@ -449,11 +612,12 @@ function parseStoredModelProviderGroups(raw: string): ModelProviderGroup[] {
   try {
     const parsed = JSON.parse(raw) as unknown;
     if (!Array.isArray(parsed)) return [];
-    const shouldMigrateCodexDirectModel =
+    const shouldMigrateCodexDirectGroups =
       getMigrationVersion() < MODEL_PROVIDER_GROUPS_MIGRATION_VERSION;
-    return parsed
-      .map((group) => normalizeGroup(group, shouldMigrateCodexDirectModel))
-      .filter((group): group is ModelProviderGroup => Boolean(group));
+    return normalizeAndCollapseModelProviderGroups(
+      parsed,
+      shouldMigrateCodexDirectGroups,
+    );
   } catch (_err) {
     return [];
   }
@@ -693,54 +857,46 @@ export function createProviderModelEntry(
   };
 }
 
+export function createCodexDirectModelRow(model = ""): CodexDirectModelRow {
+  return { id: createId("model"), model: model.trim() };
+}
+
 export function getRuntimeModelEntries(): RuntimeModelEntry[] {
   const groups = getModelProviderGroups();
   const entries: RuntimeModelEntry[] = [];
 
   for (const [groupIndex, group] of groups.entries()) {
     const authMode = normalizeProviderAuthMode(group.authMode);
-    if (authMode === "codex_auth") {
+    if (group.authMode === "codex_auth") {
       const snapshot = getCodexDirectCatalogSnapshot();
-      const catalogModels =
-        snapshot.status === "ready"
-          ? snapshot.models.map((model) => ({
-              model: model.model,
-              displayName: model.displayName,
-            }))
-          : [];
-      const candidates = buildCodexRuntimeModelCandidates({
-        catalogModels,
-        selectedModel: group.codexDirectModel || "",
-      });
-      for (const candidate of candidates) {
+      for (const row of group.models) {
+        const modelName = row.model.trim();
+        if (!modelName) continue;
         const catalogModel =
           snapshot.status === "ready"
             ? snapshot.models.find(
                 (model) =>
-                  model.model.toLowerCase() === candidate.model.toLowerCase(),
+                  model.model.toLowerCase() === modelName.toLowerCase(),
               )
             : undefined;
         entries.push({
-          entryId: `${group.id}::codex-direct::${candidate.model.toLowerCase()}`,
+          entryId: row.id,
           groupId: group.id,
-          model: candidate.model,
+          model: modelName,
           apiBase: CODEX_DIRECT_RESPONSES_URL,
           apiKey: "",
           authMode,
           providerProtocol: "codex_responses",
           providerLabel: "Codex Direct (Legacy)",
           providerOrder: groupIndex,
-          displayModelLabel: candidate.displayName,
+          displayModelLabel: catalogModel?.displayName || modelName,
           advanced: normalizeAdvancedModelConfig(undefined, authMode),
           catalogAvailability:
-            candidate.source === "catalog"
-              ? "available"
-              : snapshot.status === "ready"
-                ? "saved-unavailable"
-                : "unverified",
-          ...(catalogModel?.contextWindow
-            ? { contextWindow: catalogModel.contextWindow }
-            : {}),
+            snapshot.status !== "ready"
+              ? "unverified"
+              : catalogModel
+                ? "available"
+                : "saved-unavailable",
         });
       }
       continue;
@@ -869,20 +1025,33 @@ export function setLastUsedModelEntryId(entryId: string): void {
   setPref(LAST_USED_MODEL_ENTRY_ID_PREF_KEY, entryId.trim());
 }
 
-export function setCodexDirectModelForGroup(
-  groupId: string,
-  model: string,
-): void {
-  const normalizedGroupId = groupId.trim();
+export function getCodexDirectProviderGroup(): CodexDirectProviderGroup | null {
+  return (
+    getModelProviderGroups().find(
+      (group): group is CodexDirectProviderGroup =>
+        group.authMode === "codex_auth",
+    ) || null
+  );
+}
+
+export function setCodexDirectSelectedModel(model: string): void {
   const normalizedModel = model.trim();
-  if (!normalizedGroupId || !normalizedModel) return;
+  if (!normalizedModel) return;
   const groups = getModelProviderGroups();
   const group = groups.find(
-    (candidate) =>
-      candidate.id === normalizedGroupId && candidate.authMode === "codex_auth",
+    (candidate): candidate is CodexDirectProviderGroup =>
+      candidate.authMode === "codex_auth",
   );
-  if (!group || group.codexDirectModel === normalizedModel) return;
-  group.codexDirectModel = normalizedModel;
+  if (
+    !group ||
+    group.selectedModel === normalizedModel ||
+    !group.models.some(
+      (row) => row.model.toLowerCase() === normalizedModel.toLowerCase(),
+    )
+  ) {
+    return;
+  }
+  group.selectedModel = normalizedModel;
   setModelProviderGroups(groups);
 }
 

@@ -10,7 +10,11 @@ const CODEX_CLIENT_ID = "app_EMoamEEZ73f0CkXaXp7hrann";
 
 type IOUtilsLike = {
   read?: (path: string) => Promise<Uint8Array | ArrayBuffer>;
-  write?: (path: string, data: Uint8Array) => Promise<unknown>;
+  write?: (
+    path: string,
+    data: Uint8Array,
+    options?: { tmpPath?: string },
+  ) => Promise<unknown>;
   makeDirectory?: (
     path: string,
     options?: { createAncestors?: boolean; ignoreExisting?: boolean },
@@ -19,7 +23,11 @@ type IOUtilsLike = {
 
 type OSFileLike = {
   read?: (path: string) => Promise<Uint8Array | ArrayBuffer>;
-  writeAtomic?: (path: string, data: Uint8Array) => Promise<void>;
+  writeAtomic?: (
+    path: string,
+    data: Uint8Array,
+    options?: { tmpPath?: string },
+  ) => Promise<void>;
   makeDir?: (
     path: string,
     options?: { from?: string; ignoreExisting?: boolean },
@@ -59,6 +67,8 @@ export type CodexAuthDependencies = {
   readText?: (path: string) => Promise<string>;
   writeText?: (path: string, content: string) => Promise<void>;
 };
+
+const refreshTasksByAuthPath = new Map<string, Promise<CodexAuthSession>>();
 
 function getIOUtils(): IOUtilsLike | undefined {
   const direct = (globalThis as { IOUtils?: IOUtilsLike }).IOUtils;
@@ -164,14 +174,15 @@ async function ensureParentDirectory(path: string): Promise<void> {
 async function defaultWriteText(path: string, content: string): Promise<void> {
   await ensureParentDirectory(path);
   const data = new TextEncoder().encode(content);
+  const tmpPath = `${path}.llm-for-zotero.tmp`;
   const io = getIOUtils();
   if (io?.write) {
-    await io.write(path, data);
+    await io.write(path, data, { tmpPath });
     return;
   }
   const osFile = getOSFile();
   if (osFile?.writeAtomic) {
-    await osFile.writeAtomic(path, data);
+    await osFile.writeAtomic(path, data, { tmpPath });
     return;
   }
   throw new Error("No file API available to persist Codex auth");
@@ -203,24 +214,56 @@ function normalizeToken(value: unknown): string {
   return typeof value === "string" ? value.trim() : "";
 }
 
-export async function refreshCodexAuthSession(
-  session: CodexAuthSession,
-  options: CodexAuthDependencies & { signal?: AbortSignal } = {},
+function normalizeAuthPathKey(path: string): string {
+  const normalized = path.trim().replace(/[\\/]+/g, "/");
+  return /^[a-z]:\//i.test(normalized) || normalized.startsWith("//")
+    ? normalized.toLowerCase()
+    : normalized;
+}
+
+function sessionFromAuthJson(
+  authPath: string,
+  auth: CodexAuthJson | null,
+): CodexAuthSession {
+  const token = normalizeToken(auth?.tokens?.access_token);
+  const refreshToken = normalizeToken(auth?.tokens?.refresh_token);
+  const accountId = normalizeToken(auth?.tokens?.account_id);
+  return {
+    token,
+    refreshToken,
+    authPath,
+    ...(accountId ? { accountId } : {}),
+  };
+}
+
+async function refreshCodexAuthSessionOnce(
+  staleSession: CodexAuthSession,
+  options: CodexAuthDependencies,
 ): Promise<CodexAuthSession> {
-  if (!session.refreshToken) {
+  const dependencies = { ...options, authPath: staleSession.authPath };
+  const currentAuth = await loadCodexAuthJson(dependencies);
+  const currentSession = sessionFromAuthJson(
+    staleSession.authPath,
+    currentAuth,
+  );
+  if (currentSession.token && currentSession.token !== staleSession.token) {
+    return currentSession;
+  }
+  const refreshToken = currentSession.refreshToken || staleSession.refreshToken;
+  if (!refreshToken) {
     throw new Error(
       "codex auth refresh token missing. Please run `codex login` to restore ~/.codex/auth.json.",
     );
   }
+
   const response = await getFetch(options)(CODEX_REFRESH_TOKEN_URL, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({
       client_id: CODEX_CLIENT_ID,
       grant_type: "refresh_token",
-      refresh_token: session.refreshToken,
+      refresh_token: refreshToken,
     }),
-    signal: options.signal,
   });
   if (!response.ok) {
     throw new Error(
@@ -231,32 +274,43 @@ export async function refreshCodexAuthSession(
   const token = normalizeToken(payload.access_token);
   if (!token)
     throw new Error("Codex token refresh returned empty access token");
-  const refreshToken =
-    normalizeToken(payload.refresh_token) || session.refreshToken;
-  const dependencies = { ...options, authPath: session.authPath };
-  const current = (await loadCodexAuthJson(dependencies)) || {};
+  const nextRefreshToken =
+    normalizeToken(payload.refresh_token) || refreshToken;
+  const latest = (await loadCodexAuthJson(dependencies)) || currentAuth || {};
   const tokens: CodexTokenData = {
-    ...(current.tokens || {}),
+    ...(latest.tokens || {}),
     access_token: token,
-    refresh_token: refreshToken,
+    refresh_token: nextRefreshToken,
   };
   const nextAuth: CodexAuthJson = {
-    ...current,
+    ...latest,
     tokens,
     last_refresh: new Date().toISOString(),
   };
   await (options.writeText || defaultWriteText)(
-    session.authPath,
+    staleSession.authPath,
     `${JSON.stringify(nextAuth, null, 2)}\n`,
   );
-  return {
-    token,
-    refreshToken,
-    authPath: session.authPath,
-    ...(normalizeToken(tokens.account_id)
-      ? { accountId: normalizeToken(tokens.account_id) }
-      : {}),
-  };
+  return sessionFromAuthJson(staleSession.authPath, nextAuth);
+}
+
+export async function refreshCodexAuthSession(
+  session: CodexAuthSession,
+  options: CodexAuthDependencies & { signal?: AbortSignal } = {},
+): Promise<CodexAuthSession> {
+  const key = normalizeAuthPathKey(session.authPath);
+  const existing = refreshTasksByAuthPath.get(key);
+  if (existing) return existing;
+  const { signal: _callerSignal, ...sharedOptions } = options;
+  const task = refreshCodexAuthSessionOnce(session, sharedOptions).finally(
+    () => {
+      if (refreshTasksByAuthPath.get(key) === task) {
+        refreshTasksByAuthPath.delete(key);
+      }
+    },
+  );
+  refreshTasksByAuthPath.set(key, task);
+  return task;
 }
 
 export async function resolveCodexAuthSession(
@@ -264,20 +318,16 @@ export async function resolveCodexAuthSession(
 ): Promise<CodexAuthSession> {
   const authPath = options.authPath || resolveCodexAuthPath();
   const auth = await loadCodexAuthJson({ ...options, authPath });
-  const token = normalizeToken(auth?.tokens?.access_token);
-  const refreshToken = normalizeToken(auth?.tokens?.refresh_token);
-  const accountId = normalizeToken(auth?.tokens?.account_id);
-  const session: CodexAuthSession = {
-    token,
-    refreshToken,
-    authPath,
-    ...(accountId ? { accountId } : {}),
-  };
-  if (token) return session;
-  if (refreshToken) return refreshCodexAuthSession(session, options);
+  const session = sessionFromAuthJson(authPath, auth);
+  if (session.token) return session;
+  if (session.refreshToken) return refreshCodexAuthSession(session, options);
   throw new Error(
     "codex auth token not found. Please run `codex login` and ensure ~/.codex/auth.json is available.",
   );
+}
+
+export function resetCodexAuthRefreshStateForTests(): void {
+  refreshTasksByAuthPath.clear();
 }
 
 export function buildCodexAuthHeaders(
