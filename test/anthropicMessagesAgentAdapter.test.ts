@@ -3,7 +3,11 @@ import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { AnthropicMessagesAgentAdapter } from "../src/agent/model/anthropicMessages";
-import type { AgentRuntimeRequest, ToolSpec } from "../src/agent/types";
+import type {
+  AgentModelMessage,
+  AgentRuntimeRequest,
+  ToolSpec,
+} from "../src/agent/types";
 import { isMalformedToolArgumentsDiagnostic } from "../src/agent/toolArgumentDiagnostics";
 
 function makeSseStream(chunks: string[]): ReadableStream<Uint8Array> {
@@ -695,6 +699,109 @@ describe("AnthropicMessagesAgentAdapter", function () {
         tool_use_id: block.tool_use_id,
       })),
       [{ type: "tool_result", tool_use_id: "toolu_1" }],
+    );
+  });
+
+  it("does not replay a tool result after a corrected final answer", async function () {
+    const adapter = new AnthropicMessagesAgentAdapter();
+    const requestBodies: Record<string, unknown>[] = [];
+    let callCount = 0;
+    (
+      globalThis as typeof globalThis & {
+        ztoolkit: { getGlobal: (name: string) => unknown };
+      }
+    ).ztoolkit = {
+      getGlobal: (name: string) => {
+        if (name !== "fetch") return undefined;
+        return async (_url: string, init?: RequestInit) => {
+          callCount += 1;
+          requestBodies.push(
+            JSON.parse(String(init?.body || "{}")) as Record<string, unknown>,
+          );
+          return {
+            ok: true,
+            status: 200,
+            statusText: "OK",
+            body: undefined,
+            json: async () => ({
+              content:
+                callCount === 1
+                  ? [
+                      {
+                        type: "tool_use",
+                        id: "call_issue_387",
+                        name: "read_paper",
+                        input: { query: "methods" },
+                      },
+                    ]
+                  : [
+                      {
+                        type: "text",
+                        text:
+                          callCount === 2
+                            ? "Premature comparison."
+                            : "Corrected comparison.",
+                      },
+                    ],
+            }),
+            text: async () => "",
+          };
+        };
+      },
+    };
+
+    const request = makeRequest({
+      model: "deepseek-v4-pro",
+      apiBase: "https://api.deepseek.com/anthropic",
+    });
+    const messages: AgentModelMessage[] = [
+      { role: "user", content: "Compare these papers" },
+    ];
+    const firstStep = await adapter.runStep({ request, messages, tools });
+    assert.equal(firstStep.kind, "tool_calls");
+    if (firstStep.kind !== "tool_calls") return;
+    messages.push(firstStep.assistantMessage, {
+      role: "tool",
+      tool_call_id: firstStep.calls[0].id,
+      name: firstStep.calls[0].name,
+      content: '{"matches":["paper-a","paper-b"]}',
+    });
+
+    const secondStep = await adapter.runStep({ request, messages, tools });
+    assert.equal(secondStep.kind, "final");
+    if (secondStep.kind !== "final") return;
+    messages.push(secondStep.assistantMessage, {
+      role: "user",
+      content: "Correction for this turn: retrieve body evidence first.",
+    });
+
+    await adapter.runStep({ request, messages, tools });
+
+    const thirdRequestMessages = requestBodies[2]?.messages as Array<{
+      role?: string;
+      content?: Array<Record<string, unknown>>;
+    }>;
+    assert.deepEqual(
+      thirdRequestMessages.map((message) => message.role),
+      ["user", "assistant", "user", "assistant", "user"],
+    );
+    const toolResults = thirdRequestMessages.flatMap(
+      (message) =>
+        message.content?.filter((block) => block.type === "tool_result") || [],
+    );
+    assert.deepEqual(
+      toolResults.map((block) => block.tool_use_id),
+      ["call_issue_387"],
+    );
+    assert.equal(thirdRequestMessages[1]?.content?.[0]?.type, "tool_use");
+    assert.equal(thirdRequestMessages[2]?.content?.[0]?.type, "tool_result");
+    assert.equal(
+      thirdRequestMessages[3]?.content?.[0]?.text,
+      "Premature comparison.",
+    );
+    assert.equal(
+      thirdRequestMessages[4]?.content?.[0]?.text,
+      "Correction for this turn: retrieve body evidence first.",
     );
   });
 

@@ -28,7 +28,7 @@ import {
 } from "./messageBuilder";
 import {
   createFallbackToolCallId,
-  getToolContinuationMessages,
+  getConversationContinuationMessages,
   groupToolContinuationMessages,
 } from "./shared";
 import { resolveContentParts } from "./adapterUtils";
@@ -763,7 +763,7 @@ export class AnthropicMessagesAgentAdapter implements AgentModelAdapter {
       this.systemBlocks = initial.systemBlocks;
     }
     const continuationSource = cachedConversationMessages
-      ? getToolContinuationMessages(params.messages)
+      ? getConversationContinuationMessages(params.messages)
       : [];
     const continuation = await buildAnthropicContinuationMessages(
       continuationSource,

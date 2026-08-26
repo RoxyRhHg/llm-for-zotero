@@ -6,7 +6,11 @@ import {
   parseResponsesStepStream,
 } from "../src/agent/model/codexResponses";
 import { OpenAIResponsesAgentAdapter } from "../src/agent/model/openaiResponses";
-import type { AgentRuntimeRequest } from "../src/agent/types";
+import type {
+  AgentModelMessage,
+  AgentRuntimeRequest,
+  ToolSpec,
+} from "../src/agent/types";
 import {
   loadCodexDirectCatalog,
   resetCodexDirectCatalogForTests,
@@ -74,6 +78,130 @@ describe("CodexResponsesAgentAdapter", function () {
           { status: 200, headers: { "Content-Type": "application/json" } },
         )) as typeof fetch,
     });
+  }
+
+  async function assertCorrectedFinalContinuation(
+    targetAdapter: CodexResponsesAgentAdapter | OpenAIResponsesAgentAdapter,
+    request: AgentRuntimeRequest,
+  ): Promise<void> {
+    const requestBodies: Record<string, unknown>[] = [];
+    let callCount = 0;
+    (
+      globalThis as typeof globalThis & {
+        ztoolkit: { getGlobal: (name: string) => unknown };
+      }
+    ).ztoolkit = {
+      getGlobal: (name: string) => {
+        if (name !== "fetch") return undefined;
+        return async (_url: string, init?: RequestInit) => {
+          callCount += 1;
+          requestBodies.push(
+            JSON.parse(String(init?.body || "{}")) as Record<string, unknown>,
+          );
+          return {
+            ok: true,
+            status: 200,
+            statusText: "OK",
+            body: undefined,
+            json: async () => ({
+              output:
+                callCount === 1
+                  ? [
+                      {
+                        id: "fc_issue_387",
+                        type: "function_call",
+                        call_id: "call_issue_387",
+                        name: "library_search",
+                        arguments: '{"query":"methods"}',
+                      },
+                    ]
+                  : [
+                      {
+                        type: "message",
+                        content: [
+                          {
+                            type: "output_text",
+                            text:
+                              callCount === 2
+                                ? "Premature comparison."
+                                : "Corrected comparison.",
+                          },
+                        ],
+                      },
+                    ],
+            }),
+            text: async () => "",
+          };
+        };
+      },
+    };
+
+    const tools: ToolSpec[] = [
+      {
+        name: "library_search",
+        description: "Search the library",
+        inputSchema: { type: "object" },
+        mutability: "read",
+        requiresConfirmation: false,
+      },
+    ];
+    const messages: AgentModelMessage[] = [
+      { role: "user", content: "Compare these papers" },
+    ];
+    const firstStep = await targetAdapter.runStep({
+      request,
+      messages,
+      tools,
+    });
+    assert.equal(firstStep.kind, "tool_calls");
+    if (firstStep.kind !== "tool_calls") return;
+    messages.push(firstStep.assistantMessage, {
+      role: "tool",
+      tool_call_id: firstStep.calls[0].id,
+      name: firstStep.calls[0].name,
+      content: '{"results":[{"itemId":101},{"itemId":102}]}',
+    });
+
+    const secondStep = await targetAdapter.runStep({
+      request,
+      messages,
+      tools,
+    });
+    assert.equal(secondStep.kind, "final");
+    if (secondStep.kind !== "final") return;
+    messages.push(secondStep.assistantMessage, {
+      role: "user",
+      content: "Correction for this turn: retrieve body evidence first.",
+    });
+
+    await targetAdapter.runStep({ request, messages, tools });
+
+    const thirdInput = requestBodies[2]?.input as Array<
+      Record<string, unknown>
+    >;
+    assert.lengthOf(
+      thirdInput.filter((item) => item.type === "function_call_output"),
+      1,
+    );
+    const functionCallIndex = thirdInput.findIndex(
+      (item) => item.type === "function_call",
+    );
+    const functionOutputIndex = thirdInput.findIndex(
+      (item) => item.type === "function_call_output",
+    );
+    const finalAnswerIndex = thirdInput.findIndex((item) =>
+      JSON.stringify(item).includes("Premature comparison."),
+    );
+    const correctionIndex = thirdInput.findIndex((item) =>
+      JSON.stringify(item).includes(
+        "Correction for this turn: retrieve body evidence first.",
+      ),
+    );
+    assert.isAtLeast(functionCallIndex, 0);
+    assert.equal(functionOutputIndex, functionCallIndex + 1);
+    assert.isAbove(finalAnswerIndex, functionOutputIndex);
+    assert.equal(correctionIndex, thirdInput.length - 1);
+    assert.isAbove(correctionIndex, finalAnswerIndex);
   }
 
   it("supports tool calling for codex auth requests", function () {
@@ -484,6 +612,32 @@ describe("CodexResponsesAgentAdapter", function () {
     );
     assert.include(String(input[1]?.content || ""), "Paper A");
     assert.equal(input[2]?.content, "Use those results now");
+  });
+
+  it("does not replay an OpenAI function output after a corrected final answer", async function () {
+    await assertCorrectedFinalContinuation(
+      new OpenAIResponsesAgentAdapter(),
+      makeRequest({
+        model: "gpt-5.4",
+        apiBase: "https://api.openai.com/v1",
+        apiKey: "test-token",
+        authMode: "api_key",
+        providerProtocol: "responses_api",
+      }),
+    );
+  });
+
+  it("does not replay a Codex function output after a corrected final answer", async function () {
+    await assertCorrectedFinalContinuation(
+      new CodexResponsesAgentAdapter(),
+      makeRequest({
+        model: "gpt-5.4",
+        apiBase: "https://example.com/v1",
+        apiKey: "test-token",
+        authMode: "api_key",
+        providerProtocol: "codex_responses",
+      }),
+    );
   });
 
   it("forwards streamed OpenAI Responses usage including cached tokens", async function () {

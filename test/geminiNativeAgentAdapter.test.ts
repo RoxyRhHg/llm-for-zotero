@@ -2,7 +2,11 @@ import { assert } from "chai";
 import { GeminiNativeAgentAdapter } from "../src/agent/model/geminiNative";
 import { getModelCapabilities } from "../src/modelCapabilities";
 import { computeProfileOverrideDraft } from "../src/modules/modelProfileEditor";
-import type { AgentRuntimeRequest, ToolSpec } from "../src/agent/types";
+import type {
+  AgentModelMessage,
+  AgentRuntimeRequest,
+  ToolSpec,
+} from "../src/agent/types";
 
 function makeSseStream(chunks: string[]): ReadableStream<Uint8Array> {
   return new ReadableStream<Uint8Array>({
@@ -699,6 +703,106 @@ describe("GeminiNativeAgentAdapter", function () {
         .filter(Boolean)
         .map((response) => response.response),
       [{ results: [{ itemId: 101 }] }],
+    );
+  });
+
+  it("does not replay a function response after a corrected final answer", async function () {
+    const adapter = new GeminiNativeAgentAdapter();
+    const requestBodies: Record<string, unknown>[] = [];
+    let callCount = 0;
+    (
+      globalThis as typeof globalThis & {
+        ztoolkit: { getGlobal: (name: string) => unknown };
+      }
+    ).ztoolkit = {
+      getGlobal: (name: string) => {
+        if (name !== "fetch") return undefined;
+        return async (_url: string, init?: RequestInit) => {
+          callCount += 1;
+          requestBodies.push(
+            JSON.parse(String(init?.body || "{}")) as Record<string, unknown>,
+          );
+          return {
+            ok: true,
+            status: 200,
+            statusText: "OK",
+            body: undefined,
+            json: async () => ({
+              candidates: [
+                {
+                  content: {
+                    parts:
+                      callCount === 1
+                        ? [
+                            {
+                              functionCall: {
+                                name: "query_library",
+                                args: { query: "methods" },
+                              },
+                            },
+                          ]
+                        : [
+                            {
+                              text:
+                                callCount === 2
+                                  ? "Premature comparison."
+                                  : "Corrected comparison.",
+                            },
+                          ],
+                  },
+                },
+              ],
+            }),
+            text: async () => "",
+          };
+        };
+      },
+    };
+
+    const request = makeRequest();
+    const messages: AgentModelMessage[] = [
+      { role: "user", content: "Compare these papers" },
+    ];
+    const firstStep = await adapter.runStep({ request, messages, tools });
+    assert.equal(firstStep.kind, "tool_calls");
+    if (firstStep.kind !== "tool_calls") return;
+    messages.push(firstStep.assistantMessage, {
+      role: "tool",
+      tool_call_id: firstStep.calls[0].id,
+      name: firstStep.calls[0].name,
+      content: '{"results":[{"itemId":101},{"itemId":102}]}',
+    });
+
+    const secondStep = await adapter.runStep({ request, messages, tools });
+    assert.equal(secondStep.kind, "final");
+    if (secondStep.kind !== "final") return;
+    messages.push(secondStep.assistantMessage, {
+      role: "user",
+      content: "Correction for this turn: retrieve body evidence first.",
+    });
+
+    await adapter.runStep({ request, messages, tools });
+
+    const thirdContents = requestBodies[2]?.contents as Array<{
+      role?: string;
+      parts?: Array<Record<string, unknown>>;
+    }>;
+    assert.deepEqual(
+      thirdContents.map((message) => message.role),
+      ["user", "model", "user", "model", "user"],
+    );
+    const functionResponses = thirdContents.flatMap(
+      (message) =>
+        message.parts?.map((part) => part.functionResponse).filter(Boolean) ||
+        [],
+    );
+    assert.lengthOf(functionResponses, 1);
+    assert.property(thirdContents[1]?.parts?.[0] || {}, "functionCall");
+    assert.property(thirdContents[2]?.parts?.[0] || {}, "functionResponse");
+    assert.equal(thirdContents[3]?.parts?.[0]?.text, "Premature comparison.");
+    assert.equal(
+      thirdContents[4]?.parts?.[0]?.text,
+      "Correction for this turn: retrieve body evidence first.",
     );
   });
 
