@@ -4489,7 +4489,9 @@ async function warmQuoteSourceCachesForPaperContexts(
           error,
         });
       }
-    } else {
+      if (options?.shouldContinue?.() === false) return;
+    }
+    if (!usesPdfPageText || paper.contentSourceMode === "mineru") {
       await ensureQuoteSourceTextCachedForPaper(paper);
     }
   }
@@ -4638,7 +4640,7 @@ const MAX_QUOTE_VALIDATION_DECISION_ENTRIES = 1000;
 const MAX_QUOTE_VALIDATION_DECISION_BYTES = 4 * 1024 * 1024;
 const MAX_QUOTE_SOURCE_INDEX_ENTRIES = 64;
 const MAX_QUOTE_SOURCE_INDEX_BYTES = 2 * 1024 * 1024;
-const QUOTE_VALIDATION_POLICY_VERSION = 7;
+const QUOTE_VALIDATION_POLICY_VERSION = 8;
 type QuoteValidationDecision = ReturnType<
   typeof finalizeAssistantQuoteCitations
 >;
@@ -4954,6 +4956,9 @@ async function applyAssistantMessageQuoteGate(
             entry.status === "matched"
               ? entry.certificate.sourceMatchPageOccurrence
               : "",
+            entry.status === "matched"
+              ? entry.certificate.sourceMatchKind || "exact"
+              : "",
           ].join("\u241f"),
         ),
       ].join("\u241e")
@@ -5058,6 +5063,8 @@ async function collectLivePdfQuoteSecondaryEvidence(params: {
       {
         yieldToMain: params.yieldToMain,
         shouldContinue: params.shouldContinue,
+        allowInlineMathLocator:
+          request.verificationMode === "inline-math-locator",
       },
     );
     if (verification.status === "matched") {

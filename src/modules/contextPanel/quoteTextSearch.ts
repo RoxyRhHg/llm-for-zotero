@@ -88,6 +88,85 @@ export type QuoteTextSearchQueryKind =
   | "raw-middle"
   | "progressive";
 
+export type PairedInlineMathQuote = {
+  proseSegments: string[];
+  mathSpanCount: number;
+};
+
+function isEscapedCharacter(value: string, index: number): boolean {
+  let backslashCount = 0;
+  for (
+    let cursor = index - 1;
+    cursor >= 0 && value[cursor] === "\\";
+    cursor--
+  ) {
+    backslashCount += 1;
+  }
+  return backslashCount % 2 === 1;
+}
+
+/**
+ * Split only well-formed inline Markdown/LaTeX math. Display math and
+ * malformed delimiters deliberately return null so callers cannot broaden a
+ * prose search by guessing which characters were intended to be mathematics.
+ */
+export function splitQuoteAtPairedInlineMath(
+  value: string,
+): PairedInlineMathQuote | null {
+  const proseSegments: string[] = [];
+  let proseStart = 0;
+  let mathSpanCount = 0;
+  let cursor = 0;
+
+  while (cursor < value.length) {
+    if (
+      value.startsWith("\\[", cursor) ||
+      value.startsWith("\\]", cursor) ||
+      value.startsWith("$$", cursor)
+    ) {
+      return null;
+    }
+
+    if (value.startsWith("\\)", cursor)) return null;
+    if (value.startsWith("\\(", cursor)) {
+      const close = value.indexOf("\\)", cursor + 2);
+      if (close < 0 || close === cursor + 2) return null;
+      proseSegments.push(value.slice(proseStart, cursor));
+      mathSpanCount += 1;
+      cursor = close + 2;
+      proseStart = cursor;
+      continue;
+    }
+
+    if (value[cursor] === "$" && !isEscapedCharacter(value, cursor)) {
+      let close = cursor + 1;
+      for (; close < value.length; close += 1) {
+        if (value[close] === "\n") return null;
+        if (
+          value[close] === "$" &&
+          !isEscapedCharacter(value, close) &&
+          value[close - 1] !== "$" &&
+          value[close + 1] !== "$"
+        ) {
+          break;
+        }
+      }
+      if (close >= value.length || close === cursor + 1) return null;
+      proseSegments.push(value.slice(proseStart, cursor));
+      mathSpanCount += 1;
+      cursor = close + 1;
+      proseStart = cursor;
+      continue;
+    }
+
+    cursor += 1;
+  }
+
+  if (!mathSpanCount) return null;
+  proseSegments.push(value.slice(proseStart));
+  return { proseSegments, mathSpanCount };
+}
+
 export type QuoteTextSearchQuery = {
   query: string;
   kind: QuoteTextSearchQueryKind;

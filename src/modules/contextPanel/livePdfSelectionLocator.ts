@@ -4,6 +4,7 @@ import { clearCitationPageCache } from "./citationNavigationCache";
 import {
   findLargestUniqueQuoteTextAnchorMatch,
   normalizeLocatorText,
+  splitQuoteAtPairedInlineMath,
   splitQuoteAtEllipsisInOrder,
   stripBoundaryEllipsis,
   summarizeQuoteTextSupport,
@@ -80,6 +81,7 @@ export type LivePdfQuoteCertificate = {
   pageIndex: number;
   pageLabel?: string;
   sourceMatchText: string;
+  sourceMatchKind: "exact" | "normalized-span";
   sourceMatchPageOccurrence: number;
 };
 
@@ -2147,10 +2149,127 @@ async function extractPageTextsFromViewer(
   }
 }
 
+type InlineMathPdfLocatorResult =
+  | {
+      status: "matched";
+      page: LivePdfPageText;
+      sourceMatchText: string;
+      sourceMatchPageOccurrence: number;
+    }
+  | { status: "ambiguous" }
+  | { status: "not-found" };
+
+function resolveInlineMathQuoteInCompletePdfPages(
+  pages: LivePdfPageText[],
+  indexes: QuoteTextIndex[],
+  quoteText: string,
+): InlineMathPdfLocatorResult {
+  const split = splitQuoteAtPairedInlineMath(quoteText);
+  if (!split) return { status: "not-found" };
+
+  const proseSegments = split.proseSegments
+    .map((segment) => segment.trim())
+    .filter((segment) => buildQuoteTextIndex(segment).tokens.length > 0);
+  const hasSubstantiveSegment = proseSegments.some((segment) => {
+    const segmentIndex = buildQuoteTextIndex(segment);
+    return (
+      segmentIndex.tokens.length >= 4 &&
+      normalizeLocatorText(segment).length >= 24
+    );
+  });
+  if (!proseSegments.length || !hasSubstantiveSegment) {
+    return { status: "not-found" };
+  }
+
+  type QuoteSpan = ReturnType<
+    typeof findQuoteSourceSpansAllowingLayoutArtifacts
+  >[number];
+  type Candidate = {
+    pageOrdinal: number;
+    sourceStart: number;
+    sourceEnd: number;
+    sourceMatchText: string;
+  };
+  const candidates = new Map<string, Candidate>();
+
+  for (let pageOrdinal = 0; pageOrdinal < pages.length; pageOrdinal += 1) {
+    const spansBySegment = proseSegments.map((segment) =>
+      findQuoteSourceSpansAllowingLayoutArtifacts(
+        indexes[pageOrdinal],
+        segment,
+      ),
+    );
+    if (spansBySegment.some((spans) => !spans.length)) continue;
+
+    let sequences: QuoteSpan[][] = [[]];
+    for (const spans of spansBySegment) {
+      const nextSequences: QuoteSpan[][] = [];
+      for (const sequence of sequences) {
+        const previous = sequence[sequence.length - 1];
+        for (const span of spans) {
+          if (previous && span.sourceStart < previous.sourceEnd) continue;
+          nextSequences.push([...sequence, span]);
+          if (nextSequences.length > 256) {
+            return { status: "ambiguous" };
+          }
+        }
+      }
+      sequences = nextSequences;
+      if (!sequences.length) break;
+    }
+
+    for (const sequence of sequences) {
+      const first = sequence[0];
+      const last = sequence[sequence.length - 1];
+      if (!first || !last || last.sourceEnd <= first.sourceStart) continue;
+      const sourceMatchText = normalizePageNativeFindControllerLiteral(
+        pages[pageOrdinal].text.slice(first.sourceStart, last.sourceEnd),
+        quoteText,
+      ).trim();
+      if (!sourceMatchText) continue;
+      const key = `${pageOrdinal}\u241f${first.sourceStart}\u241f${last.sourceEnd}`;
+      candidates.set(key, {
+        pageOrdinal,
+        sourceStart: first.sourceStart,
+        sourceEnd: last.sourceEnd,
+        sourceMatchText,
+      });
+    }
+  }
+
+  if (!candidates.size) return { status: "not-found" };
+  if (candidates.size !== 1) return { status: "ambiguous" };
+
+  const candidate = Array.from(candidates.values())[0];
+  const literalLocations = pages.flatMap((page, pageOrdinal) =>
+    findQuoteSourceSpansAllowingLayoutArtifacts(
+      indexes[pageOrdinal],
+      candidate.sourceMatchText,
+    ).map((span) => ({ page, pageOrdinal, span })),
+  );
+  if (literalLocations.length !== 1) {
+    return literalLocations.length
+      ? { status: "ambiguous" }
+      : { status: "not-found" };
+  }
+  const literalLocation = literalLocations[0];
+  if (literalLocation.pageOrdinal !== candidate.pageOrdinal) {
+    return { status: "ambiguous" };
+  }
+  return {
+    status: "matched",
+    page: literalLocation.page,
+    sourceMatchText: candidate.sourceMatchText,
+    sourceMatchPageOccurrence: literalLocation.span.occurrenceIndex,
+  };
+}
+
 /**
- * Verify a quote only against the loaded PDF.js document. This path is
+ * Verify a quote only against the loaded PDF.js document. The default path is
  * deliberately stricter than navigation: partial anchors are never accepted,
  * and a negative or unique verdict requires searchable text for every page.
+ * The opt-in inline-math mode supplies only a locator for wording that an
+ * independent context-text source has already verified in full.
  */
 export async function verifyCompleteQuoteInLivePdfJs(
   reader: any,
@@ -2159,6 +2278,7 @@ export async function verifyCompleteQuoteInLivePdfJs(
   options?: {
     yieldToMain?: () => Promise<void>;
     shouldContinue?: () => boolean;
+    allowInlineMathLocator?: boolean;
   },
 ): Promise<LivePdfQuoteVerification> {
   const itemId = Math.floor(Number(contextItemId));
@@ -2185,9 +2305,9 @@ export async function verifyCompleteQuoteInLivePdfJs(
       reason: "The loaded PDF.js document is not ready for verification.",
     };
   }
-  const verificationCacheKey = `${itemId}\u241f${documentFingerprint}\u241f${hashFindControllerQuery(
-    normalizeLocatorText(cleanQuote),
-  )}`;
+  const verificationCacheKey = `${itemId}\u241f${documentFingerprint}\u241f${
+    options?.allowInlineMathLocator ? "inline-math-locator" : "complete"
+  }\u241f${hashFindControllerQuery(normalizeLocatorText(cleanQuote))}`;
   const cachedVerification =
     livePdfQuoteVerificationCache.get(verificationCacheKey);
   if (cachedVerification) {
@@ -2230,6 +2350,40 @@ export async function verifyCompleteQuoteInLivePdfJs(
     ).map((span) => ({ page, span })),
   );
   if (!locations.length) {
+    if (options?.allowInlineMathLocator) {
+      const inlineMathLocation = resolveInlineMathQuoteInCompletePdfPages(
+        pages,
+        indexes,
+        cleanQuote,
+      );
+      if (inlineMathLocation.status === "ambiguous") {
+        return {
+          status: "defer",
+          reason:
+            "The non-math prose around the verified inline math does not identify one PDF location.",
+        };
+      }
+      if (inlineMathLocation.status === "matched") {
+        const matched: Extract<
+          LivePdfQuoteVerification,
+          { status: "matched" }
+        > = {
+          status: "matched",
+          certificate: {
+            contextItemId: itemId,
+            documentFingerprint,
+            pageIndex: inlineMathLocation.page.pageIndex,
+            pageLabel: inlineMathLocation.page.pageLabel,
+            sourceMatchText: inlineMathLocation.sourceMatchText,
+            sourceMatchKind: "normalized-span",
+            sourceMatchPageOccurrence:
+              inlineMathLocation.sourceMatchPageOccurrence,
+          },
+        };
+        cacheLivePdfQuoteVerification(verificationCacheKey, matched);
+        return matched;
+      }
+    }
     // A genuine quote that straddles a page break matches no single page.
     // Probe the text around each boundary before condemning the quote; a
     // boundary match cannot form a per-page navigation certificate, so it
@@ -2291,6 +2445,7 @@ export async function verifyCompleteQuoteInLivePdfJs(
       pageIndex: location.page.pageIndex,
       pageLabel: location.page.pageLabel,
       sourceMatchText,
+      sourceMatchKind: "exact",
       sourceMatchPageOccurrence: location.span.occurrenceIndex,
     },
   };

@@ -7,6 +7,7 @@ import {
   findLargestUniqueQuoteTextAnchorMatch,
   findUniqueQuoteTextSearchMatch,
   normalizeLocatorText,
+  splitQuoteAtPairedInlineMath,
   splitQuoteAtEllipsis,
   summarizeQuoteTextSupport,
 } from "../src/modules/contextPanel/quoteTextSearch";
@@ -32,6 +33,38 @@ describe("quoteTextSearch", function () {
     assert.equal(result.length, 2);
     assert.include(result[0], "Preparatory activity");
     assert.include(result[1], "neural basis");
+  });
+
+  it("splits paired inline math at the beginning, middle, and end", function () {
+    assert.deepEqual(
+      splitQuoteAtPairedInlineMath(
+        "\\(x\\) The surrounding prose remains a searchable source locator.",
+      )?.proseSegments,
+      ["", " The surrounding prose remains a searchable source locator."],
+    );
+    assert.deepEqual(
+      splitQuoteAtPairedInlineMath(
+        "The variance \\(\\sigma^2\\) remains a searchable source locator.",
+      )?.proseSegments,
+      ["The variance ", " remains a searchable source locator."],
+    );
+    assert.deepEqual(
+      splitQuoteAtPairedInlineMath(
+        "The surrounding prose remains searchable at $t + 1$",
+      )?.proseSegments,
+      ["The surrounding prose remains searchable at ", ""],
+    );
+  });
+
+  it("refuses malformed and display-math delimiters", function () {
+    for (const quote of [
+      "The result \\(x remains unresolved.",
+      "The result x\\) remains unresolved.",
+      "The result $$x$$ remains display math.",
+      "The result \\[x\\] remains display math.",
+    ]) {
+      assert.isNull(splitQuoteAtPairedInlineMath(quote), quote);
+    }
   });
 
   it("keeps a Unicode-hyphen quote as one complete FindController query", function () {

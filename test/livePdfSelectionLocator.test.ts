@@ -515,6 +515,179 @@ describe("livePdfSelectionLocator", function () {
     }
   });
 
+  it("locates an exact MinerU inline-math quote through unique PDF prose", async function () {
+    clearPageTextCache();
+    const restore = installPdfWorkerStub(async () => null);
+    const quote =
+      "Fisher information provides a lower bound on the variance \\(\\sigma_{\\hat{s}}^2\\) of any estimator.";
+    const pdfText =
+      "Fisher information provides a lower bound on the variance s^2 of any estimator.";
+    const reader = {
+      _item: { id: 6127 },
+      itemID: 6127,
+      _window: {
+        PDFViewerApplication: {
+          pdfDocument: {
+            numPages: 2,
+            fingerprints: ["inline-math-locator-pdf"],
+            getPage: async (pageNumber: number) => ({
+              getTextContent: async () => ({
+                items: [
+                  {
+                    str:
+                      pageNumber === 2
+                        ? pdfText
+                        : "Unrelated searchable first page.",
+                  },
+                ],
+              }),
+            }),
+          },
+        },
+      },
+    };
+
+    try {
+      const strict = await verifyCompleteQuoteInLivePdfJs(reader, 6127, quote);
+      assert.equal(strict.status, "absent");
+
+      const located = await verifyCompleteQuoteInLivePdfJs(
+        reader,
+        6127,
+        quote,
+        { allowInlineMathLocator: true },
+      );
+      assert.equal(located.status, "matched");
+      if (located.status !== "matched") return;
+      assert.equal(located.certificate.pageIndex, 1);
+      assert.equal(located.certificate.sourceMatchText, pdfText);
+      assert.equal(located.certificate.sourceMatchKind, "normalized-span");
+      assert.equal(located.certificate.sourceMatchPageOccurrence, 0);
+    } finally {
+      restore();
+    }
+  });
+
+  it("does not locate changed prose by ignoring inline math", async function () {
+    clearPageTextCache();
+    const restore = installPdfWorkerStub(async () => null);
+    const reader = {
+      _item: { id: 6128 },
+      itemID: 6128,
+      _window: {
+        PDFViewerApplication: {
+          pdfDocument: {
+            numPages: 1,
+            fingerprints: ["inline-math-prose-negative-pdf"],
+            getPage: async () => ({
+              getTextContent: async () => ({
+                items: [
+                  {
+                    str: "Fisher information provides a lower bound on the variance s^2 of any estimator.",
+                  },
+                ],
+              }),
+            }),
+          },
+        },
+      },
+    };
+
+    try {
+      const result = await verifyCompleteQuoteInLivePdfJs(
+        reader,
+        6128,
+        "Fisher information provides an upper bound on the variance \\(\\sigma_{\\hat{s}}^2\\) of any estimator.",
+        { allowInlineMathLocator: true },
+      );
+
+      assert.equal(result.status, "absent");
+    } finally {
+      restore();
+    }
+  });
+
+  it("defers when inline-math prose identifies more than one PDF location", async function () {
+    clearPageTextCache();
+    const restore = installPdfWorkerStub(async () => null);
+    const quote =
+      "Fisher information provides a lower bound on the variance \\(\\sigma_{\\hat{s}}^2\\) of any estimator.";
+    const reader = {
+      _item: { id: 6129 },
+      itemID: 6129,
+      _window: {
+        PDFViewerApplication: {
+          pdfDocument: {
+            numPages: 2,
+            fingerprints: ["inline-math-ambiguous-pdf"],
+            getPage: async (pageNumber: number) => ({
+              getTextContent: async () => ({
+                items: [
+                  {
+                    str: `Fisher information provides a lower bound on the variance ${pageNumber === 1 ? "s^2" : "v"} of any estimator.`,
+                  },
+                ],
+              }),
+            }),
+          },
+        },
+      },
+    };
+
+    try {
+      const result = await verifyCompleteQuoteInLivePdfJs(reader, 6129, quote, {
+        allowInlineMathLocator: true,
+      });
+
+      assert.equal(result.status, "defer");
+      if (result.status === "defer") {
+        assert.include(result.reason, "does not identify one PDF location");
+      }
+    } finally {
+      restore();
+    }
+  });
+
+  it("rejects malformed, display, and prose-poor math locator quotes", async function () {
+    clearPageTextCache();
+    const restore = installPdfWorkerStub(async () => null);
+    const reader = {
+      _item: { id: 6130 },
+      itemID: 6130,
+      _window: {
+        PDFViewerApplication: {
+          pdfDocument: {
+            numPages: 1,
+            fingerprints: ["inline-math-shape-negative-pdf"],
+            getPage: async () => ({
+              getTextContent: async () => ({
+                items: [{ str: "A result v follows." }],
+              }),
+            }),
+          },
+        },
+      },
+    };
+
+    try {
+      for (const quote of [
+        "A result \\(s^2 follows.",
+        "A result $$s^2$$ follows.",
+        "A result \\(s^2\\) follows.",
+      ]) {
+        const result = await verifyCompleteQuoteInLivePdfJs(
+          reader,
+          6130,
+          quote,
+          { allowInlineMathLocator: true },
+        );
+        assert.equal(result.status, "absent", quote);
+      }
+    } finally {
+      restore();
+    }
+  });
+
   it("returns absent when complete PDF.js text rejects a strong fabricated quote", async function () {
     clearPageTextCache();
     const restore = installPdfWorkerStub(async () => null);
@@ -1660,6 +1833,56 @@ describe("page-native scrollToExactQuoteInReader", function () {
 
       assert.isTrue(jump.matched, JSON.stringify(jump));
       assert.include(jump.queryUsed || "", "139");
+      assert.equal(jump.highlightCoverage, 1);
+    } finally {
+      restore();
+    }
+  });
+
+  it("uses a normalized inline-math certificate as a literal PDF locator", async function () {
+    clearPageTextCache();
+    const restore = installPdfWorkerStub(async () => null);
+    const quote =
+      "Fisher information provides a lower bound on the variance \\(\\sigma_{\\hat{s}}^2\\) of any estimator.";
+    const pdfText =
+      "Fisher information provides a lower bound on the variance s^2 of any estimator.";
+    const fixture = createExactFindControllerReader({
+      pageItems: [[{ str: pdfText }]],
+      targetPageIndex: 0,
+      fingerprint: "inline-math-navigation-pdf",
+    });
+    fixture.reader._item = { id: 6131 };
+    fixture.reader.itemID = 6131;
+
+    try {
+      const verification = await verifyCompleteQuoteInLivePdfJs(
+        fixture.reader,
+        6131,
+        quote,
+        { allowInlineMathLocator: true },
+      );
+      assert.equal(
+        verification.status,
+        "matched",
+        JSON.stringify(verification),
+      );
+      if (verification.status !== "matched") return;
+      assert.equal(verification.certificate.sourceMatchKind, "normalized-span");
+
+      const jump = await scrollToExactQuoteInReader(
+        fixture.reader,
+        verification.certificate.sourceMatchText,
+        {
+          expectedPageIndex: verification.certificate.pageIndex,
+          sourceFingerprint: `pdfjs:${verification.certificate.documentFingerprint}`,
+          sourceMatchPageOccurrence:
+            verification.certificate.sourceMatchPageOccurrence,
+          verifiedFullSpan: false,
+        },
+      );
+
+      assert.isTrue(jump.matched, JSON.stringify(jump));
+      assert.equal(jump.queryUsed, pdfText);
       assert.equal(jump.highlightCoverage, 1);
     } finally {
       restore();
