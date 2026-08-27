@@ -2,6 +2,7 @@ import { assert } from "chai";
 import {
   __setMarkdownParserDisabledForTest,
   normalizeBlockBoundaries,
+  renderMathPreviewHtml,
   renderMarkdown,
   renderMarkdownForNote,
 } from "../src/utils/markdown";
@@ -610,6 +611,67 @@ describe("renderMarkdown with inline block tokens", function () {
       '<annotation encoding="application/x-tex">x</annotation>',
     );
     assert.include(html, " costs $5 in the toy example.");
+  });
+
+  it("renders the reported Fisher-information equation in a math-only preview", function () {
+    const input =
+      "Fisher information provides a lower bound on the variance \\(\\sigma_{\\hat{s}}^2\\) of any estimator.";
+    const html = renderMathPreviewHtml(input);
+
+    assert.include(
+      html,
+      '<annotation encoding="application/x-tex">\\sigma_{\\hat{s}}^2</annotation>',
+    );
+    assert.notInclude(html, "\\(\\sigma");
+    assert.include(html, "Fisher information provides a lower bound");
+    assert.include(html, "of any estimator.");
+  });
+
+  it("renders every supported math delimiter in preview prose", function () {
+    const html = renderMathPreviewHtml(
+      "$a$ begins, \\(b\\) is inline, $$c$$ is displayed, and ends with \\[d\\]",
+    );
+
+    for (const math of ["a", "b", "c", "d"]) {
+      assert.include(
+        html,
+        `<annotation encoding="application/x-tex">${math}</annotation>`,
+      );
+    }
+    assert.equal((html.match(/class="math-inline"/g) || []).length, 2);
+    assert.equal((html.match(/class="math-display-inline"/g) || []).length, 2);
+  });
+
+  it("keeps non-math preview content literal and safe", function () {
+    const input =
+      "**literal emphasis** <img src=x onerror=alert(1)> `$code$` ```\\(fenced\\)``` and $5 plus $10.";
+    const html = renderMathPreviewHtml(input);
+
+    assert.include(html, "**literal emphasis**");
+    assert.include(html, "&lt;img src=x onerror=alert(1)&gt;");
+    assert.include(html, "`$code$`");
+    assert.include(html, "```\\(fenced\\)```");
+    assert.include(html, "$5 plus $10");
+    assert.notInclude(html, "<strong>");
+    assert.notInclude(html, "<img");
+    assert.notInclude(html, "application/x-tex");
+  });
+
+  it("leaves unmatched delimiters and invalid LaTeX literal in previews", function () {
+    const unmatched = "The estimate \\(\\hat{s} is incomplete.";
+    const invalid = "The estimate \\(\\frac{\\) is invalid.";
+    const unmatchedDisplay = "Unmatched $$x; valid $y$.";
+    const escapedDisplay = "Escaped \\$$x$$ stays literal.";
+
+    assert.equal(renderMathPreviewHtml(unmatched), unmatched);
+    assert.equal(renderMathPreviewHtml(invalid), invalid);
+    assert.equal(renderMathPreviewHtml(escapedDisplay), escapedDisplay);
+    const displayHtml = renderMathPreviewHtml(unmatchedDisplay);
+    assert.include(displayHtml, "Unmatched $$x; valid ");
+    assert.include(
+      displayHtml,
+      '<annotation encoding="application/x-tex">y</annotation>',
+    );
   });
 
   it("renders nested lists without flattening child items", function () {

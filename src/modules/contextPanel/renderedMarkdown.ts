@@ -1,6 +1,7 @@
 import { config } from "../../../package.json";
 import {
   buildSafeSvgMarkup,
+  renderMathPreviewHtml,
   renderMarkdown,
   renderMarkdownWithLegacyParser,
 } from "../../utils/markdown";
@@ -2321,6 +2322,17 @@ export function attachRenderedCopyButtons(
     } else {
       copyable.insertBefore(button, copyable.firstChild);
     }
+  }
+}
+
+export function renderRenderedMathPreviewInto(
+  target: HTMLElement,
+  text: string,
+  doc: Document,
+): void {
+  const safeText = sanitizeText(text);
+  if (!setRenderedMarkdownHtml(target, renderMathPreviewHtml(safeText), doc)) {
+    target.textContent = safeText;
   }
 }
 

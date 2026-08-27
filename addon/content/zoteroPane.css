@@ -7065,6 +7065,16 @@ label.llm-search-results-item:hover {
   -webkit-line-clamp: 2;
 }
 
+.llm-quote-card-preview .math-display-inline,
+.llm-quote-card-preview .katex-display {
+  display: inline;
+  margin: 0;
+}
+
+.llm-quote-card-preview .katex {
+  font-size: 1em;
+}
+
 .llm-quote-card-citation {
   display: flex;
   justify-content: flex-end;
