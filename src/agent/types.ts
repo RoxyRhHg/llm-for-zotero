@@ -14,6 +14,7 @@ import type {
   SelectedTextSource,
   TagContextRef,
 } from "../shared/types";
+import type { WebSourceAnchor } from "../webAccess/types";
 import type {
   ChatMessage,
   ReasoningConfig as LLMReasoningConfig,
@@ -285,6 +286,11 @@ export type ToolSpec = {
    * shell commands, or direct Zotero scripts.
    */
   tier?: "normal" | "advanced";
+  /**
+   * Advertise the tool only to the in-plugin Agent runtime. External bridges,
+   * MCP, and public tool catalogs must not expose it.
+   */
+  localAgentOnly?: boolean;
 };
 
 export type AgentEvent =
@@ -372,7 +378,12 @@ export type AgentEvent =
     }
   | { type: "context_compacted"; automatic?: boolean }
   | { type: "fallback"; reason: string }
-  | { type: "final"; text: string; answerStartedAt?: number };
+  | {
+      type: "final";
+      text: string;
+      answerStartedAt?: number;
+      webSourceAnchors?: WebSourceAnchor[];
+    };
 
 export type AgentRunStatus = "running" | "completed" | "failed" | "cancelled";
 
@@ -788,6 +799,16 @@ export type AgentToolPresentation = {
     args: unknown;
     request?: AgentTraceRequestSummary;
   }) => AgentTraceChip[];
+  buildTraceDetails?: (params: {
+    args: unknown;
+    content?: unknown;
+  }) => AgentTraceDetail[];
+  /** Merge a successful result into its expandable call row in the trace. */
+  mergeResultIntoCallTrace?: boolean;
+  buildTraceSummary?: (params: {
+    args: unknown;
+    content?: unknown;
+  }) => string | null;
   /**
    * When provided, the agent trace renders a read-only card list below the
    * tool's success row. Return `null` or an empty array to suppress cards.

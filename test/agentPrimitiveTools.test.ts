@@ -682,7 +682,8 @@ describe("primitive agent tools", function () {
     assert.include(systemText, "paper_read");
     assert.include(systemText, "library_update");
     assert.include(systemText, "use workflow:'answer' and answer in chat");
-    assert.notInclude(systemText, "web_search");
+    assert.include(systemText, "web_search");
+    assert.include(systemText, "web_read");
     assert.notInclude(systemText, "search_literature_online");
     assert.notInclude(systemText, "query_library");
     assert.notInclude(systemText, "search_related_papers_online");

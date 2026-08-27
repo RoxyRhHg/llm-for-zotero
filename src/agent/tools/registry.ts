@@ -189,7 +189,10 @@ export class AgentToolRegistry {
 
   listTools(): ToolSpec[] {
     return Array.from(this.tools.values())
-      .filter((tool) => this.isModelVisibleTool(tool))
+      .filter(
+        (tool) =>
+          this.isModelVisibleTool(tool) && tool.spec.localAgentOnly !== true,
+      )
       .map((tool) => tool.spec);
   }
 

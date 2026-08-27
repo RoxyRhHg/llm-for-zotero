@@ -117,6 +117,11 @@ import {
   isConversationWriteGenerationCurrent,
   withConversationWriteLock,
 } from "../shared/conversationWriteFence";
+import {
+  assessWebAttribution,
+  type WebAttributionAssessment,
+} from "../webAccess/attribution";
+import { clearWebSourcesForRun } from "../webAccess/runSources";
 
 const TOOL_RESULT_READ_TOOL_NAME = "tool_result_read";
 
@@ -823,6 +828,7 @@ export class AgentRuntime {
       request.conversationKey,
       request.localDocuments,
     );
+    let webSourceRunId: string | undefined;
     try {
       const latestPriorRun = await getLatestAgentRunForConversation(
         request.conversationKey,
@@ -833,6 +839,7 @@ export class AgentRuntime {
           ? latestPriorRun
           : null;
       const runId = createRunId();
+      webSourceRunId = runId;
       const adapter = this.adapterFactory(request);
       const adapterCapabilities = adapter.getCapabilities(request);
       const eventStreamRedactor = new AgentEventLocalDocumentStreamRedactor(
@@ -1291,6 +1298,7 @@ export class AgentRuntime {
         intent.isBulkOperation,
       );
       let shallowLibraryCorrectionUsed = false;
+      let webAttributionCorrectionUsed = false;
       const shouldFlushStreamBuffer = (value: string): boolean => {
         if (!value) return false;
         if (value.length >= 8) return true;
@@ -1299,7 +1307,10 @@ export class AgentRuntime {
       const completeRun = async (
         finalText: string,
         status: "completed" | "failed" = "completed",
-        options: { emitFinalEvent?: boolean } = {},
+        options: {
+          emitFinalEvent?: boolean;
+          webAttribution?: WebAttributionAssessment;
+        } = {},
       ): Promise<AgentRuntimeOutcome> => {
         const redactedFinalText =
           turnPathRedactor.redactTerminalText(finalText);
@@ -1307,6 +1318,12 @@ export class AgentRuntime {
           await emit({
             type: "final",
             text: redactedFinalText,
+            ...(options.webAttribution?.status === "valid" &&
+            options.webAttribution.anchors.length
+              ? {
+                  webSourceAnchors: options.webAttribution.anchors,
+                }
+              : {}),
           });
         }
         await persistIfLive(() =>
@@ -1356,16 +1373,9 @@ export class AgentRuntime {
       const emitFinalStep = async (
         step: Extract<AgentModelStep, { kind: "final" }>,
         stepStreamedText: string,
+        webAttribution: WebAttributionAssessment,
       ): Promise<AgentRuntimeOutcome> => {
-        const returnedText = step.text || "";
-        const streamedTextOffset = stepStreamedText
-          ? returnedText.indexOf(stepStreamedText)
-          : -1;
-        const modelFinalText = stepStreamedText
-          ? streamedTextOffset >= 0
-            ? returnedText.slice(streamedTextOffset)
-            : stepStreamedText
-          : returnedText || currentAnswerText || "No response.";
+        const modelFinalText = webAttribution.cleanText;
         const contractedCapabilities = new Set(
           request.actionContract?.obligations.map(
             (obligation) => obligation.capability,
@@ -1404,14 +1414,11 @@ export class AgentRuntime {
           }
         }
         newTranscriptMessages.push(
-          receiptStatus
-            ? { role: "assistant", content: finalText }
-            : (step.assistantMessage ?? {
-                role: "assistant",
-                content: finalText,
-              }),
+          step.assistantMessage
+            ? { ...step.assistantMessage, content: finalText }
+            : { role: "assistant", content: finalText },
         );
-        return completeRun(finalText, "completed");
+        return completeRun(finalText, "completed", { webAttribution });
       };
       const runModelStep = async (
         round: number,
@@ -2173,7 +2180,48 @@ export class AgentRuntime {
                 continue;
               }
             }
-            return emitFinalStep(step, stepStreamedText);
+            const returnedText = step.text || "";
+            const streamedTextOffset = stepStreamedText
+              ? returnedText.indexOf(stepStreamedText)
+              : -1;
+            const rawModelFinalText = stepStreamedText
+              ? streamedTextOffset >= 0
+                ? returnedText.slice(streamedTextOffset)
+                : stepStreamedText
+              : returnedText || currentAnswerText || "No response.";
+            const webAttribution = assessWebAttribution(
+              turnPathRedactor.redactTerminalText(rawModelFinalText),
+              toolExecutionRecords,
+            );
+            if (webAttribution.status === "invalid") {
+              await rollbackCommittedStreamedText(stepStreamedText);
+              if (!webAttributionCorrectionUsed && segmentRound < maxRounds) {
+                webAttributionCorrectionUsed = true;
+                const assistantCorrectionMessage: AgentModelMessage = {
+                  role: "assistant",
+                  content: webAttribution.cleanText,
+                };
+                const userCorrectionMessage: AgentModelMessage = {
+                  role: "user",
+                  content: webAttribution.correctionPrompt,
+                };
+                messages.push(
+                  assistantCorrectionMessage,
+                  userCorrectionMessage,
+                );
+                continuationMessages.push(userCorrectionMessage);
+                newTranscriptMessages.push(
+                  assistantCorrectionMessage,
+                  userCorrectionMessage,
+                );
+                continue;
+              }
+              return completeRun(
+                "I used web access for this task, but could not safely attach valid paragraph-level sources to the answer.",
+                "failed",
+              );
+            }
+            return emitFinalStep(step, stepStreamedText, webAttribution);
           }
 
           // The step returned tool_calls, not a final answer.  Any text the
@@ -2276,6 +2324,7 @@ export class AgentRuntime {
         segment += 1;
       }
     } finally {
+      if (webSourceRunId) clearWebSourcesForRun(webSourceRunId);
       pathLease.release();
     }
   }

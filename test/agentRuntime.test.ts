@@ -25,6 +25,9 @@ import { AgentToolRegistry } from "../src/agent/tools/registry";
 import { ActionContractService } from "../src/agent/contracts/actionContract";
 import { createToolResultReadTool } from "../src/agent/tools/read/toolResultRead";
 import { createFileIOTool } from "../src/agent/tools/write/fileIO";
+import { createWebSearchTool } from "../src/agent/tools/read/webSearch";
+import { TAVILY_API_KEY_PREF } from "../src/webAccess/prefs";
+import type { WebAccessProvider } from "../src/webAccess/types";
 import {
   MAX_AGENT_ROUNDS,
   MAX_AGENT_TOOL_CALLS_PER_ROUND,
@@ -4384,6 +4387,234 @@ describe("AgentRuntime", function () {
       assert.isAtLeast(resetCount, 1);
       assert.notInclude(JSON.stringify(inspectedMessages), "B".repeat(1000));
       assert.include(JSON.stringify(inspectedMessages), "current request");
+    } finally {
+      restoreDb();
+    }
+  });
+});
+
+describe("web attribution runtime guard", function () {
+  beforeEach(function () {
+    clearAgentReadLedger();
+    clearAgentCoverageLedger();
+    clearAgentTranscriptStore();
+    clearAgentToolResultHandleStore();
+  });
+
+  const capabilities: AgentModelCapabilities = {
+    streaming: false,
+    toolCalls: true,
+    multimodal: false,
+    fileInputs: false,
+    reasoning: true,
+  };
+
+  const provider: WebAccessProvider = {
+    search: async (request) => ({
+      provider: "tavily",
+      query: request.query,
+      depth: request.depth,
+      topic: request.topic,
+      results: [
+        {
+          sourceId: "provider-source",
+          url: "https://example.com/current",
+          hostname: "example.com",
+          organization: "Example",
+          title: "Current facts",
+          snippet: "A current fact",
+        },
+      ],
+      usage: { credits: 1 },
+    }),
+    read: async (request) => ({
+      provider: "tavily",
+      query: request.query,
+      depth: request.depth,
+      pages: [],
+      failedResults: [],
+      usage: { credits: 0 },
+    }),
+    getUsage: async () => ({
+      key: { usage: 0, limit: 1000, searchUsage: 0, extractUsage: 0 },
+      account: {
+        currentPlan: "Free",
+        planUsage: 0,
+        planLimit: 1000,
+        paygoUsage: 0,
+        paygoLimit: 0,
+      },
+    }),
+  };
+
+  const searchStep: AgentModelStep = {
+    kind: "tool_calls",
+    calls: [
+      {
+        id: "web-call-1",
+        name: "web_search",
+        arguments: { query: "current fact" },
+      },
+    ],
+    assistantMessage: {
+      role: "assistant",
+      content: "",
+      tool_calls: [
+        {
+          id: "web-call-1",
+          name: "web_search",
+          arguments: { query: "current fact" },
+        },
+      ],
+    },
+  };
+
+  function findSourceId(messages: AgentModelMessage[]): string {
+    for (const message of messages) {
+      if (message.role !== "tool" || message.name !== "web_search") continue;
+      const content = JSON.parse(String(message.content)) as {
+        results?: Array<{ sourceId?: string }>;
+      };
+      const sourceId = content.results?.[0]?.sourceId;
+      if (sourceId) return sourceId;
+    }
+    throw new Error("Missing web source ID in mock model context");
+  }
+
+  it("allows one correction, persists clean Markdown, and stores terminal anchors", async function () {
+    const restoreDb = installMockDb();
+    try {
+      Zotero.Prefs.set(TAVILY_API_KEY_PREF, "tvly-test", true);
+      const registry = new AgentToolRegistry();
+      registry.register(createWebSearchTool(() => provider));
+      let step = 0;
+      const modelInputs: AgentModelMessage[][] = [];
+      const runtime = new AgentRuntime({
+        registry,
+        adapterFactory: () => ({
+          getCapabilities: () => capabilities,
+          supportsTools: () => true,
+          async runStep(params: AgentStepParams): Promise<AgentModelStep> {
+            modelInputs.push(params.messages.slice());
+            step += 1;
+            if (step === 1) return searchStep;
+            if (step === 2) {
+              return {
+                kind: "final",
+                text: "An unsupported current claim.",
+                assistantMessage: {
+                  role: "assistant",
+                  content: "An unsupported current claim.",
+                },
+              };
+            }
+            const sourceId = findSourceId(params.messages);
+            const text = `A supported current claim.<!--llm-web-source:${sourceId}-->`;
+            return {
+              kind: "final",
+              text,
+              assistantMessage: { role: "assistant", content: text },
+            };
+          },
+        }),
+      });
+      const events: AgentEvent[] = [];
+      const outcome = await runtime.runTurn({
+        request: {
+          conversationKey: 921,
+          mode: "agent",
+          userText: "What is current?",
+          model: "gpt-4o-mini",
+          apiBase: "https://api.openai.com/v1/chat/completions",
+          apiKey: "test",
+          authMode: "api_key",
+        },
+        onEvent: (event) => events.push(event),
+      });
+
+      assert.equal(outcome.kind, "completed");
+      if (outcome.kind !== "completed") return;
+      assert.equal(outcome.text, "A supported current claim.");
+      assert.lengthOf(modelInputs, 3);
+      const correction = modelInputs[2].find(
+        (message) =>
+          message.role === "user" &&
+          typeof message.content === "string" &&
+          message.content.includes("Correct the web attribution"),
+      );
+      assert.exists(correction);
+      const finalEvent = events.findLast(
+        (event): event is Extract<AgentEvent, { type: "final" }> =>
+          event.type === "final",
+      );
+      assert.equal(finalEvent?.text, "A supported current claim.");
+      assert.lengthOf(finalEvent?.webSourceAnchors || [], 1);
+      assert.equal(
+        finalEvent?.webSourceAnchors?.[0].offset,
+        outcome.text.length,
+      );
+      assert.notInclude(outcome.text, "llm-web-source");
+      const transcript = readPersistedTranscript(restoreDb, 921);
+      const finalAssistant = transcript.findLast(
+        (message) => message.role === "assistant",
+      );
+      assert.equal(finalAssistant?.content, "A supported current claim.");
+    } finally {
+      restoreDb();
+    }
+  });
+
+  it("fails closed after a second invalid attribution response", async function () {
+    const restoreDb = installMockDb();
+    try {
+      Zotero.Prefs.set(TAVILY_API_KEY_PREF, "tvly-test", true);
+      const registry = new AgentToolRegistry();
+      registry.register(createWebSearchTool(() => provider));
+      const runtime = new AgentRuntime({
+        registry,
+        adapterFactory: () =>
+          new MockAdapter(
+            [
+              searchStep,
+              {
+                kind: "final",
+                text: "First uncited claim.",
+                assistantMessage: {
+                  role: "assistant",
+                  content: "First uncited claim.",
+                },
+              },
+              {
+                kind: "final",
+                text: "Second uncited claim.",
+                assistantMessage: {
+                  role: "assistant",
+                  content: "Second uncited claim.",
+                },
+              },
+            ],
+            capabilities,
+          ),
+      });
+      const outcome = await runtime.runTurn({
+        request: {
+          conversationKey: 922,
+          mode: "agent",
+          userText: "What is current?",
+          model: "gpt-4o-mini",
+          apiBase: "https://api.openai.com/v1/chat/completions",
+          apiKey: "test",
+          authMode: "api_key",
+        },
+      });
+
+      assert.equal(outcome.kind, "completed");
+      if (outcome.kind !== "completed") return;
+      assert.include(outcome.text, "could not safely attach valid");
+      const run = restoreDb.runs.get(outcome.runId);
+      assert.equal(run?.status, "failed");
+      assert.notInclude(outcome.text, "First uncited claim");
+      assert.notInclude(outcome.text, "Second uncited claim");
     } finally {
       restoreDb();
     }

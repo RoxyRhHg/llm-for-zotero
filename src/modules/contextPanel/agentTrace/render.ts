@@ -45,6 +45,7 @@ import {
   buildToolResultTraceInfo,
   type ToolResultTraceInfo,
 } from "./toolResultTraceInfo";
+import { stripWebSourceMarkersForDisplay } from "../../../webAccess/attribution";
 
 type AgentTraceSummaryKind = "plan" | "tool" | "ok" | "skip" | "done";
 
@@ -212,7 +213,9 @@ export function buildAgentTraceMarkdownForRender(
           message?.quoteCitations,
       };
   return buildQuoteDisplayMarkdown({
-    markdown: sanitizeText(display.markdown || text || ""),
+    markdown: stripWebSourceMarkersForDisplay(
+      sanitizeText(display.markdown || text || ""),
+    ),
     quoteCitations: display.quoteCitations,
   });
 }
@@ -3459,22 +3462,55 @@ function appendLegacyAgentTraceEvent(
       return true;
     }
     case "tool_call": {
+      const resultEvent = ctx.toolResultsByCallId.get(entry.payload.callId);
       const resultInfo = buildToolResultTraceInfo(
         entry.payload.name,
-        ctx.toolResultsByCallId.get(entry.payload.callId),
+        resultEvent,
       );
-      const details = [
-        ...buildAgentTraceArgsDetails(entry.payload.name, entry.payload.args),
-        ...(resultInfo?.details || []),
-      ];
+      let presentationDetails: AgentTraceDetail[] = [];
+      if (resultEvent) {
+        try {
+          presentationDetails =
+            getToolDefinition(
+              entry.payload.name,
+            )?.presentation?.buildTraceDetails?.({
+              args: entry.payload.args,
+              content: resultEvent.content,
+            }) ?? [];
+        } catch {
+          presentationDetails = [];
+        }
+      }
+      const details = presentationDetails.length
+        ? presentationDetails
+        : [
+            ...buildAgentTraceArgsDetails(
+              entry.payload.name,
+              entry.payload.args,
+            ),
+            ...(resultInfo?.details || []),
+          ];
+      const presentation = getToolDefinition(entry.payload.name)?.presentation;
+      let row = summarizeAgentTraceToolCall(
+        entry.payload.name,
+        entry.payload.args,
+        ctx.requestSummary,
+        resultInfo || undefined,
+      );
+      if (resultEvent?.ok && presentation?.buildTraceSummary) {
+        try {
+          const summary = presentation.buildTraceSummary({
+            args: entry.payload.args,
+            content: resultEvent.content,
+          });
+          if (summary) row = { ...row, text: summary };
+        } catch {
+          // Keep the regular call summary when display-only formatting fails.
+        }
+      }
       ctx.items.push({
         type: "action",
-        row: summarizeAgentTraceToolCall(
-          entry.payload.name,
-          entry.payload.args,
-          ctx.requestSummary,
-          resultInfo || undefined,
-        ),
+        row,
         chips: buildAgentTraceToolChips(
           entry.payload.name,
           entry.payload.args,
@@ -3490,6 +3526,13 @@ function appendLegacyAgentTraceEvent(
       appendReasoningTraceItem(ctx, entry.payload);
       return true;
     case "tool_result": {
+      if (
+        entry.payload.ok &&
+        getToolDefinition(entry.payload.name)?.presentation
+          ?.mergeResultIntoCallTrace
+      ) {
+        return true;
+      }
       const row = summarizeAgentTraceToolResult(
         entry.payload.name,
         entry.payload.ok,

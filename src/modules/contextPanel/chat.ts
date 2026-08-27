@@ -335,6 +335,15 @@ import {
   mergeToolActivityPayload,
 } from "./agentTrace/toolActivityDedupe";
 import { renderRenderedMarkdownInto } from "./renderedMarkdown";
+import {
+  getWebSourceAnchorsFromTrace,
+  stripWebSourceMarkersForDisplay,
+} from "../../webAccess/attribution";
+import type { WebSourceAnchor } from "../../webAccess/types";
+import {
+  decorateWebSourceIndicators,
+  injectWebSourceAnchorTokens,
+} from "./webSourceIndicators";
 import { toFileUrl } from "../../utils/pathFileUrl";
 import { replaceOwnerAttachmentRefs } from "../../utils/attachmentRefStore";
 import { getNotesDirectoryConfig } from "../../utils/notesDirectoryConfig";
@@ -2505,10 +2514,14 @@ export function getReasoningOptions(
 
 export function buildAssistantDisplayMarkdownForRender(
   message: Pick<Message, "text" | "quoteCitations" | "quoteDisplayOverride">,
+  webSourceAnchors: readonly WebSourceAnchor[] = [],
 ): string {
   const display = getMessageQuoteDisplay(message);
   return buildQuoteDisplayMarkdown({
-    markdown: sanitizeText(display.markdown),
+    markdown: injectWebSourceAnchorTokens(
+      stripWebSourceMarkersForDisplay(sanitizeText(display.markdown)),
+      webSourceAnchors,
+    ),
     quoteCitations: display.quoteCitations,
   });
 }
@@ -12502,6 +12515,7 @@ export function refreshChat(
       const traceEvents = cachedTraceEvents.length
         ? cachedTraceEvents
         : msg.pendingAgentTraceEvents || [];
+      const webSourceAnchors = getWebSourceAnchorsFromTrace(traceEvents);
       let agentUsesInterleavedText = false;
       const agentTraceEl =
         msg.runMode === "agent" && !msg.compactMarker
@@ -12522,7 +12536,10 @@ export function refreshChat(
             })
           : null;
       if (hasAnswerText && !agentUsesInterleavedText) {
-        const safeText = buildAssistantDisplayMarkdownForRender(msg);
+        const safeText = buildAssistantDisplayMarkdownForRender(
+          msg,
+          webSourceAnchors,
+        );
         if (msg.streaming) bubble.classList.add("streaming");
         if (msg.compactMarker) {
           renderCompactMarkerInto(
@@ -12547,6 +12564,7 @@ export function refreshChat(
             ztoolkit.log("LLM render error:", err);
             bubble.textContent = safeText;
           }
+        decorateWebSourceIndicators(bubble, doc, webSourceAnchors);
       }
 
       const bubbleHeaderNodes: HTMLElement[] = [];

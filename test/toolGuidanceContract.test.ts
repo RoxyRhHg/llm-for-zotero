@@ -83,7 +83,6 @@ describe("tool guidance contracts", function () {
       label: "search_literature_online(mode:...)",
       pattern: /search_literature_online\(mode:/,
     },
-    { label: "web_search", pattern: /\bweb_search\b/ },
     {
       label: "import_identifiers(identifiers:...)",
       pattern: /import_identifiers\(identifiers:/,

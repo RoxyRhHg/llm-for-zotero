@@ -1,0 +1,296 @@
+import { assert } from "chai";
+import { AgentToolRegistry } from "../src/agent/tools/registry";
+import {
+  createWebSearchTool,
+  validateWebSearchInput,
+} from "../src/agent/tools/read/webSearch";
+import {
+  createWebReadTool,
+  validateWebReadInput,
+} from "../src/agent/tools/read/webRead";
+import { clearWebSourcesForRun } from "../src/webAccess/runSources";
+import {
+  getTavilyApiKey,
+  hasTavilyApiKey,
+  setTavilyApiKey,
+} from "../src/webAccess/prefs";
+import type { WebAccessProvider } from "../src/webAccess/types";
+import type { AgentToolContext } from "../src/agent/types";
+
+describe("web access agent tools", function () {
+  const originalZotero = globalThis.Zotero;
+
+  afterEach(function () {
+    clearWebSourcesForRun("run-web-tools");
+    (globalThis as typeof globalThis & { Zotero?: typeof Zotero }).Zotero =
+      originalZotero;
+  });
+
+  function context(
+    authMode: AgentToolContext["request"]["authMode"] = "api_key",
+  ) {
+    return {
+      request: {
+        conversationKey: 1,
+        mode: "agent" as const,
+        userText: "Find current information",
+        authMode,
+      },
+      runId: "run-web-tools",
+      item: null,
+      currentAnswerText: "",
+      modelName: "test-model",
+    } satisfies AgentToolContext;
+  }
+
+  function provider(): WebAccessProvider {
+    return {
+      search: async (request) => ({
+        provider: "tavily",
+        query: request.query,
+        depth: request.depth,
+        topic: request.topic,
+        results: [
+          {
+            sourceId: "provider-id",
+            url: "https://example.com/report",
+            hostname: "example.com",
+            organization: "Example",
+            title: "Report",
+            snippet: "Search passage",
+          },
+        ],
+        usage: { credits: request.depth === "advanced" ? 2 : 1 },
+      }),
+      read: async (request) => ({
+        provider: "tavily",
+        query: request.query,
+        depth: request.depth,
+        pages: [
+          {
+            sourceId: "provider-read-id",
+            url: request.urls[0],
+            hostname: "example.com",
+            organization: "Example",
+            title: "Report",
+            content: "Focused passage",
+          },
+        ],
+        failedResults: [],
+        usage: { credits: 1 },
+      }),
+      getUsage: async () => ({
+        provider: "tavily",
+        plan: "Free",
+        credential: { usage: 0, limit: 1000 },
+        monthly: { usage: 0, limit: 1000 },
+        breakdown: { searchCredits: 0, readCredits: 0 },
+        payAsYouGo: { usage: 0, limit: 0 },
+      }),
+    };
+  }
+
+  it("validates search depth, filters, limits, and dates", function () {
+    const valid = validateWebSearchInput({
+      query: "  current topic  ",
+      depth: "advanced",
+      topic: "finance",
+      maxResults: 10,
+      startDate: "2026-01-01",
+      endDate: "2026-08-01",
+      includeDomains: ["example.com", "example.com"],
+    });
+    assert.isTrue(valid.ok);
+    if (valid.ok) {
+      assert.equal(valid.value.query, "current topic");
+      assert.equal(valid.value.depth, "advanced");
+      assert.deepEqual(valid.value.includeDomains, ["example.com"]);
+    }
+    assert.isFalse(validateWebSearchInput({ query: "x", depth: "deep" }).ok);
+    assert.isFalse(validateWebSearchInput({ query: "x", topic: "social" }).ok);
+    assert.isFalse(
+      validateWebSearchInput({
+        query: "x",
+        includeDomains: ["127.0.0.1"],
+      }).ok,
+    );
+    assert.isFalse(validateWebSearchInput({ query: "x", maxResults: 11 }).ok);
+    assert.isFalse(
+      validateWebSearchInput({
+        query: "x",
+        timeRange: "week",
+        startDate: "2026-01-01",
+      }).ok,
+    );
+    assert.isFalse(
+      validateWebSearchInput({
+        query: "x",
+        startDate: "2026-09-01",
+        endDate: "2026-01-01",
+      }).ok,
+    );
+  });
+
+  it("validates read limits and public URLs", function () {
+    assert.isTrue(
+      validateWebReadInput({
+        urls: ["https://example.com/a"],
+        query: "specific detail",
+      }).ok,
+    );
+    assert.isFalse(
+      validateWebReadInput({
+        urls: ["http://127.0.0.1/private"],
+        query: "specific detail",
+      }).ok,
+    );
+    assert.isFalse(
+      validateWebReadInput({
+        urls: ["https://example.com/a"],
+        query: "specific detail",
+        depth: "deep",
+      }).ok,
+    );
+    assert.isFalse(
+      validateWebReadInput({
+        urls: Array.from(
+          { length: 6 },
+          (_, index) => `https://example.com/${index}`,
+        ),
+        query: "specific detail",
+      }).ok,
+    );
+  });
+
+  it("keeps source IDs stable within a run and restricts reads to search results", async function () {
+    const fakeProvider = provider();
+    const search = createWebSearchTool(() => fakeProvider);
+    const read = createWebReadTool(() => fakeProvider);
+    const searchResult = await search.execute(
+      {
+        query: "current topic",
+        depth: "basic",
+        topic: "general",
+        maxResults: 5,
+      },
+      context(),
+    );
+    const sourceId = searchResult.results[0].sourceId;
+    assert.match(sourceId, /^web_[a-z0-9]+$/);
+    assert.deepEqual(searchResult.citation.availableSourceIds, [sourceId]);
+
+    const readResult = await read.execute(
+      {
+        urls: ["https://example.com/report"],
+        query: "specific detail",
+        depth: "basic",
+        chunksPerSource: 3,
+      },
+      context(),
+    );
+    assert.equal(readResult.pages[0].sourceId, sourceId);
+
+    try {
+      await read.execute(
+        {
+          urls: ["https://other.example/report"],
+          query: "specific detail",
+          depth: "basic",
+          chunksPerSource: 3,
+        },
+        context(),
+      );
+      assert.fail("Expected an unsearched URL to be rejected");
+    } catch (error) {
+      assert.include(
+        error instanceof Error ? error.message : String(error),
+        "returned by web_search",
+      );
+    }
+  });
+
+  it("advertises tools only with a key and only to intended local runtimes", function () {
+    let storedKey = "";
+    (globalThis as typeof globalThis & { Zotero: typeof Zotero }).Zotero = {
+      Prefs: {
+        get: () => storedKey,
+        set: (_name: string, value: unknown) => {
+          storedKey = String(value || "");
+        },
+      },
+    } as typeof Zotero;
+
+    const registry = new AgentToolRegistry();
+    registry.register(createWebSearchTool(() => provider()));
+    registry.register(createWebReadTool(() => provider()));
+    assert.deepEqual(registry.listTools(), []);
+    assert.deepEqual(registry.listToolsForRequest(context().request), []);
+
+    storedKey = "tvly-configured";
+    assert.deepEqual(
+      registry
+        .listToolsForRequest(context("api_key").request)
+        .map((tool) => tool.name),
+      ["web_search", "web_read"],
+    );
+    assert.deepEqual(
+      registry
+        .listToolsForRequest(context("codex_auth").request)
+        .map((tool) => tool.name),
+      ["web_search", "web_read"],
+    );
+    assert.deepEqual(
+      registry.listToolsForRequest(context("codex_app_server").request),
+      [],
+    );
+    assert.deepEqual(
+      registry.listToolsForRequest(context("webchat").request),
+      [],
+    );
+  });
+
+  it("persists a trimmed local key and treats an empty value as disabled", function () {
+    let storedKey = "";
+    (globalThis as typeof globalThis & { Zotero: typeof Zotero }).Zotero = {
+      Prefs: {
+        get: () => storedKey,
+        set: (_name: string, value: unknown) => {
+          storedKey = String(value || "");
+        },
+      },
+    } as typeof Zotero;
+
+    setTavilyApiKey("  tvly-local-key  ");
+    assert.equal(getTavilyApiKey(), "tvly-local-key");
+    assert.isTrue(hasTavilyApiKey());
+    setTavilyApiKey("   ");
+    assert.equal(getTavilyApiKey(), "");
+    assert.isFalse(hasTavilyApiKey());
+  });
+
+  it("builds collapsed summaries and expandable details", async function () {
+    const search = createWebSearchTool(() => provider());
+    const args = {
+      query: "current topic",
+      depth: "advanced" as const,
+      topic: "news" as const,
+      maxResults: 5,
+    };
+    const result = await search.execute(args, context());
+    assert.isTrue(search.presentation?.mergeResultIntoCallTrace);
+    assert.equal(
+      search.presentation?.buildTraceSummary?.({ args, content: result }),
+      "Searched “current topic” · 1 result · advanced · 2 credits",
+    );
+    const details =
+      search.presentation?.buildTraceDetails?.({ args, content: result }) || [];
+    assert.deepInclude(details, { label: "Query", value: "current topic" });
+    assert.deepInclude(details, { label: "Depth", value: "advanced" });
+    assert.deepInclude(details, {
+      label: "URL 1",
+      value: "https://example.com/report",
+      kind: "url",
+    });
+    assert.deepInclude(details, { label: "Credits used", value: "2" });
+  });
+});

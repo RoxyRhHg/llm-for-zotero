@@ -34,6 +34,7 @@ declare namespace _ZoteroTypes {
       "agentClaudeConfigSource": string;
       "agentPermissionMode": string;
       "agentLibraryWriteMode": string;
+      "tavilyApiKey": string;
       "conversationSystem": string;
       "enableCodexAppServerMode": boolean;
       "codexAppServerModel": string;

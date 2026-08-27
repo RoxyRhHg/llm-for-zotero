@@ -28,6 +28,7 @@ pref("agentPermissionMode", "safe");
 // from agentPermissionMode, whose help text promises it governs the Claude
 // Code bridge only -- see src/shared/agentLibraryWriteMode.ts.
 pref("agentLibraryWriteMode", "auto");
+pref("tavilyApiKey", "");
 pref("conversationSystem", "upstream");
 pref("enableCodexAppServerMode", false);
 pref("codexAppServerModel", "gpt-5.4");

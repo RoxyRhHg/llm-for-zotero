@@ -8191,7 +8191,8 @@ label.llm-search-results-item:hover {
   padding: 6px;
 }
 
-.llm-paper-picker-item {
+.llm-paper-picker-item,
+.llm-web-source-row {
   all: unset;
   box-sizing: border-box;
   appearance: none;
@@ -8215,7 +8216,8 @@ label.llm-search-results-item:hover {
   scroll-margin-block: 6px;
 }
 
-.llm-paper-picker-item:hover {
+.llm-paper-picker-item:hover,
+.llm-web-source-row:hover {
   background: color-mix(
     in srgb,
     var(--material-background) 84%,
@@ -8237,7 +8239,8 @@ label.llm-search-results-item:hover {
   border-color: var(--color-accent, #3584e4);
 }
 
-.llm-paper-picker-item:focus-visible {
+.llm-paper-picker-item:focus-visible,
+.llm-web-source-row:focus-visible {
   outline: 1px solid var(--color-accent);
   outline-offset: 1px;
 }
@@ -9369,14 +9372,19 @@ label.llm-search-results-item:hover {
   line-height: 1;
 }
 
+.llm-selected-context-expanded,
+.llm-web-source-popover {
+  border: 1px solid var(--stroke-secondary);
+  border-radius: 10px;
+  background: var(--material-background);
+  box-shadow: 0 10px 24px rgba(0, 0, 0, 0.28);
+}
+
 .llm-selected-context-expanded {
   display: flex;
   flex-direction: column;
   gap: 8px;
   padding: 8px 10px;
-  border: 1px solid var(--stroke-secondary);
-  border-radius: 10px;
-  background: var(--material-background);
   position: absolute;
   left: 0;
   right: 0;
@@ -9385,7 +9393,6 @@ label.llm-search-results-item:hover {
   width: auto;
   max-height: min(68vh, 560px);
   overflow: auto;
-  box-shadow: 0 10px 24px rgba(0, 0, 0, 0.28);
   opacity: 0;
   visibility: hidden;
   transform: translateY(4px);
@@ -9432,6 +9439,126 @@ label.llm-search-results-item:hover {
 
 .llm-note-context-chip .llm-selected-context-expanded {
   max-height: min(20vh, 140px);
+}
+
+/* Paragraph-level web sources reuse the paper card surface and row primitives. */
+.llm-web-source-indicator {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  margin-inline-start: 4px;
+  vertical-align: -2px;
+}
+
+.llm-web-source-chip {
+  all: unset;
+  box-sizing: border-box;
+  display: inline-grid;
+  place-items: center;
+  width: 18px;
+  height: 18px;
+  border: 1px solid var(--stroke-secondary);
+  border-radius: 999px;
+  background: var(--material-background);
+  color: var(--fill-secondary);
+  cursor: pointer;
+}
+
+.llm-web-source-chip:hover,
+.llm-web-source-chip:focus-visible,
+.llm-web-source-indicator.expanded .llm-web-source-chip {
+  border-color: var(--color-accent, #3584e4);
+  color: var(--color-accent, #3584e4);
+}
+
+.llm-web-source-chip:focus-visible {
+  outline: 1px solid var(--color-accent, #3584e4);
+  outline-offset: 2px;
+}
+
+.llm-web-source-globe {
+  width: 12px;
+  height: 12px;
+  background: currentColor;
+  mask: url("icons/action-mode-global.svg") center / contain no-repeat;
+  -webkit-mask: url("icons/action-mode-global.svg") center / contain no-repeat;
+}
+
+.llm-web-source-popover {
+  position: absolute;
+  bottom: calc(100% + 8px);
+  z-index: 32;
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  box-sizing: border-box;
+  width: min(360px, calc(100vw - 24px));
+  max-height: min(52vh, 320px);
+  padding: 6px;
+  overflow-y: auto;
+  opacity: 0;
+  visibility: hidden;
+  transform: translateY(4px);
+  pointer-events: none;
+  transition:
+    opacity 0.14s ease,
+    transform 0.14s ease,
+    visibility 0.14s ease;
+}
+
+.llm-web-source-popover.llm-web-source-popover-below {
+  top: calc(100% + 8px);
+  bottom: auto;
+  transform: translateY(-4px);
+}
+
+.llm-web-source-indicator:hover .llm-web-source-popover,
+.llm-web-source-indicator:focus-within .llm-web-source-popover,
+.llm-web-source-indicator.expanded .llm-web-source-popover {
+  opacity: 1;
+  visibility: visible;
+  transform: translateY(0);
+  pointer-events: auto;
+}
+
+.llm-web-source-popover::after {
+  content: "";
+  position: absolute;
+  right: 0;
+  bottom: -10px;
+  left: 0;
+  height: 10px;
+}
+
+.llm-web-source-popover.llm-web-source-popover-below::after {
+  top: -10px;
+  bottom: auto;
+}
+
+.llm-web-source-row {
+  flex: 0 0 auto;
+  gap: 3px;
+  white-space: normal;
+}
+
+.llm-web-source-organization,
+.llm-web-source-title {
+  display: block;
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.llm-web-source-organization {
+  color: var(--fill-secondary);
+  font-size: var(--llm-fs-11);
+  font-weight: 600;
+  line-height: 1.25;
+}
+
+.llm-web-source-title {
+  color: var(--fill-primary);
+  font-size: var(--llm-fs-13);
+  line-height: 1.35;
 }
 
 .llm-selected-context-text {

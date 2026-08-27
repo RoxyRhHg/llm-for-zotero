@@ -14,6 +14,8 @@ import { createReadAttachmentTool } from "./read/readAttachment";
 import { clearPdfToolCaches } from "./read/pdfToolUtils";
 import { createSearchLiteratureOnlineTool } from "./read/searchLiteratureOnline";
 import { createToolResultReadTool } from "./read/toolResultRead";
+import { createWebSearchTool } from "./read/webSearch";
+import { createWebReadTool } from "./read/webRead";
 import { createCiteExportTool } from "./read/citeExport";
 import { createDelegatingTool, createRenamedTool } from "./facade";
 
@@ -109,7 +111,7 @@ const LITERATURE_SEARCH_GUIDANCE: ToolGuidance = {
       request.userText || "",
     ),
   instruction:
-    "When the user explicitly asks to search online or search the literature, call literature_search with workflow:'answer' by default, analyze the scholarly results, and answer in chat with explicit source attribution. Use workflow:'review' only when the user wants to import/add papers to Zotero, save selected search results to a note, refine results inside the card, or review metadata changes. If the request is not answerable from scholarly sources, say that limitation instead of pretending general web search is available. Do not use this tool for questions about the content of papers already in context (e.g. counting references, summarizing, explaining)." +
+    "When the user explicitly asks to search online or search the literature, call literature_search with workflow:'answer' by default, analyze the scholarly results, and answer in chat with explicit source attribution. Use workflow:'review' only when the user wants to import/add papers to Zotero, save selected search results to a note, refine results inside the card, or review metadata changes. If the request is not answerable from scholarly sources, use web_search when that tool is available; otherwise state the limitation. Do not use this tool for questions about the content of papers already in context (e.g. counting references, summarizing, explaining)." +
     "\n\nSource selection:" +
     "\n- recommendations, references, citations modes -> always use source:'openalex' (only OpenAlex supports these)." +
     "\n- search mode -> source:'openalex' (default, broadest coverage), source:'arxiv' (preprints, CS/ML/physics), or source:'europepmc' (biomedical/life sciences)." +
@@ -556,6 +558,8 @@ export function createBuiltInToolRegistry(
       guidance: LIBRARY_SEARCH_GUIDANCE,
     }),
   );
+  registry.register(createWebSearchTool());
+  registry.register(createWebReadTool());
   registry.register(
     createRenamedTool({
       tool: readLibrary,

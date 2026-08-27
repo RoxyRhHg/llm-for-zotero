@@ -1000,6 +1000,15 @@ describe("agentTrace render", function () {
     assert.equal(formatAgentActivityDuration(3_661_000), "1h 1m 1s");
   });
 
+  it("suppresses complete and partial web markers in streamed trace text", function () {
+    assert.equal(
+      buildAgentTraceMarkdownForRender(
+        "First.<!--llm-web-source:web_abc1234-->\n\nSecond.<!--llm-web-source:web_",
+      ),
+      "First.\n\nSecond.",
+    );
+  });
+
   it("expands activity while streaming and collapses it when complete", function () {
     const events: AgentRunEventRecord[] = [
       {

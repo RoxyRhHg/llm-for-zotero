@@ -155,7 +155,10 @@ describe("semantic tool surface", function () {
         `${legacyName} remains internally callable`,
       );
     }
-    assert.isUndefined(registry.getTool("web_search"));
+    assert.exists(registry.getTool("web_search"));
+    assert.exists(registry.getTool("web_read"));
+    assert.notInclude(names, "web_search");
+    assert.notInclude(names, "web_read");
     for (const name of ["file_io", "run_command", "zotero_script"]) {
       assert.equal(
         tools.find((tool) => tool.name === name)?.tier,
