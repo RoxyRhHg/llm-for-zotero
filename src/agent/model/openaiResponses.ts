@@ -25,10 +25,7 @@ import {
   normalizeResponsesStepFromPayload,
   parseResponsesStepStream,
 } from "./responsesShared";
-import {
-  buildResponsesFunctionTools,
-  getConversationContinuationMessages,
-} from "./shared";
+import { buildResponsesFunctionTools } from "./shared";
 import { resolveRequestContentInputs } from "./messageBuilder";
 
 async function uploadFilePart(
@@ -94,7 +91,7 @@ export class OpenAIResponsesAgentAdapter implements AgentModelAdapter {
       "You are the agent runtime inside a Zotero plugin.";
     const followupInput = this.conversationItems
       ? await buildResponsesContinuationInput(
-          getConversationContinuationMessages(params.messages),
+          params.continuationMessages || [],
           {
             resolveFilePart: async (part, signal) =>
               uploadFilePart(part, request, signal),

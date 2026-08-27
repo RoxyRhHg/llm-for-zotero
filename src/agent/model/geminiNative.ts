@@ -32,7 +32,6 @@ import {
 import {
   createFallbackToolCallId,
   getFetch,
-  getConversationContinuationMessages,
   groupToolContinuationMessages,
 } from "./shared";
 import { resolveContentParts } from "./adapterUtils";
@@ -794,7 +793,7 @@ export class GeminiNativeAgentAdapter implements AgentModelAdapter {
       this.systemInstruction = initial.systemInstruction;
     }
     const continuationSource = cachedConversationMessages
-      ? getConversationContinuationMessages(params.messages)
+      ? params.continuationMessages || []
       : [];
     const continuation =
       await buildGeminiContinuationMessages(continuationSource);

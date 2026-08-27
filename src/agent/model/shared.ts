@@ -61,21 +61,6 @@ export function stringifyUnknown(value: unknown): string {
   return "";
 }
 
-function findLastAssistantMessageIndex(messages: AgentModelMessage[]): number {
-  for (let index = messages.length - 1; index >= 0; index -= 1) {
-    if (messages[index].role === "assistant") return index;
-  }
-  return -1;
-}
-
-export function getConversationContinuationMessages(
-  messages: AgentModelMessage[],
-): AgentModelMessage[] {
-  const index = findLastAssistantMessageIndex(messages);
-  if (index < 0 || index >= messages.length - 1) return [];
-  return messages.slice(index + 1);
-}
-
 export function groupToolContinuationMessages(messages: AgentModelMessage[]): {
   toolMessages: Extract<AgentModelMessage, { role: "tool" }>[];
   followupUserMessages: Extract<AgentModelMessage, { role: "user" }>[];

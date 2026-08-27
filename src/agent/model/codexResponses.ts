@@ -22,10 +22,7 @@ import {
   normalizeResponsesStepFromPayload,
   parseResponsesStepStream,
 } from "./responsesShared";
-import {
-  buildResponsesFunctionTools,
-  getConversationContinuationMessages,
-} from "./shared";
+import { buildResponsesFunctionTools } from "./shared";
 import { CODEX_DIRECT_RESPONSES_URL } from "../../codexAuth/auth";
 import {
   assertCodexDirectModelAvailable,
@@ -89,7 +86,7 @@ export class CodexResponsesAgentAdapter implements AgentModelAdapter {
       "You are the agent runtime inside a Zotero plugin.";
     const followupInput = this.conversationItems
       ? await buildResponsesContinuationInput(
-          getConversationContinuationMessages(params.messages),
+          params.continuationMessages || [],
           {
             resolveFilePart: async (part) => [
               {

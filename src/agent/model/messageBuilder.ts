@@ -6,6 +6,7 @@ import type {
   AgentRuntimeRequest,
   AgentToolDefinition,
 } from "../types";
+import { actionToolGuidanceForCapabilities } from "../contracts/actionEvaluation";
 import { AGENT_PERSONA_INSTRUCTIONS } from "./agentPersona";
 import { buildAgentMemoryBlock } from "../store/conversationMemory";
 import { getAllSkills } from "../skills";
@@ -145,6 +146,31 @@ function buildFullUserMessage(
   const visibleTurnContext = buildVisibleTurnContextBlock(request);
   if (visibleTurnContext) {
     contextLines.push(visibleTurnContext);
+  }
+  if (request.actionContract?.obligations.length) {
+    const obligations = request.actionContract.obligations.map((obligation) => {
+      const scope = obligation.scope
+        ? obligation.scopeRole === "destination"
+          ? ` exact destination collection "${obligation.scope.collectionPath}" (ID ${obligation.scope.collectionId})`
+          : ` exact source collection "${obligation.scope.collectionPath}", direct members only, frozen item IDs [${obligation.scope.frozenTargetIds.join(", ")}]`
+        : "";
+      const constraint = obligation.constraints?.tagPrefix
+        ? `, required tag prefix "${obligation.constraints.tagPrefix}"`
+        : "";
+      return `- ${obligation.capability}; coverage=${obligation.coverage}; targets=${obligation.targetKind};${scope}${constraint}`;
+    });
+    contextLines.push(
+      [
+        "Action contract for this turn:",
+        ...obligations,
+        `Tool guidance: ${actionToolGuidanceForCapabilities(
+          request.actionContract.obligations.map(
+            (obligation) => obligation.capability,
+          ),
+        )}`,
+        "Do not widen an exact collection to its parent or descendants. A completion claim requires a verified tool receipt covering this contract; already-satisfied targets count, but prose and opaque script/command output do not.",
+      ].join("\n"),
+    );
   }
   if (request.activeNoteContext) {
     const note = request.activeNoteContext;

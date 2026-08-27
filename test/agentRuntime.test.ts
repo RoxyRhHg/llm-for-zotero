@@ -22,6 +22,7 @@ import {
   upsertAgentToolResultHandles,
 } from "../src/agent/store/toolResultHandles";
 import { AgentToolRegistry } from "../src/agent/tools/registry";
+import { ActionContractService } from "../src/agent/contracts/actionContract";
 import { createToolResultReadTool } from "../src/agent/tools/read/toolResultRead";
 import { createFileIOTool } from "../src/agent/tools/write/fileIO";
 import {
@@ -1667,7 +1668,9 @@ describe("AgentRuntime", function () {
               (message) =>
                 message.role === "user" &&
                 typeof message.content === "string" &&
-                message.content.includes("requires writing a Markdown note"),
+                message.content.includes(
+                  "requested action contract is not satisfied",
+                ),
             );
             if (stepIndex === 2) {
               return {
@@ -1726,7 +1729,8 @@ describe("AgentRuntime", function () {
 
       assert.equal(outcome.kind, "completed");
       if (outcome.kind !== "completed") return;
-      assert.equal(outcome.text, "Saved.");
+      assert.include(outcome.text, "Saved.");
+      assert.include(outcome.text, "file.write — applied");
       assert.isTrue(sawCorrectivePrompt);
       assert.deepEqual(writes, [
         {
@@ -1735,6 +1739,68 @@ describe("AgentRuntime", function () {
           content: "## Figure 2\nGrounded note.",
         },
       ]);
+    } finally {
+      restoreDb();
+    }
+  });
+
+  it("merges deterministic actions into a preclassified empty intent", async function () {
+    const restoreDb = installMockDb();
+    try {
+      let stepIndex = 0;
+      let sawCorrection = false;
+      const runtime = new AgentRuntime({
+        registry: new AgentToolRegistry(),
+        adapterFactory: () => ({
+          getCapabilities: () => ({
+            streaming: true,
+            toolCalls: true,
+            multimodal: false,
+            fileInputs: false,
+            reasoning: true,
+          }),
+          supportsTools: () => true,
+          async runStep(params: AgentStepParams): Promise<AgentModelStep> {
+            stepIndex += 1;
+            sawCorrection ||= params.messages.some(
+              (message) =>
+                message.role === "user" &&
+                typeof message.content === "string" &&
+                message.content.includes(
+                  "requested action contract is not satisfied",
+                ),
+            );
+            const text = stepIndex === 1 ? "I found it." : "Done.";
+            return {
+              kind: "final",
+              text,
+              assistantMessage: { role: "assistant", content: text },
+            };
+          },
+        }),
+      });
+
+      const outcome = await runtime.runTurn({
+        request: {
+          conversationKey: 1,
+          mode: "agent",
+          userText:
+            'Move the paper titled "A very long named paper that previously bypassed the action fallback" to the destination.',
+          model: "test-model",
+          apiBase: "",
+          apiKey: "test",
+          classifiedIntent: {
+            retrievalIntent: "none",
+            wantedSections: [],
+            actionIntents: [],
+          },
+        },
+      });
+
+      assert.equal(outcome.kind, "completed");
+      if (outcome.kind !== "completed") return;
+      assert.isTrue(sawCorrection);
+      assert.include(outcome.text, "zotero.collections coverage:one");
     } finally {
       restoreDb();
     }
@@ -1797,7 +1863,9 @@ describe("AgentRuntime", function () {
               (message) =>
                 message.role === "user" &&
                 typeof message.content === "string" &&
-                message.content.includes("exhaustive full-text reading"),
+                message.content.includes(
+                  "requested action contract is not satisfied",
+                ),
             );
             if (stepIndex === 2) {
               return {
@@ -1849,7 +1917,8 @@ describe("AgentRuntime", function () {
 
       assert.equal(outcome.kind, "completed");
       if (outcome.kind !== "completed") return;
-      assert.equal(outcome.text, "Grounded full-text answer.");
+      assert.include(outcome.text, "Grounded full-text answer.");
+      assert.include(outcome.text, "zotero.read — observed; verified");
       assert.isTrue(sawCorrection);
       assert.deepEqual(reads, [{ mode: "full" }]);
     } finally {
@@ -1888,7 +1957,18 @@ describe("AgentRuntime", function () {
         true,
       );
 
-      const registry = new AgentToolRegistry();
+      let noteExists = false;
+      const registry = new AgentToolRegistry(
+        new ActionContractService({
+          getCollectionSummary: () => null,
+          listCollectionSummaries: () => [],
+          listCollectionPaperTargets: async () => ({ papers: [] }),
+          listCollectionItemTargets: async () => ({ items: [] }),
+          getItem: (itemId) =>
+            itemId === 500 && noteExists ? ({} as Zotero.Item) : null,
+          getEditableArticleMetadata: () => null,
+        }),
+      );
       const noteWrites: unknown[] = [];
       registry.register({
         spec: {
@@ -1898,14 +1978,32 @@ describe("AgentRuntime", function () {
           mutability: "write",
           requiresConfirmation: false,
         },
-        validate: (args: unknown) => ({ ok: true, value: args }),
+        validate: (args: unknown) => ({
+          ok: true,
+          value: {
+            operation: {
+              type: "save_note" as const,
+              content: String((args as { content?: unknown }).content || ""),
+              target: "standalone" as const,
+            },
+          },
+        }),
         planMutation: async () => ({
           effect: "write",
           reversibility: "full",
         }),
         execute: async (input) => {
-          noteWrites.push(input);
-          return { content: { status: "saved" }, effect: "applied" };
+          noteWrites.push(input.operation);
+          noteExists = true;
+          return {
+            content: {
+              result: {
+                operation: "save_note",
+                result: { status: "saved", noteId: 500, collections: [] },
+              },
+            },
+            effect: "applied",
+          };
         },
       });
 
@@ -1998,14 +2096,15 @@ describe("AgentRuntime", function () {
 
       assert.equal(outcome.kind, "completed");
       if (outcome.kind !== "completed") return;
-      assert.equal(outcome.text, "Saved Zotero note.");
+      assert.include(outcome.text, "Saved Zotero note.");
+      assert.include(outcome.text, "zotero.notes — applied");
       assert.isTrue(sawInitialZoteroRule);
       assert.isFalse(sawInitialFileRule);
       assert.isFalse(sawCorrectivePrompt);
       assert.equal(stepIndex, 2);
       assert.deepEqual(noteWrites, [
         {
-          mode: "create",
+          type: "save_note",
           target: "standalone",
           content: "## Summary\nZotero note body.",
         },
@@ -4599,7 +4698,7 @@ describe("shallow guard round-limit safety", function () {
    * legitimate ("they were already in that collection") — the goal is an
    * accurate report, not a failed run.
    */
-  it("corrects the model once when a library write changed nothing", async function () {
+  it("fails truthfully after one correction when a write has no verifiable receipt", async function () {
     const restoreDb = installMockDb();
     try {
       await initAgentChangeJournal();
@@ -4692,7 +4791,7 @@ describe("shallow guard round-limit safety", function () {
         "Filed both papers",
         "the first, false claim must not be what the user is left with",
       );
-      assert.include(outcome.text, "Nothing changed");
+      assert.include(outcome.text, "could not verify completion");
     } finally {
       restoreDb();
     }

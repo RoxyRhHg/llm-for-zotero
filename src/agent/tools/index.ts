@@ -50,6 +50,7 @@ import { PdfPageService } from "../services/pdfPageService";
 import { PdfFigureExtractionService } from "../services/pdfFigureExtractionService";
 import type { AgentToolDefinition } from "../types";
 import { fail, ok, PAPER_CONTEXT_REF_SCHEMA, validateObject } from "./shared";
+import { ActionContractService } from "../contracts/actionContract";
 
 type BuiltInAgentToolDeps = {
   zoteroGateway: ZoteroGateway;
@@ -496,7 +497,9 @@ function createLibraryDeleteTool(tools: {
 export function createBuiltInToolRegistry(
   deps: BuiltInAgentToolDeps,
 ): AgentToolRegistry {
-  const registry = new AgentToolRegistry();
+  const registry = new AgentToolRegistry(
+    new ActionContractService(deps.zoteroGateway),
+  );
   const queryLibrary = createQueryLibraryTool(deps.zoteroGateway);
   const readLibrary = createReadLibraryTool(deps.zoteroGateway);
   const libraryRetrieve = createLibraryRetrieveTool(

@@ -155,26 +155,34 @@ describe("CodexResponsesAgentAdapter", function () {
     });
     assert.equal(firstStep.kind, "tool_calls");
     if (firstStep.kind !== "tool_calls") return;
-    messages.push(firstStep.assistantMessage, {
+    const toolResultMessage: AgentModelMessage = {
       role: "tool",
       tool_call_id: firstStep.calls[0].id,
       name: firstStep.calls[0].name,
       content: '{"results":[{"itemId":101},{"itemId":102}]}',
-    });
+    };
+    messages.push(firstStep.assistantMessage, toolResultMessage);
 
     const secondStep = await targetAdapter.runStep({
       request,
       messages,
+      continuationMessages: [toolResultMessage],
       tools,
     });
     assert.equal(secondStep.kind, "final");
     if (secondStep.kind !== "final") return;
-    messages.push(secondStep.assistantMessage, {
+    const correctionMessage: AgentModelMessage = {
       role: "user",
       content: "Correction for this turn: retrieve body evidence first.",
-    });
+    };
+    messages.push(secondStep.assistantMessage, correctionMessage);
 
-    await targetAdapter.runStep({ request, messages, tools });
+    await targetAdapter.runStep({
+      request,
+      messages,
+      continuationMessages: [correctionMessage],
+      tools,
+    });
 
     const thirdInput = requestBodies[2]?.input as Array<
       Record<string, unknown>

@@ -26,6 +26,7 @@ import type {
   AgentToolContext,
   AgentToolResult,
   AgentToolEffect,
+  AgentActionReceipt,
   AgentRunRecord,
 } from "./types";
 import type { AgentModelAdapter } from "./model/adapter";
@@ -45,7 +46,19 @@ import {
 } from "./model/messageBuilder";
 import { classifyWriteNoteDestination } from "./writeNoteDestination";
 import { WRITE_NOTE_SKILL_ID } from "./skills/noteIntent";
-import { detectTurnIntent } from "./model/skillClassifier";
+import {
+  detectTurnIntent,
+  inferActionIntentsFromRequest,
+} from "./model/skillClassifier";
+import {
+  mergeActionIntents,
+  reconcileNoteDestinationActionIntents,
+} from "./model/actionIntent";
+import {
+  evaluateActionContract,
+  formatReceiptStatus,
+  createUnverifiedReceipt,
+} from "./contracts/actionEvaluation";
 import {
   findLibraryRetrieveShallowSignal,
   isEvidenceSeekingTurn,
@@ -65,7 +78,6 @@ import {
 import {
   getNotesDirectoryConfig,
   getNotesDirectoryNickname,
-  isNotesDirectoryConfigured,
 } from "../utils/notesDirectoryConfig";
 import {
   buildAgentContextBudgetState,
@@ -638,36 +650,18 @@ function filterTransientRecoveryTool<T extends { name: string }>(
   return tools.filter((tool) => tool.name !== TOOL_RESULT_READ_TOOL_NAME);
 }
 
-function isWriteNoteFileRequest(
+function writeNoteDestinationForRequest(
   request: AgentRuntimeRequest,
   matchedSkills: ReadonlyArray<string>,
-): boolean {
+): import("./writeNoteDestination").WriteNoteDestination {
   const activeSkillIds = new Set([
     ...matchedSkills,
     ...(request.forcedSkillIds || []),
   ]);
-  if (!activeSkillIds.has(WRITE_NOTE_SKILL_ID)) return false;
-  return (
-    classifyWriteNoteDestination(
-      request.userText,
-      getNotesDirectoryNickname(),
-    ) === "file"
-  );
-}
-
-function isSuccessfulFileIoWrite(record: {
-  name: string;
-  ok: boolean;
-  input?: unknown;
-  content?: unknown;
-}): boolean {
-  if (record.name !== "file_io" || !record.ok) return false;
-  if (!record.input || typeof record.input !== "object") return false;
-  if ((record.input as { action?: unknown }).action !== "write") return false;
-  return !(
-    record.content &&
-    typeof record.content === "object" &&
-    "error" in record.content
+  if (!activeSkillIds.has(WRITE_NOTE_SKILL_ID)) return "none";
+  return classifyWriteNoteDestination(
+    request.userText,
+    getNotesDirectoryNickname(),
   );
 }
 
@@ -908,6 +902,7 @@ export class AgentRuntime {
         ok: boolean;
         mutability?: "read" | "write";
         effect?: AgentToolEffect;
+        receipt: AgentActionReceipt;
         input?: unknown;
         content?: unknown;
       }> = [];
@@ -1067,6 +1062,21 @@ export class AgentRuntime {
       if (turnIntent.classifiedIntent) {
         request.classifiedIntent = turnIntent.classifiedIntent;
       }
+      const fallbackActions = inferActionIntentsFromRequest(request);
+      if (fallbackActions.length) {
+        if (!request.classifiedIntent) {
+          request.classifiedIntent = {
+            retrievalIntent: "none",
+            wantedSections: [],
+            actionIntents: fallbackActions,
+          };
+        } else {
+          request.classifiedIntent.actionIntents = mergeActionIntents(
+            request.classifiedIntent.actionIntents || [],
+            fallbackActions,
+          );
+        }
+      }
       if (turnIntent.degraded) {
         // Surface the silent-regression case: a usable model config was
         // present but classification fell back to regex matching, reverting
@@ -1081,10 +1091,83 @@ export class AgentRuntime {
         });
       }
       const matchedSkills = getMatchedSkillIds(request, turnIntent.skillIds);
-      const requiresFileNoteWrite = isWriteNoteFileRequest(
+      const requestIntent = classifyRequest(request);
+      const noteDestination = writeNoteDestinationForRequest(
         request,
         matchedSkills,
       );
+      if (noteDestination !== "none" && !request.classifiedIntent) {
+        request.classifiedIntent = {
+          retrievalIntent: "none",
+          wantedSections: [],
+          actionIntents: [],
+        };
+      }
+      if (noteDestination !== "none") {
+        request.classifiedIntent!.actionIntents =
+          reconcileNoteDestinationActionIntents(
+            request.classifiedIntent!.actionIntents,
+            noteDestination,
+          );
+      }
+      const requiresFileNoteWrite = noteDestination === "file";
+      const hasPaperReadScope =
+        request.conversationKind === "paper" ||
+        Boolean(request.activeItemId) ||
+        Boolean(request.selectedPaperContexts?.length) ||
+        Boolean(request.fullTextPaperContexts?.length) ||
+        Boolean(request.pinnedPaperContexts?.length);
+      if (requestIntent.requiresFullPaperRead && hasPaperReadScope) {
+        if (!request.classifiedIntent) {
+          request.classifiedIntent = {
+            retrievalIntent: "none",
+            wantedSections: [],
+            actionIntents: [],
+          };
+        }
+        if (
+          !request.classifiedIntent.actionIntents.some(
+            (action) => action.constraints?.readMode === "full",
+          )
+        ) {
+          request.classifiedIntent.actionIntents.push({
+            capability: "zotero.read",
+            coverage: "all",
+            targetKind: "papers",
+            constraints: { readMode: "full" },
+          });
+        }
+      }
+      try {
+        request.actionContract =
+          (await this.registry.createActionContract(request)) || undefined;
+      } catch (error) {
+        const failure = error instanceof Error ? error.message : String(error);
+        const text = `I could not safely resolve the requested action scope: ${failure}`;
+        await emit({
+          type: "provider_event",
+          providerType: "agent_action_contract",
+          payload: { state: "failed", retryable: true, reason: failure },
+        });
+        await emit({ type: "final", text });
+        await persistIfLive(() => finishAgentRun(runId, "failed", text));
+        return {
+          kind: "completed",
+          runId,
+          text,
+          usedFallback: false,
+        };
+      }
+      if (request.actionContract) {
+        await emit({
+          type: "provider_event",
+          providerType: "agent_action_contract",
+          payload: {
+            state: request.actionContract.state,
+            obligations: request.actionContract.obligations,
+          },
+        });
+      }
       const noteWritePolicy = requiresFileNoteWrite
         ? getNotesDirectoryConfig()
         : null;
@@ -1118,6 +1201,7 @@ export class AgentRuntime {
           contentInputs: resolveCapabilitiesContentInputs(adapterCapabilities),
         },
       )) as AgentModelMessage[];
+      let continuationMessages: AgentModelMessage[] = [];
 
       const budgetState = buildAgentContextBudgetState({
         messages,
@@ -1202,31 +1286,11 @@ export class AgentRuntime {
       }
 
       let consecutiveToolErrors = 0;
-      const intent = classifyRequest(request);
+      const intent = requestIntent;
       const { maxRounds, maxToolCallsPerRound } = resolveAgentLimits(
         intent.isBulkOperation,
       );
-      let noteWriteCorrectionUsed = false;
-      let zeroEffectWriteCorrectionUsed = false;
-      let fullReadCorrectionUsed = false;
       let shallowLibraryCorrectionUsed = false;
-      const hasSuccessfulFileWrite = () =>
-        toolExecutionRecords.some((record) => isSuccessfulFileIoWrite(record));
-      const hasFullReadAttempt = () =>
-        toolExecutionRecords.some(
-          (record) =>
-            record.name === "paper_read" &&
-            record.ok &&
-            record.input &&
-            typeof record.input === "object" &&
-            (record.input as { mode?: unknown }).mode === "full",
-        );
-      const hasPaperReadScope =
-        request.conversationKind === "paper" ||
-        Boolean(request.activeItemId) ||
-        Boolean(request.selectedPaperContexts?.length) ||
-        Boolean(request.fullTextPaperContexts?.length) ||
-        Boolean(request.pinnedPaperContexts?.length);
       const shouldFlushStreamBuffer = (value: string): boolean => {
         if (!value) return false;
         if (value.length >= 8) return true;
@@ -1297,11 +1361,28 @@ export class AgentRuntime {
         const streamedTextOffset = stepStreamedText
           ? returnedText.indexOf(stepStreamedText)
           : -1;
-        const finalText = stepStreamedText
+        const modelFinalText = stepStreamedText
           ? streamedTextOffset >= 0
             ? returnedText.slice(streamedTextOffset)
             : stepStreamedText
           : returnedText || currentAnswerText || "No response.";
+        const contractedCapabilities = new Set(
+          request.actionContract?.obligations.map(
+            (obligation) => obligation.capability,
+          ) || [],
+        );
+        const actionReceipts = toolExecutionRecords
+          .map((record) => record.receipt)
+          .filter(
+            (receipt) =>
+              contractedCapabilities.has(receipt.capability) ||
+              receipt.descriptorKind !== "semantic_state" ||
+              receipt.capability !== "zotero.read",
+          );
+        const receiptStatus = formatReceiptStatus(actionReceipts);
+        const finalText = receiptStatus
+          ? `${modelFinalText}\n\n${receiptStatus}`
+          : modelFinalText;
         if (finalText) {
           if (!stepStreamedText) {
             currentAnswerText = finalText;
@@ -1323,10 +1404,12 @@ export class AgentRuntime {
           }
         }
         newTranscriptMessages.push(
-          step.assistantMessage ?? {
-            role: "assistant",
-            content: finalText,
-          },
+          receiptStatus
+            ? { role: "assistant", content: finalText }
+            : (step.assistantMessage ?? {
+                role: "assistant",
+                content: finalText,
+              }),
         );
         return completeRun(finalText, "completed");
       };
@@ -1430,6 +1513,7 @@ export class AgentRuntime {
         const step = await adapter.runStep({
           request,
           messages,
+          continuationMessages: [...continuationMessages],
           tools: stepToolSpecs,
           signal: params.signal,
           onTextDelta: async (delta) => {
@@ -1583,6 +1667,7 @@ export class AgentRuntime {
             return buildAdapterToolCallResult(outcome);
           },
         });
+        continuationMessages = [];
         await flushStepDelta();
         return {
           step,
@@ -1631,6 +1716,9 @@ export class AgentRuntime {
             callId: call.id,
             name: call.name,
             ok: false,
+            receipt: createUnverifiedReceipt({
+              reason: "Conversation lifecycle changed before execution.",
+            }),
             content: {
               error:
                 "Conversation lifecycle changed before this tool could execute.",
@@ -1692,6 +1780,7 @@ export class AgentRuntime {
           ok: toolResult.ok,
           mutability: executedCall.toolDefinition?.spec.mutability,
           effect: toolResult.effect,
+          receipt: toolResult.receipt,
           input: executedCall.input,
           content: toolResult.content,
         });
@@ -1737,6 +1826,7 @@ export class AgentRuntime {
           name: toolResult.name,
           ok: toolResult.ok,
           effect: toolResult.effect,
+          receipt: toolResult.receipt,
           content: toolResult.content,
           artifacts: toolResult.artifacts,
         });
@@ -1776,10 +1866,20 @@ export class AgentRuntime {
         if (filteredFollowupMessage) {
           followupMessages.push(filteredFollowupMessage);
         }
+        const rawContent = contentOverride ?? toolResult.content;
+        const contentWithReceipt =
+          rawContent &&
+          typeof rawContent === "object" &&
+          !Array.isArray(rawContent)
+            ? {
+                ...(rawContent as Record<string, unknown>),
+                receipt: toolResult.receipt,
+              }
+            : { content: rawContent, receipt: toolResult.receipt };
         return {
           callId,
           name: toolResult.name,
-          content: contentOverride ?? toolResult.content,
+          content: contentWithReceipt,
           followupMessages,
         };
       };
@@ -1798,6 +1898,9 @@ export class AgentRuntime {
               callId: call.id,
               name: call.name,
               ok: false,
+              receipt: createUnverifiedReceipt({
+                reason: "Conversation lifecycle changed before execution.",
+              }),
               content: {
                 error:
                   "Conversation lifecycle changed before this tool could execute.",
@@ -1962,133 +2065,58 @@ export class AgentRuntime {
           }
           const { step, stepStreamedText } = stepResult;
           if (step.kind === "final") {
-            if (
-              intent.requiresFullPaperRead &&
-              hasPaperReadScope &&
-              !hasFullReadAttempt()
-            ) {
-              await rollbackCommittedStreamedText(stepStreamedText);
-              if (!fullReadCorrectionUsed) {
-                fullReadCorrectionUsed = true;
-                const assistantCorrectionMessage: AgentModelMessage =
-                  step.assistantMessage ?? {
-                    role: "assistant",
-                    content: step.text || stepStreamedText,
+            if (request.actionContract) {
+              const evaluation = evaluateActionContract(
+                request.actionContract,
+                toolExecutionRecords.map((record) => record.receipt),
+              );
+              request.actionContract.state = evaluation.state;
+              await emit({
+                type: "provider_event",
+                providerType: "agent_action_contract",
+                payload: {
+                  state: evaluation.state,
+                  correctionCount: request.actionContract.correctionCount,
+                },
+              });
+              if (
+                evaluation.state !== "satisfied" &&
+                evaluation.state !== "cancelled"
+              ) {
+                await rollbackCommittedStreamedText(stepStreamedText);
+                if (
+                  request.actionContract.correctionCount < 1 &&
+                  segmentRound < maxRounds &&
+                  evaluation.correction
+                ) {
+                  request.actionContract.correctionCount += 1;
+                  const assistantCorrectionMessage: AgentModelMessage =
+                    step.assistantMessage ?? {
+                      role: "assistant",
+                      content: step.text || stepStreamedText,
+                    };
+                  const userCorrectionMessage: AgentModelMessage = {
+                    role: "user",
+                    content: evaluation.correction,
                   };
-                const userCorrectionMessage: AgentModelMessage = {
-                  role: "user",
-                  content:
-                    "Correction for this turn: the user explicitly requested exhaustive full-text reading. Call `paper_read({ mode:'full' })` for the active or explicitly targeted paper now. Overview and targeted retrieval do not satisfy this request. Preserve the returned coverage receipt, and if it is partial or unreadable, state that limitation instead of claiming the whole text was read.",
-                };
-                messages.push(
-                  assistantCorrectionMessage,
-                  userCorrectionMessage,
+                  messages.push(
+                    assistantCorrectionMessage,
+                    userCorrectionMessage,
+                  );
+                  continuationMessages.push(userCorrectionMessage);
+                  newTranscriptMessages.push(
+                    assistantCorrectionMessage,
+                    userCorrectionMessage,
+                  );
+                  continue;
+                }
+                request.actionContract.state = "failed";
+                return completeRun(
+                  evaluation.failure ||
+                    "I could not verify completion of the requested action.",
+                  "failed",
                 );
-                newTranscriptMessages.push(
-                  assistantCorrectionMessage,
-                  userCorrectionMessage,
-                );
-                continue;
               }
-              return completeRun(
-                "I could not complete the requested full-text read because the model did not call `paper_read({ mode:'full' })` after being corrected.",
-                "failed",
-              );
-            }
-            if (
-              requiresFileNoteWrite &&
-              !hasSuccessfulFileWrite() &&
-              isNotesDirectoryConfigured()
-            ) {
-              await rollbackCommittedStreamedText(stepStreamedText);
-              if (!noteWriteCorrectionUsed) {
-                noteWriteCorrectionUsed = true;
-                const assistantCorrectionMessage: AgentModelMessage =
-                  step.assistantMessage ?? {
-                    role: "assistant",
-                    content: stepStreamedText,
-                  };
-                const userCorrectionMessage: AgentModelMessage = {
-                  role: "user",
-                  content:
-                    'Correction for this turn: the user\'s request requires writing a Markdown note to the configured notes directory. Call `file_io` with `action: "write"` now, using the configured notes directory/default target path and a clear `.md` filename.' +
-                    (noteWritePolicy
-                      ? ` Default target path: ${noteWritePolicy.defaultTargetPath}.`
-                      : "") +
-                    " Do not put the note body in chat. If a write is impossible, explain the setup problem briefly.",
-                };
-                messages.push(
-                  assistantCorrectionMessage,
-                  userCorrectionMessage,
-                );
-                newTranscriptMessages.push(
-                  assistantCorrectionMessage,
-                  userCorrectionMessage,
-                );
-                continue;
-              }
-              const nickname = getNotesDirectoryNickname().trim();
-              const targetLabel = nickname ? `${nickname} note` : "note";
-              return completeRun(
-                `I could not complete the ${targetLabel} write because the model did not call \`file_io({ action:'write', filePath, content })\` after being corrected.`,
-                "failed",
-              );
-            }
-            // Zotero-write guard. The turn already refuses to finalize on an
-            // unfulfilled file_io write or full-text read; a library mutation
-            // that reported `effect:"none"` had no such check, which is how a
-            // move of zero items could be summarized as done (issue #374).
-            //
-            // This corrects once and then accepts, rather than failing the run:
-            // a zero-effect write is frequently legitimate ("they were already
-            // in that collection"), and the goal is an accurate report, not a
-            // dead turn.
-            // Only writes that were NOT superseded by a later successful call
-            // of the same tool. `toolExecutionRecords` spans the whole turn, so
-            // filtering it naively meant a first attempt that failed and was
-            // then correctly retried still produced "ran but changed nothing"
-            // — and `library_update` covers tags, collections and metadata, so
-            // one legitimately no-op call beside an applied one hit it too.
-            const supersededTools = new Set(
-              toolExecutionRecords
-                .filter(
-                  (record) =>
-                    record.ok &&
-                    (record.effect === "applied" ||
-                      record.effect === "partial"),
-                )
-                .map((record) => record.name),
-            );
-            const zeroEffectWrites = toolExecutionRecords.filter(
-              (record) =>
-                record.ok &&
-                record.effect === "none" &&
-                !supersededTools.has(record.name),
-            );
-            if (zeroEffectWrites.length && !zeroEffectWriteCorrectionUsed) {
-              zeroEffectWriteCorrectionUsed = true;
-              await rollbackCommittedStreamedText(stepStreamedText);
-              const assistantCorrectionMessage: AgentModelMessage =
-                step.assistantMessage ?? {
-                  role: "assistant",
-                  content: stepStreamedText,
-                };
-              const names = Array.from(
-                new Set(zeroEffectWrites.map((record) => record.name)),
-              ).join(", ");
-              const userCorrectionMessage: AgentModelMessage = {
-                role: "user",
-                content:
-                  `Correction for this turn: ${names} ran but changed nothing in the library. ` +
-                  "Read the per-row `reason` values in that tool result. Either fix the cause and retry (for example resolve the correct collection ID, or target items of a type the operation accepts), or tell the user plainly that nothing changed and why. " +
-                  "Do not report the request as completed.",
-              };
-              messages.push(assistantCorrectionMessage, userCorrectionMessage);
-              newTranscriptMessages.push(
-                assistantCorrectionMessage,
-                userCorrectionMessage,
-              );
-              continue;
             }
             // Shallow-answer guard: a collection/tag-scoped evidence question
             // must not finalize without library evidence. One correction turn,
@@ -2141,6 +2169,7 @@ export class AgentRuntime {
                   assistantCorrectionMessage,
                   userCorrectionMessage,
                 );
+                continuationMessages.push(userCorrectionMessage);
                 continue;
               }
             }
@@ -2162,12 +2191,16 @@ export class AgentRuntime {
           };
           messages.push(assistantToolMessage);
           if (!calls.length) break;
+          newTranscriptMessages.push(assistantToolMessage);
+          const roundToolMessages: AgentModelMessage[] = [];
+          const roundFollowupMessages: AgentModelMessage[] = [];
+          const appendRoundContinuation = () => {
+            const delta = [...roundToolMessages, ...roundFollowupMessages];
+            messages.push(...delta);
+            continuationMessages.push(...delta);
+            newTranscriptMessages.push(...delta);
+          };
           for (const call of calls) {
-            newTranscriptMessages.push({
-              role: "assistant",
-              content: "",
-              tool_calls: [call],
-            });
             const outcome = await executeToolWorkflow(call, round, {
               modelCallId: call.id,
             });
@@ -2182,14 +2215,13 @@ export class AgentRuntime {
                   2,
                 ),
               };
-              messages.push(toolMessage);
-              newTranscriptMessages.push(toolMessage);
+              roundToolMessages.push(toolMessage);
               for (const followupMessage of outcome.delivery.followupMessages) {
-                messages.push(followupMessage);
-                newTranscriptMessages.push(followupMessage);
+                roundFollowupMessages.push(followupMessage);
               }
             }
             if (outcome.stopRun) {
+              appendRoundContinuation();
               const stopFinalText = outcome.finalText || currentAnswerText;
               if (stopFinalText) {
                 newTranscriptMessages.push({
@@ -2200,14 +2232,17 @@ export class AgentRuntime {
               await persistTranscriptCheckpoint();
               return completeRun(stopFinalText, "completed");
             }
-            await persistTranscriptCheckpoint();
             if (consecutiveToolErrors >= 3) {
+              appendRoundContinuation();
+              await persistTranscriptCheckpoint();
               const finalText =
                 currentAnswerText ||
                 "Agent stopped after repeated tool errors. Please adjust the request and try again.";
               return completeRun(finalText, "failed");
             }
           }
+          appendRoundContinuation();
+          await persistTranscriptCheckpoint();
         }
 
         const newFingerprints = toolExecutionRecords

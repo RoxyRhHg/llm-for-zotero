@@ -20,6 +20,21 @@ import type {
   UsageStats,
 } from "../shared/llm";
 import type { ContextCachePlan } from "../contextCache/manager";
+import type {
+  AgentActionContract,
+  AgentActionIntent,
+  AgentActionReceipt,
+  AgentToolActionDescriptor,
+} from "./contracts/types";
+
+export type {
+  AgentActionCapability,
+  AgentActionContract,
+  AgentActionIntent,
+  AgentActionObligation,
+  AgentActionReceipt,
+  AgentToolActionDescriptor,
+} from "./contracts/types";
 
 export type AgentRequest = {
   conversationKey: number;
@@ -297,6 +312,7 @@ export type AgentEvent =
       name: string;
       ok: boolean;
       effect?: AgentToolEffect;
+      receipt: AgentActionReceipt;
       content: unknown;
       artifacts?: AgentToolArtifact[];
     }
@@ -503,6 +519,7 @@ export type ClassifiedTurnIntent = {
   retrievalIntent: "enumerate" | "verify" | "summarize" | "none";
   wantedSections: Array<"methods" | "results" | "limitations">;
   queryLanguage?: string;
+  actionIntents: AgentActionIntent[];
 };
 
 export type AgentRuntimeRequest = AgentRequest & {
@@ -510,6 +527,8 @@ export type AgentRuntimeRequest = AgentRequest & {
   conversationGeneration?: number;
   /** Set by the runtime after per-turn classification; absent on fallback. */
   classifiedIntent?: ClassifiedTurnIntent;
+  /** Internal per-turn action obligations. Persisted with transcript events. */
+  actionContract?: AgentActionContract;
   item?: Zotero.Item | null;
   history?: ChatMessage[];
   authMode?: ModelProviderAuthMode;
@@ -623,6 +642,7 @@ export type AgentToolResult = {
   name: string;
   ok: boolean;
   effect?: AgentToolEffect;
+  receipt: AgentActionReceipt;
   content: unknown;
   artifacts?: AgentToolArtifact[];
 };
@@ -796,6 +816,7 @@ export type AgentToolDefinition<TInput = unknown, TResult = unknown> = {
   isAvailable?: (request: AgentRuntimeRequest) => boolean;
   guidance?: AgentToolGuidance;
   presentation?: AgentToolPresentation;
+  describeAction?: (input: TInput) => AgentToolActionDescriptor;
   validate: (args: unknown) => AgentToolInputValidation<TInput>;
   execute: (
     input: TInput,

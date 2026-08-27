@@ -1334,6 +1334,14 @@ export class ZoteroGateway {
           ),
         );
     }
+    return this.listCurrentCollectionSummaries(normalizedLibraryID);
+  }
+
+  listCurrentCollectionSummaries(libraryID: number): CollectionSummary[] {
+    const normalizedLibraryID = Number.isFinite(libraryID)
+      ? Math.floor(libraryID)
+      : 0;
+    if (!normalizedLibraryID) return [];
     const collections = listLibraryCollections(normalizedLibraryID);
     const pathMap = buildCollectionPathMap(collections);
     return collections
@@ -1355,6 +1363,34 @@ export class ZoteroGateway {
           },
         ),
       );
+  }
+
+  listCurrentCollectionTargetIds(params: {
+    libraryID: number;
+    collectionId: number;
+    targetKind: "papers" | "items";
+  }): number[] {
+    const collection = this.getCollection(params.collectionId);
+    if (!collection || Number(collection.libraryID) !== params.libraryID) {
+      return [];
+    }
+    let memberIds: number[];
+    try {
+      memberIds = collection.getChildItems?.(true, false) || [];
+    } catch (_error) {
+      return [];
+    }
+    const directIds = [
+      ...new Set(
+        memberIds
+          .map(Number)
+          .filter((itemId) => Number.isInteger(itemId) && itemId > 0),
+      ),
+    ];
+    if (params.targetKind === "items") return directIds;
+    return directIds.filter(
+      (itemId) => this.getItem(itemId)?.isRegularItem?.() === true,
+    );
   }
 
   async getAllChildAttachmentInfos(

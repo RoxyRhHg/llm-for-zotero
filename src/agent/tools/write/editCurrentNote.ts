@@ -419,6 +419,21 @@ export function createEditCurrentNoteTool(
 ): AgentWriteToolDefinition<EditCurrentNoteInput, unknown> {
   const mutationService = new LibraryMutationService(zoteroGateway);
   return {
+    describeAction: (input) => ({
+      kind: "semantic_state",
+      capability: "zotero.notes",
+      source: "library_mutation",
+      action: {
+        kind: "note_write",
+        mode: input.mode,
+        targetItemId: input.targetItemId,
+        targetNoteId: input.targetNoteId || input.noteId,
+        destinationCollectionIds: input.collections || [],
+        expectedText: input.content
+          ? stripNoteHtml(renderRawNoteHtml(input.content))
+          : undefined,
+      },
+    }),
     spec: {
       name: "edit_current_note",
       description:

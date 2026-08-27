@@ -23,6 +23,12 @@ import { resolveSkillRequestContext } from "../skills/contextEligibility";
 import { matchesSkill } from "../skills/skillLoader";
 import type { AgentSkill } from "../skills/skillLoader";
 import type { AgentRuntimeRequest, ClassifiedTurnIntent } from "../types";
+import {
+  inferActionIntentsFromRequest,
+  mergeActionIntents,
+  parseActionIntents,
+} from "./actionIntent";
+export { inferActionIntentsFromRequest } from "./actionIntent";
 
 /**
  * Pseudo-skill ID the classifier can return when none of the real skills
@@ -114,7 +120,16 @@ export async function detectTurnIntent(
   }
   const raw = result.text;
 
-  const classifiedIntent = parseClassifiedTurnIntent(raw);
+  const parsedIntent = parseClassifiedTurnIntent(raw);
+  const classifiedIntent = parsedIntent
+    ? {
+        ...parsedIntent,
+        actionIntents: mergeActionIntents(
+          parsedIntent.actionIntents,
+          inferActionIntentsFromRequest(request),
+        ),
+      }
+    : null;
   const parsed = parseClassifierResponse(raw, skills);
   if (parsed === null) {
     (
@@ -216,6 +231,8 @@ function buildClassifierPrompt(
     '• retrievalIntent: how the question should read the library, in any language — "enumerate" for which/all/list/find-evidence questions, "verify" for exact presence/absence checks, "summarize" for themes/commonalities/comparisons/overviews across papers, "none" for pure operations (tagging, moving, editing) or single-paper reads.',
     "• wantedSections: only the sections the user explicitly asks about (methods, results, limitations); otherwise an empty array.",
     '• queryLanguage: short language code of the user message, e.g. "en", "zh", "ja".',
+    "• actionIntents: concrete actions the user requires, not suggestions. Each action has capability, coverage, targetKind, optional exact collection scope, scopeRole (source or destination), and optional constraints such as tagPrefix or collectionMode:'move'. Represent a move between named collections with separate source and destination intents. Use [] for a read-only question.",
+    "• Exact collection scope means direct members only. Set includeDescendants:true only when the user explicitly asks for subcollections or descendants.",
     "",
     "Available skills:",
     skillList,
@@ -228,7 +245,7 @@ function buildClassifierPrompt(
     request.userText,
     `"""`,
     "",
-    'Reply with ONLY a JSON object in this exact shape, no prose, no code fences: {"skillIds": ["id1", "id2"], "retrievalIntent": "enumerate|verify|summarize|none", "wantedSections": [], "queryLanguage": "en"}',
+    'Reply with ONLY a JSON object in this exact shape, no prose, no code fences: {"skillIds": ["id1", "id2"], "retrievalIntent": "enumerate|verify|summarize|none", "wantedSections": [], "queryLanguage": "en", "actionIntents": [{"capability":"zotero.tags","coverage":"all","targetKind":"papers","scopeRole":"source","scope":{"kind":"collection","path":"Parent/Leaf","includeDescendants":false},"constraints":{"tagPrefix":"topic:"}}]}',
   ].join("\n");
 }
 
@@ -263,6 +280,7 @@ export function parseClassifiedTurnIntent(
     retrievalIntent?: unknown;
     wantedSections?: unknown;
     queryLanguage?: unknown;
+    actionIntents?: unknown;
   };
   const retrievalIntent =
     typeof record.retrievalIntent === "string"
@@ -284,6 +302,7 @@ export function parseClassifiedTurnIntent(
     retrievalIntent: retrievalIntent as ClassifiedTurnIntent["retrievalIntent"],
     wantedSections,
     queryLanguage,
+    actionIntents: parseActionIntents(record.actionIntents),
   };
 }
 

@@ -3624,6 +3624,47 @@ describe("durable change journal v2", function () {
     assert.deepEqual(writes, []);
   });
 
+  it("captures a created note without calling regular-item child getters", async function () {
+    const note = {
+      id: 42,
+      parentID: false,
+      deleted: false,
+      isAnnotation: () => false,
+      isAttachment: () => false,
+      isNote: () => true,
+      isRegularItem: () => false,
+      getField: () => "",
+      getTags: () => [],
+      getCollections: () => [7],
+      getNote: () => "<p>Created note</p>",
+      getAttachments: () => {
+        throw new Error("getAttachments is invalid for notes");
+      },
+      getNotes: () => {
+        throw new Error("getNotes is invalid for notes");
+      },
+    };
+    const service = new LibraryMutationService({
+      getItem: (itemId: number) => (itemId === 42 ? note : null),
+      getEditableArticleMetadata: () => null,
+    } as never);
+
+    const state = await service.captureOperationState(
+      { type: "save_note", content: "Created note" },
+      context,
+      { result: { noteId: 42 } },
+    );
+
+    assert.deepInclude(state.items?.[0], {
+      itemId: 42,
+      exists: true,
+      collectionIds: [7],
+      noteHtmlChecksum: await sha256Text("<p>Created note</p>"),
+    });
+    assert.notProperty(state.items?.[0] || {}, "childAttachmentIds");
+    assert.notProperty(state.items?.[0] || {}, "childNoteIds");
+  });
+
   it("refuses an uncertain inverse when the crash left no post-image guard", async function () {
     await prepareAction({
       id: "uncertain-without-postimage",

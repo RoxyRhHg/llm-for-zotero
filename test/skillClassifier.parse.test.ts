@@ -137,6 +137,7 @@ describe("parseClassifiedTurnIntent", function () {
       retrievalIntent: "summarize",
       wantedSections: ["methods"],
       queryLanguage: "zh",
+      actionIntents: [],
     });
   });
 

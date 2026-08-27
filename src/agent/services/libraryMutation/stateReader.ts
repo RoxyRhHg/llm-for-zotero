@@ -429,20 +429,27 @@ export class MutationStateReader {
         if (attachmentTitle) state.attachmentTitle = attachmentTitle;
         const attachmentPath = await readAttachmentPath(item);
         if (attachmentPath) state.attachmentPath = attachmentPath;
-        state.childAttachmentIds = Array.from(
-          new Set(
-            (item.getAttachments?.() || [])
-              .map((value: unknown) => Math.floor(Number(value)))
-              .filter((value: number) => Number.isFinite(value) && value > 0),
-          ),
-        ).sort((left, right) => left - right);
-        state.childNoteIds = Array.from(
-          new Set(
-            (item.getNotes?.() || [])
-              .map((value: unknown) => Math.floor(Number(value)))
-              .filter((value: number) => Number.isFinite(value) && value > 0),
-          ),
-        ).sort((left, right) => left - right);
+        const isRegularItem =
+          item.isRegularItem?.() === true ||
+          (typeof item.isRegularItem !== "function" &&
+            item.isNote?.() !== true &&
+            item.isAttachment?.() !== true);
+        if (isRegularItem) {
+          state.childAttachmentIds = Array.from(
+            new Set(
+              (item.getAttachments?.() || [])
+                .map((value: unknown) => Math.floor(Number(value)))
+                .filter((value: number) => Number.isFinite(value) && value > 0),
+            ),
+          ).sort((left, right) => left - right);
+          state.childNoteIds = Array.from(
+            new Set(
+              (item.getNotes?.() || [])
+                .map((value: unknown) => Math.floor(Number(value)))
+                .filter((value: number) => Number.isFinite(value) && value > 0),
+            ),
+          ).sort((left, right) => left - right);
+        }
         if (item.isNote?.()) {
           state.noteHtmlChecksum = await sha256Text(item.getNote?.() || "");
         }

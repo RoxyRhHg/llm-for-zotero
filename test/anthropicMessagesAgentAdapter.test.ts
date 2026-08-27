@@ -661,6 +661,12 @@ describe("AnthropicMessagesAgentAdapter", function () {
     assert.equal(firstStep.kind, "tool_calls");
     if (firstStep.kind !== "tool_calls") return;
 
+    const executedToolResult: AgentModelMessage = {
+      role: "tool",
+      tool_call_id: "toolu_1",
+      name: "read_paper",
+      content: '{"matches":["a"]}',
+    };
     await adapter.runStep({
       request: makeRequest(),
       messages: [
@@ -668,13 +674,9 @@ describe("AnthropicMessagesAgentAdapter", function () {
           ...firstStep.assistantMessage,
           tool_calls: firstStep.calls.slice(0, 1),
         },
-        {
-          role: "tool",
-          tool_call_id: "toolu_1",
-          name: "read_paper",
-          content: '{"matches":["a"]}',
-        },
+        executedToolResult,
       ],
+      continuationMessages: [executedToolResult],
       tools,
     });
 
@@ -760,22 +762,34 @@ describe("AnthropicMessagesAgentAdapter", function () {
     const firstStep = await adapter.runStep({ request, messages, tools });
     assert.equal(firstStep.kind, "tool_calls");
     if (firstStep.kind !== "tool_calls") return;
-    messages.push(firstStep.assistantMessage, {
+    const toolResultMessage: AgentModelMessage = {
       role: "tool",
       tool_call_id: firstStep.calls[0].id,
       name: firstStep.calls[0].name,
       content: '{"matches":["paper-a","paper-b"]}',
-    });
+    };
+    messages.push(firstStep.assistantMessage, toolResultMessage);
 
-    const secondStep = await adapter.runStep({ request, messages, tools });
+    const secondStep = await adapter.runStep({
+      request,
+      messages,
+      continuationMessages: [toolResultMessage],
+      tools,
+    });
     assert.equal(secondStep.kind, "final");
     if (secondStep.kind !== "final") return;
-    messages.push(secondStep.assistantMessage, {
+    const correctionMessage: AgentModelMessage = {
       role: "user",
       content: "Correction for this turn: retrieve body evidence first.",
-    });
+    };
+    messages.push(secondStep.assistantMessage, correctionMessage);
 
-    await adapter.runStep({ request, messages, tools });
+    await adapter.runStep({
+      request,
+      messages,
+      continuationMessages: [correctionMessage],
+      tools,
+    });
 
     const thirdRequestMessages = requestBodies[2]?.messages as Array<{
       role?: string;

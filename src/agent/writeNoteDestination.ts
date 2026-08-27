@@ -68,7 +68,7 @@ function hasFileDestinationSignal(
   ) {
     return true;
   }
-  return /\b(?:save|write|export|send|put|create|make)\b[\s\S]{0,120}\b(?:to|into|as|in|under)\b[\s\S]{0,120}\b(?:files?|directories|directory|disk|local)\b/i.test(
+  return /\b(?:save|write|export|send|put|create|make)\b[\s\S]{0,120}\b(?:to|into|as|in|under)\s+(?:(?:an?|the|my|your)\s+)?(?:(?:local|markdown)\s+)?(?:files?|directories|directory|disk)\b/i.test(
     text,
   );
 }

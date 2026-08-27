@@ -1,4 +1,8 @@
 import { assert } from "chai";
+import {
+  resolveLiveAgentCredentials,
+  type LiveAgentCredentials,
+} from "./liveAgentCredentials";
 
 declare const Zotero: any;
 
@@ -26,69 +30,24 @@ describe("acceptance scenarios, live", function () {
     tags: [] as string[],
   };
   const report: string[] = [];
-  let creds: { model: string; apiBase: string; apiKey: string } | null = null;
+  const traces: string[] = [];
+  let creds: LiveAgentCredentials | null = null;
 
   function libraryID(): number {
     return Zotero.Libraries.userLibraryID;
   }
 
-  function configuredCredentialsProfilePath(): string {
-    try {
-      return String(
-        (
-          globalThis as unknown as {
-            Services?: { env?: { get?: (key: string) => string } };
-          }
-        ).Services?.env?.get?.("LLM_FOR_ZOTERO_LIVE_PROFILE_PATH") || "",
-      ).trim();
-    } catch {
-      return "";
-    }
-  }
-
   async function ensureCredentials(): Promise<boolean> {
-    const readPref = (key: string) =>
-      String(Zotero.Prefs.get(`${PREF_PREFIX}.${key}`, true) || "");
-    if (readPref("apiKey") && readPref("apiBase") && readPref("model")) {
-      creds = {
-        model: readPref("model"),
-        apiBase: readPref("apiBase"),
-        apiKey: readPref("apiKey"),
-      };
-      return true;
-    }
-    const configuredProfilePath = configuredCredentialsProfilePath();
-    const candidates = configuredProfilePath ? [configuredProfilePath] : [];
-    for (const path of candidates) {
-      try {
-        const contents = await Zotero.File.getContentsAsync(path);
-        if (typeof contents !== "string") continue;
-        const grab = (key: string) => {
-          const m = contents.match(
-            new RegExp(
-              `user_pref\\("${PREF_PREFIX.replace(/\./g, "\\.")}\\.${key}",\\s*"([^"]*)"\\)`,
-            ),
-          );
-          return m ? m[1] : "";
-        };
-        const apiKey = grab("apiKey");
-        const apiBase = grab("apiBase");
-        const model = grab("model");
-        if (apiKey && apiBase && model) {
-          creds = { model, apiBase, apiKey };
-          return true;
-        }
-      } catch {
-        /* try next */
-      }
-    }
-    return false;
+    creds = await resolveLiveAgentCredentials();
+    return Boolean(creds);
   }
 
   async function runTurn(userText: string) {
     const api = Zotero.LLMForZotero?.api?.agent;
     assert.isOk(api, "agent API must be installed");
     const toolCalls: string[] = [];
+    const contractStates: string[] = [];
+    const receipts: string[] = [];
     const conversationKey = Math.floor(Math.random() * 1_000_000) + 700_000;
 
     const result = await api.runTurn(
@@ -101,15 +60,37 @@ describe("acceptance scenarios, live", function () {
         model: creds?.model,
         apiBase: creds?.apiBase,
         apiKey: creds?.apiKey,
-        providerProtocol: "openai_chat_compat",
+        providerProtocol: creds?.providerProtocol,
+        ...(creds?.reasoningLevel
+          ? {
+              reasoning: {
+                provider: "deepseek",
+                level: creds.reasoningLevel,
+              },
+            }
+          : {}),
       },
       (event: any) => {
         if (event?.type === "tool_call" && event.name)
           toolCalls.push(event.name);
+        if (
+          event?.type === "provider_event" &&
+          event.providerType === "agent_action_contract"
+        ) {
+          contractStates.push(JSON.stringify(event.payload || {}));
+        }
+        if (event?.type === "tool_result" && event.receipt) {
+          receipts.push(JSON.stringify(event.receipt));
+        }
         if (event?.type === "confirmation_required" && event.requestId) {
           void api.resolveConfirmation(event.requestId, true);
         }
       },
+    );
+    const answer =
+      result?.kind === "completed" ? String(result.text || "") : "";
+    traces.push(
+      `PROMPT: ${userText}\n  TOOLS: ${toolCalls.join(" → ") || "(none)"}\n  OUTCOME: ${result?.kind}\n  CONTRACT: ${contractStates.join(" → ") || "(none)"}\n  RECEIPTS: ${receipts.join(" → ") || "(none)"}\n  ANSWER: ${answer.slice(0, 1200) || "(empty)"}`,
     );
     return { result, toolCalls };
   }
@@ -171,6 +152,10 @@ describe("acceptance scenarios, live", function () {
       await Zotero.File.putContentsAsync(
         "/tmp/llm-for-zotero-acceptance-report.txt",
         report.join("\n\n"),
+      );
+      await Zotero.File.putContentsAsync(
+        "/tmp/llm-for-zotero-acceptance-transcript.txt",
+        traces.join("\n\n"),
       );
     } catch {
       /* best effort */

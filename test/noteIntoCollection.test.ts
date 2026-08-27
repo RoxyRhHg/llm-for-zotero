@@ -67,6 +67,27 @@ describe("note into a collection (issue #374)", function () {
     );
   });
 
+  it("describes the stored note text rather than raw Markdown syntax", function () {
+    const { gateway } = makeGateway();
+    const tool = createEditCurrentNoteTool(gateway as never);
+    const result = tool.validate({
+      mode: "create",
+      content: "# Issue388 marker\n\n**Verified body.**",
+      target: "standalone",
+      collections: [88],
+    });
+    assert.isTrue(result.ok);
+    if (!result.ok) return;
+    const descriptor = tool.describeAction?.(result.value);
+    assert.equal(descriptor?.kind, "semantic_state");
+    if (descriptor?.kind !== "semantic_state") return;
+    assert.equal(descriptor.action?.kind, "note_write");
+    assert.equal(
+      descriptor.action?.expectedText,
+      "Issue388 marker\nVerified body.",
+    );
+  });
+
   it("names the destination collection on the confirmation card", function () {
     const { gateway } = makeGateway();
     const tool = createEditCurrentNoteTool(gateway as never);
