@@ -202,6 +202,16 @@ function normalizeDisplayText(value: unknown, maxLength: number): string {
   return readString(value).replace(/\s+/g, " ").slice(0, maxLength).trim();
 }
 
+function normalizeOptionalPublicWebUrl(value: unknown): string | undefined {
+  const raw = readString(value);
+  if (!raw) return undefined;
+  try {
+    return normalizePublicWebUrl(raw);
+  } catch {
+    return undefined;
+  }
+}
+
 function normalizeSource(
   value: unknown,
   contentField: "content" | "raw_content",
@@ -221,6 +231,8 @@ function normalizeSource(
     organization: siteName || hostname,
     title,
   };
+  const faviconUrl = normalizeOptionalPublicWebUrl(record.favicon);
+  if (faviconUrl) source.faviconUrl = faviconUrl;
   if (contentField === "content" && content) source.snippet = content;
   if (contentField === "raw_content" && content) source.content = content;
   const score = readFiniteNumber(record.score);
@@ -374,7 +386,7 @@ export class TavilyClient implements WebAccessProvider {
         include_answer: false,
         include_raw_content: false,
         include_images: false,
-        include_favicon: false,
+        include_favicon: true,
         include_usage: true,
       },
       request.signal,
@@ -412,7 +424,7 @@ export class TavilyClient implements WebAccessProvider {
         chunks_per_source: request.chunksPerSource,
         extract_depth: request.depth,
         include_images: false,
-        include_favicon: false,
+        include_favicon: true,
         include_usage: true,
         format: "text",
       },

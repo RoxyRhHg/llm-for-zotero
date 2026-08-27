@@ -1,5 +1,5 @@
 import type { PaperContextRef } from "../../../shared/types";
-import type { AgentToolDefinition } from "../../types";
+import type { AgentToolDefinition, AgentTraceDetail } from "../../types";
 import { LiteratureSearchService } from "../../services/literatureSearchService";
 import type { ZoteroGateway } from "../../services/zoteroGateway";
 import {
@@ -38,6 +38,108 @@ type SearchLiteratureOnlineInput = {
   limit?: number;
   libraryID?: number;
 };
+
+function readTraceString(value: unknown): string | undefined {
+  return typeof value === "string" && value.trim() ? value.trim() : undefined;
+}
+
+function buildLiteratureTraceUrl(
+  result: Record<string, unknown>,
+): string | undefined {
+  const directUrl =
+    readTraceString(result.openAccessUrl) || readTraceString(result.sourceUrl);
+  if (directUrl) return directUrl;
+  const doi = readTraceString(result.doi)?.replace(
+    /^https?:\/\/(?:dx\.)?doi\.org\//i,
+    "",
+  );
+  return doi ? `https://doi.org/${doi}` : undefined;
+}
+
+function buildLiteratureTraceCreator(
+  paper: Record<string, unknown>,
+  patch: Record<string, unknown>,
+): string {
+  const authors = Array.isArray(paper.authors)
+    ? paper.authors.map(readTraceString).filter(Boolean)
+    : [];
+  if (authors.length) {
+    return `${authors[0]}${authors.length > 1 ? " et al." : ""}`;
+  }
+
+  const creators = Array.isArray(patch.creators) ? patch.creators : [];
+  for (const entry of creators) {
+    if (!entry || typeof entry !== "object" || Array.isArray(entry)) continue;
+    const creator = entry as Record<string, unknown>;
+    const name =
+      readTraceString(creator.name) ||
+      [readTraceString(creator.firstName), readTraceString(creator.lastName)]
+        .filter(Boolean)
+        .join(" ");
+    if (name) return name;
+  }
+  return "Unknown creator";
+}
+
+function buildLiteratureTraceYear(
+  paper: Record<string, unknown>,
+  patch: Record<string, unknown>,
+): string {
+  if (typeof paper.year === "number" && Number.isFinite(paper.year)) {
+    return String(Math.trunc(paper.year));
+  }
+  const explicitYear = readTraceString(paper.year);
+  if (explicitYear && /^\d{4}$/.test(explicitYear)) return explicitYear;
+  const date = readTraceString(patch.date);
+  return date?.match(/\b\d{4}\b/)?.[0] || "n.d.";
+}
+
+function buildLiteratureTraceDetails(
+  args: unknown,
+  content: unknown,
+): AgentTraceDetail[] {
+  const input =
+    args && typeof args === "object" && !Array.isArray(args)
+      ? (args as Record<string, unknown>)
+      : {};
+  const result =
+    content && typeof content === "object" && !Array.isArray(content)
+      ? (content as Record<string, unknown>)
+      : {};
+  const details: AgentTraceDetail[] = [];
+  const query =
+    readTraceString(input.query) ||
+    readTraceString(input.title) ||
+    readTraceString(input.author);
+  if (query) details.push({ label: "Query", value: query });
+
+  const results = Array.isArray(result.results) ? result.results : [];
+  for (const entry of results) {
+    if (!entry || typeof entry !== "object" || Array.isArray(entry)) continue;
+    const paper = entry as Record<string, unknown>;
+    const patch =
+      paper.patch &&
+      typeof paper.patch === "object" &&
+      !Array.isArray(paper.patch)
+        ? (paper.patch as Record<string, unknown>)
+        : {};
+    const title =
+      readTraceString(paper.title) ||
+      readTraceString(paper.displayTitle) ||
+      readTraceString(patch.title);
+    if (!title) continue;
+    const creator = buildLiteratureTraceCreator(paper, patch);
+    const year = buildLiteratureTraceYear(paper, patch);
+    const value = `${creator}, ${year}, ${title}`;
+    const href = buildLiteratureTraceUrl({ ...patch, ...paper });
+    details.push({
+      label: "Paper",
+      value,
+      timeline: { icon: "paper", ...(href ? { href } : {}) },
+    });
+  }
+  return details;
+}
 
 export function createSearchLiteratureOnlineTool(
   zoteroGateway: ZoteroGateway,
@@ -110,6 +212,10 @@ export function createSearchLiteratureOnlineTool(
     },
     presentation: {
       label: "Search Literature Online",
+      traceIcon: "library",
+      mergeResultIntoCallTrace: true,
+      buildTraceDetails: ({ args, content }) =>
+        buildLiteratureTraceDetails(args, content),
       summaries: {
         onCall: ({ args }) => {
           const a =

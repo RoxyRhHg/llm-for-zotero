@@ -87,38 +87,28 @@ function buildReadTraceDetails(
       : {};
   const details: AgentTraceDetail[] = [];
   if (input.ok) {
-    details.push({ label: "Reading for", value: input.value.query });
-    details.push({ label: "Depth", value: input.value.depth });
     details.push({
-      label: "Chunks per page",
-      value: String(input.value.chunksPerSource),
+      label: "Query",
+      value: input.value.query,
     });
-  }
-  for (const [index, page] of (result.pages || []).entries()) {
     details.push({
-      label: `Page ${index + 1}`,
-      value: `${page.organization} — ${page.title}`,
+      label: "Depth",
+      value: `Depth: ${input.value.depth}`,
+      timeline: { icon: "brain" },
     });
-    details.push({ label: `Hostname ${index + 1}`, value: page.hostname });
-    details.push({ label: `URL ${index + 1}`, value: page.url, kind: "url" });
-    if (page.content) {
-      details.push({ label: `Extract ${index + 1}`, value: page.content });
+    for (const url of input.value.urls) {
+      const source = (result.pages || []).find((page) => page.url === url);
+      details.push({
+        label: "URL",
+        value: url,
+        kind: "url",
+        timeline: {
+          icon: "website",
+          href: url,
+          ...(source?.faviconUrl ? { faviconUrl: source.faviconUrl } : {}),
+        },
+      });
     }
-  }
-  for (const [index, failure] of (result.failedResults || []).entries()) {
-    details.push({
-      label: `Failed page ${index + 1}`,
-      value: `${failure.url}\n${failure.error}`,
-    });
-  }
-  if (result.usage) {
-    details.push({
-      label: "Credits used",
-      value: String(result.usage.credits),
-    });
-  }
-  if (result.requestId) {
-    details.push({ label: "Request ID", value: result.requestId });
   }
   return details;
 }
@@ -166,17 +156,13 @@ export function createWebReadTool(
     isAvailable: isWebAccessToolAvailable,
     presentation: {
       label: "Read Web Pages",
+      traceIcon: "web",
       mergeResultIntoCallTrace: true,
       buildTraceSummary: ({ args, content }) => {
         const input = validateWebReadInput(args);
         const result = content as Partial<WebReadToolResult> | undefined;
         if (!input.ok || !result) return null;
-        const success = Array.isArray(result.pages) ? result.pages.length : 0;
-        const failed = Array.isArray(result.failedResults)
-          ? result.failedResults.length
-          : 0;
-        const credits = result.usage?.credits ?? 0;
-        return `Read ${input.value.urls.length} page${input.value.urls.length === 1 ? "" : "s"} · ${success} successful · ${failed} failed · ${input.value.depth} · ${credits} credit${credits === 1 ? "" : "s"}`;
+        return `Read web pages · ${input.value.depth}`;
       },
       summaries: {
         onCall: ({ args }) => {
@@ -185,17 +171,7 @@ export function createWebReadTool(
           const count = validated.value.urls.length;
           return `Reading ${count} web page${count === 1 ? "" : "s"}`;
         },
-        onSuccess: ({ content }) => {
-          const result = content as Partial<WebReadToolResult> | undefined;
-          const success = Array.isArray(result?.pages)
-            ? result.pages.length
-            : 0;
-          const failed = Array.isArray(result?.failedResults)
-            ? result.failedResults.length
-            : 0;
-          const credits = result?.usage?.credits ?? 0;
-          return `Read ${success} web page${success === 1 ? "" : "s"}${failed ? ` · ${failed} failed` : ""} · ${credits} credit${credits === 1 ? "" : "s"}`;
-        },
+        onSuccess: "Web page reading complete",
         onEmpty: "No web pages could be read",
         onError: "Web page reading failed",
       },

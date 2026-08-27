@@ -21,6 +21,7 @@ export type WebSourceRecord = {
   hostname: string;
   organization: string;
   title: string;
+  faviconUrl?: string;
   snippet?: string;
   content?: string;
   score?: number;
@@ -29,7 +30,7 @@ export type WebSourceRecord = {
 
 export type WebSourceDisplay = Pick<
   WebSourceRecord,
-  "sourceId" | "url" | "hostname" | "organization" | "title"
+  "sourceId" | "url" | "hostname" | "organization" | "title" | "faviconUrl"
 >;
 
 /**

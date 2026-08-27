@@ -90,6 +90,67 @@ describe("chat retry model inputs", function () {
     assert.notInclude(rendered, "> Quote card boundaries");
   });
 
+  it("anchors web chips against canonical Markdown instead of a quote-review override", function () {
+    const first = "First web-supported paragraph.";
+    const second = "**Second paragraph.** It must stay separate.";
+    const rendered = buildAssistantDisplayMarkdownForRender(
+      {
+        text: `${first}\n\n${second}`,
+        quoteCitations: [],
+        quoteDisplayOverride: {
+          markdown: `Changed quote-review text.\n${second}`,
+          quoteCitations: [],
+        },
+      },
+      [
+        {
+          offset: first.length,
+          sources: [
+            {
+              sourceId: "web_abc1234",
+              url: "https://example.com/source",
+              hostname: "example.com",
+              organization: "Example",
+              title: "Source",
+            },
+          ],
+        },
+      ],
+    );
+
+    assert.equal(rendered, `${first}LLMWEBSOURCEANCHOR0END\n\n${second}`);
+    assert.notInclude(rendered, "Changed quote-review text");
+  });
+
+  it("keeps web-sourced quotations out of legacy paper quote cards", function () {
+    const text = [
+      "> Quoted text returned by a web page.",
+      ">",
+      "> Example site: Web page title",
+    ].join("\n");
+    const rendered = buildAssistantDisplayMarkdownForRender(
+      { text, quoteCitations: [] },
+      [
+        {
+          offset: text.length,
+          sources: [
+            {
+              sourceId: "web_abc1234",
+              url: "https://example.com/source",
+              hostname: "example.com",
+              organization: "Example",
+              title: "Source",
+            },
+          ],
+        },
+      ],
+    );
+
+    assert.include(rendered, "> Quoted text returned by a web page.");
+    assert.include(rendered, "LLMWEBSOURCEANCHOR0END");
+    assert.notInclude(rendered, "[[quote-occurrence:");
+  });
+
   it("isolates preserved quote anchors in nested lists from emphasized continuation text", function () {
     const quoteCitation = buildQuoteCitation({
       quoteText:

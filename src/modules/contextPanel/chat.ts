@@ -1127,9 +1127,16 @@ function decorateCompletedAssistantCitationLinks(params: {
   bubble: HTMLDivElement;
   assistantMessage: Message;
   pairedUserMessage: Message | null;
+  webSourceAnchors?: readonly WebSourceAnchor[];
 }): void {
-  const { body, panelItem, bubble, assistantMessage, pairedUserMessage } =
-    params;
+  const {
+    body,
+    panelItem,
+    bubble,
+    assistantMessage,
+    pairedUserMessage,
+    webSourceAnchors = [],
+  } = params;
   if (assistantMessage.streaming || assistantMessage.compactMarker) return;
   if (!sanitizeText(bubble.textContent || assistantMessage.text || "").trim()) {
     return;
@@ -1153,6 +1160,7 @@ function decorateCompletedAssistantCitationLinks(params: {
       assistantMessage,
       pairedUserMessage,
     });
+    if (webSourceAnchors.length) return;
     decorateAssistantCitationLinks({
       body,
       panelItem,
@@ -2516,13 +2524,20 @@ export function buildAssistantDisplayMarkdownForRender(
   message: Pick<Message, "text" | "quoteCitations" | "quoteDisplayOverride">,
   webSourceAnchors: readonly WebSourceAnchor[] = [],
 ): string {
-  const display = getMessageQuoteDisplay(message);
+  const hasWebSources = webSourceAnchors.length > 0;
+  const display = hasWebSources
+    ? {
+        markdown: message.text || "",
+        quoteCitations: message.quoteCitations,
+      }
+    : getMessageQuoteDisplay(message);
   return buildQuoteDisplayMarkdown({
     markdown: injectWebSourceAnchorTokens(
       stripWebSourceMarkersForDisplay(sanitizeText(display.markdown)),
       webSourceAnchors,
     ),
     quoteCitations: display.quoteCitations,
+    allowLegacyInference: !hasWebSources,
   });
 }
 
@@ -12715,6 +12730,7 @@ export function refreshChat(
         bubble,
         assistantMessage: msg,
         pairedUserMessage: previousUserMessage,
+        webSourceAnchors,
       });
 
       if (

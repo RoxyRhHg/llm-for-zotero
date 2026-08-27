@@ -2892,10 +2892,7 @@ export async function registerPrefsScripts(_window: Window | undefined | null) {
         try {
           const usage = await new TavilyClient(key).getUsage();
           tavilyStatus.style.color = "green";
-          tavilyStatus.textContent =
-            `${t("Connected")} · ${usage.plan}\n` +
-            `${t("API key usage")}: ${usage.credential.usage}/${usage.credential.limit} ${t("credits")} · ` +
-            `${t("Account usage")}: ${usage.monthly.usage}/${usage.monthly.limit} ${t("credits")}`;
+          tavilyStatus.textContent = `${t("Connected")} · ${usage.plan}`;
         } catch (error) {
           tavilyStatus.style.color = "red";
           tavilyStatus.textContent =

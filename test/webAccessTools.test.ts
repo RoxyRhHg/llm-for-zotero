@@ -57,6 +57,7 @@ describe("web access agent tools", function () {
             hostname: "example.com",
             organization: "Example",
             title: "Report",
+            faviconUrl: "https://example.com/favicon.ico",
             snippet: "Search passage",
           },
         ],
@@ -73,6 +74,7 @@ describe("web access agent tools", function () {
             hostname: "example.com",
             organization: "Example",
             title: "Report",
+            faviconUrl: "https://example.com/favicon.ico",
             content: "Focused passage",
           },
         ],
@@ -277,20 +279,89 @@ describe("web access agent tools", function () {
       maxResults: 5,
     };
     const result = await search.execute(args, context());
+    assert.equal(search.presentation?.traceIcon, "web");
     assert.isTrue(search.presentation?.mergeResultIntoCallTrace);
     assert.equal(
       search.presentation?.buildTraceSummary?.({ args, content: result }),
-      "Searched “current topic” · 1 result · advanced · 2 credits",
+      "Searched web · Depth: advanced",
     );
     const details =
       search.presentation?.buildTraceDetails?.({ args, content: result }) || [];
-    assert.deepInclude(details, { label: "Query", value: "current topic" });
-    assert.deepInclude(details, { label: "Depth", value: "advanced" });
-    assert.deepInclude(details, {
-      label: "URL 1",
-      value: "https://example.com/report",
-      kind: "url",
+    assert.deepEqual(details, [
+      { label: "Query", value: "current topic" },
+      {
+        label: "URL",
+        value: "https://example.com/report",
+        kind: "url",
+        timeline: {
+          icon: "website",
+          href: "https://example.com/report",
+          faviconUrl: "https://example.com/favicon.ico",
+        },
+      },
+    ]);
+    assert.equal(
+      search.presentation?.buildTraceSummary?.({
+        args: { ...args, depth: "basic" },
+        content: result,
+      }),
+      "Searched web · Depth: basic",
+    );
+    assert.notDeepInclude(details, {
+      label: "Snippet",
+      value: "Search passage",
     });
-    assert.deepInclude(details, { label: "Credits used", value: "2" });
+    assert.notDeepInclude(details, {
+      label: "Credits used",
+      value: "2",
+    });
+  });
+
+  it("builds the same connected query, depth, and URL list for web reads", async function () {
+    const fakeProvider = provider();
+    const search = createWebSearchTool(() => fakeProvider);
+    const read = createWebReadTool(() => fakeProvider);
+    await search.execute(
+      {
+        query: "current topic",
+        depth: "basic",
+        topic: "general",
+        maxResults: 5,
+      },
+      context(),
+    );
+    const args = {
+      urls: ["https://example.com/report"],
+      query: "specific detail",
+      depth: "basic" as const,
+      chunksPerSource: 3,
+    };
+    const result = await read.execute(args, context());
+    assert.equal(read.presentation?.traceIcon, "web");
+    assert.equal(
+      read.presentation?.buildTraceSummary?.({ args, content: result }),
+      "Read web pages · basic",
+    );
+    assert.deepEqual(
+      read.presentation?.buildTraceDetails?.({ args, content: result }),
+      [
+        { label: "Query", value: "specific detail" },
+        {
+          label: "Depth",
+          value: "Depth: basic",
+          timeline: { icon: "brain" },
+        },
+        {
+          label: "URL",
+          value: "https://example.com/report",
+          kind: "url",
+          timeline: {
+            icon: "website",
+            href: "https://example.com/report",
+            faviconUrl: "https://example.com/favicon.ico",
+          },
+        },
+      ],
+    );
   });
 });

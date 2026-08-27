@@ -419,10 +419,22 @@ export type AgentToolCall = {
 
 export type AgentTraceDetailKind = "text" | "code" | "json" | "url";
 
+export type AgentTraceTimelineIcon = "brain" | "paper" | "website";
+
+export type AgentTraceTimelineRow = {
+  icon: AgentTraceTimelineIcon;
+  /** Public HTTP(S) destination opened through Zotero when the row is clicked. */
+  href?: string;
+  /** Optional public favicon URL. Website rows fall back to the globe icon. */
+  faviconUrl?: string;
+};
+
 export type AgentTraceDetail = {
   label: string;
   value: string;
   kind?: AgentTraceDetailKind;
+  /** Render this detail as one row in the compact connected trace timeline. */
+  timeline?: AgentTraceTimelineRow;
 };
 
 export type AgentTraceChip = {
@@ -786,6 +798,8 @@ export type AgentToolResultCard = {
 
 export type AgentToolPresentation = {
   label?: string;
+  /** Optional semantic icon for this tool's compact activity-summary row. */
+  traceIcon?: "library" | "web";
   summaries?: {
     onCall?: AgentToolPresentationSummary;
     onPending?: AgentToolPresentationSummary;

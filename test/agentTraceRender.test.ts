@@ -7,6 +7,7 @@ import {
   formatAgentActivityDuration,
   getPendingActionButtonLayout,
   renderAgentTrace,
+  renderAgentTraceDetailsBodyForTests,
   renderPendingActionCard,
 } from "../src/modules/contextPanel/agentTrace/render";
 import {
@@ -57,6 +58,10 @@ class FakeClassList {
 
   contains(cls: string): boolean {
     return this.classes.has(cls);
+  }
+
+  remove(...classes: string[]) {
+    for (const cls of classes) this.classes.delete(cls);
   }
 
   toString(): string {
@@ -1007,6 +1012,104 @@ describe("agentTrace render", function () {
       ),
       "First.\n\nSecond.",
     );
+  });
+
+  it("renders connected trace rows and launches their safe URLs", function () {
+    const globalScope = globalThis as typeof globalThis & {
+      Zotero?: { launchURL?: (url: string) => void };
+    };
+    const originalZotero = globalScope.Zotero;
+    let launchedUrl = "";
+    globalScope.Zotero = {
+      ...(originalZotero || {}),
+      launchURL: (url: string) => {
+        launchedUrl = url;
+      },
+    };
+
+    try {
+      const body = renderAgentTraceDetailsBodyForTests(fakeDocument, [
+        { label: "Query", value: "representational drift" },
+        {
+          label: "Depth",
+          value: "Depth: basic",
+          timeline: { icon: "brain" },
+        },
+        {
+          label: "URL",
+          value: "https://example.com/a/long/result/url",
+          timeline: {
+            icon: "website",
+            href: "https://example.com/a/long/result/url",
+            faviconUrl: "https://example.com/favicon.ico",
+          },
+        },
+        {
+          label: "Paper",
+          value: "Alice Example, 2025, A useful paper",
+          timeline: {
+            icon: "paper",
+            href: "https://doi.org/10.1000/example",
+          },
+        },
+      ]) as unknown as FakeElement;
+
+      assert.isTrue(
+        body.classList.contains("llm-agent-process-details-with-timeline"),
+      );
+      assert.lengthOf(body.findAllByClass("llm-agent-trace-timeline"), 1);
+      assert.lengthOf(body.findAllByClass("llm-agent-trace-timeline-row"), 3);
+      assert.lengthOf(
+        body.findAllByClass("llm-agent-trace-timeline-icon-brain"),
+        1,
+      );
+      assert.lengthOf(
+        body.findAllByClass("llm-agent-trace-timeline-icon-website"),
+        1,
+      );
+      assert.lengthOf(
+        body.findAllByClass("llm-agent-trace-timeline-icon-paper"),
+        1,
+      );
+      const favicons = body.findAllByClass("llm-agent-trace-timeline-favicon");
+      assert.lengthOf(favicons, 1);
+      const websiteIcon = body.findAllByClass(
+        "llm-agent-trace-timeline-icon-website",
+      )[0];
+      assert.isTrue(
+        websiteIcon.classList.contains(
+          "llm-agent-trace-timeline-icon-has-favicon",
+        ),
+      );
+      assert.equal(
+        (favicons[0] as unknown as HTMLImageElement).src,
+        "https://example.com/favicon.ico",
+      );
+      favicons[0].dispatchFakeEvent("error");
+      assert.isTrue((favicons[0] as unknown as HTMLImageElement).hidden);
+      assert.isFalse(
+        websiteIcon.classList.contains(
+          "llm-agent-trace-timeline-icon-has-favicon",
+        ),
+      );
+      assert.deepEqual(
+        body
+          .findAllByClass("llm-agent-trace-timeline-value")
+          .map(collectFakeText),
+        [
+          "Depth: basic",
+          "https://example.com/a/long/result/url",
+          "Alice Example, 2025, A useful paper",
+        ],
+      );
+
+      const links = body.findAllByClass("llm-agent-trace-timeline-row-link");
+      assert.lengthOf(links, 2);
+      links[0].dispatchFakeEvent("click");
+      assert.equal(launchedUrl, "https://example.com/a/long/result/url");
+    } finally {
+      globalScope.Zotero = originalZotero;
+    }
   });
 
   it("expands activity while streaming and collapses it when complete", function () {

@@ -22,6 +22,7 @@ describe("Tavily web access client", function () {
               site_name: "Example Organization",
               title: "Current report",
               content: "Relevant result passage",
+              favicon: "https://www.example.com/favicon.ico#cached",
               score: 0.91,
             },
           ],
@@ -52,7 +53,7 @@ describe("Tavily web access client", function () {
       include_answer: false,
       include_raw_content: false,
       include_images: false,
-      include_favicon: false,
+      include_favicon: true,
       include_usage: true,
     });
     assert.deepEqual(result.usage, { credits: 2 });
@@ -60,6 +61,10 @@ describe("Tavily web access client", function () {
     assert.equal(result.results[0].hostname, "example.com");
     assert.equal(result.results[0].organization, "Example Organization");
     assert.equal(result.results[0].title, "Current report");
+    assert.equal(
+      result.results[0].faviconUrl,
+      "https://www.example.com/favicon.ico",
+    );
     assert.equal(result.results[0].snippet, "Relevant result passage");
   });
 
@@ -75,6 +80,7 @@ describe("Tavily web access client", function () {
               url: "https://example.org/a",
               title: "Page A",
               raw_content: "Task-relevant extracted passage",
+              favicon: "https://example.org/favicon.ico",
             },
           ],
           failed_results: [
@@ -96,11 +102,12 @@ describe("Tavily web access client", function () {
       extract_depth: "basic",
       chunks_per_source: 3,
       include_images: false,
-      include_favicon: false,
+      include_favicon: true,
       include_usage: true,
       format: "text",
     });
     assert.lengthOf(result.pages, 1);
+    assert.equal(result.pages[0].faviconUrl, "https://example.org/favicon.ico");
     assert.equal(result.pages[0].content, "Task-relevant extracted passage");
     assert.deepEqual(result.failedResults, [
       {
@@ -108,6 +115,33 @@ describe("Tavily web access client", function () {
         error: "Extraction unavailable",
       },
     ]);
+  });
+
+  it("keeps a result while discarding an unsafe favicon URL", async function () {
+    const client = new TavilyClient("secret", async () => ({
+      status: 200,
+      body: {
+        query: "topic",
+        results: [
+          {
+            url: "https://example.org/page",
+            title: "Safe page",
+            content: "Passage",
+            favicon: "http://127.0.0.1/favicon.ico",
+          },
+        ],
+        usage: { credits: 1 },
+      },
+    }));
+    const result = await client.search({
+      query: "topic",
+      depth: "basic",
+      topic: "general",
+      maxResults: 5,
+    });
+
+    assert.lengthOf(result.results, 1);
+    assert.notProperty(result.results[0], "faviconUrl");
   });
 
   it("loads plan and credit usage from the usage endpoint", async function () {

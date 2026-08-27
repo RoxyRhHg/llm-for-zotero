@@ -171,52 +171,18 @@ function buildSearchTraceDetails(
   const details: AgentTraceDetail[] = [];
   if (input.ok) {
     details.push({ label: "Query", value: input.value.query });
-    details.push({ label: "Depth", value: input.value.depth });
-    details.push({ label: "Topic", value: input.value.topic });
-    if (input.value.timeRange) {
-      details.push({ label: "Time range", value: input.value.timeRange });
-    }
-    if (input.value.startDate || input.value.endDate) {
-      details.push({
-        label: "Date range",
-        value: `${input.value.startDate || "…"} – ${input.value.endDate || "…"}`,
-      });
-    }
-    if (input.value.includeDomains?.length) {
-      details.push({
-        label: "Included domains",
-        value: input.value.includeDomains.join(", "),
-      });
-    }
-    if (input.value.excludeDomains?.length) {
-      details.push({
-        label: "Excluded domains",
-        value: input.value.excludeDomains.join(", "),
-      });
-    }
   }
-  for (const [index, source] of (result.results || []).entries()) {
+  for (const source of result.results || []) {
     details.push({
-      label: `Result ${index + 1}`,
-      value: `${source.organization} — ${source.title}`,
+      label: "URL",
+      value: source.url,
+      kind: "url",
+      timeline: {
+        icon: "website",
+        href: source.url,
+        ...(source.faviconUrl ? { faviconUrl: source.faviconUrl } : {}),
+      },
     });
-    details.push({
-      label: `Hostname ${index + 1}`,
-      value: source.hostname,
-    });
-    details.push({ label: `URL ${index + 1}`, value: source.url, kind: "url" });
-    if (source.snippet) {
-      details.push({ label: `Snippet ${index + 1}`, value: source.snippet });
-    }
-  }
-  if (result.usage) {
-    details.push({
-      label: "Credits used",
-      value: String(result.usage.credits),
-    });
-  }
-  if (result.requestId) {
-    details.push({ label: "Request ID", value: result.requestId });
   }
   return details;
 }
@@ -282,14 +248,13 @@ export function createWebSearchTool(
     },
     presentation: {
       label: "Search Web",
+      traceIcon: "web",
       mergeResultIntoCallTrace: true,
       buildTraceSummary: ({ args, content }) => {
         const input = validateWebSearchInput(args);
         const result = content as Partial<WebSearchToolResult> | undefined;
         if (!input.ok || !result) return null;
-        const count = Array.isArray(result.results) ? result.results.length : 0;
-        const credits = result.usage?.credits ?? 0;
-        return `Searched “${input.value.query}” · ${count} result${count === 1 ? "" : "s"} · ${input.value.depth} · ${credits} credit${credits === 1 ? "" : "s"}`;
+        return `Searched web · Depth: ${input.value.depth}`;
       },
       summaries: {
         onCall: ({ args }) => {
@@ -298,14 +263,7 @@ export function createWebSearchTool(
             ? `Searching the web for “${validated.value.query}”`
             : "Searching the web";
         },
-        onSuccess: ({ content }) => {
-          const result = content as Partial<WebSearchToolResult> | undefined;
-          const count = Array.isArray(result?.results)
-            ? result.results.length
-            : 0;
-          const credits = result?.usage?.credits ?? 0;
-          return `Found ${count} web result${count === 1 ? "" : "s"} · ${credits} credit${credits === 1 ? "" : "s"}`;
-        },
+        onSuccess: "Web search complete",
         onEmpty: "No web results found",
         onError: "Web search failed",
       },

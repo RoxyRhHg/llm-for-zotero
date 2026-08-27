@@ -167,7 +167,10 @@ describe("search_literature_online tool", function () {
                 {
                   id: "https://openalex.org/W123",
                   display_name: "Related Paper",
-                  authorships: [{ author: { display_name: "Bob Example" } }],
+                  authorships: [
+                    { author: { display_name: "Bob Example" } },
+                    { author: { display_name: "Riley Example" } },
+                  ],
                   publication_year: 2025,
                   cited_by_count: 4,
                   doi: "https://doi.org/10.1000/related",
@@ -199,6 +202,25 @@ describe("search_literature_online tool", function () {
     assert.lengthOf(results, 1);
     assert.equal(results[0].title, "Related Paper");
     assert.equal(results[0].doi, "10.1000/related");
+    assert.equal(tool.presentation?.traceIcon, "library");
+    assert.isTrue(tool.presentation?.mergeResultIntoCallTrace);
+    assert.deepEqual(
+      tool.presentation?.buildTraceDetails?.({
+        args: validated.value,
+        content: result,
+      }),
+      [
+        { label: "Query", value: "neural networks" },
+        {
+          label: "Paper",
+          value: "Bob Example et al., 2025, Related Paper",
+          timeline: {
+            icon: "paper",
+            href: "https://example.com/paper.pdf",
+          },
+        },
+      ],
+    );
     const reviewAction = await tool.createResultReviewAction?.(
       validated.value,
       {

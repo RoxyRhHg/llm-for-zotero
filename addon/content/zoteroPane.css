@@ -4916,6 +4916,32 @@ label.llm-search-results-item:hover {
   white-space: nowrap;
 }
 
+.llm-at-icon-library,
+.llm-at-icon-web {
+  flex: 0 0 14px;
+  width: 14px;
+  height: 14px;
+  margin-top: 1px;
+  background-color: currentColor;
+  font-size: 0;
+  mask-position: center;
+  mask-repeat: no-repeat;
+  mask-size: contain;
+  -webkit-mask-position: center;
+  -webkit-mask-repeat: no-repeat;
+  -webkit-mask-size: contain;
+}
+
+.llm-at-icon-library {
+  mask-image: url("icons/action-library.svg");
+  -webkit-mask-image: url("icons/action-library.svg");
+}
+
+.llm-at-icon-web {
+  mask-image: url("icons/action-mode-global.svg");
+  -webkit-mask-image: url("icons/action-mode-global.svg");
+}
+
 .llm-at-text {
   flex: 1 1 auto;
   min-width: 0;
@@ -4962,6 +4988,152 @@ label.llm-search-results-item:hover {
 
 .llm-agent-process-detail-value-url {
   color: var(--color-accent);
+}
+
+.llm-agent-process-details-with-timeline {
+  gap: 5px;
+  padding-left: 0;
+  border-left: 0;
+}
+
+.llm-agent-process-details-with-timeline > .llm-agent-process-detail {
+  padding-left: 8px;
+  border-left: 1px solid
+    color-mix(in srgb, var(--stroke-secondary) 80%, transparent);
+}
+
+.llm-agent-trace-timeline {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  padding: 1px 0;
+}
+
+.llm-agent-trace-timeline::before {
+  content: "";
+  position: absolute;
+  z-index: 0;
+  top: 11px;
+  bottom: 11px;
+  left: 8px;
+  width: 1px;
+  background: color-mix(
+    in srgb,
+    var(--stroke-primary, var(--fill-tertiary)) 68%,
+    transparent
+  );
+}
+
+.llm-agent-trace-timeline-row {
+  position: relative;
+  z-index: 1;
+  display: grid;
+  grid-template-columns: 18px minmax(0, 1fr);
+  align-items: center;
+  gap: 7px;
+  box-sizing: border-box;
+  min-width: 0;
+  min-height: 23px;
+  margin: 0;
+  padding: 2px 4px 2px 0;
+  border: 0;
+  border-radius: 5px;
+  background: transparent;
+  color: var(--fill-secondary);
+  font: inherit;
+  text-align: left;
+}
+
+.llm-agent-trace-timeline-row-link {
+  cursor: pointer;
+}
+
+.llm-agent-trace-timeline-row-link:hover,
+.llm-agent-trace-timeline-row-link:focus-visible {
+  background: var(--fill-quinary);
+  color: var(--color-accent);
+  outline: none;
+}
+
+.llm-agent-trace-timeline-icon {
+  position: relative;
+  z-index: 1;
+  display: inline-block;
+  width: 16px;
+  height: 16px;
+  margin-left: 1px;
+  border-radius: 4px;
+  background: var(--material-sidepane, var(--material-background));
+  color: var(--fill-tertiary);
+}
+
+.llm-agent-trace-timeline-icon::before {
+  content: "";
+  position: absolute;
+  inset: 1px;
+  background-color: currentColor;
+  mask-position: center;
+  mask-repeat: no-repeat;
+  mask-size: contain;
+  -webkit-mask-position: center;
+  -webkit-mask-repeat: no-repeat;
+  -webkit-mask-size: contain;
+}
+
+.llm-agent-trace-timeline-icon-brain::before {
+  mask-image: url("icons/action-reasoning-brain.svg");
+  -webkit-mask-image: url("icons/action-reasoning-brain.svg");
+}
+
+.llm-agent-trace-timeline-icon-paper::before {
+  mask-image: url("icons/action-paper.svg");
+  -webkit-mask-image: url("icons/action-paper.svg");
+}
+
+.llm-agent-trace-timeline-icon-website::before {
+  mask-image: url("icons/action-mode-global.svg");
+  -webkit-mask-image: url("icons/action-mode-global.svg");
+}
+
+.llm-agent-trace-timeline-icon-website.llm-agent-trace-timeline-icon-has-favicon::before,
+.llm-web-source-site-icon.llm-web-source-site-icon-has-favicon::before {
+  display: none;
+}
+
+.llm-agent-trace-timeline-favicon,
+.llm-web-source-favicon {
+  position: absolute;
+  z-index: 1;
+  inset: 0;
+  display: block;
+  width: 100%;
+  height: 100%;
+  border-radius: 3px;
+  object-fit: contain;
+}
+
+.llm-agent-trace-timeline-favicon {
+  background: var(--material-sidepane, var(--material-background));
+}
+
+.llm-web-source-favicon {
+  background: var(--material-background);
+}
+
+.llm-agent-trace-timeline-favicon[hidden],
+.llm-web-source-favicon[hidden] {
+  display: none;
+}
+
+.llm-agent-trace-timeline-value {
+  min-width: 0;
+  overflow: hidden;
+  color: currentColor;
+  font-size: var(--llm-fs-10);
+  line-height: 1.35;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .llm-agent-process-detail-value-code,
@@ -9495,14 +9667,15 @@ label.llm-search-results-item:hover {
 }
 
 .llm-web-source-popover {
-  position: absolute;
-  bottom: calc(100% + 8px);
-  z-index: 32;
+  position: fixed;
+  top: 0;
+  left: 0;
+  z-index: 2147483600;
   display: flex;
   flex-direction: column;
   gap: 3px;
   box-sizing: border-box;
-  width: min(360px, calc(100vw - 24px));
+  width: 360px;
   max-height: min(52vh, 320px);
   padding: 6px;
   overflow-y: auto;
@@ -9517,38 +9690,59 @@ label.llm-search-results-item:hover {
 }
 
 .llm-web-source-popover.llm-web-source-popover-below {
-  top: calc(100% + 8px);
-  bottom: auto;
   transform: translateY(-4px);
 }
 
-.llm-web-source-indicator:hover .llm-web-source-popover,
-.llm-web-source-indicator:focus-within .llm-web-source-popover,
-.llm-web-source-indicator.expanded .llm-web-source-popover {
+.llm-web-source-popover.llm-web-source-popover-visible {
   opacity: 1;
   visibility: visible;
   transform: translateY(0);
   pointer-events: auto;
 }
 
-.llm-web-source-popover::after {
-  content: "";
-  position: absolute;
-  right: 0;
-  bottom: -10px;
-  left: 0;
-  height: 10px;
-}
-
-.llm-web-source-popover.llm-web-source-popover-below::after {
-  top: -10px;
-  bottom: auto;
-}
-
 .llm-web-source-row {
   flex: 0 0 auto;
-  gap: 3px;
+  grid-template-columns: 18px minmax(0, 1fr);
+  align-items: start;
+  gap: 8px;
   white-space: normal;
+}
+
+.llm-web-source-row + .llm-web-source-row::before {
+  content: "";
+  position: absolute;
+  top: -2px;
+  right: 9px;
+  left: 9px;
+  height: 1px;
+  background: var(--stroke-secondary, rgba(120, 120, 120, 0.35));
+  pointer-events: none;
+}
+
+.llm-web-source-site-icon {
+  position: relative;
+  display: block;
+  width: 16px;
+  height: 16px;
+  margin-top: 1px;
+  border-radius: 3px;
+  background: var(--material-background);
+  color: var(--fill-tertiary);
+}
+
+.llm-web-source-site-icon::before {
+  content: "";
+  position: absolute;
+  inset: 1px;
+  background: currentColor;
+  mask: url("icons/action-mode-global.svg") center / contain no-repeat;
+  -webkit-mask: url("icons/action-mode-global.svg") center / contain no-repeat;
+}
+
+.llm-web-source-content {
+  display: grid;
+  min-width: 0;
+  gap: 3px;
 }
 
 .llm-web-source-organization,

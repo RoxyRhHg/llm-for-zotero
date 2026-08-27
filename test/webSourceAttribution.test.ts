@@ -14,6 +14,7 @@ describe("web source attribution", function () {
     hostname: "example.com",
     organization: "Example Organization",
     title: "Annual report",
+    faviconUrl: "https://example.com/favicon.ico",
     snippet: "Result snippet",
   };
   const records: WebToolExecutionRecord[] = [
@@ -42,6 +43,7 @@ describe("web source attribution", function () {
       sourceId: "web_abc1234",
       organization: "Example Organization",
       title: "Annual report",
+      faviconUrl: "https://example.com/favicon.ico",
     });
   });
 
@@ -58,6 +60,32 @@ describe("web source attribution", function () {
         "The answer does not rely on the search.",
       );
     }
+  });
+
+  it("preserves a paragraph break declared by a source marker", function () {
+    const first = "A web-supported paragraph.";
+    const second = "**A separate paragraph.** More text.";
+    const assessment = assessWebAttribution(
+      `${first}<!--llm-web-source:web_abc1234-->\n${second}`,
+      records,
+    );
+    assert.equal(assessment.status, "valid");
+    if (assessment.status !== "valid") return;
+    assert.equal(assessment.cleanText, `${first}\n\n${second}`);
+    assert.equal(assessment.anchors[0].offset, first.length);
+  });
+
+  it("keeps a compact list compact while anchoring the preceding item", function () {
+    const first = "- First sourced item.";
+    const second = "- Second item.";
+    const assessment = assessWebAttribution(
+      `${first}<!--llm-web-source:web_abc1234-->\n${second}`,
+      records,
+    );
+    assert.equal(assessment.status, "valid");
+    if (assessment.status !== "valid") return;
+    assert.equal(assessment.cleanText, `${first}\n${second}`);
+    assert.equal(assessment.anchors[0].offset, first.length);
   });
 
   it("rejects missing, unknown, failed, and unsafe sources", function () {
@@ -164,6 +192,25 @@ describe("web source attribution", function () {
     assert.equal(
       injectWebSourceAnchorTokens("Answer", restored),
       "AnswerLLMWEBSOURCEANCHOR0END",
+    );
+  });
+
+  it("keeps restored paragraph anchors separated without loosening lists", function () {
+    const anchors = [
+      {
+        offset: "First paragraph.".length,
+        sources: [source],
+      },
+    ];
+    assert.equal(
+      injectWebSourceAnchorTokens("First paragraph.\n**Second.**", anchors),
+      "First paragraph.LLMWEBSOURCEANCHOR0END\n\n**Second.**",
+    );
+    assert.equal(
+      injectWebSourceAnchorTokens("- First item.\n- Second item.", [
+        { offset: "- First item.".length, sources: [source] },
+      ]),
+      "- First item.LLMWEBSOURCEANCHOR0END\n- Second item.",
     );
   });
 

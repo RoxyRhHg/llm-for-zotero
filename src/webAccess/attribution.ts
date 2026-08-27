@@ -54,6 +54,15 @@ function asObject(value: unknown): Record<string, unknown> | null {
     : null;
 }
 
+function normalizeOptionalPublicWebUrl(value: unknown): string | undefined {
+  if (typeof value !== "string" || !value.trim()) return undefined;
+  try {
+    return normalizePublicWebUrl(value);
+  } catch {
+    return undefined;
+  }
+}
+
 function normalizeSource(value: unknown): WebSourceDisplay | null {
   const source = asObject(value);
   if (!source) return null;
@@ -75,7 +84,15 @@ function normalizeSource(value: unknown): WebSourceDisplay | null {
       typeof source.title === "string" && source.title.trim()
         ? source.title.trim()
         : hostname;
-    return { sourceId, url, hostname, organization, title };
+    const faviconUrl = normalizeOptionalPublicWebUrl(source.faviconUrl);
+    return {
+      sourceId,
+      url,
+      hostname,
+      organization,
+      title,
+      ...(faviconUrl ? { faviconUrl } : {}),
+    };
   } catch {
     return null;
   }
@@ -86,6 +103,7 @@ function mergeSource(
   incoming: WebSourceDisplay,
 ): WebSourceDisplay {
   if (current.url !== incoming.url) return current;
+  const faviconUrl = current.faviconUrl || incoming.faviconUrl;
   return {
     ...current,
     organization:
@@ -93,6 +111,7 @@ function mergeSource(
         ? incoming.organization
         : current.organization,
     title: current.title === current.hostname ? incoming.title : current.title,
+    ...(faviconUrl ? { faviconUrl } : {}),
   };
 }
 
@@ -193,6 +212,24 @@ function stripOccurrences(
   return clean + text.slice(cursor);
 }
 
+function preserveDeclaredParagraphBoundaries(
+  text: string,
+  markers: readonly MarkerOccurrence[],
+): string {
+  let normalized = text;
+  for (const marker of [...markers].reverse()) {
+    const after = normalized.slice(marker.end);
+    if (!after.startsWith("\n") || after.startsWith("\n\n")) continue;
+    const nextLine = after.slice(1).split("\n", 1)[0] || "";
+    if (!nextLine.trim()) continue;
+    // A following list marker is already a CommonMark block boundary. Adding
+    // a blank line would turn a compact list into a loose one.
+    if (/^\s*(?:[-+*]|\d{1,9}[.)])\s+/.test(nextLine)) continue;
+    normalized = `${normalized.slice(0, marker.end)}\n${normalized.slice(marker.end)}`;
+  }
+  return normalized;
+}
+
 function hasResidualMarkerOutsideFences(text: string): boolean {
   let fence: { character: "`" | "~"; length: number } | null = null;
   for (const lineWithBreak of text.match(/[^\n]*(?:\n|$)/g) || []) {
@@ -265,18 +302,22 @@ export function assessWebAttribution(
   records: readonly WebToolExecutionRecord[],
 ): WebAttributionAssessment {
   const collected = collectSuccessfulWebSources(records);
-  const markers = collectMarkersOutsideFences(text);
+  const initialMarkers = collectMarkersOutsideFences(text);
+  const normalizedText = collected.webToolsRan
+    ? preserveDeclaredParagraphBoundaries(text, initialMarkers)
+    : text;
+  const markers = collectMarkersOutsideFences(normalizedText);
   if (!collected.webToolsRan) {
     return {
       status: "not_used",
-      cleanText: stripOccurrences(text, markers),
+      cleanText: stripOccurrences(normalizedText, markers),
       anchors: [],
     };
   }
   const sourceIds = Array.from(collected.sources.keys());
-  if (hasResidualMarkerOutsideFences(text)) {
+  if (hasResidualMarkerOutsideFences(normalizedText)) {
     return invalidAssessment(
-      text,
+      normalizedText,
       markers,
       "A web source marker is incomplete or malformed.",
       sourceIds,
@@ -284,7 +325,7 @@ export function assessWebAttribution(
   }
   if (!markers.length) {
     return invalidAssessment(
-      text,
+      normalizedText,
       markers,
       "The answer omitted the required paragraph-level web source markers.",
       sourceIds,
@@ -295,12 +336,12 @@ export function assessWebAttribution(
   let sawNone = false;
   const markerLines = new Set<number>();
   for (const [index, marker] of markers.entries()) {
-    const lineStart = text.lastIndexOf("\n", marker.start - 1) + 1;
-    const lineEndRaw = text.indexOf("\n", marker.end);
-    const lineEnd = lineEndRaw < 0 ? text.length : lineEndRaw;
-    if (text.slice(marker.end, lineEnd).trim()) {
+    const lineStart = normalizedText.lastIndexOf("\n", marker.start - 1) + 1;
+    const lineEndRaw = normalizedText.indexOf("\n", marker.end);
+    const lineEnd = lineEndRaw < 0 ? normalizedText.length : lineEndRaw;
+    if (normalizedText.slice(marker.end, lineEnd).trim()) {
       return invalidAssessment(
-        text,
+        normalizedText,
         markers,
         "Each marker must be the final content on its paragraph line.",
         sourceIds,
@@ -308,7 +349,7 @@ export function assessWebAttribution(
     }
     if (markerLines.has(lineStart)) {
       return invalidAssessment(
-        text,
+        normalizedText,
         markers,
         "Each paragraph may contain only one web source marker.",
         sourceIds,
@@ -317,9 +358,9 @@ export function assessWebAttribution(
     markerLines.add(lineStart);
     if (marker.value === "none") {
       sawNone = true;
-      if (markers.length !== 1 || text.slice(marker.end).trim()) {
+      if (markers.length !== 1 || normalizedText.slice(marker.end).trim()) {
         return invalidAssessment(
-          text,
+          normalizedText,
           markers,
           "The none marker may appear only once, at the end of the answer.",
           sourceIds,
@@ -327,9 +368,9 @@ export function assessWebAttribution(
       }
       continue;
     }
-    if (!text.slice(lineStart, marker.start).trim()) {
+    if (!normalizedText.slice(lineStart, marker.start).trim()) {
       return invalidAssessment(
-        text,
+        normalizedText,
         markers,
         "Each marker must follow paragraph text on the same line.",
         sourceIds,
@@ -337,7 +378,7 @@ export function assessWebAttribution(
     }
     if (sawNone) {
       return invalidAssessment(
-        text,
+        normalizedText,
         markers,
         "The none marker cannot be combined with source citations.",
         sourceIds,
@@ -348,7 +389,7 @@ export function assessWebAttribution(
     );
     if (!ids.length || ids.some((id) => !SOURCE_ID_PATTERN.test(id))) {
       return invalidAssessment(
-        text,
+        normalizedText,
         markers,
         "A web source marker contains an invalid source ID.",
         sourceIds,
@@ -361,7 +402,7 @@ export function assessWebAttribution(
       )
     ) {
       return invalidAssessment(
-        text,
+        normalizedText,
         markers,
         "A web source marker cites an unknown, unsafe, or failed result.",
         sourceIds,
@@ -374,7 +415,7 @@ export function assessWebAttribution(
   }
   if (sawNone && anchors.length) {
     return invalidAssessment(
-      text,
+      normalizedText,
       markers,
       "The none marker cannot be combined with source citations.",
       sourceIds,
@@ -383,8 +424,8 @@ export function assessWebAttribution(
   return {
     status: "valid",
     cleanText: sawNone
-      ? stripOccurrences(text, markers).trimEnd()
-      : stripOccurrences(text, markers),
+      ? stripOccurrences(normalizedText, markers).trimEnd()
+      : stripOccurrences(normalizedText, markers),
     anchors,
   };
 }
