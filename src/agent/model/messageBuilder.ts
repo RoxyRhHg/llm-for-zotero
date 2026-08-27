@@ -44,6 +44,10 @@ import {
   formatSelectedTextLocator,
   renderSelectedTextAnchorContext,
 } from "../../modules/contextPanel/selectedTextAnchorFormatting";
+import {
+  buildInstructionInventory,
+  type InstructionInventory,
+} from "./instructionInventory";
 
 export function isMultimodalRequestSupported(
   request: AgentRuntimeRequest,
@@ -369,12 +373,13 @@ function buildSystemPrompt(sections: PromptSection[]): string {
 function collectToolGuidanceInstructions(
   request: AgentRuntimeRequest,
   tools: AgentToolDefinition<any, any>[],
+  matchedSkillIds: ReadonlyArray<string>,
 ): string[] {
   const instructions = new Set<string>();
   for (const tool of tools) {
     const guidance = tool.guidance;
     if (!guidance) continue;
-    if (!guidance.matches(request)) continue;
+    if (!guidance.matches(request, { matchedSkillIds })) continue;
     const instruction = guidance.instruction.trim();
     if (instruction) instructions.add(instruction);
   }
@@ -475,15 +480,40 @@ function getInScopePaperContexts(request: AgentRuntimeRequest) {
   ];
 }
 
-function buildFigureMineruInstruction(
+function hasFigureTaskIntent(
   request: AgentRuntimeRequest,
   matchedSkillIds: ReadonlyArray<string>,
-): string {
+): boolean {
   const activeSkillIds = new Set([
     ...matchedSkillIds,
     ...(request.forcedSkillIds || []),
   ]);
-  if (!activeSkillIds.has("analyze-figures")) return "";
+  if (activeSkillIds.has("analyze-figures")) return true;
+  const text = request.userText || "";
+  if (
+    /\b(?:figure|fig\.?|table|diagram|chart|graph|plot|schematic|image|panel)\s*(?:[a-z]?\d+[a-z]?|[ivx]+)\b/i.test(
+      text,
+    )
+  ) {
+    return true;
+  }
+  if (
+    /\b(?:analy[sz]e|interpret|inspect|describe|walk\s+me\s+through|explain)\s+(?:this|that|the)\s+(?:figure|fig\.?|table|diagram|chart|graph|plot|schematic|image|panel)\b/i.test(
+      text,
+    )
+  ) {
+    return true;
+  }
+  return /\b(?:this|that|the)\s+(?:figure|fig\.?|table|diagram|chart|graph|plot|schematic|image|panel)\b.{0,80}\b(?:show|mean|indicate|depict|demonstrate)\b/i.test(
+    text,
+  );
+}
+
+function buildFigureMineruInstruction(
+  request: AgentRuntimeRequest,
+  matchedSkillIds: ReadonlyArray<string>,
+): string {
+  if (!hasFigureTaskIntent(request, matchedSkillIds)) return "";
   const mineruPapers = getInScopePaperContexts(request).filter((entry) =>
     Boolean(entry.mineruCacheDir),
   );
@@ -560,9 +590,17 @@ function buildRuntimePlatformSection(): string {
   return buildRuntimePlatformGuidanceText();
 }
 
-function buildTextOnlyModelInstruction(request: AgentRuntimeRequest): string {
+function buildTextOnlyModelInstruction(
+  request: AgentRuntimeRequest,
+  matchedSkillIds: ReadonlyArray<string>,
+): string {
   if (isMultimodalRequestSupported(request)) return "";
   const modelLabel = (request.model || "selected model").trim();
+  if (!hasFigureTaskIntent(request, matchedSkillIds)) {
+    return request.screenshots?.length
+      ? `MODEL LIMITATION: ${modelLabel} is text-only and cannot inspect the supplied screenshots.`
+      : "";
+  }
   return (
     `MODEL LIMITATION: ${modelLabel} is treated as text-only in this plugin. ` +
     "Do not rely on screenshots, PDF page images, or image-file visual inspection. " +
@@ -579,6 +617,7 @@ export async function buildAgentInitialMessages(
   options: {
     transcriptMessages?: AgentModelMessage[];
     contentInputs?: AgentContentInputCapabilities;
+    onInstructionInventory?: (inventory: InstructionInventory) => void;
   } = {},
 ): Promise<AgentModelMessage[]> {
   const memoryBlock = await buildAgentMemoryBlock(request.conversationKey);
@@ -588,11 +627,18 @@ export async function buildAgentInitialMessages(
     buildWriteNoteFileInstruction(request, matchedSkillIds),
     buildForcedSkillWholeLibraryInstruction(request),
   ].filter(Boolean);
-  const turnGuidanceBlock = buildTurnGuidanceBlock([
+  const dynamicGuidanceInstructions = [
     autoReadInstruction,
     ...workflowParityInstructions,
-    ...collectToolGuidanceInstructions(request, tools),
-    ...collectSkillGuidanceInstructions(request, matchedSkillIds),
+    ...collectToolGuidanceInstructions(request, tools, matchedSkillIds),
+  ];
+  const matchedSkillInstructions = collectSkillGuidanceInstructions(
+    request,
+    matchedSkillIds,
+  );
+  const turnGuidanceBlock = buildTurnGuidanceBlock([
+    ...dynamicGuidanceInstructions,
+    ...matchedSkillInstructions,
   ]);
   const coverageBlock = buildAgentCoverageContextBlock({
     conversationKey: request.conversationKey,
@@ -614,7 +660,7 @@ export async function buildAgentInitialMessages(
     },
     {
       id: "model-limitations",
-      lines: [buildTextOnlyModelInstruction(request)],
+      lines: [buildTextOnlyModelInstruction(request, matchedSkillIds)],
     },
     {
       id: "custom-instructions",
@@ -638,10 +684,17 @@ export async function buildAgentInitialMessages(
     resourceContextPlan?.stableContextBlock ||
     buildAgentStableResourceContextBlock(request);
 
-  return [
+  const fixedPrompt = buildSystemPrompt(sections);
+  const turnMessage = buildUserMessage(request, resourceContextPlan, {
+    coverageBlock,
+    memoryBlock,
+    turnGuidanceBlock,
+    contentInputs: options.contentInputs,
+  });
+  const messages: AgentModelMessage[] = [
     {
       role: "system",
-      content: buildSystemPrompt(sections),
+      content: fixedPrompt,
     },
     ...(stableResourceBlock
       ? [
@@ -655,11 +708,23 @@ export async function buildAgentInitialMessages(
     ...(options.transcriptMessages?.length
       ? options.transcriptMessages
       : normalizeHistoryMessages(request)),
-    buildUserMessage(request, resourceContextPlan, {
-      coverageBlock,
-      memoryBlock,
-      turnGuidanceBlock,
-      contentInputs: options.contentInputs,
-    }),
+    turnMessage,
   ];
+  if (options.onInstructionInventory) {
+    const turnText = stringifyMessageContent(turnMessage.content);
+    options.onInstructionInventory(
+      buildInstructionInventory({
+        fixed: fixedPrompt,
+        tools,
+        matchedSkills: matchedSkillInstructions,
+        dynamicGuidance: buildTurnGuidanceBlock(dynamicGuidanceInstructions),
+        stableResource: stableResourceBlock,
+        turnResource: turnGuidanceBlock
+          ? turnText.replace(turnGuidanceBlock, "").trim()
+          : turnText,
+        providerMessages: messages,
+      }),
+    );
+  }
+  return messages;
 }

@@ -12,6 +12,7 @@ import {
   resetCodexDirectCatalogForTests,
 } from "../src/codexAuth/modelCatalog";
 import { CODEX_DIRECT_RESPONSES_URL } from "../src/codexAuth/auth";
+import { CORE_RESEARCH_CONTRACT } from "../src/shared/instructionContracts";
 
 describe("llmClient prepareChatRequest", function () {
   const originalZotero = globalThis.Zotero;
@@ -154,10 +155,7 @@ describe("llmClient prepareChatRequest", function () {
     assert.isArray(capturedBody?.input);
     const input = capturedBody?.input as Array<Record<string, unknown>>;
     assert.equal(input[0]?.role, "system");
-    assert.include(
-      String(input[0]?.content || ""),
-      "You are an intelligent research assistant",
-    );
+    assert.include(String(input[0]?.content || ""), CORE_RESEARCH_CONTRACT);
     assert.equal(input[input.length - 1]?.role, "user");
   });
 

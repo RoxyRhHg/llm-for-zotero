@@ -16,10 +16,13 @@ import type {
   NoteContextRef,
   PaperContextRef,
 } from "../shared/types";
+import { NOTE_EDITING_QUOTE_BLOCK_GUIDANCE } from "../shared/quoteGuidance";
 import {
-  BALANCED_EVIDENCE_GUIDANCE,
-  NOTE_EDITING_QUOTE_BLOCK_GUIDANCE,
-} from "../shared/quoteGuidance";
+  AGENT_ACTION_CONTRACT,
+  CORE_RESEARCH_CONTRACT,
+  PAPER_CITATION_CONTRACT,
+  RUNTIME_CAPABILITY_CONTEXT,
+} from "../shared/instructionContracts";
 import {
   addZoteroMcpToolActivityObserver,
   addZoteroMcpConfirmationHandler,
@@ -1412,6 +1415,13 @@ export function buildZoteroEnvironmentManifest(params: {
     );
   }
 
+  lines.push(
+    CORE_RESEARCH_CONTRACT,
+    PAPER_CITATION_CONTRACT,
+    AGENT_ACTION_CONTRACT,
+    RUNTIME_CAPABILITY_CONTEXT,
+  );
+
   if (!params.mcpEnabled) {
     lines.push(
       "- Zotero MCP tools: disabled for this turn. Do not claim access to Zotero library or PDF tools unless another tool source is available.",
@@ -1445,37 +1455,17 @@ export function buildZoteroEnvironmentManifest(params: {
   }
 
   lines.push(
-    "- You are Codex. Zotero resources and MCP tools are available when useful; they are not mandatory for every response.",
-    "- Use tools only when they materially improve the answer or are required to inspect/update Zotero. If available context is enough, answer directly.",
-    "- For Zotero library, profile, item, PDF, and note facts not shown in context, use Zotero MCP tools instead of local Zotero database/filesystem copies.",
+    "- Zotero MCP is ready for facts or actions absent from context.",
     ...(params.rawPdfMode
       ? [
           "- Raw PDF content: read only the exact current-turn local paths with native shell or file capabilities. Never use paper_read, MinerU, extracted-text context, sibling attachments, or paths from earlier turns as a substitute.",
         ]
       : [
-          "- Paper content: use paper_read overview for broad single-paper summaries, targeted for specific sections/results/methods, and visual/capture only for figures, layout, pages, or current reader capture. For bounded selected multi-paper synthesis, comparison, commonality, or theme questions, overview is the answer style, not the read depth; use library_retrieve or the supplied evidence ledger for body-evidence coverage before answering.",
-        ]),
-    `- ${BALANCED_EVIDENCE_GUIDANCE}`,
-    "- Citations: use the provided sourceLabel for paper-grounded claims. When paper_read provides verified quote anchors like [[quote:Q_x7a2]], use those anchor tokens only when exact wording is useful instead of manually copying the quote or sourceLabel. Use `>` blockquotes only for direct original source text. Direct quote text must be copied verbatim in the original source language; never translate quote text to match the user's language. If a translation, interpretation, emphasis, example, or opinion is useful, write it outside the blockquote as explanation or in a fenced `text` block, not as the quoted source passage. If no quote anchor is provided for a direct quote, put the sourceLabel on the next non-empty line after the blockquote. Copy the Source label string exactly. Do not invent author/year/page/section labels. Do not write [[source=...]], section=..., or chunk=... metadata in the final answer. Do not call tools solely to discover quotes or page numbers; the UI citation binder may resolve page links after rendering.",
-    "- External lookup is allowed when the user asks for current web information, or when paper_read shows local paper content is unavailable and Zotero metadata/abstract is insufficient. Label external sources separately.",
-    "- Write/update requests should use semantic Zotero MCP write tools. Review cards or direct tool results are the deliverable for tool-backed writes.",
-    ...(params.rawPdfMode
-      ? []
-      : [
-          "- Advanced tools run_command, file_io, and zotero_script are escape hatches for explicit shell/file/script tasks or unsupported formats, not ordinary paper/library reading.",
+          "- Paper reading: use overview for broad single-paper answers, targeted for specific details, and visual/capture only for figures, layout, or pages. For bounded multi-paper synthesis, use library_retrieve or the supplied body-evidence ledger; overview is the answer style, not the read depth.",
         ]),
   );
   if (scope.activeNoteId) {
     lines.push(`- ${NOTE_EDITING_QUOTE_BLOCK_GUIDANCE}`);
-  }
-  if (scope.kind === "paper" && !params.rawPdfMode) {
-    lines.push(
-      "- Active paper resources are listed above. Use their IDs directly when a paper_read call is useful.",
-    );
-  } else if (scope.kind !== "paper") {
-    lines.push(
-      "- Library resources are listed above. Use library_search/library_read when the answer needs library data that is not already visible.",
-    );
   }
   return [
     lines.join("\n"),

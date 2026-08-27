@@ -10,6 +10,7 @@ import { createReadPaperTool } from "../src/agent/tools/read/readPaper";
 import { createSearchPaperTool } from "../src/agent/tools/read/searchPaper";
 import { getPagedOperationId } from "../src/agent/actions/pagedWorkflow";
 import { createFileIOTool } from "../src/agent/tools/write/fileIO";
+import { createBuiltInToolRegistry } from "../src/agent/tools";
 import { createEditCurrentNoteTool } from "../src/agent/tools/write/editCurrentNote";
 import { createApplyTagsTool } from "../src/agent/tools/write/applyTags";
 import { createUpdateMetadataTool } from "../src/agent/tools/write/updateMetadata";
@@ -19,6 +20,7 @@ import { getNotesDirectoryConfig } from "../src/utils/notesDirectoryConfig";
 import type { AgentModelMessage, AgentToolContext } from "../src/agent/types";
 import type { PaperContextRef } from "../src/shared/types";
 import type { PdfContext } from "../src/modules/contextPanel/types";
+import { PAPER_CITATION_CONTRACT } from "../src/shared/instructionContracts";
 
 function makeMetadataSnapshot(itemId: number, title: string) {
   return {
@@ -660,7 +662,7 @@ describe("primitive agent tools", function () {
     assert.isFalse(updateCalled);
   });
 
-  it("builds system instructions around semantic tool names", async function () {
+  it("keeps fixed instructions focused on cross-turn semantic invariants", async function () {
     const messages = await buildAgentInitialMessages(
       {
         conversationKey: 1,
@@ -680,10 +682,12 @@ describe("primitive agent tools", function () {
     assert.include(systemText, "library_retrieve");
     assert.include(systemText, "library_read");
     assert.include(systemText, "paper_read");
-    assert.include(systemText, "library_update");
-    assert.include(systemText, "use workflow:'answer' and answer in chat");
+    assert.include(systemText, "workflow:'answer'");
     assert.include(systemText, "web_search");
     assert.include(systemText, "web_read");
+    assert.include(systemText, "use the semantic tool");
+    assert.include(systemText, "current-turn verified receipt");
+    assert.notInclude(systemText, "library_update");
     assert.notInclude(systemText, "search_literature_online");
     assert.notInclude(systemText, "query_library");
     assert.notInclude(systemText, "search_related_papers_online");
@@ -808,10 +812,8 @@ describe("primitive agent tools", function () {
     assert.include(userText, "source_label=(Smith, 2021)");
     assert.include(resourceText, "citationLabel=Smith, 2021");
     assert.include(resourceText, "sourceLabel=(Lee, 2022)");
-    assert.include(
-      resourceText,
-      "for direct quotes and substantive paper-grounded claims",
-    );
+    assert.include(messageText(messages[0]), PAPER_CITATION_CONTRACT);
+    assert.notInclude(resourceText, "include short direct-source blockquotes");
   });
 
   it("file_io adds source metadata only for Codex app-server MinerU paper reads", async function () {
@@ -2471,20 +2473,25 @@ describe("primitive agent tools", function () {
   });
 
   it("adds direct-card guidance for write tool requests", async function () {
+    const registry = createBuiltInToolRegistry({
+      zoteroGateway: {} as never,
+      pdfService: {} as never,
+      pdfPageService: {} as never,
+      retrievalService: {} as never,
+    });
     const messages = await buildAgentInitialMessages(
       {
         conversationKey: 2,
         mode: "agent",
         userText: "can you help me tag these papers?",
       },
-      [],
+      registry.listToolDefinitions(),
       [],
     );
-    const systemText =
-      typeof messages[0]?.content === "string" ? messages[0].content : "";
-    assert.include(systemText, "library_update");
-    assert.include(systemText, "collection membership");
-    assert.include(systemText, "confirmation card is the deliverable");
+    const turnText = messageText(messages[messages.length - 1]);
+    assert.include(turnText, "library_update");
+    assert.include(turnText, "collection membership");
+    assert.include(turnText, "confirmation card is the deliverable");
   });
 
   it("edit_current_note confirms and updates the active note", async function () {

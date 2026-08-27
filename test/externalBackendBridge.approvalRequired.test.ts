@@ -1,6 +1,12 @@
 import { assert } from "chai";
 import { describe, it } from "mocha";
 import { createExternalBackendBridgeRuntime } from "../src/agent/externalBackendBridge";
+import {
+  AGENT_ACTION_CONTRACT,
+  CORE_RESEARCH_CONTRACT,
+  PAPER_CITATION_CONTRACT,
+  RUNTIME_CAPABILITY_CONTEXT,
+} from "../src/shared/instructionContracts";
 
 describe("external bridge action approval handling", function () {
   function createRuntime() {
@@ -464,11 +470,25 @@ describe("external bridge action approval handling", function () {
         "Do not create a Papers, papers, Notes, or other alternate subfolder",
       );
       assert.include(customInstruction, "Original agent-mode Zotero behavior");
-      assert.include(customInstruction, "NEVER output rewritten");
+      assert.include(
+        customInstruction,
+        "a prose plan or unwritten note body is not completion",
+      );
       assert.include(customInstruction, "library_retrieve");
       assert.include(customInstruction, "zotero_script");
       assert.include(customInstruction, '"this folder"');
       assert.include(customInstruction, "selected Zotero scopes");
+      assert.equal(
+        customInstruction.split(PAPER_CITATION_CONTRACT).length - 1,
+        1,
+      );
+      for (const contract of [
+        CORE_RESEARCH_CONTRACT,
+        AGENT_ACTION_CONTRACT,
+        RUNTIME_CAPABILITY_CONTEXT,
+      ]) {
+        assert.include(customInstruction, contract);
+      }
       const mcpServers = capturedBody?.mcpServers as
         | Record<
             string,

@@ -130,11 +130,12 @@ describe("parseClassifierResponse unmatched pseudo-skill", function () {
 describe("parseClassifiedTurnIntent", function () {
   it("parses a valid full intent object", function () {
     const result = parseClassifiedTurnIntent(
-      '{"skillIds":[],"retrievalIntent":"summarize","wantedSections":["methods"],"queryLanguage":"zh"}',
+      '{"skillIds":[],"retrievalIntent":"summarize","externalSearchIntent":"both","wantedSections":["methods"],"queryLanguage":"zh"}',
     );
 
     assert.deepEqual(result, {
       retrievalIntent: "summarize",
+      externalSearchIntent: "both",
       wantedSections: ["methods"],
       queryLanguage: "zh",
       actionIntents: [],
@@ -153,6 +154,45 @@ describe("parseClassifiedTurnIntent", function () {
     );
 
     assert.deepEqual(result?.wantedSections, ["methods"]);
+  });
+
+  for (const externalSearchIntent of [
+    "none",
+    "web",
+    "literature",
+    "both",
+  ] as const) {
+    it(`parses external search intent ${externalSearchIntent}`, function () {
+      const result = parseClassifiedTurnIntent(
+        JSON.stringify({
+          retrievalIntent: "none",
+          externalSearchIntent,
+          wantedSections: [],
+          queryLanguage: "es",
+          actionIntents: [],
+        }),
+      );
+
+      assert.equal(result?.externalSearchIntent, externalSearchIntent);
+    });
+  }
+
+  it("omits a missing or invalid external search hint without losing other intent fields", function () {
+    const missing = parseClassifiedTurnIntent(
+      '{"retrievalIntent":"verify","wantedSections":["results"],"queryLanguage":"zh","actionIntents":[]}',
+    );
+    const invalid = parseClassifiedTurnIntent(
+      '{"retrievalIntent":"verify","externalSearchIntent":"browse","wantedSections":["results"],"queryLanguage":"zh","actionIntents":[]}',
+    );
+
+    for (const result of [missing, invalid]) {
+      assert.deepEqual(result, {
+        retrievalIntent: "verify",
+        wantedSections: ["results"],
+        queryLanguage: "zh",
+        actionIntents: [],
+      });
+    }
   });
 });
 
@@ -198,7 +238,7 @@ describe("detectTurnIntent", function () {
       {
         llmCall: async (params) => {
           captured = params as unknown as Record<string, unknown>;
-          return '{"skillIds":["unmatched"],"retrievalIntent":"none","wantedSections":[],"queryLanguage":"en"}';
+          return '{"skillIds":["unmatched"],"retrievalIntent":"none","externalSearchIntent":"none","wantedSections":[],"queryLanguage":"en"}';
         },
       },
     );
@@ -209,6 +249,14 @@ describe("detectTurnIntent", function () {
       level: "low",
     });
     assert.deepEqual(captured.profileOverride, profileOverride);
+    assert.include(
+      String(captured.prompt || ""),
+      '"externalSearchIntent": "none|web|literature|both"',
+    );
+    assert.include(
+      String(captured.prompt || ""),
+      "The tools are complementary, not mutually exclusive",
+    );
   });
 
   it("records unparseable classifier output as a distinct degradation reason", async function () {

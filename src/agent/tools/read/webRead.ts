@@ -140,7 +140,7 @@ export function createWebReadTool(
             type: "string",
             enum: ["basic", "advanced"],
             description:
-              "basic is the default. Use advanced only for complex or JavaScript-heavy pages.",
+              "Extraction depth. advanced provides deeper page retrieval.",
           },
           chunksPerSource: {
             type: "integer",

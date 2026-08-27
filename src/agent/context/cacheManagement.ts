@@ -2,7 +2,6 @@ import {
   planContextCacheReuse,
   type ContextCachePlan,
 } from "../../contextCache/manager";
-import { BALANCED_EVIDENCE_GUIDANCE } from "../../shared/quoteGuidance";
 import {
   installConversationKeyLedgerAgentTriggers,
   isConversationKeyRetiredInMemory,
@@ -1078,8 +1077,7 @@ export function buildAgentEvidenceContextBlock(params: {
   return [
     "Preserved evidence from prior agent tool reads:",
     "Reuse this evidence when it directly answers the follow-up. Re-read only when the user asks for updated evidence, the preserved snippets are insufficient, or the resource scope changed.",
-    BALANCED_EVIDENCE_GUIDANCE,
-    "Citation rule: if a [[quote:<id>]] anchor is explicitly provided, use that anchor for the direct quote; otherwise quote preserved text directly and put sourceLabel on the next non-empty line after the blockquote. Use `>` blockquotes only for direct original source text. Direct quote text must be copied verbatim in the original source language. Put interpretation, emphasis, examples, or opinion in normal prose or fenced `text` blocks, never in `>` blockquotes. Copy the Source label string exactly. Do not invent author/year/page/section labels. Do not write quoteCitationId, [[source=...]], section=..., chunk=..., page metadata, or invent [[quote:<id>]] anchors.",
+    "Each preserved snippet may include a sourceLabel and a verified quote anchor. Treat those fields as citation data governed by the system citation contract; never invent missing anchors or provenance.",
     ...entries.flatMap(formatEvidenceEntry),
   ].join("\n");
 }

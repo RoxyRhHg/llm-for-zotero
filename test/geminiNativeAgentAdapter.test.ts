@@ -7,6 +7,7 @@ import type {
   AgentRuntimeRequest,
   ToolSpec,
 } from "../src/agent/types";
+import { PAPER_CITATION_CONTRACT } from "../src/shared/instructionContracts";
 
 function makeSseStream(chunks: string[]): ReadableStream<Uint8Array> {
   return new ReadableStream<Uint8Array>({
@@ -100,6 +101,7 @@ describe("GeminiNativeAgentAdapter", function () {
     const step = await adapter.runStep({
       request: makeRequest(),
       messages: [
+        { role: "system", content: PAPER_CITATION_CONTRACT },
         {
           role: "user",
           content: [
@@ -122,6 +124,13 @@ describe("GeminiNativeAgentAdapter", function () {
       (capturedBody?.tools as Array<Record<string, unknown>>)?.[0]
         ?.functionDeclarations as Array<Record<string, unknown>>
     )?.[0]?.parameters as Record<string, unknown>) || { type: "" };
+    const systemParts = (
+      (capturedBody?.systemInstruction as { parts?: Array<{ text?: string }> })
+        ?.parts || []
+    )
+      .map((part) => part.text || "")
+      .join("\n");
+    assert.equal(systemParts.split(PAPER_CITATION_CONTRACT).length - 1, 1);
     assert.equal(
       ((firstParts?.[1]?.inlineData as Record<string, unknown>)
         ?.mimeType as string) || "",

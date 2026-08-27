@@ -44,6 +44,7 @@ import {
   buildAgentInitialMessages,
   normalizeHistoryMessages,
 } from "./model/messageBuilder";
+import type { InstructionInventory } from "./model/instructionInventory";
 import { classifyWriteNoteDestination } from "./writeNoteDestination";
 import { WRITE_NOTE_SKILL_ID } from "./skills/noteIntent";
 import {
@@ -1198,6 +1199,9 @@ export class AgentRuntime {
           screenshotCount: request.screenshots?.length || 0,
         },
       });
+      const captureInstructionInventory =
+        request.metadata?.instructionHarnessInventory === true;
+      const instructionInventoryHolder: { value?: InstructionInventory } = {};
       const messages = (await buildAgentInitialMessages(
         request,
         toolDefinitions,
@@ -1206,8 +1210,28 @@ export class AgentRuntime {
         {
           transcriptMessages: transcriptMessagesForPrompt,
           contentInputs: resolveCapabilitiesContentInputs(adapterCapabilities),
+          ...(captureInstructionInventory
+            ? {
+                onInstructionInventory: (inventory: InstructionInventory) => {
+                  instructionInventoryHolder.value = inventory;
+                },
+              }
+            : {}),
         },
       )) as AgentModelMessage[];
+      const instructionInventory = instructionInventoryHolder.value;
+      if (captureInstructionInventory && instructionInventory) {
+        await emit({
+          type: "provider_event",
+          providerType: "instruction_harness_inventory",
+          payload: {
+            model: request.model || "",
+            protocol: request.providerProtocol || "",
+            matchedSkillIds: matchedSkills,
+            ...instructionInventory,
+          },
+        });
+      }
       let continuationMessages: AgentModelMessage[] = [];
 
       const budgetState = buildAgentContextBudgetState({

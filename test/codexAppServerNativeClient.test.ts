@@ -38,6 +38,7 @@ import {
 import { AgentToolRegistry } from "../src/agent/tools/registry";
 import { getCodexProfileSignature } from "../src/codexAppServer/constants";
 import { getUserSkillsRuntimeRootDir } from "../src/agent/skills/userSkills";
+import { PAPER_CITATION_CONTRACT } from "../src/shared/instructionContracts";
 import {
   BUILTIN_SKILL_FILES,
   parseSkill,
@@ -1622,19 +1623,14 @@ describe("Codex app-server native client", function () {
       mcpEnabled: true,
       mcpReady: true,
     });
-    assert.include(manifest, "You are Codex");
+    assert.include(manifest, "Zotero MCP is ready");
+    assert.include(manifest, "facts or actions absent from context");
+    assert.include(manifest, PAPER_CITATION_CONTRACT);
+    assert.equal(manifest.split(PAPER_CITATION_CONTRACT).length - 1, 1);
+    assert.include(manifest, "verified quote anchors like [[quote:Q_x7a2]]");
     assert.include(
       manifest,
-      "Zotero resources and MCP tools are available when useful",
-    );
-    assert.include(
-      manifest,
-      "Use tools only when they materially improve the answer",
-    );
-    assert.include(manifest, "quote anchors like [[quote:Q_x7a2]]");
-    assert.include(
-      manifest,
-      "Do not call tools solely to discover quotes or page numbers",
+      "Do not call additional tools solely to discover quotes or page numbers",
     );
     assert.notInclude(manifest, "page N");
     assert.notInclude(manifest, "use shell creatively");

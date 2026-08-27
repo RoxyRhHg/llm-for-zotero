@@ -9,6 +9,7 @@ import type {
   ToolSpec,
 } from "../src/agent/types";
 import { isMalformedToolArgumentsDiagnostic } from "../src/agent/toolArgumentDiagnostics";
+import { PAPER_CITATION_CONTRACT } from "../src/shared/instructionContracts";
 
 function makeSseStream(chunks: string[]): ReadableStream<Uint8Array> {
   return new ReadableStream<Uint8Array>({
@@ -96,7 +97,7 @@ describe("AnthropicMessagesAgentAdapter", function () {
     const step = await adapter.runStep({
       request: makeRequest(),
       messages: [
-        { role: "system", content: "System" },
+        { role: "system", content: PAPER_CITATION_CONTRACT },
         { role: "user", content: "Search methods" },
       ],
       tools,
@@ -106,11 +107,85 @@ describe("AnthropicMessagesAgentAdapter", function () {
       (capturedBody?.tools as Array<Record<string, unknown>>)[0]?.name,
       "read_paper",
     );
+    const serializedSystem = Array.isArray(capturedBody?.system)
+      ? (capturedBody.system as Array<{ text?: string }>)
+          .map((entry) => entry.text || "")
+          .join("\n")
+      : String(capturedBody?.system || "");
+    assert.equal(serializedSystem.split(PAPER_CITATION_CONTRACT).length - 1, 1);
     assert.equal(step.kind, "tool_calls");
     if (step.kind !== "tool_calls") return;
     assert.equal(step.calls[0].id, "toolu_123");
     assert.deepEqual(step.calls[0].arguments, { query: "methods" });
   });
+
+  for (const provider of [
+    {
+      name: "DeepSeek",
+      model: "deepseek-chat",
+      apiBase: "https://api.deepseek.com/v1",
+      endpoint: "https://api.deepseek.com/anthropic/v1/messages",
+    },
+    {
+      name: "MiniMax",
+      model: "MiniMax-M2.1",
+      apiBase: "https://api.minimax.io/v1",
+      endpoint: "https://api.minimax.io/anthropic/v1/messages",
+    },
+  ]) {
+    it(`serializes the canonical citation contract through ${provider.name}'s Anthropic-compatible protocol`, async function () {
+      let capturedUrl = "";
+      let capturedBody: Record<string, unknown> = {};
+      (
+        globalThis as typeof globalThis & {
+          ztoolkit: { getGlobal: (name: string) => unknown };
+        }
+      ).ztoolkit = {
+        getGlobal: (name: string) => {
+          if (name !== "fetch") return undefined;
+          return async (url: string, init?: RequestInit) => {
+            capturedUrl = url;
+            capturedBody = JSON.parse(String(init?.body || "{}")) as Record<
+              string,
+              unknown
+            >;
+            return {
+              ok: true,
+              status: 200,
+              statusText: "OK",
+              json: async () => ({ content: [{ type: "text", text: "OK" }] }),
+              text: async () => "",
+            };
+          };
+        },
+      };
+
+      await new AnthropicMessagesAgentAdapter().runStep({
+        request: makeRequest({
+          model: provider.model,
+          apiBase: provider.apiBase,
+          apiKey: "provider-test",
+          providerProtocol: "anthropic_messages",
+        }),
+        messages: [
+          { role: "system", content: PAPER_CITATION_CONTRACT },
+          { role: "user", content: "Explain the result." },
+        ],
+        tools: [],
+      });
+
+      const serializedSystem = Array.isArray(capturedBody.system)
+        ? (capturedBody.system as Array<{ text?: string }>)
+            .map((entry) => entry.text || "")
+            .join("\n")
+        : String(capturedBody.system || "");
+      assert.equal(capturedUrl, provider.endpoint);
+      assert.equal(
+        serializedSystem.split(PAPER_CITATION_CONTRACT).length - 1,
+        1,
+      );
+    });
+  }
 
   it("applies cache_control to the marked stable system block", async function () {
     const adapter = new AnthropicMessagesAgentAdapter();

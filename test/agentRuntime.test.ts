@@ -335,6 +335,7 @@ describe("AgentRuntime", function () {
           model: "gpt-5.4",
           apiBase: "",
           apiKey: "test",
+          metadata: { instructionHarnessInventory: true },
         },
         onEvent: (event) => {
           events.push(event);
@@ -351,8 +352,72 @@ describe("AgentRuntime", function () {
         "Skill activated: simple-paper-qa",
         "Skill activated: evidence-based-qa",
       ]);
+      const inventoryEvent = events.find(
+        (event) =>
+          event.type === "provider_event" &&
+          event.providerType === "instruction_harness_inventory",
+      );
+      assert.isDefined(inventoryEvent);
+      if (inventoryEvent?.type === "provider_event") {
+        assert.deepEqual(inventoryEvent.payload?.matchedSkillIds, [
+          "simple-paper-qa",
+          "evidence-based-qa",
+        ]);
+        assert.isAbove(Number(inventoryEvent.payload?.fixedTokens || 0), 0);
+        assert.isAbove(
+          Number(inventoryEvent.payload?.matchedSkillTokens || 0),
+          0,
+        );
+        assert.match(
+          String(inventoryEvent.payload?.promptHash || ""),
+          /^fnv1a32-[0-9a-f]{8}$/,
+        );
+      }
     } finally {
       setUserSkills([]);
+      restoreDb();
+    }
+  });
+
+  it("keeps instruction inventory telemetry opt-in", async function () {
+    const restoreDb = installMockDb();
+    try {
+      const runtime = new AgentRuntime({
+        registry: new AgentToolRegistry(),
+        adapterFactory: () =>
+          new MockAdapter(
+            [
+              {
+                kind: "final",
+                text: "Done.",
+                assistantMessage: { role: "assistant", content: "Done." },
+              },
+            ],
+            { streaming: false, toolCalls: true, multimodal: false },
+          ),
+      });
+      const events: AgentEvent[] = [];
+
+      await runtime.runTurn({
+        request: {
+          conversationKey: 2,
+          mode: "agent",
+          userText: "Hello",
+          model: "gpt-5.4",
+          apiBase: "",
+          apiKey: "test",
+        },
+        onEvent: (event) => events.push(event),
+      });
+
+      assert.isFalse(
+        events.some(
+          (event) =>
+            event.type === "provider_event" &&
+            event.providerType === "instruction_harness_inventory",
+        ),
+      );
+    } finally {
       restoreDb();
     }
   });

@@ -1,4 +1,5 @@
 import type {
+  AgentRuntimeRequest,
   AgentToolDefinition,
   AgentToolInputValidation,
   AgentTraceDetail,
@@ -34,6 +35,27 @@ export type WebSearchInput = {
 export type WebSearchToolResult = WebSearchResponse & {
   citation: ReturnType<typeof webCitationInstruction>;
 };
+
+const EXPLICIT_WEB_SEARCH_FALLBACK_PATTERNS = [
+  /\b(?:web search|search (?:the )?(?:web|internet)|search online|online search|browse (?:the )?web|look up online|verify online|check online)\b/i,
+  /\b(?:search|browse|look up|find|verify|check|provide|cite|give)\b.{0,80}\b(?:website|online sources?|official sources?|official website|official documentation)\b/i,
+];
+
+const TIME_SENSITIVE_WEB_FALLBACK_PATTERN =
+  /\b(?:latest (?:version|release|news|price|status|schedule)|today(?:'s)?|news|weather|forecast|breaking news|release notes?|current (?:price|version|release|status|schedule|weather|officeholder|president|ceo)|currently (?:serves|serving|holds|available)|price of|as of)\b/i;
+
+export function matchesWebSearchGuidance(
+  request: Pick<AgentRuntimeRequest, "userText" | "classifiedIntent">,
+): boolean {
+  const intent = request.classifiedIntent?.externalSearchIntent;
+  if (intent !== undefined) return intent === "web" || intent === "both";
+  const userText = request.userText || "";
+  return (
+    EXPLICIT_WEB_SEARCH_FALLBACK_PATTERNS.some((pattern) =>
+      pattern.test(userText),
+    ) || TIME_SENSITIVE_WEB_FALLBACK_PATTERN.test(userText)
+  );
+}
 
 function normalizeDepth(value: unknown): WebAccessDepth {
   return value === "advanced" ? "advanced" : "basic";
@@ -194,7 +216,7 @@ export function createWebSearchTool(
     spec: {
       name: "web_search",
       description:
-        "Search the current public web with Tavily. Use this for current facts, general websites, news, products, organizations, or other non-scholarly online information. Use literature_search for scholarly paper discovery.",
+        "Search the current public web with Tavily when the answer materially needs current facts or concrete general-web evidence. Use literature_search for scholarly discovery; a request may use both for distinct evidence needs.",
       inputSchema: {
         type: "object",
         required: ["query"],
@@ -208,7 +230,7 @@ export function createWebSearchTool(
             type: "string",
             enum: ["basic", "advanced"],
             description:
-              "basic is the default and costs 1 credit. Use advanced only when broader/deeper retrieval is needed; it costs 2 credits.",
+              "Search depth. basic costs 1 credit; advanced provides broader and deeper retrieval and costs 2 credits.",
           },
           topic: {
             type: "string",
@@ -239,12 +261,9 @@ export function createWebSearchTool(
     },
     isAvailable: isWebAccessToolAvailable,
     guidance: {
-      matches: (request) =>
-        /\b(web|website|internet|online|latest|current|today|news|price|weather|company|organization|product|documentation)\b/i.test(
-          request.userText,
-        ),
+      matches: matchesWebSearchGuidance,
       instruction:
-        "Use web_search for current or general web information that is not primarily scholarly literature. Start with depth:'basic'; use depth:'advanced' only when the task needs deeper retrieval. Use web_read on the strongest result URLs when snippets are insufficient. Every final-answer paragraph that uses these results must end with the exact hidden source marker described in the tool result, using only returned sourceId values. Do not add a references footer.",
+        "Use web_search when the request needs current or general public evidence. A mixed request may also use literature_search for distinct scholarly evidence. Preserve the user's language by default, choose basic or advanced depth according to the retrieval need, and use web_read when search snippets are insufficient. Every final-answer paragraph that uses web results must end with the exact hidden source marker described in the tool result, using only returned sourceId values. Do not add a references footer.",
     },
     presentation: {
       label: "Search Web",

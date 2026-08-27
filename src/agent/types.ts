@@ -540,6 +540,7 @@ export type ExhaustiveReadBackend =
  */
 export type ClassifiedTurnIntent = {
   retrievalIntent: "enumerate" | "verify" | "summarize" | "none";
+  externalSearchIntent?: "none" | "web" | "literature" | "both";
   wantedSections: Array<"methods" | "results" | "limitations">;
   queryLanguage?: string;
   actionIntents: AgentActionIntent[];
@@ -762,7 +763,10 @@ export type AgentToolInputValidation<T> =
   | { ok: false; error: string };
 
 export type AgentToolGuidance = {
-  matches: (request: AgentRuntimeRequest) => boolean;
+  matches: (
+    request: AgentRuntimeRequest,
+    context?: { matchedSkillIds: ReadonlyArray<string> },
+  ) => boolean;
   instruction: string;
 };
 

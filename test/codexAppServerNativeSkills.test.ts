@@ -249,8 +249,9 @@ describe("Codex native skills", function () {
     assert.deepEqual(resolved.matchedSkillIds, ["evidence-based-qa"]);
     assert.include(
       resolved.instructionBlock,
-      "a particular claim in a paper or selected collection",
+      "For a selected collection/folder or whole-library evidence question",
     );
+    assert.include(resolved.instructionBlock, "for exact presence/absence");
   });
 
   it("builds native request context from scope and UI context", function () {

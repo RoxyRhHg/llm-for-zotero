@@ -7,6 +7,7 @@ import {
   buildProviderTransportHeaders,
 } from "../src/utils/providerTransport";
 import { detectProviderPreset } from "../src/utils/providerPresets";
+import { PAPER_CITATION_CONTRACT } from "../src/shared/instructionContracts";
 
 describe("ollama native protocol", function () {
   const originalZotero = globalThis.Zotero;
@@ -344,6 +345,13 @@ describe("ollama native protocol", function () {
       assert.equal(capturedUrl, "http://localhost:11434/api/chat");
       assert.equal(body.model, "gemma3");
       assert.equal(body.stream, true);
+      const serializedMessages = (body.messages as Array<{ content?: string }>)
+        .map((message) => message.content || "")
+        .join("\n");
+      assert.equal(
+        serializedMessages.split(PAPER_CITATION_CONTRACT).length - 1,
+        1,
+      );
       // The plugin's 4096 default would let a thinking model spend the whole
       // budget reasoning and return empty content.
       assert.equal(

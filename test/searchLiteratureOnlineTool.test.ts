@@ -303,5 +303,25 @@ describe("search_literature_online tool", function () {
     );
     assert.include(tool.guidance?.instruction || "", "workflow:'answer'");
     assert.include(tool.guidance?.instruction || "", "workflow:'review'");
+    assert.isFalse(
+      tool.guidance?.matches({
+        conversationKey: 12,
+        mode: "agent",
+        userText: "search the web for the latest Zotero release notes",
+      }) || false,
+    );
+    assert.isTrue(
+      tool.guidance?.matches({
+        conversationKey: 13,
+        mode: "agent",
+        userText: "查找论文并核对当前官方文档",
+        classifiedIntent: {
+          retrievalIntent: "none",
+          externalSearchIntent: "both",
+          wantedSections: [],
+          actionIntents: [],
+        },
+      }) || false,
+    );
   });
 });

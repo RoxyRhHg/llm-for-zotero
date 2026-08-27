@@ -16,6 +16,7 @@ import {
   resetCodexDirectCatalogForTests,
 } from "../src/codexAuth/modelCatalog";
 import { CODEX_DIRECT_RESPONSES_URL } from "../src/codexAuth/auth";
+import { PAPER_CITATION_CONTRACT } from "../src/shared/instructionContracts";
 
 describe("CodexResponsesAgentAdapter", function () {
   const originalToolkit = (
@@ -376,7 +377,10 @@ describe("CodexResponsesAgentAdapter", function () {
         authMode: "api_key",
         apiKey: "test-token",
       }),
-      messages: [{ role: "user", content: "Hello" }],
+      messages: [
+        { role: "system", content: PAPER_CITATION_CONTRACT },
+        { role: "user", content: "Hello" },
+      ],
       tools: [],
     });
 
@@ -388,6 +392,11 @@ describe("CodexResponsesAgentAdapter", function () {
       ),
     );
     assert.deepEqual(capturedBody?.include, ["reasoning.encrypted_content"]);
+    assert.equal(
+      String(capturedBody?.instructions || "").split(PAPER_CITATION_CONTRACT)
+        .length - 1,
+      1,
+    );
   });
 
   it("sends exact catalog effort and ignores direct advanced settings", async function () {

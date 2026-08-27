@@ -2597,28 +2597,18 @@ describe("semantic tool surface", function () {
   it("compare-papers guidance prefers one targeted batched read for method comparisons", function () {
     const raw = BUILTIN_SKILL_FILES["compare-papers.md"];
     assert.include(raw, "contexts: paper-set,library-corpus");
-    assert.include(raw, "targeted first when the dimension is known");
+    assert.include(raw, "start with one batched targeted read");
     assert.include(
       raw,
       "A selected Zotero collection/folder is also a valid comparison corpus",
     );
+    assert.include(raw, "prefer one scoped `library_retrieve(");
     assert.include(
       raw,
-      "library_retrieve({ query:'methods methodology method section'",
+      "Make follow-up `paper_read({ mode:'targeted', ... })` calls only for concrete missing dimensions",
     );
-    assert.include(
-      raw,
-      "paper_read({ mode:'targeted', query:'methods methodology method section', targets:[...] })",
-    );
-    assert.include(
-      raw,
-      "For method-section requests, do not call overview first",
-    );
-    assert.include(raw, "include short direct-source blockquotes");
-    assert.include(
-      raw,
-      "Do not call visual/page tools, `file_io`, or `run_command`",
-    );
+    assert.include(raw, "Apply the system citation contract");
+    assert.notInclude(raw, "include short direct-source blockquotes");
   });
 
   it("matches compare-papers for collection-scoped comparison requests", function () {

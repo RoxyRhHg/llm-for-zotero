@@ -2,6 +2,7 @@ import { assert } from "chai";
 import { OpenAICompatibleAgentAdapter } from "../src/agent/model/openaiCompatible";
 import type { AgentRuntimeRequest, ToolSpec } from "../src/agent/types";
 import { isMalformedToolArgumentsDiagnostic } from "../src/agent/toolArgumentDiagnostics";
+import { PAPER_CITATION_CONTRACT } from "../src/shared/instructionContracts";
 
 function makeSseStream(chunks: string[]): ReadableStream<Uint8Array> {
   return new ReadableStream<Uint8Array>({
@@ -68,6 +69,75 @@ describe("OpenAICompatibleAgentAdapter", function () {
       ),
     );
   });
+
+  for (const provider of [
+    {
+      name: "DeepSeek",
+      model: "deepseek-chat",
+      apiBase: "https://api.deepseek.com/anthropic",
+      endpoint: "https://api.deepseek.com/v1/chat/completions",
+    },
+    {
+      name: "MiniMax",
+      model: "MiniMax-M2.1",
+      apiBase: "https://api.minimax.io/anthropic",
+      endpoint: "https://api.minimax.io/v1/chat/completions",
+    },
+  ]) {
+    it(`serializes the canonical citation contract through ${provider.name}'s OpenAI-compatible protocol`, async function () {
+      let capturedUrl = "";
+      let capturedBody: Record<string, unknown> = {};
+      (
+        globalThis as typeof globalThis & {
+          ztoolkit: { getGlobal: (name: string) => unknown };
+        }
+      ).ztoolkit = {
+        getGlobal: (name: string) => {
+          if (name !== "fetch") return undefined;
+          return async (url: string, init?: RequestInit) => {
+            capturedUrl = url;
+            capturedBody = JSON.parse(String(init?.body || "{}")) as Record<
+              string,
+              unknown
+            >;
+            return {
+              ok: true,
+              status: 200,
+              statusText: "OK",
+              headers: { get: () => "application/json" },
+              json: async () => ({ choices: [{ message: { content: "OK" } }] }),
+              text: async () => "",
+            };
+          };
+        },
+      };
+
+      await adapter.runStep({
+        request: makeRequest({
+          model: provider.model,
+          apiBase: provider.apiBase,
+          apiKey: "provider-test",
+          providerProtocol: "openai_chat_compat",
+        }),
+        messages: [
+          { role: "system", content: PAPER_CITATION_CONTRACT },
+          { role: "user", content: "Explain the result." },
+        ],
+        tools: [],
+      });
+
+      const serializedMessages = (
+        capturedBody.messages as Array<{ content?: string }>
+      )
+        .map((message) => message.content || "")
+        .join("\n");
+      assert.equal(capturedUrl, provider.endpoint);
+      assert.equal(
+        serializedMessages.split(PAPER_CITATION_CONTRACT).length - 1,
+        1,
+      );
+    });
+  }
 
   it("keeps codex auth disabled for now", function () {
     assert.isFalse(
@@ -192,7 +262,10 @@ describe("OpenAICompatibleAgentAdapter", function () {
     });
     const firstStep = await adapter.runStep({
       request,
-      messages: [{ role: "user", content: "Summarize the paper" }],
+      messages: [
+        { role: "system", content: PAPER_CITATION_CONTRACT },
+        { role: "user", content: "Summarize the paper" },
+      ],
       tools,
     });
 
@@ -201,6 +274,17 @@ describe("OpenAICompatibleAgentAdapter", function () {
     assert.equal(
       firstStep.assistantMessage.reasoning_content,
       "Need the full text.",
+    );
+    const firstMessages = requestBodies[0]?.messages as Array<{
+      role?: string;
+      content?: string;
+    }>;
+    assert.equal(
+      firstMessages
+        .map((message) => message.content || "")
+        .join("\n")
+        .split(PAPER_CITATION_CONTRACT).length - 1,
+      1,
     );
 
     await adapter.runStep({

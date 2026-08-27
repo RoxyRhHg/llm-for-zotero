@@ -3,7 +3,6 @@ import type {
   AgentAttachmentResourceSummary,
   AgentRuntimeRequest,
 } from "../types";
-import { BALANCED_EVIDENCE_GUIDANCE } from "../../shared/quoteGuidance";
 import type { PaperContextRef, TagContextRef } from "../../shared/types";
 import {
   buildPaperQuoteCitationGuidance,
@@ -601,31 +600,10 @@ export function buildAgentStableResourceContextBlock(
   const retrievalOnlyPapers = (request.selectedPaperContexts || []).filter(
     (entry) => !fullTextPaperKeySet.has(paperKey(entry)),
   );
-  const citationPaperRefs = [
-    ...(request.selectedTextPaperContexts || []).filter(
-      (entry): entry is PaperContextRef => Boolean(entry),
-    ),
-    ...retrievalOnlyPapers,
-    ...(request.fullTextPaperContexts || []),
-  ];
   const lines = [
     "Stable Zotero resource context:",
     ...buildScopeIdentityLines(request),
   ];
-
-  if (citationPaperRefs.length) {
-    lines.push(
-      BALANCED_EVIDENCE_GUIDANCE,
-      "Citation/source label rule: for direct quotes and substantive paper-grounded claims, use the exact sourceLabel shown for the relevant paper.",
-      "If quote anchors like [[quote:Q_x7a2]] are provided, use the anchor token for direct quotes instead of manually copying the quote or sourceLabel.",
-      "Use `>` blockquotes only for direct original source text.",
-      "Direct quote text must be copied verbatim in the original source language; never translate quote text to match the user's language.",
-      "Put interpretation, emphasis, examples, opinion, or translation in normal prose or fenced `text` blocks, not in `>` blockquotes.",
-      "If no quote anchor is provided for a direct quote, keep the source label attached to the quote: put it on the next non-empty line after the blockquote, before any commentary.",
-      "Copy the Source label string exactly. Do not invent author/year/page/section labels.",
-      "Do not write [[source=...]], section=..., or chunk=... metadata in the final answer; those fields are internal context only.",
-    );
-  }
   if (retrievalOnlyPapers.length) {
     lines.push(
       "Retrieval-only paper refs:",

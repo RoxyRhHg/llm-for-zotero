@@ -1,5 +1,9 @@
 import type { PaperContextRef } from "../../../shared/types";
-import type { AgentToolDefinition, AgentTraceDetail } from "../../types";
+import type {
+  AgentRuntimeRequest,
+  AgentToolDefinition,
+  AgentTraceDetail,
+} from "../../types";
 import { LiteratureSearchService } from "../../services/literatureSearchService";
 import type { ZoteroGateway } from "../../services/zoteroGateway";
 import {
@@ -38,6 +42,19 @@ type SearchLiteratureOnlineInput = {
   limit?: number;
   libraryID?: number;
 };
+
+const LITERATURE_SEARCH_FALLBACK_PATTERN =
+  /\b(?:(?:related|similar)\s+(?:papers?|studies|articles?)|(?:find|discover|recommend|search|look up)(?:\s+\S+){0,8}\s+(?:papers?|studies|scholarly articles?|academic literature|research literature)|(?:search|review)\s+(?:the\s+)?literature|literature search|scholarly search|citations?|references?|papers?\s+(?:by|from)|publications?\s+(?:by|from)|doi|arxiv)\b/i;
+
+export function matchesLiteratureSearchGuidance(
+  request: Pick<AgentRuntimeRequest, "userText" | "classifiedIntent">,
+): boolean {
+  const intent = request.classifiedIntent?.externalSearchIntent;
+  if (intent !== undefined) {
+    return intent === "literature" || intent === "both";
+  }
+  return LITERATURE_SEARCH_FALLBACK_PATTERN.test(request.userText || "");
+}
 
 function readTraceString(value: unknown): string | undefined {
   return typeof value === "string" && value.trim() ? value.trim() : undefined;
@@ -196,12 +213,9 @@ export function createSearchLiteratureOnlineTool(
       requiresConfirmation: false,
     },
     guidance: {
-      matches: (request) =>
-        /\b(related papers?|similar papers?|find papers?|search (the )?(internet|online|web|literature)|online search|web search|citations?|references?|papers? (by|from)|publications? (by|from))\b/i.test(
-          request.userText,
-        ),
+      matches: matchesLiteratureSearchGuidance,
       instruction:
-        "When the user explicitly asks to search online or search the literature, use search_literature_online with workflow:'answer' by default so the model can answer from scholarly results and cite sources. Use workflow:'review' only when the user wants to import/add papers to Zotero, save selected search results to a note, refine results inside the card, or review metadata changes. Do not use this tool for questions about the content of papers already in context (e.g. counting references, summarizing, explaining)." +
+        "When the request needs external scholarly evidence, use search_literature_online with workflow:'answer' by default so the model can answer from scholarly results and cite sources. A mixed request may also use web_search for distinct general-web evidence. Use workflow:'review' only when the user wants to import/add papers to Zotero, save selected search results to a note, refine results inside the card, or review metadata changes. Do not use this tool for questions about the content of papers already in context (e.g. counting references, summarizing, explaining). Preserve the user's language by default." +
         "\n\nSource selection:" +
         "\n• recommendations, references, citations modes → always use source:'openalex' (only OpenAlex supports these)." +
         "\n• search mode → source:'openalex' (default, broadest coverage), source:'arxiv' (preprints, CS/ML/physics), or source:'europepmc' (biomedical/life sciences)." +
