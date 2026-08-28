@@ -106,6 +106,7 @@ import type { RuntimeConversationSystem } from "./runtimeSystemControls";
 import { collectReaderSelectionDocuments } from "./readerSelection";
 import { getReaderContextPanelForTab } from "./readerPopupPanelRouting";
 import type { ConversationSystem } from "../../shared/types";
+import { clearPaperRestoreTargetsForWorkflowTests } from "../../shared/paperConversationRestore";
 import { relayGetStateSnapshot } from "../../webchat/relayServer";
 import {
   activeClaudeConversationModeByLibrary,
@@ -3141,6 +3142,7 @@ async function reset(): Promise<void> {
   lastFinalRequest = null;
   disposeWorkflowPanels();
   clearWorkflowConversationRuntimeState();
+  await clearPaperRestoreTargetsForWorkflowTests();
   const userLibraryID = Math.floor(
     Number(Zotero.Libraries?.userLibraryID || 0),
   );

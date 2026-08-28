@@ -2832,7 +2832,7 @@ export function createExternalBackendBridgeRuntime(options: {
       return result;
     },
     runTurn: async (rawParams: RunTurnParams): Promise<AgentRuntimeOutcome> => {
-      let params: ResolvedRunTurnParams = {
+      const params: ResolvedRunTurnParams = {
         ...rawParams,
         request: resolveAgentRuntimeRequest(rawParams.request),
       };

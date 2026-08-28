@@ -15,8 +15,13 @@ import {
   type ClaudeReasoningMode,
   type ClaudeRuntimeModel,
 } from "./constants";
-import { buildClaudeLibraryStateKey, buildClaudePaperStateKey } from "./state";
+import { buildClaudeLibraryStateKey } from "./state";
 import { getClaudeProfileSignature } from "./projectSkills";
+import {
+  forgetPaperRestoreTarget,
+  getPaperRestoreTarget,
+  rememberPaperRestoreTarget,
+} from "../shared/paperConversationRestore";
 
 type ZoteroPrefsAPI = {
   get?: (key: string, global?: boolean) => unknown;
@@ -289,20 +294,6 @@ export function setClaudeManagedInstructionTemplatePref(value: string): string {
   return normalized;
 }
 
-function buildLegacyPaperConversationMapKey(
-  libraryID: number,
-  paperItemID: number,
-): string {
-  return `${Math.floor(libraryID)}:${Math.floor(paperItemID)}`;
-}
-
-function buildPaperConversationMapKey(
-  libraryID: number,
-  paperItemID: number,
-): string {
-  return buildClaudePaperStateKey(libraryID, paperItemID);
-}
-
 function buildLegacyGlobalConversationMapKey(libraryID: number): string {
   return String(Math.floor(libraryID));
 }
@@ -388,24 +379,11 @@ export function getLastUsedClaudePaperConversationKey(
   libraryID: number,
   paperItemID: number,
 ): number | null {
-  if (!Number.isFinite(libraryID) || libraryID <= 0) return null;
-  if (!Number.isFinite(paperItemID) || paperItemID <= 0) return null;
-  const map = getJsonPref("claudeCodePaperConversationMap");
-  const scopedValue = Number(
-    map[buildPaperConversationMapKey(libraryID, paperItemID)],
-  );
-  if (Number.isFinite(scopedValue) && scopedValue > 0) {
-    return isConversationKeyInRange(scopedValue, "paper")
-      ? Math.floor(scopedValue)
-      : null;
-  }
-  const legacyValue = Number(
-    map[buildLegacyPaperConversationMapKey(libraryID, paperItemID)],
-  );
-  if (!Number.isFinite(legacyValue) || legacyValue <= 0) return null;
-  return isConversationKeyInRange(legacyValue, "paper")
-    ? Math.floor(legacyValue)
-    : null;
+  return getPaperRestoreTarget({
+    system: "claude_code",
+    libraryID,
+    paperItemID,
+  });
 }
 
 export function setLastUsedClaudePaperConversationKey(
@@ -417,10 +395,10 @@ export function setLastUsedClaudePaperConversationKey(
   if (!Number.isFinite(paperItemID) || paperItemID <= 0) return;
   if (!Number.isFinite(conversationKey) || conversationKey <= 0) return;
   if (!isConversationKeyInRange(conversationKey, "paper")) return;
-  const map = getJsonPref("claudeCodePaperConversationMap");
-  map[buildPaperConversationMapKey(libraryID, paperItemID)] =
-    Math.floor(conversationKey);
-  setJsonPref("claudeCodePaperConversationMap", map);
+  rememberPaperRestoreTarget(
+    { system: "claude_code", libraryID, paperItemID },
+    conversationKey,
+  );
 }
 
 export function removeLastUsedClaudePaperConversationKey(
@@ -429,9 +407,7 @@ export function removeLastUsedClaudePaperConversationKey(
 ): void {
   if (!Number.isFinite(libraryID) || libraryID <= 0) return;
   if (!Number.isFinite(paperItemID) || paperItemID <= 0) return;
-  const map = getJsonPref("claudeCodePaperConversationMap");
-  delete map[buildPaperConversationMapKey(libraryID, paperItemID)];
-  setJsonPref("claudeCodePaperConversationMap", map);
+  forgetPaperRestoreTarget({ system: "claude_code", libraryID, paperItemID });
 }
 
 function buildLastAllocatedMapKey(kind: "global" | "paper"): string {

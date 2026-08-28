@@ -66,6 +66,7 @@ import {
   type ConversationRegistryRow,
   type PaperContextJsonColumns,
 } from "../shared/conversationRegistry";
+import { stagePaperRestoreTargetForStartup } from "../shared/paperConversationRestore";
 import {
   repairRecoverableCatalogMessageConversationIDs,
   repairRecoverableMessageConversationIDs,
@@ -524,9 +525,8 @@ async function migrateLegacyClaudeConversationKeys(): Promise<
     if (kind === "paper" && paperItemID) {
       const paperStateKey = `${libraryID}:${paperItemID}`;
       if (!latestPaperByState.has(paperStateKey)) {
-        setLastUsedClaudePaperConversationKey(
-          libraryID,
-          paperItemID,
+        stagePaperRestoreTargetForStartup(
+          { system: "claude_code", libraryID, paperItemID },
           targetConversationKey,
         );
         latestPaperByState.add(paperStateKey);
@@ -928,11 +928,6 @@ export async function repairClaudeConversationIdentityRegistry(
            SET conversation_id = ?
            WHERE conversation_key = ?`,
           [repairedConversationID, summary.conversationKey],
-        );
-        setLastUsedClaudePaperConversationKey(
-          summary.libraryID,
-          inferredPaperItemID,
-          summary.conversationKey,
         );
         await repairRegisteredConversationScope(
           {
