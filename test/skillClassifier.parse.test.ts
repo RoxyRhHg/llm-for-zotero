@@ -156,11 +156,12 @@ describe("parseClassifierResponse unmatched pseudo-skill", function () {
 describe("parseClassifiedTurnIntent", function () {
   it("parses a valid full intent object", function () {
     const result = parseClassifiedTurnIntent(
-      '{"skillIds":[],"retrievalIntent":"summarize","externalSearchIntent":"both","wantedSections":["methods"],"queryLanguage":"zh"}',
+      '{"skillIds":[],"retrievalIntent":"summarize","paperTargetIntent":"all_visible","externalSearchIntent":"both","wantedSections":["methods"],"queryLanguage":"zh"}',
     );
 
     assert.deepEqual(result, {
       retrievalIntent: "summarize",
+      paperTargetIntent: "all_visible",
       externalSearchIntent: "both",
       wantedSections: ["methods"],
       queryLanguage: "zh",
@@ -168,6 +169,40 @@ describe("parseClassifiedTurnIntent", function () {
       actionInterpretationSource: "classifier",
       actionIntents: [],
     });
+  });
+
+  it("keeps valid intent when paperTargetIntent is missing or malformed", function () {
+    for (const paperTargetIntent of [undefined, "both"]) {
+      const result = parseClassifiedTurnIntent(
+        JSON.stringify({
+          retrievalIntent: "summarize",
+          paperTargetIntent,
+          wantedSections: [],
+          actionIntents: [],
+        }),
+      );
+      assert.equal(result?.retrievalIntent, "summarize");
+      assert.isUndefined(result?.paperTargetIntent);
+    }
+  });
+
+  it("parses every bounded paperTargetIntent value", function () {
+    for (const paperTargetIntent of [
+      "active",
+      "added",
+      "all_visible",
+      "unspecified",
+    ] as const) {
+      const result = parseClassifiedTurnIntent(
+        JSON.stringify({
+          retrievalIntent: "none",
+          paperTargetIntent,
+          wantedSections: [],
+          actionIntents: [],
+        }),
+      );
+      assert.equal(result?.paperTargetIntent, paperTargetIntent);
+    }
   });
 
   it("returns null when retrievalIntent is missing or invalid", function () {

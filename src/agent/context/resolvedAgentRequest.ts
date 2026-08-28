@@ -62,6 +62,7 @@ export function resolveAgentRuntimeRequest(
     libraryID: input.libraryID,
     conversationKind: input.conversationKind,
     activeItemId: input.activeItemId,
+    activePaperContext: input.activePaperContext,
     selectedPaperContexts: input.selectedPaperContexts,
     pdfPaperContexts: input.pdfPaperContexts,
     fullTextPaperContexts: input.fullTextPaperContexts,
@@ -80,6 +81,7 @@ export function resolveAgentRuntimeRequest(
   if (!scopeResult.ok) throw new InvalidTurnPaperScopeError(scopeResult);
 
   const {
+    activePaperContext: _activePaperContext,
     selectedPaperContexts: _selectedPaperContexts,
     pdfPaperContexts: _pdfPaperContexts,
     fullTextPaperContexts: _fullTextPaperContexts,
@@ -93,6 +95,7 @@ export function resolveAgentRuntimeRequest(
     localDocuments: _localDocuments,
     ...rest
   } = input;
+  void _activePaperContext;
   void _selectedPaperContexts;
   void _pdfPaperContexts;
   void _fullTextPaperContexts;

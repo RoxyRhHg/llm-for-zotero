@@ -8,7 +8,10 @@ import {
   setUserSkills,
 } from "../src/agent/skills";
 import { AgentToolRegistry } from "../src/agent/tools/registry";
-import { createPaperReadTool as createResolvedPaperReadTool } from "../src/agent/tools/read/paperRead";
+import {
+  createPaperReadTool as createResolvedPaperReadTool,
+  resolveMetadataOverviewTitleForTests,
+} from "../src/agent/tools/read/paperRead";
 import type { AgentToolContext } from "../src/agent/types";
 import { resolveAgentRuntimeRequest } from "../src/agent/context/resolvedAgentRequest";
 import {
@@ -86,6 +89,54 @@ describe("semantic tool surface", function () {
     currentAnswerText: "",
     modelName: "gpt-5.5",
   };
+
+  it("uses content-source titles only for genuinely standalone attachments", function () {
+    assert.equal(
+      resolveMetadataOverviewTitleForTests({
+        source: "live",
+        itemId: 77,
+        contextItemId: 77,
+        creators: [],
+        contentSource: {
+          itemId: 77,
+          title: "Standalone preprint.pdf",
+        },
+        warnings: [],
+      }),
+      "Standalone preprint.pdf",
+    );
+    assert.equal(
+      resolveMetadataOverviewTitleForTests({
+        source: "live",
+        itemId: 42,
+        contextItemId: 101,
+        title: "Bibliographic title",
+        creators: [],
+        contentSource: {
+          itemId: 101,
+          parentItemId: 42,
+          title: "Full Text PDF",
+        },
+        warnings: [],
+      }),
+      "Bibliographic title",
+    );
+    assert.equal(
+      resolveMetadataOverviewTitleForTests({
+        source: "live",
+        itemId: 42,
+        contextItemId: 101,
+        creators: [],
+        contentSource: {
+          itemId: 101,
+          parentItemId: 42,
+          title: "Full Text PDF",
+        },
+        warnings: [],
+      }),
+      "Paper 42",
+    );
+  });
 
   function resolvedSkillRequest(
     fields: Partial<import("../src/agent/types").AgentRuntimeRequestInput>,
@@ -804,12 +855,86 @@ describe("semantic tool surface", function () {
     assert.equal(result?.backend, "zotero_metadata");
     assert.equal(result?.sourceKind, "zotero_metadata");
     assert.equal(result?.contentStatus, "no_extractable_pdf_text");
+    assert.include(String(result?.text || ""), "Title: Metadata Only Paper");
     assert.include(String(result?.text || ""), "This abstract is enough");
     assert.equal(result?.sourceLabel, "(Charest, 2014)");
     assert.lengthOf(
       (output as { quoteCitations?: unknown[] }).quoteCitations || [],
       0,
     );
+  });
+
+  it("paper_read overview never promotes a child attachment title over a cleared live paper title", async function () {
+    const paperContext = {
+      libraryID: 1,
+      itemId: 42,
+      contextItemId: 101,
+      title: "Stored stale title",
+    };
+    const items = new Map<number, Zotero.Item>([
+      [
+        42,
+        {
+          id: 42,
+          libraryID: 1,
+          key: "PARENT42",
+          itemTypeID: 1,
+          itemType: "journalArticle",
+          isRegularItem: () => true,
+          isAttachment: () => false,
+          isNote: () => false,
+          getDisplayTitle: () => "Item 42",
+          getField: () => "",
+          getCreatorsJSON: () => [],
+        } as unknown as Zotero.Item,
+      ],
+      [
+        101,
+        {
+          id: 101,
+          libraryID: 1,
+          key: "PDF101",
+          parentID: 42,
+          itemTypeID: 14,
+          itemType: "attachment",
+          attachmentFilename: "paper.pdf",
+          attachmentContentType: "application/pdf",
+          isRegularItem: () => false,
+          isAttachment: () => true,
+          isNote: () => false,
+          getDisplayTitle: () => "Full Text PDF",
+          getField: (fieldName: string) =>
+            fieldName === "title" ? "Full Text PDF" : "",
+          getCreatorsJSON: () => [],
+          getFilename: () => "paper.pdf",
+        } as unknown as Zotero.Item,
+      ],
+    ]);
+    const tool = createPaperReadTool(
+      {
+        getOverviewExcerpt: async () => {
+          throw new Error("No extractable PDF text available");
+        },
+      } as never,
+      {} as never,
+      {} as never,
+      {
+        listPaperContexts: () => [paperContext],
+        resolvePaperContextTarget: () => paperContext,
+        getItem: (itemId: number) => items.get(itemId) || null,
+      } as never,
+    );
+    const validated = tool.validate({ mode: "overview" });
+    assert.isTrue(validated.ok);
+    if (!validated.ok) return;
+
+    const output = await tool.execute(validated.value, baseContext);
+    const result = (output as { results?: Array<Record<string, unknown>> })
+      .results?.[0];
+    const text = String(result?.text || "");
+    assert.include(text, "Title: Paper 42");
+    assert.notInclude(text, "Full Text PDF");
+    assert.notInclude(text, "Stored stale title");
   });
 
   it("paper_read overview keeps MinerU failure warning while using Zotero metadata fallback", async function () {

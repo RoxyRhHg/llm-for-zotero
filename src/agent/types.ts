@@ -62,6 +62,8 @@ export type AgentRequest = {
   scopeId?: string;
   scopeLabel?: string;
   activeItemId?: number;
+  /** Input-only exact active paper/content-source identity from the UI. */
+  activePaperContext?: PaperContextRef;
   selectedTextContexts?: SelectedTextContext[];
   resolvedSelectedTextAnchors?: ResolvedSelectedTextAnchor[];
   selectedTexts?: string[];
@@ -556,6 +558,7 @@ export type ExhaustiveReadBackend =
  */
 export type ClassifiedTurnIntent = {
   retrievalIntent: "enumerate" | "verify" | "summarize" | "none";
+  paperTargetIntent?: "active" | "added" | "all_visible" | "unspecified";
   externalSearchIntent?: "none" | "web" | "literature" | "both";
   wantedSections: Array<"methods" | "results" | "limitations">;
   queryLanguage?: string;
@@ -605,6 +608,7 @@ export type LegacyPaperContextField =
 export type ResolvedAgentRuntimeRequest = Omit<
   AgentRuntimeRequestInput,
   | LegacyPaperContextField
+  | "activePaperContext"
   | "selectedTextContexts"
   | "resolvedSelectedTextAnchors"
   | "localDocuments"

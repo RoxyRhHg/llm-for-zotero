@@ -558,10 +558,14 @@ function normalizePaperContexts(
   const seen = new Set<string>();
   for (const entry of entries) {
     if (!entry) continue;
+    const libraryID = Number(entry.libraryID);
     const itemId = Number(entry.itemId);
     const contextItemId = Number(entry.contextItemId);
     if (!Number.isFinite(itemId) || !Number.isFinite(contextItemId)) continue;
     const normalized: PaperContextRef = {
+      ...(Number.isFinite(libraryID) && libraryID > 0
+        ? { libraryID: Math.floor(libraryID) }
+        : {}),
       itemId: Math.floor(itemId),
       contextItemId: Math.floor(contextItemId),
       title: `${entry.title || `Paper ${Math.floor(itemId)}`}`.trim(),
@@ -576,7 +580,7 @@ function normalizePaperContexts(
     if (entry.mineruCacheDir?.trim()) {
       normalized.mineruCacheDir = entry.mineruCacheDir.trim();
     }
-    const key = `${normalized.itemId}:${normalized.contextItemId}`;
+    const key = `${normalized.libraryID || 0}:${normalized.itemId}:${normalized.contextItemId}`;
     if (seen.has(key)) continue;
     seen.add(key);
     out.push(normalized);

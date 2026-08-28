@@ -259,6 +259,7 @@ function buildClassifierPrompt(
     '• When the user\'s message genuinely combines multiple distinct subtasks (e.g. "read this paper, analyze figure 1, and write a note"), return every skill ID that maps to a distinct subtask. Do NOT pad the list with tangentially related skills.',
     '• The user\'s message may be in any language (Chinese, Japanese, Korean, Spanish, French, German, Russian, Arabic, …). Match intent language-independently: a note request like "为这篇论文写阅读笔记" maps to the note-writing skill exactly as its English equivalent would.',
     '• retrievalIntent: how the question should read the library, in any language — "enumerate" for which/all/list/find-evidence questions, "verify" for exact presence/absence checks, "summarize" for themes/commonalities/comparisons/overviews across papers, "none" for pure operations (tagging, moving, editing) or single-paper reads.',
+    '• paperTargetIntent: which visible paper set the user references, in any language — "active" for this/current paper, "added" for selected/attached/added papers other than the active paper, "all_visible" for both/these/all papers visible in the turn, and "unspecified" only when no paper-set reference was found.',
     '• externalSearchIntent: whether the answer needs live external evidence, in any language — "web" for general public web information, "literature" for scholarly discovery or external scholarly metadata, "both" when distinct parts need each source, and "none" when the available context or stable knowledge is sufficient. The tools are complementary, not mutually exclusive.',
     "• wantedSections: only the sections the user explicitly asks about (methods, results, limitations); otherwise an empty array.",
     '• queryLanguage: short language code of the user message, e.g. "en", "zh", "ja".',
@@ -280,7 +281,7 @@ function buildClassifierPrompt(
     request.userText,
     `"""`,
     "",
-    'Reply with ONLY a JSON object in this exact shape, no prose, no code fences: {"skillIds": ["id1", "id2"], "retrievalIntent": "enumerate|verify|summarize|none", "externalSearchIntent": "none|web|literature|both", "wantedSections": [], "queryLanguage": "en", "writeDisposition":"none|required|uncertain", "actionIntents": [{"operation":"apply_tags","coverage":"all","targetKind":"papers","parameters":{"tags":["topic:drift"]},"scopeRole":"source","scope":{"kind":"collection","path":"Parent/Leaf","includeDescendants":false},"constraints":{"tagPrefix":"topic:"}}]}',
+    'Reply with ONLY a JSON object in this exact shape, no prose, no code fences: {"skillIds": ["id1", "id2"], "retrievalIntent": "enumerate|verify|summarize|none", "paperTargetIntent":"active|added|all_visible|unspecified", "externalSearchIntent": "none|web|literature|both", "wantedSections": [], "queryLanguage": "en", "writeDisposition":"none|required|uncertain", "actionIntents": [{"operation":"apply_tags","coverage":"all","targetKind":"papers","parameters":{"tags":["topic:drift"]},"scopeRole":"source","scope":{"kind":"collection","path":"Parent/Leaf","includeDescendants":false},"constraints":{"tagPrefix":"topic:"}}]}',
   ].join("\n");
 }
 
@@ -289,6 +290,12 @@ const VALID_RETRIEVAL_INTENTS = new Set([
   "verify",
   "summarize",
   "none",
+]);
+const VALID_PAPER_TARGET_INTENTS = new Set([
+  "active",
+  "added",
+  "all_visible",
+  "unspecified",
 ]);
 const VALID_EXTERNAL_SEARCH_INTENTS = new Set([
   "none",
@@ -319,6 +326,7 @@ export function parseClassifiedTurnIntent(
   if (!parsed || typeof parsed !== "object") return null;
   const record = parsed as {
     retrievalIntent?: unknown;
+    paperTargetIntent?: unknown;
     externalSearchIntent?: unknown;
     wantedSections?: unknown;
     queryLanguage?: unknown;
@@ -330,6 +338,13 @@ export function parseClassifiedTurnIntent(
       ? record.retrievalIntent.trim()
       : "";
   if (!VALID_RETRIEVAL_INTENTS.has(retrievalIntent)) return null;
+  const paperTargetIntent =
+    typeof record.paperTargetIntent === "string" &&
+    VALID_PAPER_TARGET_INTENTS.has(record.paperTargetIntent.trim())
+      ? (record.paperTargetIntent.trim() as NonNullable<
+          ClassifiedTurnIntent["paperTargetIntent"]
+        >)
+      : undefined;
   const externalSearchIntent =
     typeof record.externalSearchIntent === "string" &&
     VALID_EXTERNAL_SEARCH_INTENTS.has(record.externalSearchIntent.trim())
@@ -360,6 +375,7 @@ export function parseClassifiedTurnIntent(
   if (writeDisposition === "required" && !actionIntents.length) return null;
   return {
     retrievalIntent: retrievalIntent as ClassifiedTurnIntent["retrievalIntent"],
+    ...(paperTargetIntent ? { paperTargetIntent } : {}),
     ...(externalSearchIntent ? { externalSearchIntent } : {}),
     wantedSections,
     queryLanguage,

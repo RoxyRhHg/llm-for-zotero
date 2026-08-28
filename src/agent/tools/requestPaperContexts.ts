@@ -39,7 +39,7 @@ export function collectRequestPaperContexts(
     ) {
       return;
     }
-    const key = `${entry.itemId}:${entry.contextItemId}`;
+    const key = `${entry.libraryID || 0}:${entry.itemId}:${entry.contextItemId}`;
     const existingIndex = indexByKey.get(key);
     if (existingIndex !== undefined) {
       out[existingIndex] = merge(out[existingIndex], entry);

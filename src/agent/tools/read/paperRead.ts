@@ -48,7 +48,10 @@ import { detectExplicitFullReadIntent } from "../../../modules/contextPanel/retr
 import { createCodexAppServerExhaustiveReaderSession } from "../../../codexAppServer/exhaustiveReader";
 import { createZoteroMetadataResolver } from "../../../services/zoteroMetadata/resolver";
 import { projectPaperMetadata } from "../../../services/zoteroMetadata/projections";
-import type { ZoteroMetadataResolver } from "../../../services/zoteroMetadata/types";
+import type {
+  ProjectedPaperMetadata,
+  ZoteroMetadataResolver,
+} from "../../../services/zoteroMetadata/types";
 
 type PaperReadMode =
   | "overview"
@@ -140,7 +143,7 @@ function dedupePaperContexts(
 ): NonNullable<PdfTarget["paperContext"]>[] {
   const seen = new Set<string>();
   return paperContexts.filter((paperContext) => {
-    const key = `${paperContext.itemId}:${paperContext.contextItemId}`;
+    const key = `${paperContext.libraryID || 0}:${paperContext.itemId}:${paperContext.contextItemId}`;
     if (seen.has(key)) return false;
     seen.add(key);
     return true;
@@ -173,19 +176,15 @@ function resolveFullReadTargets(params: {
   const selected = dedupePaperContexts([
     ...getTurnPapersWithRoles(params.context.request, ["selected"]),
   ]);
+  const activePaper = getTurnPapersWithRoles(params.context.request, [
+    "active",
+  ])[0];
   const available = dedupePaperContexts([
     ...params.zoteroGateway.listPaperContexts(params.context.request),
+    ...(activePaper ? [activePaper] : []),
     ...selected,
     ...explicitTargets,
   ]);
-  const activeItemId = Math.floor(
-    Number(params.context.request.activeItemId || 0),
-  );
-  const activePaper = available.find(
-    (paperContext) =>
-      paperContext.itemId === activeItemId ||
-      paperContext.contextItemId === activeItemId,
-  );
   const intendedTargets = resolveFullReadPaperTargets({
     question: requestText,
     availablePapers: available,
@@ -196,13 +195,13 @@ function resolveFullReadTargets(params: {
     const intendedKeys = new Set(
       intendedTargets.map(
         (paperContext) =>
-          `${paperContext.itemId}:${paperContext.contextItemId}`,
+          `${paperContext.libraryID || 0}:${paperContext.itemId}:${paperContext.contextItemId}`,
       ),
     );
     const explicitKeys = new Set(
       explicitTargets.map(
         (paperContext) =>
-          `${paperContext.itemId}:${paperContext.contextItemId}`,
+          `${paperContext.libraryID || 0}:${paperContext.itemId}:${paperContext.contextItemId}`,
       ),
     );
     const targetsAgree =
@@ -430,6 +429,23 @@ function normalizeMetadataValue(value: unknown): string {
   return typeof value === "string" ? value.replace(/\s+/g, " ").trim() : "";
 }
 
+function resolveMetadataOverviewTitle(
+  metadata: ProjectedPaperMetadata,
+): string {
+  const bibliographicTitle = normalizeMetadataValue(metadata.title);
+  if (bibliographicTitle) return bibliographicTitle;
+  const contentSource = metadata.contentSource;
+  const standaloneContentTitle =
+    contentSource?.itemId === metadata.itemId &&
+    contentSource.parentItemId === undefined
+      ? normalizeMetadataValue(contentSource.title)
+      : "";
+  return standaloneContentTitle || `Paper ${metadata.itemId}`;
+}
+
+export const resolveMetadataOverviewTitleForTests =
+  resolveMetadataOverviewTitle;
+
 function buildMetadataOverview(params: {
   paperContext: NonNullable<PdfTarget["paperContext"]>;
   metadataResolver: ZoteroMetadataResolver;
@@ -439,9 +455,7 @@ function buildMetadataOverview(params: {
     params.metadataResolver.resolvePaperMetadata(params.paperContext),
     params.paperContext,
   );
-  const title =
-    normalizeMetadataValue(metadata.title) ||
-    `Paper ${params.paperContext.itemId}`;
+  const title = resolveMetadataOverviewTitle(metadata);
   const authors = normalizeMetadataValue(metadata.creatorDisplay);
   const abstract = normalizeMetadataValue(metadata.abstract);
   const lines = [

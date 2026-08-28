@@ -197,6 +197,121 @@ function createDeps(params: {
 }
 
 describe("agent engine final UI release", function () {
+  it("preserves exact active paper identity for retries and edited-message overrides", async function () {
+    const retry = async (
+      conversationKey: number,
+      activePaperContextOverride?: {
+        libraryID: number;
+        itemId: number;
+        contextItemId: number;
+        title: string;
+      },
+    ) => {
+      const userMessage = {
+        role: "user" as const,
+        text: "summarize",
+        timestamp: 100,
+        runMode: "agent" as const,
+      };
+      const assistantMessage: any = {
+        role: "assistant" as const,
+        text: "previous",
+        timestamp: 200,
+        runMode: "agent" as const,
+      };
+      const runtime = {
+        getCapabilities: () => ({
+          streaming: true,
+          toolCalls: true,
+          multimodal: false,
+        }),
+        runTurn: async () =>
+          ({
+            kind: "completed",
+            runId: `run-${conversationKey}`,
+            text: "Done.",
+            usedFallback: false,
+          }) as AgentRuntimeOutcome,
+      } as unknown as AgentRuntime;
+      const deps = createDeps({
+        runtime,
+        pendingWrites: [],
+        idleRestores: [],
+        statuses: [],
+      });
+      deps.chatHistory.set(conversationKey, [userMessage, assistantMessage]);
+      deps.findLatestRetryPair = () => ({
+        userIndex: 0,
+        userMessage,
+        assistantMessage,
+      });
+      deps.reconstructRetryPayload = () => ({
+        question: userMessage.text,
+        screenshotImages: [],
+        paperContexts: [],
+        pdfPaperContexts: [],
+        fullTextPaperContexts: [],
+        selectedCollectionContexts: [],
+        selectedTagContexts: [],
+      });
+      deps.includeAutoLoadedPaperContext = (
+        _item,
+        paperContexts,
+        fullTextPaperContexts,
+      ) => ({
+        paperContexts: paperContexts || [],
+        fullTextPaperContexts: fullTextPaperContexts || [],
+        activePaperContext: {
+          libraryID: 1,
+          itemId: 42,
+          contextItemId: 100,
+          title: "Default attachment",
+        },
+      });
+      let capturedActivePaperContext: unknown;
+      const buildRequest = deps.buildAgentRuntimeRequest;
+      deps.buildAgentRuntimeRequest = async (params) => {
+        capturedActivePaperContext = params.activePaperContext;
+        return await buildRequest(params);
+      };
+
+      await retryAgentTurn(
+        {} as Element,
+        fakeItem(conversationKey),
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        deps,
+        undefined,
+        undefined,
+        activePaperContextOverride,
+      );
+      return capturedActivePaperContext;
+    };
+
+    assert.deepInclude((await retry(120)) as Record<string, unknown>, {
+      libraryID: 1,
+      itemId: 42,
+      contextItemId: 100,
+    });
+    assert.deepInclude(
+      (await retry(121, {
+        libraryID: 1,
+        itemId: 42,
+        contextItemId: 101,
+        title: "Edited active attachment",
+      })) as Record<string, unknown>,
+      { libraryID: 1, itemId: 42, contextItemId: 101 },
+    );
+  });
+
   it("admits only one rapid retry while conversation loading is deferred", async function () {
     const conversationKey = 122;
     const userMessage = {

@@ -364,9 +364,9 @@ function dedupePaperContextRefs(
     ) {
       continue;
     }
-    const key = `${Math.floor(Number(paperContext.itemId))}:${Math.floor(
-      Number(paperContext.contextItemId),
-    )}`;
+    const key = `${Math.floor(Number(paperContext.libraryID || 0))}:${Math.floor(
+      Number(paperContext.itemId),
+    )}:${Math.floor(Number(paperContext.contextItemId))}`;
     if (seen.has(key)) continue;
     seen.add(key);
     out.push(paperContext);
@@ -427,16 +427,18 @@ export function resolveDefaultTargets(
   const scope = getTurnPaperScopeFromRequest(context.request);
   const activePaper = getActiveTurnPaper(scope);
   const activeKey = activePaper
-    ? `${activePaper.itemId}:${activePaper.contextItemId}`
+    ? `${activePaper.libraryID}:${activePaper.itemId}:${activePaper.contextItemId}`
     : "";
   const addedPapers = scope.papers
     .filter(
       (entry) =>
-        `${entry.paper.itemId}:${entry.paper.contextItemId}` !== activeKey,
+        `${entry.paper.libraryID}:${entry.paper.itemId}:${entry.paper.contextItemId}` !==
+        activeKey,
     )
     .map((entry) => entry.paper);
   const allPapers = scope.papers.map((entry) => entry.paper);
   const userText = context.request.userText || "";
+  const paperTargetIntent = context.request.classifiedIntent?.paperTargetIntent;
   const requestsActivePaper =
     /\b(?:this|the current|current|active)\s+(?:paper|article|study|document|pdf)\b/i.test(
       userText,
@@ -449,7 +451,32 @@ export function resolveDefaultTargets(
     /\b(?:these|both|all(?:\s+of\s+the)?)\s+(?:papers?|articles?|studies|documents?|pdfs?)\b/i.test(
       userText,
     );
-  const implicit = requestsActivePaper
+  const classifiedTargets =
+    paperTargetIntent === "active"
+      ? activePaper
+        ? [activePaper]
+        : []
+      : paperTargetIntent === "added"
+        ? activePaper
+          ? addedPapers
+          : allPapers
+        : paperTargetIntent === "all_visible"
+          ? allPapers
+          : paperTargetIntent === "unspecified"
+            ? activePaper
+              ? [activePaper]
+              : allPapers
+            : undefined;
+  const legacySummarizeTargets =
+    paperTargetIntent === undefined &&
+    context.request.classifiedIntent?.retrievalIntent === "summarize" &&
+    allPapers.length > 1
+      ? allPapers
+      : undefined;
+  // A failed classifier leaves classifiedIntent absent. In that degraded mode
+  // the English-only phrases above are the compatibility fallback, so requests
+  // expressed differently may require explicit target/targets selectors.
+  const heuristicTargets = requestsActivePaper
     ? activePaper
       ? [activePaper]
       : []
@@ -460,6 +487,8 @@ export function resolveDefaultTargets(
         : activePaper
           ? [activePaper]
           : allPapers;
+  const implicit =
+    classifiedTargets || legacySummarizeTargets || heuristicTargets;
   return dedupePaperContextRefs(implicit).slice(0, maxCount);
 }
 

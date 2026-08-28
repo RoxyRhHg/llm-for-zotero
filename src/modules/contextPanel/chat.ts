@@ -807,6 +807,13 @@ function normalizePaperContexts(paperContexts: unknown): PaperContextRef[] {
   return normalizePaperContextRefs(paperContexts, { sanitizeText });
 }
 
+function completePaperContextKey(
+  paperContext: PaperContextRef,
+  fallbackLibraryID = 0,
+): string {
+  return `${Math.floor(Number(paperContext.libraryID || fallbackLibraryID))}:${Math.floor(Number(paperContext.itemId))}:${Math.floor(Number(paperContext.contextItemId))}`;
+}
+
 function normalizeCollectionContexts(
   collectionContexts: unknown,
 ): CollectionContextRef[] {
@@ -927,7 +934,7 @@ function collectRecentPaperContexts(history: Message[]): PaperContextRef[] {
     if (!message || message.role !== "user") continue;
     const contexts = getMessageCitationPaperContexts(message);
     for (const context of contexts) {
-      const key = `${context.itemId}:${context.contextItemId}`;
+      const key = completePaperContextKey(context);
       if (seen.has(key)) continue;
       seen.add(key);
       out.push(context);
@@ -1932,19 +1939,17 @@ function normalizeStoredPaperContextRoutes(params: {
     ),
   ]).map((paper) => ({ ...paper, contentSourceMode: "pdf" as const }));
   const pdfKeys = new Set(
-    pdfPaperContexts.map((paper) => `${paper.itemId}:${paper.contextItemId}`),
+    pdfPaperContexts.map((paper) => completePaperContextKey(paper)),
   );
   const fullTextPaperContexts = allFullTextPaperContexts.filter(
-    (paper) => !pdfKeys.has(`${paper.itemId}:${paper.contextItemId}`),
+    (paper) => !pdfKeys.has(completePaperContextKey(paper)),
   );
   const fullTextKeys = new Set(
-    fullTextPaperContexts.map(
-      (paper) => `${paper.itemId}:${paper.contextItemId}`,
-    ),
+    fullTextPaperContexts.map((paper) => completePaperContextKey(paper)),
   );
   return {
     paperContexts: allPaperContexts.filter((paper) => {
-      const key = `${paper.itemId}:${paper.contextItemId}`;
+      const key = completePaperContextKey(paper);
       return !pdfKeys.has(key) && !fullTextKeys.has(key);
     }),
     pdfPaperContexts,
@@ -1998,12 +2003,11 @@ function deriveConversationComposeContextSnapshot(
     return { paperContexts: [], collectionContexts: [], tagContexts: [] };
   }
   const autoPaperKey = autoLoadedPaperContext
-    ? `${autoLoadedPaperContext.itemId}:${autoLoadedPaperContext.contextItemId}`
+    ? completePaperContextKey(autoLoadedPaperContext)
     : "";
   const paperContexts = getMessageDisplayPaperContexts(latestUserMessage)
     .filter(
-      (paperContext) =>
-        `${paperContext.itemId}:${paperContext.contextItemId}` !== autoPaperKey,
+      (paperContext) => completePaperContextKey(paperContext) !== autoPaperKey,
     )
     .map(toContinuationPaperContext);
   return {
@@ -4101,8 +4105,8 @@ async function buildContextPlanForRequest(params: {
   ) => void;
 }): Promise<ContextPlanForRequest> {
   const pdfModePaperKeys = new Set(
-    (params.pdfPaperContexts || []).map(
-      (paper) => `${paper.itemId}:${paper.contextItemId}`,
+    (params.pdfPaperContexts || []).map((paper) =>
+      completePaperContextKey(paper, params.item.libraryID),
     ),
   );
   const explicitPaperContext = normalizePaperContexts(
@@ -4138,7 +4142,7 @@ async function buildContextPlanForRequest(params: {
     );
     if (!autoLoaded) return false;
     return pdfModePaperKeys.has(
-      `${autoLoaded.itemId}:${autoLoaded.contextItemId}`,
+      completePaperContextKey(autoLoaded, params.item.libraryID),
     );
   })();
   const activeContextItem = activeContextItemInPdfMode
@@ -4156,7 +4160,10 @@ async function buildContextPlanForRequest(params: {
     // Exclude PDF-mode papers from the text retrieval pipeline
     paperContexts: pdfModePaperKeys.size
       ? params.paperContexts.filter(
-          (p) => !pdfModePaperKeys.has(`${p.itemId}:${p.contextItemId}`),
+          (p) =>
+            !pdfModePaperKeys.has(
+              completePaperContextKey(p, params.item.libraryID),
+            ),
         )
       : params.paperContexts,
     fullTextPaperContexts: params.fullTextPaperContexts,
@@ -7282,11 +7289,18 @@ function includeAutoLoadedPaperContext(
 ): {
   paperContexts: PaperContextRef[];
   fullTextPaperContexts: PaperContextRef[];
+  activePaperContext?: PaperContextRef;
 } {
-  const normalizedPaperContexts = normalizePaperContexts(paperContexts);
+  const itemLibraryID = Math.floor(Number(item.libraryID)) || 0;
+  const withRequestLibrary = (paper: PaperContextRef): PaperContextRef =>
+    paper.libraryID || !itemLibraryID
+      ? paper
+      : { ...paper, libraryID: itemLibraryID };
+  const normalizedPaperContexts =
+    normalizePaperContexts(paperContexts).map(withRequestLibrary);
   const normalizedFullTextPaperContexts = normalizePaperContexts(
     fullTextPaperContexts,
-  );
+  ).map(withRequestLibrary);
   if (resolveDisplayConversationKind(item) === "global") {
     return {
       paperContexts: normalizedPaperContexts,
@@ -7308,15 +7322,21 @@ function includeAutoLoadedPaperContext(
       ),
     };
   }
+  const activePaperContext: PaperContextRef = {
+    ...autoLoadedPaperContext,
+    libraryID:
+      Math.floor(Number(autoLoadedPaperContext.libraryID || item.libraryID)) ||
+      undefined,
+  };
   // Always include auto-loaded paper in paperContexts (for display in chat history).
   // Only add to fullTextPaperContexts if NOT in PDF mode.
-  const autoKey = `${autoLoadedPaperContext.itemId}:${autoLoadedPaperContext.contextItemId}`;
+  const autoKey = completePaperContextKey(activePaperContext, itemLibraryID);
   const isExcludedFromTextPipeline = excludePaperKeys?.has(autoKey) === true;
   return {
     paperContexts: isExcludedFromTextPipeline
       ? normalizedPaperContexts
       : normalizePaperContexts([
-          autoLoadedPaperContext,
+          activePaperContext,
           ...normalizedPaperContexts,
         ]),
     fullTextPaperContexts: isExcludedFromTextPipeline
@@ -7324,11 +7344,12 @@ function includeAutoLoadedPaperContext(
       : fullTextPaperContexts === undefined
         ? limitFullTextPaperContexts(
             normalizePaperContexts([
-              autoLoadedPaperContext,
+              activePaperContext,
               ...normalizedFullTextPaperContexts,
             ]),
           )
         : limitFullTextPaperContexts(normalizedFullTextPaperContexts),
+    activePaperContext,
   };
 }
 
@@ -7617,20 +7638,21 @@ export async function editLatestUserMessageAndRetry(
   const selectedTagContextsForMessage =
     normalizeTagContexts(selectedTagContexts);
   const pdfExcludeKeys = new Set(
-    normalizedPdfPaperContexts.map(
-      (paper) => `${paper.itemId}:${paper.contextItemId}`,
+    normalizedPdfPaperContexts.map((paper) =>
+      completePaperContextKey(paper, item.libraryID),
     ),
   );
-  let {
-    paperContexts: paperContextsForMessage,
-    fullTextPaperContexts: fullTextPaperContextsForMessage,
-  } = includeAutoLoadedPaperContext(
+  const autoLoadedPaperContext = includeAutoLoadedPaperContext(
     item,
     normalizedPaperContexts,
     normalizedFullTextPaperContexts,
     pdfExcludeKeys.size > 0 ? pdfExcludeKeys : undefined,
     contextSource,
   );
+  let paperContextsForMessage = autoLoadedPaperContext.paperContexts;
+  let fullTextPaperContextsForMessage =
+    autoLoadedPaperContext.fullTextPaperContexts;
+  const activePaperContext = autoLoadedPaperContext.activePaperContext;
   const editRetryCodexNativeMcpLightContext = shouldUseCodexNativeLightContext({
     isCodexNativeTurn:
       retryConversationSystem === "codex" &&
@@ -7795,6 +7817,7 @@ export async function editLatestUserMessageAndRetry(
           modelAttachments,
           requestId,
           onProviderDispatch,
+          activePaperContext,
         )
       : await retryLatestAssistantResponse(
           body,
@@ -9097,13 +9120,14 @@ export async function editUserTurnAndRetry(opts: {
   const selectedTagContextsForMessage =
     normalizeTagContexts(selectedTagContexts);
   const pdfExcludeKeysEdit = new Set(
-    normalizedPdfPaperContexts.map(
-      (paper) => `${paper.itemId}:${paper.contextItemId}`,
+    normalizedPdfPaperContexts.map((paper) =>
+      completePaperContextKey(paper, item.libraryID),
     ),
   );
   const {
     paperContexts: paperContextsForMessage,
     fullTextPaperContexts: fullTextPaperContextsForMessage,
+    activePaperContext,
   } = includeAutoLoadedPaperContext(
     item,
     normalizedPaperContexts,
@@ -9261,6 +9285,7 @@ export async function editUserTurnAndRetry(opts: {
         modelAttachments,
         requestId,
         onProviderDispatch,
+        activePaperContext,
       )
     : await retryLatestAssistantResponse(
         body,
@@ -9286,6 +9311,7 @@ export type BuildAgentRuntimeRequestParams = {
   conversationKey: number;
   conversationGeneration?: number;
   item: Zotero.Item;
+  activePaperContext?: PaperContextRef;
   userText: string;
   selectedTextContexts?: SelectedTextContext[];
   resolvedSelectedTextAnchors?: ResolvedSelectedTextAnchor[];
@@ -9616,6 +9642,22 @@ async function buildAgentRuntimeRequest(
     enrichPaperContextsWithMineruCache(params.paperContexts),
     enrichPaperContextsWithMineruCache(params.fullTextPaperContexts),
   ]);
+  const requestLibraryID = Math.floor(Number(params.item.libraryID)) || 0;
+  const completePaperKey = (paper: PaperContextRef) =>
+    `${Math.floor(Number(paper.libraryID || requestLibraryID))}:${Math.floor(
+      Number(paper.itemId),
+    )}:${Math.floor(Number(paper.contextItemId))}`;
+  const activePaperContext = params.activePaperContext
+    ? [
+        ...(enrichedPaperContexts || []),
+        ...(enrichedFullTextPapers || []),
+        ...rawPdfPaperContexts,
+      ].find(
+        (paper) =>
+          completePaperKey(paper) ===
+          completePaperKey(params.activePaperContext!),
+      ) || params.activePaperContext
+    : undefined;
   const attachmentResourcePool = buildAgentAttachmentResourcePool({
     paperContexts: enrichedPaperContexts,
     fullTextPaperContexts: enrichedFullTextPapers,
@@ -9646,6 +9688,15 @@ async function buildAgentRuntimeRequest(
     userText: params.userText,
     conversationKind,
     activeItemId: activeNoteSession?.noteId || params.item.id,
+    activePaperContext: activePaperContext
+      ? {
+          ...activePaperContext,
+          libraryID:
+            Math.floor(
+              Number(activePaperContext.libraryID || requestLibraryID),
+            ) || undefined,
+        }
+      : undefined,
     selectedTextContexts: params.selectedTextContexts,
     resolvedSelectedTextAnchors: params.resolvedSelectedTextAnchors,
     selectedTexts: params.selectedTexts,
@@ -9939,6 +9990,7 @@ async function retryLatestAgentResponse(
   modelAttachmentsOverride?: ChatAttachment[],
   requestId?: number,
   onProviderDispatch?: () => void,
+  activePaperContextOverride?: PaperContextRef,
 ): Promise<true> {
   const conversationSystem = resolveEffectiveConversationSystem({
     item,
@@ -9979,6 +10031,7 @@ async function retryLatestAgentResponse(
     ),
     requestId,
     onProviderDispatch,
+    activePaperContextOverride,
   );
   return true;
 }
@@ -10569,8 +10622,8 @@ export async function sendQuestion(
     opts.webchatPdfPaperContexts ?? normalizedPdfPaperContexts,
   ).map((paper) => ({ ...paper, contentSourceMode: "pdf" as const }));
   const pdfModePaperKeys = new Set(
-    normalizedPdfPaperContexts.map(
-      (paper) => `${paper.itemId}:${paper.contextItemId}`,
+    normalizedPdfPaperContexts.map((paper) =>
+      completePaperContextKey(paper, item.libraryID),
     ),
   );
   const normalizedFullTextPaperContexts = normalizePaperContexts(

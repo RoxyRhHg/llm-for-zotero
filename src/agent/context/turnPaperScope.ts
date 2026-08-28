@@ -140,9 +140,17 @@ function normalizePaper(
   if (!paper) return null;
   const itemId = normalizePositiveInt(paper.itemId);
   const contextItemId = normalizePositiveInt(paper.contextItemId);
-  if (!itemId || !contextItemId || !libraryID) return null;
+  const paperLibraryID = normalizePositiveInt(paper.libraryID);
+  if (
+    !itemId ||
+    !contextItemId ||
+    !libraryID ||
+    (paperLibraryID !== undefined && paperLibraryID !== libraryID)
+  ) {
+    return null;
+  }
   return {
-    libraryID,
+    libraryID: paperLibraryID || libraryID,
     itemId,
     contextItemId,
     title: normalizeText(paper.title) || `Paper ${itemId}`,
@@ -275,6 +283,7 @@ export function buildTurnPaperScope(
 ): TurnPaperScopeBuildResult {
   const libraryID =
     normalizePositiveInt(input.libraryID) ||
+    normalizePositiveInt(input.activePaperContext?.libraryID) ||
     normalizePositiveInt(input.selectedCollectionContexts?.[0]?.libraryID) ||
     normalizePositiveInt(input.selectedTagContexts?.[0]?.libraryID) ||
     0;

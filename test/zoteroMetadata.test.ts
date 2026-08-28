@@ -332,6 +332,42 @@ describe("unified Zotero metadata resolver", function () {
     assert.equal(projectLibraryReadMetadata(explicit.value).kind, "attachment");
   });
 
+  it("keeps a cleared live parent title distinct from its child attachment title", function () {
+    const parent = fakeItem({
+      id: 42,
+      itemTypeID: 1,
+      itemType: "journalArticle",
+      fields: {},
+    });
+    const attachment = fakeItem({
+      id: 101,
+      itemTypeID: 14,
+      itemType: "attachment",
+      parentID: 42,
+      fields: { title: "Full Text PDF" },
+      attachment: {
+        filename: "paper.pdf",
+        contentType: "application/pdf",
+      },
+    });
+    installZotero([parent, attachment]);
+    const ref = paperRef(42, 101);
+
+    const projected = projectPaperMetadata(
+      createZoteroMetadataResolver().resolvePaperMetadata(ref),
+      ref,
+    );
+
+    assert.equal(projected.source, "live");
+    assert.notProperty(projected, "title");
+    assert.deepInclude(projected.contentSource || {}, {
+      itemId: 101,
+      parentItemId: 42,
+      title: "Full Text PDF",
+    });
+    assert.notEqual(projected.title, ref.title);
+  });
+
   it("resolves a standalone attachment without fabricating bibliography", function () {
     const attachment = fakeItem({
       id: 551,

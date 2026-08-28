@@ -536,10 +536,12 @@ function normalizePaperContext(
   value: PaperContextRef | undefined,
 ): PaperContextRef | undefined {
   if (!value) return undefined;
+  const libraryID = normalizePositiveInt(value.libraryID);
   const itemId = normalizePositiveInt(value.itemId);
   const contextItemId = normalizePositiveInt(value.contextItemId);
   if (!itemId || !contextItemId) return undefined;
   return {
+    ...(libraryID ? { libraryID } : {}),
     itemId,
     contextItemId,
     title: normalizeText(value.title) || `Paper ${itemId}`,
@@ -561,7 +563,7 @@ function normalizePaperContexts(
   for (const value of values) {
     const normalized = normalizePaperContext(value);
     if (!normalized) continue;
-    const key = `${normalized.itemId}:${normalized.contextItemId}`;
+    const key = `${normalized.libraryID || 0}:${normalized.itemId}:${normalized.contextItemId}`;
     if (seen.has(key)) continue;
     seen.add(key);
     out.push(normalized);

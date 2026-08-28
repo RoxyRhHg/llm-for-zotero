@@ -346,6 +346,7 @@ export function resolvePaperContextRefFromNote(
   }
   if (!title) title = `Note ${noteItemId}`;
   return {
+    libraryID: Math.floor(Number(noteItem.libraryID)) || undefined,
     itemId: noteItemId,
     contextItemId: noteItemId,
     title,
@@ -408,6 +409,9 @@ export function resolvePaperContextRefFromAttachment(
   );
 
   return {
+    libraryID:
+      Math.floor(Number(paperItem.libraryID || contextItem.libraryID)) ||
+      undefined,
     itemId: normalizedPaperItemId,
     contextItemId: normalizedContextItemId,
     title: title || `Paper ${normalizedPaperItemId}`,
@@ -463,6 +467,7 @@ export function resolvePaperContextRefFromItem(
     ),
   );
   return {
+    libraryID: Math.floor(Number(item.libraryID)) || undefined,
     itemId: normalizedItemId,
     contextItemId,
     title: title || `Paper ${normalizedItemId}`,

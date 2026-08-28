@@ -359,6 +359,7 @@ export class AgentToolRegistry {
               context.request.actionContract,
               prepared,
               params,
+              context.request.actionProgress,
             )
           : createFallbackToolReceipts({
               toolName: call.name,

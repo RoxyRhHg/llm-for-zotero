@@ -1,4 +1,5 @@
 import type {
+  AgentActionParameters,
   AgentJournalActionScope,
   AgentJournalStepOutcome,
   AgentWriteToolDefinition,
@@ -85,19 +86,60 @@ function operationForBatchJob(job: string) {
         : null;
 }
 
-function frozenContractTargets(
+function unresolvedCollectionContractTargets(
   job: string,
   context: import("../../types").AgentToolContext,
+  durableRemainingItemIds?: number[],
+  proposalParameters?: AgentActionParameters,
 ): number[] | null {
   const operation = operationForBatchJob(job);
   if (!operation) return null;
-  const obligation = context.request.actionContract?.obligations.find(
-    (entry) =>
-      entry.operation === operation && entry.scopeRole !== "destination",
-  );
-  return obligation?.targetBoundary
-    ? [...obligation.targetBoundary.frozenTargetIds]
-    : null;
+  const obligations =
+    context.request.actionContract?.obligations.filter(
+      (entry) =>
+        entry.operation === operation &&
+        entry.proofDomain === "zotero_state" &&
+        entry.scopeRole !== "destination" &&
+        entry.targetBoundary?.kind === "collection" &&
+        entry.targetBoundary.libraryID === context.request.libraryID &&
+        Object.entries(entry.parameters || {}).every(([key, expected]) => {
+          if (expected === undefined) return true;
+          const actual =
+            proposalParameters?.[key as keyof AgentActionParameters];
+          return Array.isArray(expected)
+            ? Array.isArray(actual) &&
+                expected.length === actual.length &&
+                [...expected].every((value) => actual.includes(value as never))
+            : actual === expected;
+        }) &&
+        !(
+          entry.constraints?.collectionMode === "move" &&
+          proposalParameters?.sourceCollectionId === undefined
+        ),
+    ) || [];
+  if (!obligations.length) return null;
+  const unresolved = obligations.flatMap((obligation) => {
+    const progress = context.request.actionProgress?.obligations.find(
+      (entry) => entry.obligationId === obligation.id,
+    );
+    if (
+      progress?.status === "fulfilled" ||
+      progress?.status === "already_satisfied" ||
+      progress?.status === "cancelled"
+    ) {
+      return [];
+    }
+    if (progress) {
+      return progress.unresolvedTargetIds
+        .map((target) => Number(target.match(/^item:(\d+)$/)?.[1]))
+        .filter((itemId) => Number.isInteger(itemId) && itemId > 0);
+    }
+    return obligation.targetBoundary?.frozenTargetIds || [];
+  });
+  const union = [...new Set(unresolved)].sort((left, right) => left - right);
+  if (!durableRemainingItemIds) return union;
+  const durableRemaining = new Set(durableRemainingItemIds);
+  return union.filter((itemId) => durableRemaining.has(itemId));
 }
 
 function bindFrozenTargets(
@@ -140,6 +182,7 @@ export function createLibraryBatchTool(deps: {
     jobArgs: Record<string, unknown>,
     identity: string,
     context?: import("../../types").AgentToolContext,
+    durableRemainingItemIds?: number[],
   ) => {
     const operation = operationForBatchJob(job);
     if (!operation) return [];
@@ -148,20 +191,20 @@ export function createLibraryBatchTool(deps: {
           .map(Number)
           .filter((itemId) => Number.isInteger(itemId) && itemId > 0)
       : [];
-    const obligation = context?.request.actionContract?.obligations.find(
-      (entry) =>
-        entry.operation === operation && entry.scopeRole !== "destination",
-    );
-    const progress = context?.request.actionProgress?.obligations.find(
-      (entry) => entry.obligationId === obligation?.id,
-    );
-    const progressItemIds = (progress?.unresolvedTargetIds || [])
-      .map((target) => Number(target.match(/^item:(\d+)$/)?.[1]))
-      .filter((itemId) => Number.isInteger(itemId) && itemId > 0);
-    const itemIds = progressItemIds.length
-      ? progressItemIds
-      : obligation?.targetBoundary?.frozenTargetIds || requestedItemIds;
     const targetCollectionId = normalizePositiveInt(jobArgs.targetCollectionId);
+    const proposalParameters = targetCollectionId
+      ? { destinationCollectionId: targetCollectionId }
+      : undefined;
+    const contractTargets = context
+      ? unresolvedCollectionContractTargets(
+          job,
+          context,
+          durableRemainingItemIds,
+          proposalParameters,
+        )
+      : null;
+    const itemIds =
+      contractTargets ?? durableRemainingItemIds ?? requestedItemIds;
     return [
       {
         id: `${operation}:library_batch:${identity}`,
@@ -169,9 +212,7 @@ export function createLibraryBatchTool(deps: {
         capability: capabilityForLibraryMutation(operation),
         operation,
         source: "library_mutation" as const,
-        parameters: targetCollectionId
-          ? { destinationCollectionId: targetCollectionId }
-          : undefined,
+        parameters: proposalParameters,
         requestedTargets: itemIds.map((itemId) => `item:${itemId}`),
         destinationCollectionIds: targetCollectionId
           ? [targetCollectionId]
@@ -193,6 +234,7 @@ export function createLibraryBatchTool(deps: {
       }
       const job = await store.getBatchJob(input.resumeJobId);
       let args: Record<string, unknown> = {};
+      let durableRemainingItemIds: number[] | undefined;
       if (job) {
         try {
           const parsed = JSON.parse(job.inputJson);
@@ -200,9 +242,24 @@ export function createLibraryBatchTool(deps: {
         } catch {
           args = {};
         }
+        try {
+          const plan = JSON.parse(job.planJson || "{}");
+          if (validateObject<Record<string, unknown>>(plan)) {
+            durableRemainingItemIds =
+              normalizeItemIds(plan.remainingItemIds) || undefined;
+          }
+        } catch {
+          durableRemainingItemIds = undefined;
+        }
       }
       return job
-        ? describeBatchOperation(job.action, args, job.jobId, context)
+        ? describeBatchOperation(
+            job.action,
+            args,
+            job.jobId,
+            context,
+            durableRemainingItemIds,
+          )
         : [];
     },
     spec: {
@@ -444,12 +501,24 @@ export function createLibraryBatchTool(deps: {
         now,
         store,
       });
-      if (!prepared.resumed) {
-        const frozenItemIds = frozenContractTargets(prepared.job, context);
-        if (frozenItemIds) {
-          prepared.jobArgs = bindFrozenTargets(prepared.jobArgs, frozenItemIds);
-          prepared.totalCount = frozenItemIds.length;
-        }
+      const durableRemainingItemIds = prepared.resumed
+        ? normalizeItemIds(prepared.jobArgs._batchItemIds) || []
+        : undefined;
+      const contractTargets = unresolvedCollectionContractTargets(
+        prepared.job,
+        context,
+        durableRemainingItemIds,
+        normalizePositiveInt(prepared.jobArgs.targetCollectionId)
+          ? {
+              destinationCollectionId: normalizePositiveInt(
+                prepared.jobArgs.targetCollectionId,
+              ),
+            }
+          : undefined,
+      );
+      if (contractTargets !== null) {
+        prepared.jobArgs = bindFrozenTargets(prepared.jobArgs, contractTargets);
+        if (!prepared.resumed) prepared.totalCount = contractTargets.length;
       }
       const action = deps.actionRegistry.getAction(prepared.job);
       if (!action) {

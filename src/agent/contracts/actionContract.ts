@@ -95,6 +95,114 @@ function matchingObligations(
   );
 }
 
+function obligationStatus(
+  progress: AgentActionProgressLedger | undefined,
+  obligationId: string,
+) {
+  return progress?.obligations.find(
+    (entry) => entry.obligationId === obligationId,
+  )?.status;
+}
+
+function obligationIsUnresolved(
+  progress: AgentActionProgressLedger | undefined,
+  obligationId: string,
+): boolean {
+  const status = obligationStatus(progress, obligationId);
+  return (
+    status !== "fulfilled" &&
+    status !== "already_satisfied" &&
+    status !== "cancelled"
+  );
+}
+
+function unresolvedBoundaryItemIds(
+  obligation: AgentActionObligation,
+  progress: AgentActionProgressLedger | undefined,
+): number[] {
+  if (!obligation.targetBoundary) return [];
+  const entry = progress?.obligations.find(
+    (candidate) => candidate.obligationId === obligation.id,
+  );
+  if (!entry) return obligation.targetBoundary.frozenTargetIds;
+  if (!obligationIsUnresolved(progress, obligation.id)) return [];
+  return entry.unresolvedTargetIds
+    .map((target) => Number(target.match(/^item:(\d+)$/)?.[1]))
+    .filter((itemId) => Number.isInteger(itemId) && itemId > 0);
+}
+
+function isSourceCollectionItemObligation(
+  obligation: AgentActionObligation,
+): boolean {
+  return Boolean(
+    obligation.scopeRole !== "destination" &&
+    obligation.scope &&
+    obligation.targetBoundary?.kind === "collection",
+  );
+}
+
+function proposalItemTargets(proposal: AgentActionProposal): string[] {
+  return proposal.requestedTargets.filter((target) =>
+    /^item:\d+$/.test(target),
+  );
+}
+
+function proposalSatisfiesConstraints(
+  obligation: AgentActionObligation,
+  proposal: AgentActionProposal,
+): boolean {
+  const prefix = obligation.constraints?.tagPrefix;
+  if (
+    prefix &&
+    (proposal.parameters?.tags || []).some((tag) => !tag.startsWith(prefix))
+  ) {
+    return false;
+  }
+  if (
+    obligation.constraints?.collectionMode === "move" &&
+    proposal.parameters?.sourceCollectionId === undefined
+  ) {
+    return false;
+  }
+  return true;
+}
+
+function assignedSourceCollectionObligations(
+  contract: AgentActionContract,
+  proposal: AgentActionProposal,
+  progress?: AgentActionProgressLedger,
+): AgentActionObligation[] {
+  const requested = new Set(proposalItemTargets(proposal));
+  return matchingObligations(contract, proposal).filter(
+    (obligation) =>
+      isSourceCollectionItemObligation(obligation) &&
+      obligationIsUnresolved(progress, obligation.id) &&
+      proposalSatisfiesConstraints(obligation, proposal) &&
+      unresolvedBoundaryItemIds(obligation, progress).some((itemId) =>
+        requested.has(itemTarget(itemId)),
+      ),
+  );
+}
+
+function narrowReceiptToBoundary(
+  receipt: AgentActionReceipt,
+  obligation: AgentActionObligation,
+): AgentActionReceipt {
+  if (!obligation.targetBoundary) return receipt;
+  const allowed = new Set(
+    obligation.targetBoundary.frozenTargetIds.map(itemTarget),
+  );
+  const narrow = (targets: string[]) =>
+    targets.filter((target) => allowed.has(target));
+  return {
+    ...receipt,
+    requestedTargets: narrow(receipt.requestedTargets),
+    appliedTargets: narrow(receipt.appliedTargets),
+    alreadySatisfiedTargets: narrow(receipt.alreadySatisfiedTargets),
+    rejectedTargets: narrow(receipt.rejectedTargets),
+  };
+}
+
 function failure(
   message: string,
   contract: AgentActionContract,
@@ -365,16 +473,9 @@ export class ActionContractService {
             : [proposal.operation],
         );
       }
-      const openMatches = matches.filter((obligation) => {
-        const status = options.progress?.obligations.find(
-          (entry) => entry.obligationId === obligation.id,
-        )?.status;
-        return (
-          status !== "fulfilled" &&
-          status !== "already_satisfied" &&
-          status !== "cancelled"
-        );
-      });
+      const openMatches = matches.filter((obligation) =>
+        obligationIsUnresolved(options.progress, obligation.id),
+      );
       if (!openMatches.length) {
         const cancelled = matches.some(
           (obligation) =>
@@ -393,6 +494,7 @@ export class ActionContractService {
         );
       }
       for (const obligation of openMatches) {
+        if (isSourceCollectionItemObligation(obligation)) continue;
         const prefix = obligation.constraints?.tagPrefix;
         const tags = proposal.parameters?.tags || [];
         if (prefix && tags.some((tag) => !tag.startsWith(prefix))) {
@@ -406,6 +508,88 @@ export class ActionContractService {
             [],
           );
         }
+      }
+      const sourceCollectionMatches = openMatches.filter(
+        isSourceCollectionItemObligation,
+      );
+      const assignedSourceCollections = assignedSourceCollectionObligations(
+        contract,
+        proposal,
+        options.progress,
+      );
+      if (sourceCollectionMatches.length) {
+        const requestedItems = proposalItemTargets(proposal);
+        if (!requestedItems.length || !assignedSourceCollections.length) {
+          return failure(
+            "Action scope rejected: proposed targets do not intersect an unresolved source-collection boundary.",
+            contract,
+            prepared,
+            requestedItems,
+            [],
+          );
+        }
+        const libraries = new Set(
+          assignedSourceCollections.map(
+            (obligation) => obligation.targetBoundary!.libraryID,
+          ),
+        );
+        if (libraries.size !== 1) {
+          return failure(
+            "Action scope rejected: source-collection boundaries belong to different Zotero libraries.",
+            contract,
+            prepared,
+            requestedItems,
+            [],
+          );
+        }
+        const authorizedUnion = new Set(
+          assignedSourceCollections.flatMap((obligation) =>
+            unresolvedBoundaryItemIds(obligation, options.progress).map(
+              itemTarget,
+            ),
+          ),
+        );
+        const rejected = requestedItems.filter(
+          (target) => !authorizedUnion.has(target),
+        );
+        if (rejected.length) {
+          return failure(
+            "Action scope rejected: proposed targets fall outside the assigned source-collection union.",
+            contract,
+            prepared,
+            rejected,
+            [],
+          );
+        }
+        for (const obligation of assignedSourceCollections) {
+          const scope = obligation.scope!;
+          const boundary = obligation.targetBoundary!;
+          const currentTargets = await listScopeTargetIds(this.gateway, {
+            libraryID: scope.libraryID,
+            collectionId: scope.collectionId,
+            collectionPath: scope.collectionPath,
+            targetKind: obligation.targetKind,
+            includeDescendants: scope.includeDescendants,
+          });
+          if (
+            !sameArrayValues(
+              currentTargets.map(String),
+              boundary.frozenTargetIds.map(String),
+            )
+          ) {
+            return failure(
+              "Frozen target scope changed after planning; refresh and retry before mutating.",
+              contract,
+              prepared,
+              [],
+              boundary.frozenTargetIds.map(itemTarget),
+            );
+          }
+        }
+      }
+      for (const obligation of openMatches.filter(
+        (entry) => !isSourceCollectionItemObligation(entry),
+      )) {
         if (!obligation.targetBoundary) continue;
         const scope = obligation.scope;
         const boundary = obligation.targetBoundary;
@@ -484,12 +668,21 @@ export class ActionContractService {
       }
       const proposed = new Set(
         prepared.proposals
-          .filter((proposal) =>
-            matchingObligations(contract, proposal).includes(obligation),
-          )
+          .filter((proposal) => {
+            if (!isSourceCollectionItemObligation(obligation)) {
+              return matchingObligations(contract, proposal).includes(
+                obligation,
+              );
+            }
+            return assignedSourceCollectionObligations(
+              contract,
+              proposal,
+              options.progress,
+            ).includes(obligation);
+          })
           .flatMap((proposal) => proposal.requestedTargets),
       );
-      const missing = obligation.targetBoundary.frozenTargetIds
+      const missing = unresolvedBoundaryItemIds(obligation, options.progress)
         .map(itemTarget)
         .filter((target) => !proposed.has(target));
       if (missing.length) {
@@ -516,13 +709,39 @@ export class ActionContractService {
       content?: unknown;
       actionEvidence?: AgentActionEvidence[];
     },
+    progress?: AgentActionProgressLedger,
   ): AgentActionReceipt[] {
     return prepared.proposals.flatMap((proposal) => {
-      const obligations = contract
-        ? matchingObligations(contract, proposal)
-        : [undefined];
+      let obligations: Array<AgentActionObligation | undefined>;
+      if (!contract) {
+        obligations = [undefined];
+      } else {
+        const matches = matchingObligations(contract, proposal);
+        const hasSourceCollectionMatch = matches.some(
+          isSourceCollectionItemObligation,
+        );
+        obligations = hasSourceCollectionMatch
+          ? [
+              ...assignedSourceCollectionObligations(
+                contract,
+                proposal,
+                progress,
+              ),
+              ...matches.filter(
+                (obligation) =>
+                  !isSourceCollectionItemObligation(obligation) &&
+                  obligationIsUnresolved(progress, obligation.id),
+              ),
+            ]
+          : matches;
+      }
       return (obligations.length ? obligations : [undefined]).map(
-        (obligation) => this.finalizeProposal(proposal, obligation, params),
+        (obligation) => {
+          const receipt = this.finalizeProposal(proposal, obligation, params);
+          return obligation && isSourceCollectionItemObligation(obligation)
+            ? narrowReceiptToBoundary(receipt, obligation)
+            : receipt;
+        },
       );
     });
   }

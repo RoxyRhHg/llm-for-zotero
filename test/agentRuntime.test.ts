@@ -5480,7 +5480,15 @@ describe("shallow guard round-limit safety", function () {
       };
       const registry = new AgentToolRegistry(
         createTestActionContractService((itemId) =>
-          [1, 2, 3].includes(itemId) ? ({ id: itemId } as Zotero.Item) : null,
+          [1, 2, 3].includes(itemId)
+            ? ({
+                id: itemId,
+                libraryID: 1,
+                isRegularItem: () => true,
+                isAttachment: () => false,
+                isAnnotation: () => false,
+              } as unknown as Zotero.Item)
+            : null,
         ),
       );
       registry.register({

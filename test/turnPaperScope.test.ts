@@ -69,6 +69,41 @@ describe("TurnPaperScope", function () {
     assert.notProperty(resolved, "citationPaperContexts");
   });
 
+  it("treats the complete supplied active identity as authoritative over a portal or note item ID", function () {
+    const exactActive: PaperContextRef = {
+      libraryID: 1,
+      itemId: 42,
+      contextItemId: 101,
+      title: "Exact active attachment",
+    };
+    const defaultAttachment: PaperContextRef = {
+      libraryID: 1,
+      itemId: 42,
+      contextItemId: 100,
+      title: "Default attachment",
+    };
+    const resolved = resolveAgentRuntimeRequest(
+      input({
+        activeItemId: 700,
+        activePaperContext: exactActive,
+        selectedPaperContexts: [defaultAttachment, exactActive],
+        pdfPaperContexts: [exactActive],
+      }),
+    );
+
+    assert.deepEqual(
+      resolved.turnPaperScope.papers.map((entry) => ({
+        key: buildTurnPaperKey(entry.paper),
+        roles: entry.roles,
+      })),
+      [
+        { key: "1:42:101", roles: ["active", "raw_pdf"] },
+        { key: "1:42:100", roles: ["selected"] },
+      ],
+    );
+    assert.notProperty(resolved, "activePaperContext");
+  });
+
   it("strips nested passage identities while preserving indexed associations and gaps", function () {
     const passageOnlyPaper: PaperContextRef = {
       itemId: 40,
@@ -332,6 +367,15 @@ describe("TurnPaperScope", function () {
       listPaperContexts: () => {
         throw new Error("resolved requests must not reconstruct tool scope");
       },
+      resolvePaperContextTarget: (selector: {
+        itemId?: number;
+        contextItemId?: number;
+      }) =>
+        [activePaper, addedPaper].find(
+          (paper) =>
+            paper.itemId === selector.itemId &&
+            paper.contextItemId === selector.contextItemId,
+        ) || null,
     } as never;
     const targets = (userText: string) => {
       const request = resolveAgentRuntimeRequest(input({ userText }));
@@ -348,6 +392,115 @@ describe("TurnPaperScope", function () {
     assert.deepEqual(targets("Compare the added papers"), [20]);
     assert.deepEqual(targets("Compare these papers"), [10, 20]);
     assert.deepEqual(targets("Compare both papers"), [10, 20]);
+  });
+
+  it("uses classified paper-set intent before English heuristics with a legacy summarize fallback", function () {
+    const gateway = {
+      listPaperContexts: () => {
+        throw new Error("resolved requests must not reconstruct tool scope");
+      },
+      resolvePaperContextTarget: (selector: {
+        itemId?: number;
+        contextItemId?: number;
+      }) =>
+        [activePaper, addedPaper].find(
+          (paper) =>
+            paper.itemId === selector.itemId &&
+            paper.contextItemId === selector.contextItemId,
+        ) || null,
+    } as never;
+    const targets = (
+      paperTargetIntent:
+        | "active"
+        | "added"
+        | "all_visible"
+        | "unspecified"
+        | undefined,
+      retrievalIntent: "enumerate" | "verify" | "summarize" | "none" = "none",
+      userText = "比较这些论文",
+      overrides: Partial<AgentRuntimeRequestInput> = {},
+    ) => {
+      const request = resolveAgentRuntimeRequest(
+        input({
+          userText,
+          classifiedIntent: {
+            retrievalIntent,
+            ...(paperTargetIntent ? { paperTargetIntent } : {}),
+            wantedSections: [],
+            actionIntents: [],
+          },
+          ...overrides,
+        }),
+      );
+      return resolveDefaultTargets(
+        undefined,
+        undefined,
+        { request },
+        gateway,
+        8,
+      ).map((paper) => paper.itemId);
+    };
+
+    assert.deepEqual(targets("all_visible"), [10, 20]);
+    assert.deepEqual(targets("active"), [10]);
+    assert.deepEqual(targets("added"), [20]);
+    assert.deepEqual(targets("unspecified"), [10]);
+    assert.deepEqual(targets(undefined, "summarize"), [10, 20]);
+    assert.deepEqual(
+      targets("all_visible", "none", "比较这些论文", {
+        selectedPaperContexts: [activePaper, activePaper, addedPaper],
+      }),
+      [10, 20],
+    );
+    assert.deepEqual(
+      targets("active", "none", "this paper", {
+        conversationKind: "global",
+        activeItemId: undefined,
+        activePaperContext: undefined,
+        selectedPaperContexts: [addedPaper],
+      }),
+      [],
+    );
+    assert.deepEqual(
+      targets("added", "none", "已添加的论文", {
+        conversationKind: "global",
+        activeItemId: undefined,
+        activePaperContext: undefined,
+        selectedPaperContexts: [activePaper, addedPaper],
+      }),
+      [10, 20],
+    );
+
+    const explicitRequest = resolveAgentRuntimeRequest(
+      input({
+        classifiedIntent: {
+          retrievalIntent: "summarize",
+          paperTargetIntent: "all_visible",
+          wantedSections: [],
+          actionIntents: [],
+        },
+      }),
+    );
+    assert.deepEqual(
+      resolveDefaultTargets(
+        undefined,
+        [{ paperContext: addedPaper }],
+        { request: explicitRequest },
+        gateway,
+        8,
+      ).map((paper) => paper.itemId),
+      [20],
+    );
+    assert.deepEqual(
+      resolveDefaultTargets(
+        undefined,
+        undefined,
+        { request: explicitRequest },
+        gateway,
+        1,
+      ).map((paper) => paper.itemId),
+      [10],
+    );
   });
 
   it("creates independent immutable-by-type snapshots for successive turns", function () {
