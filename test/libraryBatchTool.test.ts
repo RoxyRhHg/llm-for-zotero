@@ -85,10 +85,15 @@ describe("library_batch", function () {
       value: Parameters<LibraryBatchJobStore["advanceBatchJob"]>[0],
     ) => void;
     onMarkRunning?: (jobId: string) => void;
+    onCreate?: (
+      value: Parameters<LibraryBatchJobStore["createBatchJob"]>[0],
+    ) => void;
     claim?: boolean;
   }): LibraryBatchJobStore {
     return {
-      createBatchJob: async () => undefined,
+      createBatchJob: async (value) => {
+        params?.onCreate?.(value);
+      },
       advanceBatchJob: async (value) => {
         params?.onAdvance?.(value);
       },
@@ -472,6 +477,86 @@ describe("library_batch", function () {
       totalCount: 42,
     });
     assert.deepEqual(advances[0].plan, { remainingItemIds: [101, 102] });
+  });
+
+  it("executes a scoped batch from the contract's frozen targets without duplicating them in the initial job input", async function () {
+    installMode("yolo");
+    let executedInput: Record<string, unknown> = {};
+    let persistedInput: Record<string, unknown> = {};
+    const actionRegistry = new ActionRegistry();
+    actionRegistry.register({
+      name: "auto_tag",
+      description: "Tag papers",
+      inputSchema: { type: "object" },
+      execute: async (input: unknown) => {
+        executedInput = input as Record<string, unknown>;
+        return { ok: true, output: { tagged: 0, processed: 0 } };
+      },
+    } as never);
+    const tool = createLibraryBatchTool({
+      actionRegistry,
+      toolRegistry: {} as never,
+      zoteroGateway: {} as never,
+      now: () => 1000,
+      batchJobStore: makeJobStore({
+        onCreate: (value) => {
+          persistedInput = value.input;
+        },
+      }),
+    });
+    const validated = tool.validate({
+      job: "auto_tag",
+      jobArgs: { scope: "collection", collectionIds: [3], pageSize: 20 },
+    });
+    assert.isTrue(validated.ok);
+    if (!validated.ok) return;
+
+    await tool.execute(validated.value, {
+      ...context,
+      request: {
+        ...context.request,
+        actionContract: {
+          version: 2,
+          id: "contract-frozen",
+          writeDisposition: "required",
+          interpretationSource: "classifier",
+          obligations: [
+            {
+              id: "obligation-frozen",
+              capability: "zotero.tags",
+              operation: "apply_tags",
+              proofDomain: "zotero_state",
+              coverage: "all",
+              targetKind: "papers",
+              scopeRole: "source",
+              scope: {
+                kind: "collection",
+                includeDescendants: false,
+                libraryID: 1,
+                collectionId: 3,
+                collectionPath: "Representation_Drift",
+              },
+              targetBoundary: {
+                kind: "collection",
+                libraryID: 1,
+                frozenTargetIds: [41, 42, 43],
+                scopeDigest: "v1:1:3:direct:41:42:43",
+              },
+            },
+          ],
+        },
+      },
+    });
+
+    assert.deepEqual(executedInput._batchItemIds, [41, 42, 43]);
+    assert.notProperty(executedInput, "scope");
+    assert.notProperty(executedInput, "collectionIds");
+    assert.deepEqual(persistedInput, {
+      scope: "collection",
+      collectionIds: [3],
+      pageSize: 20,
+      startOffset: 0,
+    });
   });
 
   it("lists interrupted jobs without requiring yolo or confirmation", async function () {

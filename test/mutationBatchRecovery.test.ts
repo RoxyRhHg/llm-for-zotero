@@ -272,6 +272,55 @@ describe("multi-operation durable mutation recovery", function () {
     assert.equal(step.status, "uncertain");
   });
 
+  it("reconciles a may-have-applied operation from native state before retry", async function () {
+    const db = await installJournal();
+    let executeCalls = 0;
+    const operation = {
+      type: "update_metadata" as const,
+      itemId: 1,
+      metadata: { title: "new" },
+    };
+    const mutationService = {
+      planOperation: async () => ({
+        effect: "write" as const,
+        reversibility: "full" as const,
+        description: "update 1",
+        inverseOperations: [inverseFor(1)],
+        precondition: {
+          version: 1 as const,
+          operation: "update_metadata" as const,
+          items: [{ itemId: 1, exists: true, fields: { title: "old" } }],
+        },
+      }),
+      executeOperation: async () => {
+        executeCalls += 1;
+        throw new Error("transport ended after Zotero committed");
+      },
+      captureOperationState: async () => ({
+        version: 1 as const,
+        operation: "update_metadata" as const,
+        items: [{ itemId: 1, exists: true, fields: { title: "new" } }],
+      }),
+    };
+
+    const outcome = await executeLibraryMutationAction({
+      service: mutationService as never,
+      operations: [operation],
+      context,
+      facadeToolName: "update_metadata",
+    });
+
+    assert.equal(executeCalls, 1);
+    assert.equal(outcome.effect, "none");
+    assert.lengthOf(outcome.actionEvidence, 1);
+    assert.equal(
+      outcome.actionEvidence[0].postState.items?.[0].fields?.title,
+      "new",
+    );
+    assert.equal([...db.actions.values()][0].status, "no_effect");
+    assert.equal([...db.steps.values()][0].status, "no_effect");
+  });
+
   it("does not start the next write when its durable step cannot be prepared", async function () {
     const db = await installJournal();
     let calls = 0;

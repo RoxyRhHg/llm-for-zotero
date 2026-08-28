@@ -138,6 +138,8 @@ describe("parseClassifiedTurnIntent", function () {
       externalSearchIntent: "both",
       wantedSections: ["methods"],
       queryLanguage: "zh",
+      writeDisposition: "none",
+      actionInterpretationSource: "classifier",
       actionIntents: [],
     });
   });
@@ -146,6 +148,14 @@ describe("parseClassifiedTurnIntent", function () {
     assert.isNull(parseClassifiedTurnIntent('{"skillIds":[]}'));
     assert.isNull(parseClassifiedTurnIntent('{"retrievalIntent":"browse"}'));
     assert.isNull(parseClassifiedTurnIntent("not json"));
+  });
+
+  it("rejects required-write classifications without typed obligations", function () {
+    assert.isNull(
+      parseClassifiedTurnIntent(
+        '{"retrievalIntent":"none","wantedSections":[],"writeDisposition":"required","actionIntents":[]}',
+      ),
+    );
   });
 
   it("filters unknown wantedSections entries", function () {
@@ -190,6 +200,8 @@ describe("parseClassifiedTurnIntent", function () {
         retrievalIntent: "verify",
         wantedSections: ["results"],
         queryLanguage: "zh",
+        writeDisposition: "none",
+        actionInterpretationSource: "classifier",
         actionIntents: [],
       });
     }
@@ -257,6 +269,10 @@ describe("detectTurnIntent", function () {
       String(captured.prompt || ""),
       "The tools are complementary, not mutually exclusive",
     );
+    assert.include(
+      String(captured.prompt || ""),
+      '"use library_batch auto_tag" is apply_tags, not command_execute',
+    );
   });
 
   it("records unparseable classifier output as a distinct degradation reason", async function () {
@@ -274,6 +290,48 @@ describe("detectTurnIntent", function () {
 
     assert.isTrue(result.degraded);
     assert.equal(result.failureReason, "unparseable");
+  });
+
+  it("degrades to deterministic action parsing for required writes with no obligations", async function () {
+    const result = await detectTurnIntent(
+      {
+        userText: "create a Zotero note and export a markdown file",
+        model: "gpt-5.4",
+        apiBase: "https://api.openai.com/v1",
+        apiKey: "key",
+        providerProtocol: "openai_chat_compat",
+      } as any,
+      SKILLS,
+      {
+        llmCall: async () =>
+          '{"skillIds":["unmatched"],"retrievalIntent":"none","wantedSections":[],"writeDisposition":"required","actionIntents":[]}',
+      },
+    );
+
+    assert.isTrue(result.degraded);
+    assert.equal(result.failureReason, "unparseable");
+    assert.isNull(result.classifiedIntent);
+  });
+
+  it("rejects a classifier verb that contradicts an explicit tag removal", async function () {
+    const result = await detectTurnIntent(
+      {
+        userText: 'Remove exactly the tag "reviewed" from item 41.',
+        model: "gpt-5.4",
+        apiBase: "https://api.openai.com/v1",
+        apiKey: "key",
+        providerProtocol: "openai_chat_compat",
+      } as any,
+      SKILLS,
+      {
+        llmCall: async () =>
+          '{"skillIds":["unmatched"],"retrievalIntent":"none","wantedSections":[],"writeDisposition":"required","actionIntents":[{"operation":"set_item_tags","coverage":"one","targetKind":"papers","parameters":{"tags":["reviewed"]}}]}',
+      },
+    );
+
+    assert.isTrue(result.degraded);
+    assert.equal(result.failureReason, "unparseable");
+    assert.isNull(result.classifiedIntent);
   });
 });
 

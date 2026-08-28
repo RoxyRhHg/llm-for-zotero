@@ -77,6 +77,8 @@ export function buildActionExecutionContext(params: {
       fullTextPaperContexts: request.fullTextPaperContexts,
       selectedCollectionContexts: request.selectedCollectionContexts,
       selectedTagContexts: request.selectedTagContexts,
+      actionContract: request.actionContract,
+      actionProgress: request.actionProgress,
     },
     signal: context.signal,
   };

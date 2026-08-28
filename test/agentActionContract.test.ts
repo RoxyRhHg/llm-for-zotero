@@ -1,18 +1,16 @@
 import { assert } from "chai";
-import {
-  ActionContractService,
-  extractLibraryMutationOperations,
-} from "../src/agent/contracts/actionContract";
+import { ActionContractService } from "../src/agent/contracts/actionContract";
 import { evaluateActionContract } from "../src/agent/contracts/actionEvaluation";
-import {
-  inferActionIntentsFromRequest,
-  parseClassifiedTurnIntent,
-} from "../src/agent/model/skillClassifier";
 import type {
-  AgentActionContract,
+  AgentActionIntent,
+  AgentActionEvidence,
   AgentRuntimeRequest,
   AgentToolDefinition,
 } from "../src/agent/types";
+import type {
+  LibraryMutationOperation,
+  LibraryMutationState,
+} from "../src/agent/services/libraryMutation/contracts";
 
 type FakeItemState = {
   tags: string[];
@@ -21,6 +19,7 @@ type FakeItemState = {
   deleted?: boolean;
   noteHtml?: string;
   parentItemId?: number | null;
+  annotation?: boolean;
 };
 
 function createHarness() {
@@ -30,43 +29,93 @@ function createHarness() {
     [12, [50, 51]],
   ]);
   const items = new Map<number, FakeItemState>();
-  const summaries = [
-    { collectionId: 10, libraryID: 1, name: "Parent", path: "Parent" },
-    {
-      collectionId: 11,
-      libraryID: 1,
-      name: "Leaf",
-      path: "Parent/Leaf",
-    },
-    {
-      collectionId: 12,
-      libraryID: 1,
-      name: "Sibling",
-      path: "Parent/Sibling",
-    },
-  ];
+  const collections = new Map([
+    [
+      10,
+      {
+        collectionId: 10,
+        libraryID: 1,
+        name: "Parent",
+        path: "Parent",
+        parentCollectionId: null,
+        deleted: false,
+      },
+    ],
+    [
+      11,
+      {
+        collectionId: 11,
+        libraryID: 1,
+        name: "Leaf",
+        path: "Parent/Leaf",
+        parentCollectionId: 10,
+        deleted: false,
+      },
+    ],
+    [
+      12,
+      {
+        collectionId: 12,
+        libraryID: 1,
+        name: "Sibling",
+        path: "Parent/Sibling",
+        parentCollectionId: 10,
+        deleted: false,
+      },
+    ],
+  ]);
+  const settings = new Map<string, unknown>();
   const gateway = {
     getCollectionSummary(collectionId: number) {
-      return (
-        summaries.find((summary) => summary.collectionId === collectionId) ||
-        null
-      );
+      const collection = collections.get(collectionId);
+      return collection
+        ? {
+            collectionId: collection.collectionId,
+            libraryID: collection.libraryID,
+            name: collection.name,
+            path: collection.path,
+          }
+        : null;
+    },
+    getCollectionNativeState(collectionId: number) {
+      const collection = collections.get(collectionId);
+      return collection
+        ? {
+            exists: true,
+            name: collection.name,
+            parentCollectionId: collection.parentCollectionId,
+            deleted: collection.deleted,
+          }
+        : {
+            exists: false,
+            name: "",
+            parentCollectionId: null,
+            deleted: false,
+          };
     },
     listCollectionSummaries(libraryID: number) {
-      return summaries.filter((summary) => summary.libraryID === libraryID);
+      return [...collections.values()]
+        .filter((entry) => entry.libraryID === libraryID && !entry.deleted)
+        .map(({ collectionId, name, path }) => ({
+          collectionId,
+          libraryID,
+          name,
+          path,
+        }));
     },
     listCurrentCollectionSummaries(libraryID: number) {
-      return summaries.filter((summary) => summary.libraryID === libraryID);
+      return this.listCollectionSummaries(libraryID);
     },
     listCurrentCollectionTargetIds(params: { collectionId: number }) {
       return [...(directMembers.get(params.collectionId) || [])];
     },
+    async listCurrentLibraryTargetIds() {
+      return [...items.keys()];
+    },
     async listCollectionPaperTargets(params: { collectionId: number }) {
       return {
         papers: (directMembers.get(params.collectionId) || []).map(
-          (itemId) => ({
-            itemId,
-          }),
+          (itemId) => ({ itemId }),
         ),
       };
     },
@@ -85,6 +134,7 @@ function createHarness() {
         parentID: state.parentItemId || false,
         deleted: state.deleted,
         isNote: () => state.noteHtml !== undefined,
+        isAnnotation: () => state.annotation === true,
         getNote: () => state.noteHtml || "",
         getTags: () => state.tags.map((tag) => ({ tag })),
         getCollections: () => state.collections,
@@ -92,45 +142,75 @@ function createHarness() {
     },
     getEditableArticleMetadata(item: Zotero.Item | null | undefined) {
       if (!item) return null;
-      const state = [...items.values()].find(
-        (candidate) => candidate.collections === item.getCollections(),
-      );
+      const state = items.get(Number(item.id));
       return state ? { fields: state.fields, creators: [] } : null;
+    },
+    getSettingNativeState(key: string) {
+      return settings.has(key)
+        ? { exists: true, value: settings.get(key) }
+        : { exists: false, value: undefined };
     },
   };
   return {
+    collections,
     directMembers,
     gateway,
     items,
+    settings,
     service: new ActionContractService(gateway),
   };
 }
 
-function scopedRequest(): AgentRuntimeRequest {
+function tagIntent(
+  operation: "apply_tags" | "remove_tags" | "set_item_tags" = "apply_tags",
+): AgentActionIntent {
+  return {
+    capability: "zotero.tags",
+    operation,
+    proofDomain: "zotero_state",
+    coverage: "all",
+    targetKind: "papers",
+    parameters: { tags: ["topic:drift"] },
+    scope: { kind: "collection", includeDescendants: false },
+  };
+}
+
+function requestWithIntents(
+  actionIntents: AgentActionIntent[],
+  options: {
+    disposition?: "none" | "required" | "uncertain";
+    selectedCollection?: number;
+    userText?: string;
+  } = {},
+): AgentRuntimeRequest {
+  const selectedCollection = options.selectedCollection ?? 11;
   return {
     conversationKey: 1,
     mode: "agent",
-    userText: "Tag every paper in the selected collection",
+    userText: options.userText || "test action",
     model: "test",
-    selectedCollectionContexts: [
-      { collectionId: 11, libraryID: 1, name: "Leaf" },
-    ],
+    selectedCollectionContexts:
+      selectedCollection > 0
+        ? [
+            {
+              collectionId: selectedCollection,
+              libraryID: 1,
+              name: selectedCollection === 11 ? "Leaf" : "Parent",
+            },
+          ]
+        : [],
     classifiedIntent: {
       retrievalIntent: "none",
       wantedSections: [],
-      actionIntents: [
-        {
-          capability: "zotero.tags",
-          coverage: "all",
-          targetKind: "papers",
-          scope: { kind: "collection", includeDescendants: false },
-        },
-      ],
+      writeDisposition:
+        options.disposition || (actionIntents.length ? "required" : "none"),
+      actionInterpretationSource: "classifier",
+      actionIntents,
     },
   };
 }
 
-function semanticTool(): AgentToolDefinition<any, unknown> {
+function mutationTool(): AgentToolDefinition<any, unknown> {
   return {
     spec: {
       name: "library_update",
@@ -139,616 +219,774 @@ function semanticTool(): AgentToolDefinition<any, unknown> {
       mutability: "write",
       requiresConfirmation: true,
     },
-    describeAction: () => ({
-      kind: "semantic_state",
-      capability: "zotero.read",
-      source: "library_mutation",
-    }),
     validate: (input) => ({ ok: true, value: input }),
     execute: async () => ({ content: {}, effect: "applied" }),
   };
 }
 
-describe("systematic agent action contracts", function () {
-  it("resolves a newly created named collection from current Zotero state rather than a stale search snapshot", async function () {
-    const { gateway, service } = createHarness();
-    gateway.listCollectionSummaries = () => [];
-    gateway.listCollectionItemTargets = async () => ({ items: [] });
-    const request = scopedRequest();
-    request.selectedCollectionContexts = [];
-    request.libraryID = 1;
-    request.classifiedIntent!.actionIntents[0].scope = {
-      kind: "collection",
-      path: "Parent/Leaf",
-      includeDescendants: false,
-    };
+function mutationEvidence(
+  operationValue: LibraryMutationOperation,
+  preState: LibraryMutationState,
+  postState: LibraryMutationState,
+  journalStepId: string,
+  effect: AgentActionEvidence["effect"] = "applied",
+): AgentActionEvidence[] {
+  return [
+    {
+      version: 1,
+      proofDomain: "zotero_state",
+      operationValue,
+      preState,
+      postState,
+      journalStepId,
+      effect,
+    },
+  ];
+}
 
-    const contract = await service.createContract(request);
-
-    assert.equal(contract?.obligations[0].scope?.collectionId, 11);
-    assert.deepEqual(
-      contract?.obligations[0].scope?.frozenTargetIds,
-      [1, 2, 3],
-    );
-  });
-
-  it("freezes exact direct membership and rejects parent, sibling, and partial targets", async function () {
+describe("Action Contract V2", function () {
+  it("rejects remove and replace proposals for an add-tag obligation", async function () {
     const { service } = createHarness();
-    const contract = await service.createContract(scopedRequest());
-    assert.deepEqual(
-      contract?.obligations[0].scope?.frozenTargetIds,
-      [1, 2, 3],
+    const contract = await service.createContract(
+      requestWithIntents([tagIntent()]),
     );
-
-    const exact = await service.prepare(semanticTool(), {
-      operation: { type: "apply_tags", itemIds: [1, 2, 3], tags: ["topic"] },
-    });
-    assert.isNull(await service.validateScope(contract!, exact));
-
-    const widened = await service.prepare(semanticTool(), {
-      operation: {
-        type: "apply_tags",
-        itemIds: [1, 2, 3, 50, 90],
-        tags: ["topic"],
-      },
-    });
-    const widenedFailure = await service.validateScope(contract!, widened);
-    assert.deepEqual(widenedFailure?.rejectedTargets, ["item:50", "item:90"]);
-    assert.equal(widenedFailure?.expectedCount, 3);
-    assert.equal(widenedFailure?.proposedCount, 5);
-
-    const partial = await service.prepare(semanticTool(), {
-      operation: { type: "apply_tags", itemIds: [1, 2], tags: ["topic"] },
-    });
-    assert.deepEqual(
-      (await service.validateScope(contract!, partial))?.missingTargets,
-      ["item:3"],
-    );
-  });
-
-  it("turns membership drift between planning and execution into a retryable refusal", async function () {
-    const { service, directMembers } = createHarness();
-    const contract = await service.createContract(scopedRequest());
-    directMembers.set(11, [1, 2, 3, 4]);
-    const prepared = await service.prepare(semanticTool(), {
-      operation: { type: "apply_tags", itemIds: [1, 2, 3], tags: ["topic"] },
-    });
-    const failure = await service.validateScope(contract!, prepared);
-    assert.include(failure?.message || "", "changed after planning");
-    assert.equal(failure?.expectedCount, 3);
-  });
-
-  it("allows itemless setup operations without satisfying scoped item coverage", async function () {
-    const { service } = createHarness();
-    const request = scopedRequest();
-    request.classifiedIntent!.actionIntents[0].capability =
-      "zotero.collections";
-    const contract = (await service.createContract(request))!;
-    const prepared = await service.prepare(semanticTool(), {
-      operation: { type: "create_collection", name: "Destination" },
-    });
-
-    assert.isNull(await service.validateScope(contract, prepared));
-    const receipt = service.finalize(prepared, {
-      ok: true,
-      effect: "applied",
-      content: { result: { collectionId: 20 } },
-    });
-    assert.equal(evaluateActionContract(contract, [receipt]).state, "pending");
-  });
-
-  it("includes descendants only when the contract explicitly requests them", async function () {
-    const { service } = createHarness();
-    const request = scopedRequest();
-    request.selectedCollectionContexts = [
-      { collectionId: 10, libraryID: 1, name: "Parent" },
-    ];
-    request.classifiedIntent!.actionIntents[0].scope!.includeDescendants = true;
-    const contract = await service.createContract(request);
-    assert.deepEqual(
-      [...(contract?.obligations[0].scope?.frozenTargetIds || [])].sort(
-        (left, right) => left - right,
-      ),
-      [1, 2, 3, 50, 51, 90],
-    );
-  });
-
-  it("validates exact destination collections and tag-prefix constraints", async function () {
-    const { service } = createHarness();
-    const noteRequest = scopedRequest();
-    noteRequest.classifiedIntent!.actionIntents = [
+    for (const operation of [
       {
-        capability: "zotero.notes",
-        coverage: "one",
-        targetKind: "items",
-        scopeRole: "destination",
-        scope: { kind: "collection", includeDescendants: false },
-      },
-    ];
-    const noteContract = await service.createContract(noteRequest);
-    const wrongDestination = await service.prepare(semanticTool(), {
-      operation: {
-        type: "save_note",
-        target: "standalone",
-        content: "note",
-        collections: [12],
-      },
-    });
-    assert.deepEqual(
-      (await service.validateScope(noteContract!, wrongDestination))
-        ?.rejectedTargets,
-      ["collection:12"],
-    );
-
-    const tagRequest = scopedRequest();
-    tagRequest.classifiedIntent!.actionIntents[0].constraints = {
-      tagPrefix: "topic:",
-    };
-    const tagContract = await service.createContract(tagRequest);
-    const invalidTag = await service.prepare(semanticTool(), {
-      operation: {
-        type: "apply_tags",
+        type: "remove_tags" as const,
         itemIds: [1, 2, 3],
-        tags: ["topic:methods", "unprefixed"],
+        tags: ["topic:drift"],
       },
-    });
-    assert.deepEqual(
-      (await service.validateScope(tagContract!, invalidTag))?.rejectedTargets,
-      ["tag:unprefixed"],
-    );
+      {
+        type: "set_item_tags" as const,
+        assignments: [1, 2, 3].map((itemId) => ({
+          itemId,
+          tags: ["topic:drift"],
+        })),
+      },
+    ]) {
+      const prepared = await service.prepare(mutationTool(), { operation });
+      const rejection = await service.validateScope(contract, prepared);
+      assert.include(rejection?.message || "", operation.type);
+      assert.include(rejection?.message || "", "does not match");
+    }
   });
 
-  it("requires atomic source removal and exact destination membership for a true move", async function () {
+  it("rejects every model-originated write for a no-write contract", async function () {
     const { service } = createHarness();
-    const request = scopedRequest();
-    request.selectedCollectionContexts = [];
-    request.libraryID = 1;
-    request.userText =
-      'Move the paper titled "Target" out of the collection "Parent/Leaf" and into "Parent/Sibling".';
-    request.classifiedIntent!.actionIntents =
-      inferActionIntentsFromRequest(request);
-    const contract = await service.createContract(request);
-
-    const addOnly = await service.prepare(semanticTool(), {
+    const contract = await service.createContract(
+      requestWithIntents([], { disposition: "none" }),
+    );
+    const prepared = await service.prepare(mutationTool(), {
       operation: {
-        type: "move_to_collection",
+        type: "apply_tags",
         itemIds: [1],
-        targetCollectionId: 12,
-        mode: "add",
+        tags: ["topic:drift"],
       },
     });
     assert.include(
-      (await service.validateScope(contract!, addOnly))?.message || "",
-      "True move required",
-    );
-
-    const trueMove = await service.prepare(semanticTool(), {
-      operation: {
-        type: "move_to_collection",
-        itemIds: [1],
-        targetCollectionId: 12,
-        mode: "move",
-        from: 11,
-      },
-    });
-    assert.isNull(await service.validateScope(contract!, trueMove));
-  });
-
-  it("counts already-satisfied targets toward complete verified coverage", async function () {
-    const { service, items } = createHarness();
-    items.set(1, { tags: [], collections: [11], fields: {} });
-    items.set(2, { tags: ["topic"], collections: [11], fields: {} });
-    items.set(3, { tags: [], collections: [11], fields: {} });
-    const contract = (await service.createContract(scopedRequest()))!;
-    const prepared = await service.prepare(semanticTool(), {
-      operation: {
-        type: "apply_tags",
-        itemIds: [1, 2, 3],
-        tags: ["topic"],
-      },
-    });
-    items.get(1)!.tags = ["topic"];
-    items.get(3)!.tags = ["topic"];
-    const receipt = service.finalize(prepared, {
-      ok: true,
-      effect: "partial",
-    });
-    assert.deepEqual(receipt.appliedTargets, ["item:1", "item:3"]);
-    assert.deepEqual(receipt.alreadySatisfiedTargets, ["item:2"]);
-    assert.equal(receipt.verification, "verified");
-    assert.equal(
-      evaluateActionContract(contract, [receipt]).state,
-      "satisfied",
+      (await service.validateScope(contract, prepared))?.message || "",
+      "authorizes no mutations",
     );
   });
 
-  it("verifies standalone note creation from the note tool's actual result and Zotero state", async function () {
-    const { service, items } = createHarness();
-    const request = scopedRequest();
-    request.classifiedIntent!.actionIntents = [
-      {
-        capability: "zotero.notes",
-        coverage: "one",
-        targetKind: "items",
-        scopeRole: "destination",
-        scope: { kind: "collection", includeDescendants: false },
-      },
-    ];
-    const contract = (await service.createContract(request))!;
-    const tool: AgentToolDefinition<any, unknown> = {
-      ...semanticTool(),
-      describeAction: (input) => ({
-        kind: "semantic_state",
-        capability: "zotero.notes",
-        source: "library_mutation",
-        action: {
-          kind: "note_write",
-          mode: input.mode,
-          destinationCollectionIds: input.collections,
-          expectedText: input.content,
-        },
-      }),
-    };
-    const prepared = await service.prepare(tool, {
-      mode: "create",
-      target: "standalone",
-      collections: [11],
-      content: "Issue388 note",
-    });
-    assert.isNull(await service.validateScope(contract, prepared));
-    items.set(42, {
-      tags: [],
-      collections: [11],
-      fields: {},
-      noteHtml: "<p>Issue388 note</p>",
-    });
-    const receipt = service.finalize(prepared, {
-      ok: true,
-      effect: "applied",
-      content: {
-        result: {
-          operation: "save_note",
-          result: { status: "created", noteId: 42 },
-        },
-      },
-    });
-    assert.equal(receipt.capability, "zotero.notes");
-    assert.equal(receipt.verification, "verified");
-    assert.deepEqual(receipt.appliedTargets, ["item:42"]);
-    assert.equal(
-      evaluateActionContract(contract, [receipt]).state,
-      "satisfied",
-    );
-  });
-
-  it("verifies rendered Zotero note text against Markdown-structured input", async function () {
-    const { service, items } = createHarness();
-    const tool: AgentToolDefinition<any, unknown> = {
-      ...semanticTool(),
-      describeAction: () => ({
-        kind: "semantic_state",
-        capability: "zotero.notes",
-        source: "library_mutation",
-        action: {
-          kind: "note_write",
-          mode: "create",
-          destinationCollectionIds: [11],
-          expectedText: "# Issue388-note-flash\n\n**Issue388-note-flash**",
-        },
-      }),
-    };
-    const prepared = await service.prepare(tool, {});
-    items.set(43, {
-      tags: [],
-      collections: [11],
-      fields: {},
-      noteHtml:
-        "<p>Model response: deepseek-v4-flash</p><h1>Issue388-note-flash</h1><p><strong>Issue388-note-flash</strong></p><hr/><p>Written by LLM-for-Zotero.</p>",
-    });
-    const receipt = service.finalize(prepared, {
-      ok: true,
-      effect: "applied",
-      content: {
-        operation: "save_note",
-        result: { status: "standalone_created", noteId: 43 },
-      },
-    });
-    assert.equal(receipt.status, "applied");
-    assert.equal(receipt.verification, "verified");
-    assert.deepEqual(receipt.appliedTargets, ["item:43"]);
-  });
-
-  it("verifies note edits against the addressed note's stored content", async function () {
-    const { service, items } = createHarness();
-    items.set(42, {
-      tags: [],
-      collections: [11],
-      fields: {},
-      noteHtml: "<p>Edited note</p>",
-    });
-    const prepared = await service.prepare(
-      {
-        ...semanticTool(),
-        describeAction: () => ({
-          kind: "semantic_state",
-          capability: "zotero.notes",
-          source: "library_mutation",
-          action: {
-            kind: "note_write",
-            mode: "edit",
-            targetNoteId: 42,
-            destinationCollectionIds: [],
-            expectedText: "Edited note",
-          },
-        }),
-      },
-      { mode: "edit", targetNoteId: 42, content: "Edited note" },
-    );
-    const receipt = service.finalize(prepared, {
-      ok: true,
-      effect: "applied",
-      content: { status: "updated", noteId: 42 },
-    });
-    assert.equal(receipt.verification, "verified");
-    assert.deepEqual(receipt.requestedTargets, ["item:42"]);
-  });
-
-  it("keeps artifact and execution-only proof levels distinct", async function () {
+  it("binds top-level and explicitly nested collection creation precisely", async function () {
     const { service } = createHarness();
-    const file = await service.prepare(
+    for (const testCase of [
       {
-        ...semanticTool(),
-        spec: { ...semanticTool().spec, name: "file_io" },
-        describeAction: () => ({
-          kind: "artifact_state",
-          capability: "file.write",
-        }),
-      },
-      { filePath: "/tmp/example.md" },
-    );
-    const fileReceipt = service.finalize(file, { ok: true, effect: "applied" });
-    assert.equal(fileReceipt.verification, "verified");
-    assert.deepEqual(fileReceipt.appliedTargets, ["file:/tmp/example.md"]);
-
-    const command = await service.prepare(
-      {
-        ...semanticTool(),
-        spec: { ...semanticTool().spec, name: "run_command" },
-        describeAction: () => ({
-          kind: "execution_only",
-          capability: "command.execute",
-        }),
-      },
-      { command: "true" },
-    );
-    const commandReceipt = service.finalize(command, {
-      ok: true,
-      effect: "applied",
-    });
-    assert.equal(commandReceipt.verification, "execution_only");
-    assert.equal(commandReceipt.status, "observed");
-    assert.deepEqual(commandReceipt.appliedTargets, []);
-
-    const cancelled = service.finalize(file, {
-      ok: false,
-      cancelled: true,
-      reason: "User denied action",
-    });
-    assert.equal(cancelled.status, "cancelled");
-    assert.equal(cancelled.verification, "verified");
-  });
-
-  it("rejects an unrelated execution-only escape from a semantic action contract", async function () {
-    const { service } = createHarness();
-    const contract = await service.createContract(scopedRequest());
-    const command = await service.prepare(
-      {
-        ...semanticTool(),
-        spec: { ...semanticTool().spec, name: "run_command" },
-        describeAction: () => ({
-          kind: "execution_only",
-          capability: "command.execute",
-        }),
-      },
-      { command: "echo bypass" },
-    );
-
-    const rejection = await service.validateScope(
-      contract || undefined,
-      command,
-    );
-
-    assert.include(rejection?.message || "", "outside this action contract");
-    assert.deepEqual(rejection?.missingTargets, ["zotero.tags"]);
-  });
-
-  it("extracts nested facade operations and assigns action capabilities", async function () {
-    const { service } = createHarness();
-    const cases = [
-      [
-        { type: "update_metadata", itemId: 1, metadata: { title: "T" } },
-        "zotero.metadata",
-      ],
-      [
-        { type: "move_to_collection", itemIds: [1], targetCollectionId: 12 },
-        "zotero.collections",
-      ],
-      [
-        {
-          type: "save_notes_batch",
-          notes: [{ targetItemId: 1, content: "N" }],
+        collectionName: "ACV2 Methods",
+        scope: {
+          kind: "collection" as const,
+          path: "ACV2 Methods",
+          includeDescendants: false,
         },
-        "zotero.notes",
-      ],
-      [{ type: "trash_items", itemIds: [1] }, "zotero.trash"],
-      [{ type: "delete_attachment", attachmentId: 1 }, "zotero.attachments"],
-    ] as const;
-    for (const [operation, capability] of cases) {
-      const input = { delegateInput: { operation } };
-      assert.lengthOf(extractLibraryMutationOperations(input), 1);
+        selectedCollection: 0,
+        userText: 'Create top-level collection "ACV2 Methods".',
+        expectedParentId: null,
+      },
+      {
+        collectionName: "Methods",
+        selectedCollection: 10,
+        userText: 'Create a collection named "Methods" under this collection.',
+        expectedParentId: 10,
+      },
+    ]) {
+      const contract = await service.createContract(
+        requestWithIntents(
+          [
+            {
+              capability: "zotero.collections",
+              operation: "create_collection",
+              proofDomain: "zotero_state",
+              coverage: "one",
+              targetKind: "items",
+              parameters: { collectionName: testCase.collectionName },
+              scope: testCase.scope,
+            },
+          ],
+          testCase,
+        ),
+      );
+
+      const obligation = contract.obligations[0];
+      assert.isUndefined(obligation.scope);
       assert.equal(
-        (await service.prepare(semanticTool(), input)).capability,
-        capability,
+        obligation.parameters?.parentCollectionId,
+        testCase.expectedParentId,
       );
     }
   });
 
-  it("reports an omitted obligation as pending instead of accepting prose", function () {
-    const contract: AgentActionContract = {
-      version: 1,
-      state: "pending",
-      correctionCount: 0,
-      obligations: [
-        {
-          id: "zotero.tags:unscoped",
-          capability: "zotero.tags",
-          coverage: "some",
-          targetKind: "papers",
-        },
-      ],
-    };
-    const evaluation = evaluateActionContract(contract, []);
-    assert.equal(evaluation.state, "pending");
-    assert.include(evaluation.correction || "", "verified receipt");
-    assert.include(evaluation.correction || "", "library_update");
-    assert.include(evaluation.failure || "", "zotero.tags");
-  });
-
-  it("keeps a verified success satisfied when a later redundant call is cancelled", function () {
-    const contract: AgentActionContract = {
-      version: 1,
-      state: "pending",
-      correctionCount: 0,
-      obligations: [
-        {
-          id: "zotero.tags:unscoped",
-          capability: "zotero.tags",
-          coverage: "one",
-          targetKind: "papers",
-        },
-      ],
-    };
-    const receipt = {
-      version: 1 as const,
-      descriptorKind: "semantic_state" as const,
-      capability: "zotero.tags" as const,
-      verification: "verified" as const,
-      status: "applied" as const,
-      requestedTargets: ["item:1"],
-      appliedTargets: ["item:1"],
-      alreadySatisfiedTargets: [],
-      rejectedTargets: [],
-      reasons: [],
-      verifiedFacts: [],
-    };
-    const cancelled = {
-      ...receipt,
-      status: "cancelled" as const,
-      appliedTargets: [],
-      reasons: ["User denied redundant action"],
-    };
-
-    assert.equal(
-      evaluateActionContract(contract, [receipt, cancelled]).state,
-      "satisfied",
+  it("requires an explicit proposal when a mixed tool plans a concrete write", async function () {
+    const { service } = createHarness();
+    const contract = await service.createContract(
+      requestWithIntents([tagIntent()]),
     );
-    assert.equal(
-      evaluateActionContract(contract, [cancelled]).state,
-      "cancelled",
-    );
-  });
-
-  it("parses action intents and lets selected leaf context override a model-expanded parent", function () {
-    const parsed = parseClassifiedTurnIntent(
-      JSON.stringify({
-        retrievalIntent: "none",
-        wantedSections: [],
-        actionIntents: [
-          {
-            capability: "zotero.tags",
-            coverage: "all",
-            targetKind: "papers",
-            scope: {
-              kind: "collection",
-              path: "Parent",
-              includeDescendants: true,
-            },
-          },
-        ],
-      }),
-    );
-    assert.equal(parsed?.actionIntents[0].scope?.path, "Parent");
-    const inferred = inferActionIntentsFromRequest({
-      userText: 'Tag every paper in collection "Parent"',
-      selectedCollectionContexts: [
-        { collectionId: 11, libraryID: 1, name: "Leaf" },
-      ],
-    });
-    assert.equal(inferred[0].scope?.path, undefined);
-    assert.isFalse(inferred[0].scope?.includeDescendants);
-  });
-
-  it("keeps long named-item operations under deterministic action enforcement", function () {
-    const move = inferActionIntentsFromRequest({
-      userText:
-        'Move the paper titled "MoveSubject-with-a-title-long-enough-to-defeat-windowed-regex-matching" out of the collection "MoveFrom" and into "MoveTo". It should end up only in the destination.',
-    });
-    assert.deepInclude(move, {
-      capability: "zotero.collections",
-      coverage: "one",
-      targetKind: "items",
-      scopeRole: "source",
-      scope: {
-        kind: "collection",
-        path: "MoveFrom",
-        includeDescendants: false,
+    const prepared = await service.prepare(
+      {
+        ...mutationTool(),
+        describeAction: () => [],
       },
-      constraints: { collectionMode: "move" },
-    });
-    assert.deepInclude(move, {
-      capability: "zotero.collections",
-      coverage: "one",
-      targetKind: "items",
-      scopeRole: "destination",
-      scope: {
-        kind: "collection",
-        path: "MoveTo",
-        includeDescendants: false,
+      { mode: "write" },
+    );
+
+    assert.isNull(await service.validateScope(contract, prepared));
+    assert.include(
+      (
+        await service.validateScope(contract, prepared, {
+          concreteWrite: true,
+        })
+      )?.message || "",
+      "did not produce a typed action proposal",
+    );
+  });
+
+  it("freezes exact direct membership and rejects sibling and partial targets", async function () {
+    const { service } = createHarness();
+    const contract = await service.createContract(
+      requestWithIntents([tagIntent()]),
+    );
+    assert.deepEqual(
+      contract.obligations[0].targetBoundary?.frozenTargetIds,
+      [1, 2, 3],
+    );
+    assert.match(
+      contract.obligations[0].targetBoundary?.scopeDigest || "",
+      /^v1:/,
+    );
+
+    const widened = await service.prepare(mutationTool(), {
+      operation: {
+        type: "apply_tags",
+        itemIds: [1, 2, 3, 50],
+        tags: ["topic:drift"],
       },
-      constraints: { collectionMode: "move" },
-    });
-
-    const metadata = inferActionIntentsFromRequest({
-      userText:
-        'Set the Extra field on the paper titled "A similarly long paper title that separates the verb from its field name" to "verified".',
-    });
-    assert.equal(metadata[0]?.capability, "zotero.metadata");
-    assert.equal(metadata[0]?.coverage, "one");
-
-    const collection = inferActionIntentsFromRequest({
-      userText: 'Create a new collection called "Action Contract Target".',
-    });
-    assert.equal(collection[0]?.capability, "zotero.collections");
-
-    const tagsOnly = inferActionIntentsFromRequest({
-      userText:
-        'Look at papers whose title contains "Acc3". Decide on exactly 3 topic tags that describe this set, then tag every paper. Use the same 3 tags across the whole set.',
     });
     assert.deepEqual(
-      tagsOnly.map((intent) => intent.capability),
-      ["zotero.tags"],
+      (await service.validateScope(contract, widened))?.rejectedTargets,
+      ["item:50"],
     );
 
-    const importIntoNewCollection = inferActionIntentsFromRequest({
-      userText:
-        'Search the literature online, then import the 3 most relevant papers into a new Zotero collection called "Future Collection".',
+    const partial = await service.prepare(mutationTool(), {
+      operation: {
+        type: "apply_tags",
+        itemIds: [1, 2],
+        tags: ["topic:drift"],
+      },
     });
-    assert.sameMembers(
-      importIntoNewCollection.map((intent) => intent.capability),
-      ["zotero.collections", "zotero.import"],
+    assert.deepEqual(
+      (await service.validateScope(contract, partial))?.missingTargets,
+      ["item:3"],
     );
-    assert.isTrue(
-      importIntoNewCollection.every((intent) => intent.scope === undefined),
+  });
+
+  it("freezes a whole-library obligation before the first write", async function () {
+    const { service, items } = createHarness();
+    for (const itemId of [1, 2, 3]) {
+      items.set(itemId, { tags: [], collections: [], fields: {} });
+    }
+    const intent = { ...tagIntent(), scope: undefined };
+    const contract = await service.createContract({
+      ...requestWithIntents([intent], { selectedCollection: 0 }),
+      libraryID: 1,
+    });
+
+    assert.equal(contract.obligations[0].targetBoundary?.kind, "library");
+    assert.deepEqual(
+      contract.obligations[0].targetBoundary?.frozenTargetIds,
+      [1, 2, 3],
+    );
+
+    const widened = await service.prepare(mutationTool(), {
+      operation: {
+        type: "apply_tags",
+        itemIds: [1, 2, 3, 50],
+        tags: ["topic:drift"],
+      },
+    });
+    assert.deepEqual(
+      (await service.validateScope(contract, widened))?.rejectedTargets,
+      ["item:50"],
+    );
+
+    const partial = await service.prepare(mutationTool(), {
+      operation: {
+        type: "apply_tags",
+        itemIds: [1, 2],
+        tags: ["topic:drift"],
+      },
+    });
+    assert.deepEqual(
+      (await service.validateScope(contract, partial))?.missingTargets,
+      ["item:3"],
+    );
+  });
+
+  it("revalidates frozen membership immediately before execution", async function () {
+    const { service, directMembers } = createHarness();
+    const contract = await service.createContract(
+      requestWithIntents([tagIntent()]),
+    );
+    directMembers.set(11, [1, 2, 3, 4]);
+    const operation: LibraryMutationOperation = {
+      type: "apply_tags",
+      itemIds: [1, 2, 3],
+      tags: ["topic:drift"],
+    };
+    const prepared = await service.prepare(mutationTool(), { operation });
+    assert.include(
+      (await service.validateScope(contract, prepared))?.message || "",
+      "changed after planning",
+    );
+  });
+
+  it("closes an add-tag obligation only after native state verifies every target", async function () {
+    const { service, items } = createHarness();
+    items.set(1, { tags: [], collections: [11], fields: {} });
+    items.set(2, {
+      tags: ["topic:drift"],
+      collections: [11],
+      fields: {},
+    });
+    items.set(3, { tags: [], collections: [11], fields: {} });
+    const contract = await service.createContract(
+      requestWithIntents([tagIntent()]),
+    );
+    const progress = service.createProgress(contract);
+    const operation: LibraryMutationOperation = {
+      type: "apply_tags",
+      itemIds: [1, 2, 3],
+      tags: ["topic:drift"],
+    };
+    const prepared = await service.prepare(mutationTool(), { operation });
+    items.get(1)!.tags.push("topic:drift");
+    items.get(3)!.tags.push("topic:drift");
+    const receipts = service.finalize(contract, prepared, {
+      ok: true,
+      effect: "partial",
+      content: { actionId: "journal-1" },
+      actionEvidence: mutationEvidence(
+        operation,
+        {
+          version: 1,
+          operation: "apply_tags",
+          items: [
+            { itemId: 1, exists: true, tags: [] },
+            { itemId: 2, exists: true, tags: ["topic:drift"] },
+            { itemId: 3, exists: true, tags: [] },
+          ],
+        },
+        {
+          version: 1,
+          operation: "apply_tags",
+          items: [1, 2, 3].map((itemId) => ({
+            itemId,
+            exists: true,
+            tags: ["topic:drift"],
+          })),
+        },
+        "journal-1:1",
+        "partial",
+      ),
+    });
+    service.applyReceipts(progress, receipts);
+    assert.deepEqual(receipts[0].appliedTargets, [
+      "item:1",
+      "item:2",
+      "item:3",
+    ]);
+    assert.deepEqual(receipts[0].alreadySatisfiedTargets, []);
+    assert.equal(receipts[0].verification, "verified");
+    assert.equal(
+      evaluateActionContract(contract, receipts, progress).state,
+      "satisfied",
+    );
+  });
+
+  it("binds and verifies collection create, update, and delete result IDs", async function () {
+    const { service, collections } = createHarness();
+    const cases: Array<{
+      intent: AgentActionIntent;
+      operation: LibraryMutationOperation;
+      mutate: () => unknown;
+      preState: LibraryMutationState;
+      postState: LibraryMutationState;
+      journalStepId: string;
+      target: string;
+    }> = [
+      {
+        intent: {
+          capability: "zotero.collections",
+          operation: "create_collection",
+          proofDomain: "zotero_state",
+          coverage: "one",
+          targetKind: "items",
+          parameters: { collectionName: "Methods" },
+        },
+        operation: { type: "create_collection", name: "Methods", libraryID: 1 },
+        mutate: () =>
+          collections.set(20, {
+            collectionId: 20,
+            libraryID: 1,
+            name: "Methods",
+            path: "Methods",
+            parentCollectionId: null,
+            deleted: false,
+          }),
+        preState: { version: 1, operation: "create_collection" },
+        postState: {
+          version: 1,
+          operation: "create_collection",
+          collections: [
+            {
+              collectionId: 20,
+              exists: true,
+              name: "Methods",
+              parentCollectionId: null,
+              deleted: false,
+            },
+          ],
+        },
+        journalStepId: "journal-create:1",
+        target: "collection:20",
+      },
+      {
+        intent: {
+          capability: "zotero.collections",
+          operation: "update_collection",
+          proofDomain: "zotero_state",
+          coverage: "one",
+          targetKind: "items",
+          parameters: { collectionId: 12, collectionName: "Methods 2" },
+        },
+        operation: {
+          type: "update_collection",
+          collectionId: 12,
+          name: "Methods 2",
+        },
+        mutate: () => {
+          collections.get(12)!.name = "Methods 2";
+        },
+        preState: {
+          version: 1,
+          operation: "update_collection",
+          collections: [
+            {
+              collectionId: 12,
+              exists: true,
+              name: "Sibling",
+              parentCollectionId: 10,
+              deleted: false,
+            },
+          ],
+        },
+        postState: {
+          version: 1,
+          operation: "update_collection",
+          collections: [
+            {
+              collectionId: 12,
+              exists: true,
+              name: "Methods 2",
+              parentCollectionId: 10,
+              deleted: false,
+            },
+          ],
+        },
+        journalStepId: "journal-update:1",
+        target: "collection:12",
+      },
+      {
+        intent: {
+          capability: "zotero.collections",
+          operation: "delete_collection",
+          proofDomain: "zotero_state",
+          coverage: "one",
+          targetKind: "items",
+          parameters: { collectionId: 12 },
+        },
+        operation: { type: "delete_collection", collectionId: 12 },
+        mutate: () => {
+          collections.get(12)!.deleted = true;
+        },
+        preState: {
+          version: 1,
+          operation: "delete_collection",
+          collections: [
+            {
+              collectionId: 12,
+              exists: true,
+              name: "Methods 2",
+              parentCollectionId: 10,
+              deleted: false,
+            },
+          ],
+        },
+        postState: {
+          version: 1,
+          operation: "delete_collection",
+          collections: [
+            {
+              collectionId: 12,
+              exists: true,
+              name: "Methods 2",
+              parentCollectionId: 10,
+              deleted: true,
+            },
+          ],
+        },
+        journalStepId: "journal-delete:1",
+        target: "collection:12",
+      },
+    ];
+    for (const entry of cases) {
+      const contract = await service.createContract(
+        requestWithIntents([entry.intent], { selectedCollection: 0 }),
+      );
+      const prepared = await service.prepare(mutationTool(), {
+        operation: entry.operation,
+      });
+      assert.isNull(await service.validateScope(contract, prepared));
+      if (
+        entry.operation.type === "update_collection" ||
+        entry.operation.type === "delete_collection"
+      ) {
+        const wrongTarget = await service.prepare(mutationTool(), {
+          operation: { ...entry.operation, collectionId: 11 },
+        });
+        assert.include(
+          (await service.validateScope(contract, wrongTarget))?.message || "",
+          "does not match",
+        );
+      }
+      entry.mutate();
+      const receipts = service.finalize(contract, prepared, {
+        ok: true,
+        effect: "applied",
+        content: { actionId: entry.journalStepId.split(":")[0] },
+        actionEvidence: mutationEvidence(
+          entry.operation,
+          entry.preState,
+          entry.postState,
+          entry.journalStepId,
+        ),
+      });
+      assert.equal(receipts[0].verification, "verified");
+      assert.deepEqual(receipts[0].appliedTargets, [entry.target]);
+      assert.equal(
+        evaluateActionContract(contract, receipts).state,
+        "satisfied",
+      );
+    }
+  });
+
+  it("requires file readback identity and keeps execution proof separate", async function () {
+    const { service } = createHarness();
+    const fileTool: AgentToolDefinition<any, unknown> = {
+      ...mutationTool(),
+      describeAction: (input) => [
+        {
+          id: `file_write:${input.filePath}`,
+          proofDomain: "file_state",
+          capability: "file.write",
+          operation: "file_write",
+          source: "file_io",
+          parameters: { filePath: input.filePath },
+          requestedTargets: [`file:${input.filePath}`],
+          destinationCollectionIds: [],
+        },
+      ],
+    };
+    const fileContract = await service.createContract(
+      requestWithIntents(
+        [
+          {
+            capability: "file.write",
+            operation: "file_write",
+            proofDomain: "file_state",
+            coverage: "one",
+            targetKind: "items",
+            parameters: { filePath: "/tmp/acv2.md" },
+          },
+        ],
+        { selectedCollection: 0 },
+      ),
+    );
+    const preparedFile = await service.prepare(fileTool, {
+      filePath: "/tmp/acv2.md",
+    });
+    const noReadback = service.finalize(fileContract, preparedFile, {
+      ok: true,
+      effect: "applied",
+      content: { filePath: "/tmp/acv2.md" },
+    });
+    assert.equal(noReadback[0].verification, "unverified");
+    const verified = service.finalize(fileContract, preparedFile, {
+      ok: true,
+      effect: "applied",
+      content: {
+        filePath: "/tmp/acv2.md",
+        exists: true,
+        expectedContentHash: "abc",
+        contentHash: "abc",
+      },
+    });
+    assert.equal(verified[0].verification, "verified");
+    assert.equal(verified[0].evidenceRef, "sha256:abc");
+
+    const command = await service.prepare(
+      {
+        ...mutationTool(),
+        describeAction: () => [
+          {
+            id: "command:true",
+            proofDomain: "execution",
+            capability: "command.execute",
+            operation: "command_execute",
+            source: "command",
+            requestedTargets: [],
+            destinationCollectionIds: [],
+          },
+        ],
+      },
+      {},
+    );
+    assert.include(
+      (await service.validateScope(fileContract, command))?.message || "",
+      "does not match",
+    );
+  });
+
+  it("closes Zotero-note and file-export obligations independently", async function () {
+    const { service, items } = createHarness();
+    items.set(700, {
+      tags: [],
+      collections: [],
+      fields: {},
+      noteHtml: "<h2>Summary</h2><p>Grounded body.</p>",
+    });
+    const contract = await service.createContract(
+      requestWithIntents(
+        [
+          {
+            capability: "zotero.notes",
+            operation: "note_create",
+            proofDomain: "zotero_state",
+            coverage: "one",
+            targetKind: "items",
+            parameters: { noteMode: "create" },
+          },
+          {
+            capability: "file.write",
+            operation: "file_write",
+            proofDomain: "file_state",
+            coverage: "one",
+            targetKind: "items",
+            parameters: { filePath: "/tmp/mixed-note.md" },
+          },
+        ],
+        { selectedCollection: 0 },
+      ),
+    );
+    const notePrepared = await service.prepare(
+      {
+        ...mutationTool(),
+        describeAction: () => [
+          {
+            id: "note_create:700",
+            proofDomain: "zotero_state",
+            capability: "zotero.notes",
+            operation: "note_create",
+            source: "zotero_native",
+            parameters: {
+              noteMode: "create",
+              expectedText: "Grounded body.",
+            },
+            requestedTargets: [],
+            destinationCollectionIds: [],
+          },
+        ],
+      },
+      {},
+    );
+    const noteReceipts = service.finalize(contract, notePrepared, {
+      ok: true,
+      effect: "applied",
+      content: { actionId: "note-step", result: { noteId: 700 } },
+    });
+    assert.equal(
+      evaluateActionContract(contract, noteReceipts).state,
+      "pending",
+    );
+
+    const filePrepared = await service.prepare(
+      {
+        ...mutationTool(),
+        describeAction: () => [
+          {
+            id: "file_write:/tmp/mixed-note.md",
+            proofDomain: "file_state",
+            capability: "file.write",
+            operation: "file_write",
+            source: "file_io",
+            parameters: { filePath: "/tmp/mixed-note.md" },
+            requestedTargets: ["file:/tmp/mixed-note.md"],
+            destinationCollectionIds: [],
+          },
+        ],
+      },
+      {},
+    );
+    const fileReceipts = service.finalize(contract, filePrepared, {
+      ok: true,
+      effect: "applied",
+      content: {
+        filePath: "/tmp/mixed-note.md",
+        exists: true,
+        expectedContentHash: "mixed-hash",
+        contentHash: "mixed-hash",
+      },
+    });
+    assert.equal(
+      evaluateActionContract(contract, fileReceipts).state,
+      "pending",
+    );
+    assert.equal(
+      evaluateActionContract(contract, [...noteReceipts, ...fileReceipts])
+        .state,
+      "satisfied",
+    );
+  });
+
+  it("applies replayed receipts idempotently by obligation and journal identity", async function () {
+    const { service, items } = createHarness();
+    for (const itemId of [1, 2, 3]) {
+      items.set(itemId, {
+        tags: ["topic:drift"],
+        collections: [11],
+        fields: {},
+      });
+    }
+    const contract = await service.createContract(
+      requestWithIntents([tagIntent()]),
+    );
+    const progress = service.createProgress(contract);
+    const prepared = await service.prepare(mutationTool(), {
+      operation: {
+        type: "apply_tags",
+        itemIds: [1, 2, 3],
+        tags: ["topic:drift"],
+      },
+    });
+    const receipts = service.finalize(contract, prepared, {
+      ok: true,
+      effect: "applied",
+      content: { actionId: "journal-once" },
+    });
+    service.applyReceipts(progress, receipts);
+    service.applyReceipts(progress, receipts);
+    assert.lengthOf(progress.appliedReceiptKeys, 1);
+    assert.deepEqual(progress.obligations[0].journalStepIds, ["journal-once"]);
+  });
+
+  it("treats cancellation as terminal without a corrective retry", async function () {
+    const { service } = createHarness();
+    const contract = await service.createContract(
+      requestWithIntents([tagIntent()]),
+    );
+    const prepared = await service.prepare(mutationTool(), {
+      operation: {
+        type: "apply_tags",
+        itemIds: [1, 2, 3],
+        tags: ["topic:drift"],
+      },
+    });
+    const receipts = service.finalize(contract, prepared, {
+      ok: false,
+      cancelled: true,
+      reason: "User denied action",
+    });
+    assert.equal(receipts[0].verification, "not_applicable");
+    const evaluation = evaluateActionContract(contract, receipts);
+    assert.equal(evaluation.state, "cancelled");
+    assert.isUndefined(evaluation.correction);
+  });
+
+  it("keeps a verified success satisfied when a redundant retry is cancelled", async function () {
+    const { service, items } = createHarness();
+    for (const itemId of [1, 2, 3]) {
+      items.set(itemId, {
+        tags: ["topic:drift"],
+        collections: [11],
+        fields: {},
+      });
+    }
+    const contract = await service.createContract(
+      requestWithIntents([tagIntent()]),
+    );
+    const operation: LibraryMutationOperation = {
+      type: "apply_tags",
+      itemIds: [1, 2, 3],
+      tags: ["topic:drift"],
+    };
+    const prepared = await service.prepare(mutationTool(), { operation });
+    const satisfiedState: LibraryMutationState = {
+      version: 1,
+      operation: "apply_tags",
+      items: [1, 2, 3].map((itemId) => ({
+        itemId,
+        exists: true,
+        tags: ["topic:drift"],
+      })),
+    };
+    const success = service.finalize(contract, prepared, {
+      ok: true,
+      effect: "none",
+      content: { actionId: "journal-success" },
+      actionEvidence: mutationEvidence(
+        operation,
+        satisfiedState,
+        satisfiedState,
+        "journal-success:1",
+        "none",
+      ),
+    });
+    const cancelled = service.finalize(contract, prepared, {
+      ok: false,
+      cancelled: true,
+      reason: "User denied redundant action",
+    });
+    const progress = service.createProgress(contract);
+    service.applyReceipts(progress, success);
+    service.applyReceipts(progress, cancelled);
+    assert.equal(progress.obligations[0].status, "already_satisfied");
+    const duplicate = await service.validateScope(contract, prepared, {
+      progress,
+    });
+    assert.include(duplicate?.message || "", "already verified");
+    assert.equal(
+      evaluateActionContract(contract, [...success, ...cancelled], progress)
+        .state,
+      "satisfied",
     );
   });
 });

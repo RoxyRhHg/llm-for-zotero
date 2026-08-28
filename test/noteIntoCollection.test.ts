@@ -67,7 +67,7 @@ describe("note into a collection (issue #374)", function () {
     );
   });
 
-  it("describes the stored note text rather than raw Markdown syntax", function () {
+  it("describes the stored note text rather than raw Markdown syntax", async function () {
     const { gateway } = makeGateway();
     const tool = createEditCurrentNoteTool(gateway as never);
     const result = tool.validate({
@@ -78,12 +78,11 @@ describe("note into a collection (issue #374)", function () {
     });
     assert.isTrue(result.ok);
     if (!result.ok) return;
-    const descriptor = tool.describeAction?.(result.value);
-    assert.equal(descriptor?.kind, "semantic_state");
-    if (descriptor?.kind !== "semantic_state") return;
-    assert.equal(descriptor.action?.kind, "note_write");
+    const descriptor = (await tool.describeAction?.(result.value))?.[0];
+    assert.equal(descriptor?.proofDomain, "zotero_state");
+    assert.equal(descriptor?.operation, "note_create");
     assert.equal(
-      descriptor.action?.expectedText,
+      descriptor?.parameters?.expectedText,
       "Issue388 marker\nVerified body.",
     );
   });

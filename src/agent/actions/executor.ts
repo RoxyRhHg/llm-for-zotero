@@ -38,6 +38,8 @@ function buildToolContext(
       selectedCollectionContexts:
         ctx.requestContext?.selectedCollectionContexts,
       selectedTagContexts: ctx.requestContext?.selectedTagContexts,
+      actionContract: ctx.requestContext?.actionContract,
+      actionProgress: ctx.requestContext?.actionProgress,
     },
     runId: ctx.runId,
     item: syntheticItem,

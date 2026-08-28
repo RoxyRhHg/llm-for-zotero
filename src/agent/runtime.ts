@@ -27,6 +27,8 @@ import type {
   AgentToolResult,
   AgentToolEffect,
   AgentActionReceipt,
+  AgentActionContract,
+  AgentActionProgressLedger,
   AgentRunRecord,
 } from "./types";
 import type { AgentModelAdapter } from "./model/adapter";
@@ -51,10 +53,7 @@ import {
   detectTurnIntent,
   inferActionIntentsFromRequest,
 } from "./model/skillClassifier";
-import {
-  mergeActionIntents,
-  reconcileNoteDestinationActionIntents,
-} from "./model/actionIntent";
+import { reconcileNoteDestinationActionIntents } from "./model/actionIntent";
 import {
   evaluateActionContract,
   formatReceiptStatus,
@@ -611,6 +610,44 @@ function buildInterruptedRunRecoveryMessage(params: {
   };
 }
 
+function isExplicitResumeRequest(text: string): boolean {
+  return /^\s*(?:continue|resume|keep going|go on|pick up where you left off)\b/i.test(
+    text,
+  );
+}
+
+function readActionCheckpoint(
+  events: Awaited<ReturnType<typeof getAgentRunTrace>>["events"],
+): {
+  contract: AgentActionContract;
+  progress: AgentActionProgressLedger;
+} | null {
+  for (let index = events.length - 1; index >= 0; index -= 1) {
+    const event = events[index].payload;
+    if (
+      event.type !== "provider_event" ||
+      event.providerType !== "agent_action_contract"
+    ) {
+      continue;
+    }
+    const contract = event.payload?.contract as AgentActionContract | undefined;
+    const progress = event.payload?.progress as
+      | AgentActionProgressLedger
+      | undefined;
+    if (
+      contract?.version === 2 &&
+      typeof contract.id === "string" &&
+      Array.isArray(contract.obligations) &&
+      progress?.version === 1 &&
+      progress.contractId === contract.id &&
+      Array.isArray(progress.obligations)
+    ) {
+      return { contract, progress };
+    }
+  }
+  return null;
+}
+
 type ExecutedToolCall = {
   toolResult: AgentToolResult;
   toolDefinition?: import("./types").AgentToolDefinition<any, any>;
@@ -903,6 +940,17 @@ export class AgentRuntime {
         modelName: request.model || "unknown",
         modelProviderLabel: request.modelProviderLabel,
         signal: params.signal,
+        checkpointActionProgress: async () => {
+          if (!request.actionContract || !request.actionProgress) return;
+          await emit({
+            type: "provider_event",
+            providerType: "agent_action_contract",
+            payload: {
+              contract: request.actionContract,
+              progress: request.actionProgress,
+            },
+          });
+        },
       };
       const toolsUsedThisTurn: string[] = [];
       const toolExecutionRecords: Array<{
@@ -910,7 +958,7 @@ export class AgentRuntime {
         ok: boolean;
         mutability?: "read" | "write";
         effect?: AgentToolEffect;
-        receipt: AgentActionReceipt;
+        actionReceipts: AgentActionReceipt[];
         input?: unknown;
         content?: unknown;
       }> = [];
@@ -948,14 +996,21 @@ export class AgentRuntime {
         ? transcriptSegment.messages
         : normalizeHistoryMessages(request);
       let recoveryMessage: AgentModelMessage | null = null;
+      let interruptedActionCheckpoint: ReturnType<typeof readActionCheckpoint> =
+        null;
       if (interruptedPriorRun) {
-        const [actions, latestTranscriptSegment] = await Promise.all([
-          listJournalActions({
-            runId: interruptedPriorRun.runId,
-            limit: 50,
-          }),
-          loadLatestAgentTranscriptSegment(request.conversationKey),
-        ]);
+        const [actions, latestTranscriptSegment, interruptedTrace] =
+          await Promise.all([
+            listJournalActions({
+              runId: interruptedPriorRun.runId,
+              limit: 50,
+            }),
+            loadLatestAgentTranscriptSegment(request.conversationKey),
+            getAgentRunTrace(interruptedPriorRun.runId),
+          ]);
+        interruptedActionCheckpoint = readActionCheckpoint(
+          interruptedTrace.events,
+        );
         const compatibilityMatches =
           latestTranscriptSegment?.compatibilityKey ===
           transcriptCompatibilityKey;
@@ -1064,25 +1119,26 @@ export class AgentRuntime {
       //      and emitted as trace events for UI visibility.
       // The resulting prompt package is reused across every model inference
       // inside the agent loop — no per-step classification cost.
+      const preclassifiedIntent = request.classifiedIntent;
       const turnIntent = await detectTurnIntent(request, getAllSkills(), {
         signal: params.signal,
       });
-      if (turnIntent.classifiedIntent) {
+      if (!preclassifiedIntent && turnIntent.classifiedIntent) {
         request.classifiedIntent = turnIntent.classifiedIntent;
-      }
-      const fallbackActions = inferActionIntentsFromRequest(request);
-      if (fallbackActions.length) {
-        if (!request.classifiedIntent) {
+      } else if (!preclassifiedIntent && !turnIntent.classifiedIntent) {
+        const fallbackActions = inferActionIntentsFromRequest(request);
+        if (fallbackActions.length) {
           request.classifiedIntent = {
             retrievalIntent: "none",
             wantedSections: [],
+            writeDisposition: fallbackActions.some(
+              (intent) => intent.operation !== "read_full",
+            )
+              ? "required"
+              : "none",
+            actionInterpretationSource: "deterministic_fallback",
             actionIntents: fallbackActions,
           };
-        } else {
-          request.classifiedIntent.actionIntents = mergeActionIntents(
-            request.classifiedIntent.actionIntents || [],
-            fallbackActions,
-          );
         }
       }
       if (turnIntent.degraded) {
@@ -1108,17 +1164,27 @@ export class AgentRuntime {
         request.classifiedIntent = {
           retrievalIntent: "none",
           wantedSections: [],
+          writeDisposition: "required",
+          actionInterpretationSource: "deterministic_fallback",
           actionIntents: [],
         };
       }
-      if (noteDestination !== "none") {
+      if (
+        noteDestination !== "none" &&
+        request.classifiedIntent!.actionInterpretationSource !== "classifier"
+      ) {
         request.classifiedIntent!.actionIntents =
           reconcileNoteDestinationActionIntents(
             request.classifiedIntent!.actionIntents,
             noteDestination,
           );
+        request.classifiedIntent!.writeDisposition = "required";
       }
-      const requiresFileNoteWrite = noteDestination === "file";
+      const requiresFileNoteWrite = Boolean(
+        request.classifiedIntent?.actionIntents?.some(
+          (intent) => intent.operation === "file_write",
+        ),
+      );
       const hasPaperReadScope =
         request.conversationKind === "paper" ||
         Boolean(request.activeItemId) ||
@@ -1130,6 +1196,8 @@ export class AgentRuntime {
           request.classifiedIntent = {
             retrievalIntent: "none",
             wantedSections: [],
+            writeDisposition: "none",
+            actionInterpretationSource: "deterministic_fallback",
             actionIntents: [],
           };
         }
@@ -1140,6 +1208,8 @@ export class AgentRuntime {
         ) {
           request.classifiedIntent.actionIntents.push({
             capability: "zotero.read",
+            operation: "read_full",
+            proofDomain: "zotero_state",
             coverage: "all",
             targetKind: "papers",
             constraints: { readMode: "full" },
@@ -1147,8 +1217,16 @@ export class AgentRuntime {
         }
       }
       try {
-        request.actionContract =
-          (await this.registry.createActionContract(request)) || undefined;
+        if (
+          interruptedActionCheckpoint &&
+          isExplicitResumeRequest(request.userText)
+        ) {
+          request.actionContract = interruptedActionCheckpoint.contract;
+          request.actionProgress = interruptedActionCheckpoint.progress;
+        } else {
+          request.actionContract =
+            (await this.registry.createActionContract(request)) || undefined;
+        }
       } catch (error) {
         const failure = error instanceof Error ? error.message : String(error);
         const text = `I could not safely resolve the requested action scope: ${failure}`;
@@ -1167,12 +1245,15 @@ export class AgentRuntime {
         };
       }
       if (request.actionContract) {
+        request.actionProgress ||= this.registry.createActionProgress(
+          request.actionContract,
+        );
         await emit({
           type: "provider_event",
           providerType: "agent_action_contract",
           payload: {
-            state: request.actionContract.state,
-            obligations: request.actionContract.obligations,
+            contract: request.actionContract,
+            progress: request.actionProgress,
           },
         });
       }
@@ -1400,18 +1481,15 @@ export class AgentRuntime {
         webAttribution: WebAttributionAssessment,
       ): Promise<AgentRuntimeOutcome> => {
         const modelFinalText = webAttribution.cleanText;
-        const contractedCapabilities = new Set(
-          request.actionContract?.obligations.map(
-            (obligation) => obligation.capability,
-          ) || [],
-        );
         const actionReceipts = toolExecutionRecords
-          .map((record) => record.receipt)
-          .filter(
-            (receipt) =>
-              contractedCapabilities.has(receipt.capability) ||
-              receipt.descriptorKind !== "semantic_state" ||
-              receipt.capability !== "zotero.read",
+          .flatMap((record) => record.actionReceipts)
+          .filter((receipt) =>
+            request.actionContract?.obligations.some(
+              (obligation) =>
+                receipt.obligationId === obligation.id ||
+                (receipt.operation === obligation.operation &&
+                  receipt.proofDomain === obligation.proofDomain),
+            ),
           );
         const receiptStatus = formatReceiptStatus(actionReceipts);
         const finalText = receiptStatus
@@ -1747,9 +1825,11 @@ export class AgentRuntime {
             callId: call.id,
             name: call.name,
             ok: false,
-            receipt: createUnverifiedReceipt({
-              reason: "Conversation lifecycle changed before execution.",
-            }),
+            actionReceipts: [
+              createUnverifiedReceipt({
+                reason: "Conversation lifecycle changed before execution.",
+              }),
+            ],
             content: {
               error:
                 "Conversation lifecycle changed before this tool could execute.",
@@ -1773,6 +1853,7 @@ export class AgentRuntime {
             currentAnswerText,
           },
           {
+            callerKind: options.inheritedApproval ? "action" : "model",
             inheritedApproval: options.inheritedApproval,
             isExecutionAllowed: executionAllowed,
             executeWithLock: (task) =>
@@ -1811,7 +1892,7 @@ export class AgentRuntime {
           ok: toolResult.ok,
           mutability: executedCall.toolDefinition?.spec.mutability,
           effect: toolResult.effect,
-          receipt: toolResult.receipt,
+          actionReceipts: toolResult.actionReceipts,
           input: executedCall.input,
           content: toolResult.content,
         });
@@ -1857,10 +1938,20 @@ export class AgentRuntime {
           name: toolResult.name,
           ok: toolResult.ok,
           effect: toolResult.effect,
-          receipt: toolResult.receipt,
+          actionReceipts: toolResult.actionReceipts,
           content: toolResult.content,
           artifacts: toolResult.artifacts,
         });
+        if (request.actionContract && request.actionProgress) {
+          await emit({
+            type: "provider_event",
+            providerType: "agent_action_contract",
+            payload: {
+              contract: request.actionContract,
+              progress: request.actionProgress,
+            },
+          });
+        }
         return executedCall;
       };
       const buildToolDelivery = async (
@@ -1904,9 +1995,12 @@ export class AgentRuntime {
           !Array.isArray(rawContent)
             ? {
                 ...(rawContent as Record<string, unknown>),
-                receipt: toolResult.receipt,
+                actionReceipts: toolResult.actionReceipts,
               }
-            : { content: rawContent, receipt: toolResult.receipt };
+            : {
+                content: rawContent,
+                actionReceipts: toolResult.actionReceipts,
+              };
         return {
           callId,
           name: toolResult.name,
@@ -1929,9 +2023,11 @@ export class AgentRuntime {
               callId: call.id,
               name: call.name,
               ok: false,
-              receipt: createUnverifiedReceipt({
-                reason: "Conversation lifecycle changed before execution.",
-              }),
+              actionReceipts: [
+                createUnverifiedReceipt({
+                  reason: "Conversation lifecycle changed before execution.",
+                }),
+              ],
               content: {
                 error:
                   "Conversation lifecycle changed before this tool could execute.",
@@ -2099,15 +2195,19 @@ export class AgentRuntime {
             if (request.actionContract) {
               const evaluation = evaluateActionContract(
                 request.actionContract,
-                toolExecutionRecords.map((record) => record.receipt),
+                toolExecutionRecords.flatMap((record) => record.actionReceipts),
+                request.actionProgress,
               );
-              request.actionContract.state = evaluation.state;
+              if (request.actionProgress) {
+                request.actionProgress.state = evaluation.state;
+              }
               await emit({
                 type: "provider_event",
                 providerType: "agent_action_contract",
                 payload: {
                   state: evaluation.state,
-                  correctionCount: request.actionContract.correctionCount,
+                  contract: request.actionContract,
+                  progress: request.actionProgress,
                 },
               });
               if (
@@ -2116,11 +2216,14 @@ export class AgentRuntime {
               ) {
                 await rollbackCommittedStreamedText(stepStreamedText);
                 if (
-                  request.actionContract.correctionCount < 1 &&
+                  (request.actionProgress?.correctionCount || 0) < 1 &&
                   segmentRound < maxRounds &&
                   evaluation.correction
                 ) {
-                  request.actionContract.correctionCount += 1;
+                  if (request.actionProgress) {
+                    request.actionProgress.correctionCount += 1;
+                    request.actionProgress.updatedAt = Date.now();
+                  }
                   const assistantCorrectionMessage: AgentModelMessage =
                     step.assistantMessage ?? {
                       role: "assistant",
@@ -2141,7 +2244,10 @@ export class AgentRuntime {
                   );
                   continue;
                 }
-                request.actionContract.state = "failed";
+                if (request.actionProgress) {
+                  request.actionProgress.state = "failed";
+                  request.actionProgress.updatedAt = Date.now();
+                }
                 return completeRun(
                   evaluation.failure ||
                     "I could not verify completion of the requested action.",

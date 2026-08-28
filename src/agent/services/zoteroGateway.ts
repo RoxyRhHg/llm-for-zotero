@@ -40,6 +40,20 @@ import {
   refusalFor,
   type LibraryOperation,
 } from "../capabilities/libraryObjects";
+import type {
+  BatchTagAssignment,
+  EditableArticleCreator,
+  EditableArticleMetadataField,
+  EditableArticleMetadataPatch,
+  EditableArticleMetadataSnapshot,
+} from "./libraryMutation/valueTypes";
+export type {
+  BatchTagAssignment,
+  EditableArticleCreator,
+  EditableArticleMetadataField,
+  EditableArticleMetadataPatch,
+  EditableArticleMetadataSnapshot,
+} from "./libraryMutation/valueTypes";
 
 export const EDITABLE_ARTICLE_METADATA_FIELDS = [
   "title",
@@ -61,31 +75,6 @@ export const EDITABLE_ARTICLE_METADATA_FIELDS = [
   "publisher",
   "place",
 ] as const;
-
-export type EditableArticleMetadataField =
-  (typeof EDITABLE_ARTICLE_METADATA_FIELDS)[number];
-
-export type EditableArticleCreator = {
-  creatorType: string;
-  firstName?: string;
-  lastName?: string;
-  name?: string;
-  fieldMode?: 0 | 1;
-};
-
-export type EditableArticleMetadataPatch = Partial<
-  Record<EditableArticleMetadataField, string>
-> & {
-  creators?: EditableArticleCreator[];
-};
-
-export type EditableArticleMetadataSnapshot = {
-  itemId: number;
-  itemType: string;
-  title: string;
-  fields: Record<EditableArticleMetadataField, string>;
-  creators: EditableArticleCreator[];
-};
 
 export type LibraryPaperTargetAttachment = {
   contextItemId: number;
@@ -168,11 +157,6 @@ export type BatchTagItemResult = {
   addedTags: string[];
   skippedTags: string[];
   reason?: string;
-};
-
-export type BatchTagAssignment = {
-  itemId: number;
-  tags: string[];
 };
 
 export type BatchMoveItemResult = {
@@ -1309,6 +1293,34 @@ export class ZoteroGateway {
     };
   }
 
+  /** Uncached native state used to verify collection mutation receipts. */
+  getCollectionNativeState(collectionId: number): {
+    exists: boolean;
+    name: string;
+    parentCollectionId: number | null;
+    deleted: boolean;
+  } {
+    const collection = this.getCollection(collectionId);
+    return collection
+      ? {
+          exists: true,
+          name: normalizeText(collection.name),
+          parentCollectionId:
+            Number(collection.parentID) > 0
+              ? Number(collection.parentID)
+              : null,
+          deleted: Boolean(
+            (collection as Zotero.Collection & { deleted?: boolean }).deleted,
+          ),
+        }
+      : {
+          exists: false,
+          name: "",
+          parentCollectionId: null,
+          deleted: false,
+        };
+  }
+
   listCollectionSummaries(libraryID: number): CollectionSummary[] {
     const normalizedLibraryID = Number.isFinite(libraryID)
       ? Math.floor(libraryID)
@@ -1391,6 +1403,27 @@ export class ZoteroGateway {
     return directIds.filter(
       (itemId) => this.getItem(itemId)?.isRegularItem?.() === true,
     );
+  }
+
+  async listCurrentLibraryTargetIds(params: {
+    libraryID: number;
+    targetKind: "papers" | "items";
+  }): Promise<number[]> {
+    const items: Zotero.Item[] = await Zotero.Items.getAll(
+      params.libraryID,
+      true,
+      false,
+      false,
+    );
+    return items
+      .filter((item) => {
+        if (params.targetKind === "papers") return item.isRegularItem?.();
+        return Boolean(
+          item.isRegularItem?.() || item.isNote?.() || item.isAttachment?.(),
+        );
+      })
+      .map((item) => item.id)
+      .filter((itemId) => Number.isInteger(itemId) && itemId > 0);
   }
 
   async getAllChildAttachmentInfos(
@@ -4632,6 +4665,13 @@ export class ZoteroGateway {
       }
       return { key, value, type: spec.type, description: spec.description };
     });
+  }
+
+  getSettingNativeState(key: string): { exists: boolean; value: unknown } {
+    const setting = this.listSettings().find((entry) => entry.key === key);
+    return setting
+      ? { exists: true, value: setting.value }
+      : { exists: false, value: undefined };
   }
 
   /** Restore an allowlisted preference without applying user-input coercion. */

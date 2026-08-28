@@ -26,8 +26,8 @@ import { withActiveJournalAction } from "./mutationCoordinator";
 import {
   atomizeMutationOperationFromHandler,
   isRegisteredLibraryMutationOperation,
-  mutationInverseIsSatisfied,
-} from "./libraryMutation/handlerRegistry";
+  mutationPostconditionIsSatisfied,
+} from "./libraryMutation/handlerOperations";
 import { canonicalJson } from "./libraryMutation/canonicalJson";
 import { MutationStateView } from "./libraryMutation/stateView";
 
@@ -644,7 +644,7 @@ async function classifyLibraryInverseOperation(params: {
     if (
       params.allowCompleted &&
       (mutationStateMatchesReference(current, precondition) ||
-        mutationInverseIsSatisfied(params.operation, currentView))
+        mutationPostconditionIsSatisfied(params.operation, currentView))
     ) {
       return { kind: "completed" };
     }

@@ -10,6 +10,7 @@ import type {
   AgentToolResult,
   AgentToolReviewResolution,
 } from "../types";
+import { describeLibraryMutationActions } from "../contracts/actionContract";
 import { fail, ok } from "./shared";
 
 type DelegatedInput<TInput> = {
@@ -103,6 +104,9 @@ export function createRenamedTool<TInput, TResult>(params: {
       : params.label
         ? { label: params.label }
         : undefined,
+    describeAction: (input, context) =>
+      tool.describeAction?.(input, context) ||
+      describeLibraryMutationActions(input),
     execute: (input, context) =>
       tool.execute(input, {
         ...context,
@@ -157,6 +161,9 @@ export function createDelegatingTool<TResult = unknown>(params: {
       if (!choice.ok) return fail(choice.error);
       return validateDelegate(choice.value);
     },
+    describeAction: (input, context) =>
+      input.delegateTool.describeAction?.(input.delegateInput, context) ||
+      describeLibraryMutationActions(input.delegateInput),
     async shouldRequireConfirmation(input, context) {
       const tool = input.delegateTool;
       if (tool.shouldRequireConfirmation) {

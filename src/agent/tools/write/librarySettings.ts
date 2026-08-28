@@ -24,6 +24,24 @@ export function createLibrarySettingsTool(
   zoteroGateway: ZoteroGateway,
 ): AgentWriteToolDefinition<LibrarySettingsInput, unknown> {
   return {
+    describeAction: (input) =>
+      input.action === "set"
+        ? [
+            {
+              id: `settings_update:${input.key}`,
+              proofDomain: "zotero_state",
+              capability: "zotero.settings",
+              operation: "settings_update",
+              source: "zotero_native",
+              parameters: {
+                settingsKey: input.key,
+                settingsValue: JSON.stringify(input.value),
+              },
+              requestedTargets: [`setting:${input.key}`],
+              destinationCollectionIds: [],
+            },
+          ]
+        : [],
     spec: {
       name: "library_settings",
       description:

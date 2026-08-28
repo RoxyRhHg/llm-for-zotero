@@ -22,7 +22,10 @@ import {
   upsertAgentToolResultHandles,
 } from "../src/agent/store/toolResultHandles";
 import { AgentToolRegistry } from "../src/agent/tools/registry";
-import { ActionContractService } from "../src/agent/contracts/actionContract";
+import {
+  ActionContractService,
+  describeLibraryMutationActions,
+} from "../src/agent/contracts/actionContract";
 import { createToolResultReadTool } from "../src/agent/tools/read/toolResultRead";
 import { createFileIOTool } from "../src/agent/tools/write/fileIO";
 import { createWebSearchTool } from "../src/agent/tools/read/webSearch";
@@ -58,6 +61,33 @@ type InstalledMockDb = (() => void) & {
   transcripts: MockDbRow[];
   journalDb: ChangeJournalTestDb;
 };
+
+function createTestActionContractService(
+  getItem: (itemId: number) => Zotero.Item | null = () => null,
+): ActionContractService {
+  return new ActionContractService({
+    getCollectionSummary: () => null,
+    listCollectionSummaries: () => [],
+    listCollectionPaperTargets: async () => ({ papers: [] }),
+    listCollectionItemTargets: async () => ({ items: [] }),
+    getItem,
+    getEditableArticleMetadata: () => null,
+  });
+}
+
+function commandActionDescriptor(id: string) {
+  return [
+    {
+      id,
+      proofDomain: "execution" as const,
+      capability: "command.execute" as const,
+      operation: "command_execute" as const,
+      source: "command" as const,
+      requestedTargets: [],
+      destinationCollectionIds: [],
+    },
+  ];
+}
 
 function installMockDb(): InstalledMockDb {
   const runs = new Map<string, MockDbRow>();
@@ -425,7 +455,20 @@ describe("AgentRuntime", function () {
   it("executes tool calls and resumes after approval", async function () {
     const restoreDb = installMockDb();
     try {
-      const registry = new AgentToolRegistry();
+      const registry = new AgentToolRegistry(
+        createTestActionContractService((itemId) =>
+          itemId === 500
+            ? ({
+                id: 500,
+                parentID: false,
+                deleted: false,
+                isNote: () => true,
+                getNote: () => "edited hello",
+                getCollections: () => [],
+              } as unknown as Zotero.Item)
+            : null,
+        ),
+      );
       registry.register({
         spec: {
           name: "mutate_library",
@@ -435,6 +478,21 @@ describe("AgentRuntime", function () {
           requiresConfirmation: true,
         },
         validate: () => ({ ok: true, value: { content: "hello" } }),
+        describeAction: (input) => [
+          {
+            id: "note_create:approval-test",
+            proofDomain: "zotero_state",
+            capability: "zotero.notes",
+            operation: "note_create",
+            source: "zotero_native",
+            parameters: {
+              noteMode: "create",
+              expectedText: input.content,
+            },
+            requestedTargets: [],
+            destinationCollectionIds: [],
+          },
+        ],
         createPendingAction: () => ({
           toolName: "mutate_library",
           title: "Save hello",
@@ -484,6 +542,7 @@ describe("AgentRuntime", function () {
         execute: async (input) => ({
           content: {
             status: "created",
+            noteId: 500,
             saved: input.content,
             target: input.target,
           },
@@ -539,7 +598,7 @@ describe("AgentRuntime", function () {
         request: {
           conversationKey: 1,
           mode: "agent",
-          userText: "save this",
+          userText: "create a standalone note with hello",
           model: "gpt-4o-mini",
           apiBase: "https://api.openai.com/v1/chat/completions",
           apiKey: "test",
@@ -558,7 +617,8 @@ describe("AgentRuntime", function () {
 
       assert.equal(outcome.kind, "completed");
       if (outcome.kind !== "completed") return;
-      assert.equal(outcome.text, "Saved.");
+      assert.include(outcome.text, "Saved.");
+      assert.include(outcome.text, "note_create — applied");
       assert.isTrue(events.some((event) => event.type === "tool_call"));
       assert.isTrue(events.some((event) => event.type === "tool_result"));
       const toolResultEvent = events.find(
@@ -570,6 +630,7 @@ describe("AgentRuntime", function () {
           : null,
         {
           status: "created",
+          noteId: 500,
           saved: "edited hello",
           target: "standalone",
         },
@@ -1686,7 +1747,7 @@ describe("AgentRuntime", function () {
         true,
       );
 
-      const registry = new AgentToolRegistry();
+      const registry = new AgentToolRegistry(createTestActionContractService());
       const writes: unknown[] = [];
       registry.register({
         spec: {
@@ -1701,9 +1762,35 @@ describe("AgentRuntime", function () {
           effect: "write",
           reversibility: "full",
         }),
+        describeAction: (input) => [
+          {
+            id: `file_write:${String((input as { filePath?: unknown }).filePath || "")}`,
+            proofDomain: "file_state",
+            capability: "file.write",
+            operation: "file_write",
+            source: "file_io",
+            parameters: {
+              filePath: String(
+                (input as { filePath?: unknown }).filePath || "",
+              ),
+            },
+            requestedTargets: [
+              `file:${String((input as { filePath?: unknown }).filePath || "")}`,
+            ],
+            destinationCollectionIds: [],
+          },
+        ],
         execute: async (input) => {
           writes.push(input);
-          return { content: input, effect: "applied" };
+          return {
+            content: {
+              ...(input as Record<string, unknown>),
+              exists: true,
+              expectedContentHash: "verified-hash",
+              contentHash: "verified-hash",
+            },
+            effect: "applied",
+          };
         },
       });
 
@@ -1736,9 +1823,7 @@ describe("AgentRuntime", function () {
               (message) =>
                 message.role === "user" &&
                 typeof message.content === "string" &&
-                message.content.includes(
-                  "requested action contract is not satisfied",
-                ),
+                message.content.includes("open typed obligation(s)"),
             );
             if (stepIndex === 2) {
               return {
@@ -1798,7 +1883,7 @@ describe("AgentRuntime", function () {
       assert.equal(outcome.kind, "completed");
       if (outcome.kind !== "completed") return;
       assert.include(outcome.text, "Saved.");
-      assert.include(outcome.text, "file.write — applied");
+      assert.include(outcome.text, "file_write — applied");
       assert.isTrue(sawCorrectivePrompt);
       assert.deepEqual(writes, [
         {
@@ -1812,7 +1897,7 @@ describe("AgentRuntime", function () {
     }
   });
 
-  it("merges deterministic actions into a preclassified empty intent", async function () {
+  it("keeps a successful preclassified empty intent authoritative", async function () {
     const restoreDb = installMockDb();
     try {
       let stepIndex = 0;
@@ -1834,9 +1919,7 @@ describe("AgentRuntime", function () {
               (message) =>
                 message.role === "user" &&
                 typeof message.content === "string" &&
-                message.content.includes(
-                  "requested action contract is not satisfied",
-                ),
+                message.content.includes("open typed obligation(s)"),
             );
             const text = stepIndex === 1 ? "I found it." : "Done.";
             return {
@@ -1867,8 +1950,8 @@ describe("AgentRuntime", function () {
 
       assert.equal(outcome.kind, "completed");
       if (outcome.kind !== "completed") return;
-      assert.isTrue(sawCorrection);
-      assert.include(outcome.text, "zotero.collections coverage:one");
+      assert.isFalse(sawCorrection);
+      assert.equal(outcome.text, "I found it.");
     } finally {
       restoreDb();
     }
@@ -1931,9 +2014,7 @@ describe("AgentRuntime", function () {
               (message) =>
                 message.role === "user" &&
                 typeof message.content === "string" &&
-                message.content.includes(
-                  "requested action contract is not satisfied",
-                ),
+                message.content.includes("open typed obligation(s)"),
             );
             if (stepIndex === 2) {
               return {
@@ -1986,7 +2067,7 @@ describe("AgentRuntime", function () {
       assert.equal(outcome.kind, "completed");
       if (outcome.kind !== "completed") return;
       assert.include(outcome.text, "Grounded full-text answer.");
-      assert.include(outcome.text, "zotero.read — observed; verified");
+      assert.include(outcome.text, "read_full — observed; verified");
       assert.isTrue(sawCorrection);
       assert.deepEqual(reads, [{ mode: "full" }]);
     } finally {
@@ -2033,7 +2114,16 @@ describe("AgentRuntime", function () {
           listCollectionPaperTargets: async () => ({ papers: [] }),
           listCollectionItemTargets: async () => ({ items: [] }),
           getItem: (itemId) =>
-            itemId === 500 && noteExists ? ({} as Zotero.Item) : null,
+            itemId === 500 && noteExists
+              ? ({
+                  id: 500,
+                  parentID: false,
+                  deleted: false,
+                  isNote: () => true,
+                  getNote: () => "<h2>Summary</h2><p>Zotero note body.</p>",
+                  getCollections: () => [],
+                } as unknown as Zotero.Item)
+              : null,
           getEditableArticleMetadata: () => null,
         }),
       );
@@ -2056,6 +2146,21 @@ describe("AgentRuntime", function () {
             },
           },
         }),
+        describeAction: (input) => [
+          {
+            id: "note_create:standalone",
+            proofDomain: "zotero_state",
+            capability: "zotero.notes",
+            operation: "note_create",
+            source: "zotero_native",
+            parameters: {
+              noteMode: "create",
+              expectedText: String(input.operation.content || ""),
+            },
+            requestedTargets: [],
+            destinationCollectionIds: [],
+          },
+        ],
         planMutation: async () => ({
           effect: "write",
           reversibility: "full",
@@ -2165,7 +2270,7 @@ describe("AgentRuntime", function () {
       assert.equal(outcome.kind, "completed");
       if (outcome.kind !== "completed") return;
       assert.include(outcome.text, "Saved Zotero note.");
-      assert.include(outcome.text, "zotero.notes — applied");
+      assert.include(outcome.text, "note_create — applied");
       assert.isTrue(sawInitialZoteroRule);
       assert.isFalse(sawInitialFileRule);
       assert.isFalse(sawCorrectivePrompt);
@@ -2187,6 +2292,7 @@ describe("AgentRuntime", function () {
     const originalIOUtils = (globalThis as { IOUtils?: unknown }).IOUtils;
     const createdDirs: string[] = [];
     const writes: Array<{ path: string; text: string }> = [];
+    const writtenBytes = new Map<string, Uint8Array>();
     try {
       await initAgentChangeJournal();
       (
@@ -2238,10 +2344,13 @@ describe("AgentRuntime", function () {
             path,
             text: new TextDecoder("utf-8").decode(data),
           });
+          writtenBytes.set(path, data);
         },
+        read: async (path: string) =>
+          writtenBytes.get(path) || new Uint8Array(),
       };
 
-      const registry = new AgentToolRegistry();
+      const registry = new AgentToolRegistry(createTestActionContractService());
       registry.register(createFileIOTool());
       const runtime = new AgentRuntime({
         registry,
@@ -3055,7 +3164,7 @@ describe("AgentRuntime", function () {
     try {
       await initAgentChangeJournal();
       const conversationKey = 704;
-      const registry = new AgentToolRegistry();
+      const registry = new AgentToolRegistry(createTestActionContractService());
       registry.register({
         spec: {
           name: "confirmation_write",
@@ -3065,6 +3174,8 @@ describe("AgentRuntime", function () {
           requiresConfirmation: true,
         },
         validate: () => ({ ok: true, value: {} }),
+        describeAction: () =>
+          commandActionDescriptor("command_execute:pending-confirmation"),
         planMutation: () => ({
           effect: "write",
           reversibility: "full",
@@ -3134,7 +3245,7 @@ describe("AgentRuntime", function () {
         request: {
           conversationKey,
           mode: "agent",
-          userText: "ask before changing anything",
+          userText: "run command after asking for confirmation",
           model: "gpt-4o-mini",
           apiBase: "https://api.openai.com/v1/chat/completions",
           apiKey: "test",
@@ -3150,7 +3261,10 @@ describe("AgentRuntime", function () {
       const pendingTranscript = JSON.stringify(
         readPersistedTranscript(installed, conversationKey),
       );
-      assert.include(pendingTranscript, "ask before changing anything");
+      assert.include(
+        pendingTranscript,
+        "run command after asking for confirmation",
+      );
       assert.notInclude(pendingTranscript, "pending-confirmation-call");
       assert.isTrue(runtime.resolveConfirmation(requestId, false));
       await run;
@@ -3276,7 +3390,7 @@ describe("AgentRuntime", function () {
       const conversationKey = 702;
       const actionId = "recovery-action";
       let writes = 0;
-      const registry = new AgentToolRegistry();
+      const registry = new AgentToolRegistry(createTestActionContractService());
       registry.register({
         spec: {
           name: "recovery_write",
@@ -3286,6 +3400,8 @@ describe("AgentRuntime", function () {
           requiresConfirmation: false,
         },
         validate: () => ({ ok: true, value: {} }),
+        describeAction: () =>
+          commandActionDescriptor("command_execute:recovery-write"),
         planMutation: () => ({ effect: "write", reversibility: "full" }),
         execute: async (_input, context) => {
           writes += 1;
@@ -3357,7 +3473,7 @@ describe("AgentRuntime", function () {
           request: {
             conversationKey,
             mode: "agent",
-            userText: "save this once",
+            userText: "run command once",
             model: "gpt-4o-mini",
             apiBase: "https://api.openai.com/v1/chat/completions",
             apiKey: "test",
@@ -3433,7 +3549,7 @@ describe("AgentRuntime", function () {
       const conversationKey = 703;
       const actionId = "changed-key-action";
       let writes = 0;
-      const registry = new AgentToolRegistry();
+      const registry = new AgentToolRegistry(createTestActionContractService());
       registry.register({
         spec: {
           name: "changed_key_write",
@@ -3443,6 +3559,8 @@ describe("AgentRuntime", function () {
           requiresConfirmation: false,
         },
         validate: () => ({ ok: true, value: {} }),
+        describeAction: () =>
+          commandActionDescriptor("command_execute:changed-key"),
         planMutation: () => ({ effect: "write", reversibility: "full" }),
         execute: async (_input, context) => {
           writes += 1;
@@ -3513,7 +3631,7 @@ describe("AgentRuntime", function () {
           request: {
             conversationKey,
             mode: "agent",
-            userText: "preserve this original goal",
+            userText: "run command to preserve this original goal",
             model: "gpt-4o-mini",
             apiBase: "https://api.openai.com/v1/chat/completions",
             apiKey: "test",
@@ -3580,7 +3698,10 @@ describe("AgentRuntime", function () {
       });
 
       const serialized = JSON.stringify(continuedMessages);
-      assert.include(serialized, "Prior goal: preserve this original goal");
+      assert.include(
+        serialized,
+        "Prior goal: run command to preserve this original goal",
+      );
       assert.include(serialized, `actionId=${actionId}`);
       assert.include(serialized, "status=partially_applied");
       assert.include(serialized, "affectedCount=1");
@@ -4998,7 +5119,16 @@ describe("shallow guard round-limit safety", function () {
     const restoreDb = installMockDb();
     try {
       await initAgentChangeJournal();
-      const registry = new AgentToolRegistry();
+      const registry = new AgentToolRegistry(
+        new ActionContractService({
+          getCollectionSummary: () => null,
+          listCollectionSummaries: () => [],
+          listCollectionPaperTargets: async () => ({ papers: [] }),
+          listCollectionItemTargets: async () => ({ items: [] }),
+          getItem: () => null,
+          getEditableArticleMetadata: () => null,
+        }),
+      );
       registry.register({
         spec: {
           name: "library_update",
@@ -5087,7 +5217,7 @@ describe("shallow guard round-limit safety", function () {
         "Filed both papers",
         "the first, false claim must not be what the user is left with",
       );
-      assert.include(outcome.text, "could not verify completion");
+      assert.include(outcome.text, "write was blocked");
     } finally {
       restoreDb();
     }
@@ -5099,10 +5229,10 @@ describe("shallow guard round-limit safety", function () {
    * -- and persistence was gated on a clean finish, so the run discarded its
    * own transcript *after* its library writes had landed.
    */
-  it("does not fail the run when the user declines three confirmations", async function () {
+  it("does not retry a typed obligation after the user declines it", async function () {
     const restoreDb = installMockDb();
     try {
-      const registry = new AgentToolRegistry();
+      const registry = new AgentToolRegistry(createTestActionContractService());
       registry.register({
         spec: {
           name: "library_update",
@@ -5112,6 +5242,8 @@ describe("shallow guard round-limit safety", function () {
           requiresConfirmation: true,
         },
         validate: (args) => ({ ok: true, value: args as never }),
+        describeAction: () =>
+          commandActionDescriptor("command_execute:cancel-once"),
         createPendingAction: () => ({
           toolName: "library_update",
           title: "Confirm",
@@ -5177,7 +5309,7 @@ describe("shallow guard round-limit safety", function () {
         request: {
           conversationKey: 992,
           mode: "agent",
-          userText: "file these",
+          userText: "run command after confirmation",
           model: "gpt-4o-mini",
           apiBase: "https://api.openai.com/v1/chat/completions",
           apiKey: "test",
@@ -5193,7 +5325,7 @@ describe("shallow guard round-limit safety", function () {
 
       (globalThis as Record<string, any>).Zotero = previousZotero;
 
-      assert.equal(denials, 3, "all three confirmations were declined");
+      assert.equal(denials, 1, "the cancelled obligation must not be retried");
 
       assert.equal(
         outcome.kind,
@@ -5212,14 +5344,24 @@ describe("shallow guard round-limit safety", function () {
    * that failed and was then correctly retried still produced "ran but
    * changed nothing … Do not report the request as completed" — with the
    * items sitting in the collection and the user told otherwise. The false
-   * correction was also persisted into the transcript.
+   * correction was also persisted into the transcript. The first attempt
+   * below is deliberately unverified; the second attaches native tag state.
    */
   it("does not correct a zero-effect write that a later call superseded", async function () {
     const restoreDb = installMockDb();
     try {
       await initAgentChangeJournal();
       let call = 0;
-      const registry = new AgentToolRegistry();
+      const operation = {
+        type: "apply_tags" as const,
+        itemIds: [1, 2, 3],
+        tags: ["reviewed"],
+      };
+      const registry = new AgentToolRegistry(
+        createTestActionContractService((itemId) =>
+          [1, 2, 3].includes(itemId) ? ({ id: itemId } as Zotero.Item) : null,
+        ),
+      );
       registry.register({
         spec: {
           name: "library_update",
@@ -5228,7 +5370,8 @@ describe("shallow guard round-limit safety", function () {
           mutability: "write",
           requiresConfirmation: false,
         },
-        validate: (args) => ({ ok: true, value: args as never }),
+        validate: () => ({ ok: true, value: { operation } }),
+        describeAction: (input) => describeLibraryMutationActions(input),
         planMutation: async () => ({
           effect: "write",
           reversibility: "full",
@@ -5238,7 +5381,7 @@ describe("shallow guard round-limit safety", function () {
           return call === 1
             ? {
                 content: {
-                  movedCount: 0,
+                  taggedCount: 0,
                   selectedCount: 3,
                   items: [
                     {
@@ -5252,7 +5395,7 @@ describe("shallow guard round-limit safety", function () {
               }
             : {
                 content: {
-                  movedCount: 3,
+                  taggedCount: 3,
                   selectedCount: 3,
                   items: [
                     { itemId: 1, status: "moved" },
@@ -5261,6 +5404,33 @@ describe("shallow guard round-limit safety", function () {
                   ],
                 },
                 effect: "applied",
+                actionEvidence: [
+                  {
+                    version: 1 as const,
+                    proofDomain: "zotero_state" as const,
+                    operationValue: operation,
+                    preState: {
+                      version: 1 as const,
+                      operation: "apply_tags" as const,
+                      items: [1, 2, 3].map((itemId) => ({
+                        itemId,
+                        exists: true,
+                        tags: [],
+                      })),
+                    },
+                    postState: {
+                      version: 1 as const,
+                      operation: "apply_tags" as const,
+                      items: [1, 2, 3].map((itemId) => ({
+                        itemId,
+                        exists: true,
+                        tags: ["reviewed"],
+                      })),
+                    },
+                    journalStepId: "retry:2",
+                    effect: "applied" as const,
+                  },
+                ],
               };
         },
       } as never);
@@ -5280,10 +5450,10 @@ describe("shallow guard round-limit safety", function () {
               toolStep("c2"),
               {
                 kind: "final",
-                text: "Moved all 3 papers into Reading List.",
+                text: "Tagged all 3 papers as reviewed.",
                 assistantMessage: {
                   role: "assistant",
-                  content: "Moved all 3 papers into Reading List.",
+                  content: "Tagged all 3 papers as reviewed.",
                 },
               },
             ],
@@ -5295,11 +5465,16 @@ describe("shallow guard round-limit safety", function () {
         request: {
           conversationKey: 993,
           mode: "agent",
-          userText: "move these into Reading List",
+          userText: 'Add the tag "reviewed" to these papers.',
           model: "gpt-4o-mini",
           apiBase: "https://api.openai.com/v1/chat/completions",
           apiKey: "test",
           libraryID: 1,
+          selectedPaperContexts: [1, 2, 3].map((itemId) => ({
+            itemId,
+            contextItemId: itemId,
+            title: `Paper ${itemId}`,
+          })),
         },
         onEvent: () => undefined,
       });
@@ -5308,7 +5483,7 @@ describe("shallow guard round-limit safety", function () {
       if (outcome.kind !== "completed") return;
       assert.include(
         outcome.text,
-        "Moved all 3",
+        "Tagged all 3",
         "the retry succeeded, so the true answer must survive",
       );
       assert.equal(call, 2, "exactly the two writes, no forced third round");

@@ -1,10 +1,15 @@
 import type {
-  AgentActionCapability,
+  AgentActionProposal,
   AgentToolActionDescriptor,
   AgentToolDefinition,
 } from "../types";
 import type { LibraryMutationOperation } from "../services/libraryMutationService";
-import { isRegisteredLibraryMutationOperation } from "../services/libraryMutation/handlerRegistry";
+import {
+  actionDetailsForLibraryMutation,
+  capabilityForLibraryMutation,
+  isRegisteredLibraryMutationOperation,
+} from "../services/libraryMutation/handlerOperations";
+import { innermostToolResult } from "./toolResultEnvelope";
 
 export type CollectionSummary = {
   collectionId: number;
@@ -15,6 +20,13 @@ export type CollectionSummary = {
 
 export type ActionContractGateway = {
   getCollectionSummary(collectionId: number): CollectionSummary | null;
+  getCollectionNativeState?(collectionId: number): {
+    exists: boolean;
+    name: string;
+    parentCollectionId: number | null;
+    deleted: boolean;
+  };
+  getSettingNativeState?(key: string): { exists: boolean; value: unknown };
   listCollectionSummaries(libraryID: number): CollectionSummary[];
   /** Native collection state for scope freezing; must not use a search snapshot. */
   listCurrentCollectionSummaries?(libraryID: number): CollectionSummary[];
@@ -24,13 +36,24 @@ export type ActionContractGateway = {
     collectionId: number;
     targetKind: "papers" | "items";
   }): number[];
+  /** Current native top-level targets used to freeze whole-library scope. */
+  listCurrentLibraryTargetIds?(params: {
+    libraryID: number;
+    targetKind: "papers" | "items";
+  }): Promise<number[]>;
   listCollectionPaperTargets(params: {
     libraryID: number;
     collectionId: number;
   }): Promise<{ papers: Array<{ itemId: number }> }>;
+  listLibraryPaperTargets?(params: {
+    libraryID: number;
+  }): Promise<{ papers: Array<{ itemId: number }> }>;
   listCollectionItemTargets(params: {
     libraryID: number;
     collectionId: number;
+  }): Promise<{ items: Array<{ itemId: number }> }>;
+  listLibraryItemTargets?(params: {
+    libraryID: number;
   }): Promise<{ items: Array<{ itemId: number }> }>;
   getItem(itemId: number): Zotero.Item | null;
   getEditableArticleMetadata(
@@ -39,8 +62,9 @@ export type ActionContractGateway = {
 };
 
 export type PreparedActionExecution = {
-  descriptor: AgentToolActionDescriptor;
-  capability: AgentActionCapability;
+  mutability: "read" | "write";
+  hasExplicitAdapter: boolean;
+  proposals: AgentActionProposal[];
   operations: LibraryMutationOperation[];
   requestedTargets: string[];
   destinationCollectionIds: number[];
@@ -51,48 +75,9 @@ export type PreparedActionExecution = {
 function nestedOperationResult(
   content: unknown,
 ): Record<string, unknown> | null {
-  if (!content || typeof content !== "object") return null;
-  let current = content as Record<string, unknown>;
-  for (let depth = 0; depth < 3; depth += 1) {
-    if (
-      typeof current.operation === "string" &&
-      current.result &&
-      typeof current.result === "object"
-    ) {
-      return current.result as Record<string, unknown>;
-    }
-    if (!current.result || typeof current.result !== "object") break;
-    current = current.result as Record<string, unknown>;
-  }
-  return current;
+  const result = innermostToolResult(content);
+  return Object.keys(result).length ? result : null;
 }
-
-const CAPABILITY_BY_OPERATION: Partial<
-  Record<LibraryMutationOperation["type"], AgentActionCapability>
-> = {
-  update_metadata: "zotero.metadata",
-  apply_tags: "zotero.tags",
-  remove_tags: "zotero.tags",
-  set_item_tags: "zotero.tags",
-  update_library_tag: "zotero.tags",
-  move_to_collection: "zotero.collections",
-  remove_from_collection: "zotero.collections",
-  set_item_collections: "zotero.collections",
-  create_collection: "zotero.collections",
-  update_collection: "zotero.collections",
-  delete_collection: "zotero.collections",
-  save_note: "zotero.notes",
-  save_notes_batch: "zotero.notes",
-  import_identifiers: "zotero.import",
-  import_local_files: "zotero.import",
-  create_items: "zotero.import",
-  trash_items: "zotero.trash",
-  restore_from_trash: "zotero.trash",
-  merge_items: "zotero.trash",
-  delete_attachment: "zotero.attachments",
-  rename_attachment: "zotero.attachments",
-  relink_attachment: "zotero.attachments",
-};
 
 export function normalizePath(value: string | undefined): string {
   return (value || "")
@@ -117,9 +102,13 @@ export function itemTarget(itemId: number): string {
   return `item:${itemId}`;
 }
 
-export function targetItemId(target: string): number | null {
-  const match = target.match(/^item:(\d+)$/);
-  return match ? Number(match[1]) : null;
+export function fingerprintText(value: string): string {
+  let hash = 0x811c9dc5;
+  for (let index = 0; index < value.length; index += 1) {
+    hash ^= value.charCodeAt(index);
+    hash = Math.imul(hash, 0x01000193);
+  }
+  return `fnv1a32:${(hash >>> 0).toString(16).padStart(8, "0")}`;
 }
 
 export function extractLibraryMutationOperations(
@@ -128,166 +117,51 @@ export function extractLibraryMutationOperations(
   if (!input || typeof input !== "object") return [];
   if (isRegisteredLibraryMutationOperation(input)) return [input];
   const record = input as Record<string, unknown>;
-  const operations: LibraryMutationOperation[] = [];
-  if (record.operation) {
-    operations.push(...extractLibraryMutationOperations(record.operation));
+  if (isRegisteredLibraryMutationOperation(record.operation)) {
+    return [record.operation];
   }
-  if (Array.isArray(record.operations)) {
-    for (const operation of record.operations) {
-      operations.push(...extractLibraryMutationOperations(operation));
-    }
-  }
-  if (record.delegateInput) {
-    operations.push(...extractLibraryMutationOperations(record.delegateInput));
-  }
-  return operations;
+  return Array.isArray(record.operations) &&
+    record.operations.every(isRegisteredLibraryMutationOperation)
+    ? record.operations
+    : [];
 }
 
-export function operationItemIds(
-  operation: LibraryMutationOperation,
-): number[] {
-  switch (operation.type) {
-    case "update_metadata":
-      return operation.itemId ? [operation.itemId] : [];
-    case "apply_tags":
-      return uniqueNumbers([
-        ...(operation.itemIds || []),
-        ...(operation.assignments || []).map((entry) => entry.itemId),
-      ]);
-    case "remove_tags":
-    case "trash_items":
-      return uniqueNumbers(operation.itemIds);
-    case "move_to_collection":
-      return uniqueNumbers([
-        ...(operation.itemIds || []),
-        ...(operation.assignments || []).map((entry) => entry.itemId),
-      ]);
-    case "remove_from_collection":
-      return uniqueNumbers(operation.itemIds);
-    case "set_item_tags":
-    case "set_item_collections":
-    case "reparent_items":
-      return uniqueNumbers(operation.assignments.map((entry) => entry.itemId));
-    case "save_notes_batch":
-      return uniqueNumbers(operation.notes.map((entry) => entry.targetItemId));
-    case "save_note":
-      return operation.targetItemId ? [operation.targetItemId] : [];
-    case "restore_from_trash":
-      return uniqueNumbers(operation.itemIds || []);
-    case "merge_items":
-      return uniqueNumbers([operation.masterItemId, ...operation.otherItemIds]);
-    case "delete_attachment":
-    case "rename_attachment":
-    case "relink_attachment":
-      return [operation.attachmentId];
-    case "relate_items":
-      return uniqueNumbers([operation.itemId, ...operation.relatedItemIds]);
-    default:
-      return [];
-  }
-}
-
-export function operationDestinationCollectionIds(
-  operation: LibraryMutationOperation,
-): number[] {
-  switch (operation.type) {
-    case "move_to_collection":
-      return uniqueNumbers([
-        Number(operation.targetCollectionId),
-        ...(operation.assignments || []).map((assignment) =>
-          Number(assignment.targetCollectionId),
-        ),
-      ]);
-    case "save_note":
-      return uniqueNumbers(operation.collections || []);
-    case "save_notes_batch":
-      return uniqueNumbers(
-        operation.notes.flatMap((note) => note.collections || []),
-      );
-    case "import_identifiers":
-    case "import_local_files":
-      return operation.targetCollectionId ? [operation.targetCollectionId] : [];
-    case "create_items":
-      return uniqueNumbers(
-        operation.items.flatMap((item) => item.collections || []),
-      );
-    default:
-      return [];
-  }
-}
-
-export function operationTags(operation: LibraryMutationOperation): string[] {
-  switch (operation.type) {
-    case "apply_tags":
-      return uniqueStrings([
-        ...(operation.tags || []),
-        ...(operation.assignments || []).flatMap(
-          (assignment) => assignment.tags,
-        ),
-      ]);
-    case "set_item_tags":
-      return uniqueStrings(
-        operation.assignments.flatMap((assignment) => assignment.tags),
-      );
-    default:
-      return [];
-  }
-}
-
-export function defaultActionDescriptorForTool(
-  tool: AgentToolDefinition<any, any>,
-): AgentToolActionDescriptor {
-  if (tool.spec.name === "file_io") {
-    return { kind: "artifact_state", capability: "file.write" };
-  }
-  if (tool.spec.name === "run_command") {
-    return { kind: "execution_only", capability: "command.execute" };
-  }
-  if (tool.spec.name === "zotero_script") {
-    return { kind: "execution_only", capability: "zotero.script" };
-  }
-  return {
-    kind: "semantic_state",
-    capability: "zotero.read",
-    source:
-      tool.spec.mutability === "write" ? "library_mutation" : "zotero_read",
-  };
-}
-
-function inferDescriptor(
-  tool: AgentToolDefinition<any, any>,
+export function describeLibraryMutationActions(
   input: unknown,
-): AgentToolActionDescriptor {
-  const described = tool.describeAction?.(input);
-  if (described) return described;
-  return defaultActionDescriptorForTool(tool);
+): AgentToolActionDescriptor[] {
+  return extractLibraryMutationOperations(input).map((operation, index) => {
+    const details = actionDetailsForLibraryMutation(operation);
+    return {
+      id: `${operation.type}:${operation.id || index}`,
+      proofDomain: "zotero_state",
+      capability: capabilityForLibraryMutation(operation),
+      operation: operation.type,
+      parameters: details.parameters,
+      source: "library_mutation",
+      operationValue: operation,
+      requestedTargets: details.requestedTargets,
+      destinationCollectionIds: details.destinationCollectionIds,
+    };
+  });
 }
 
-function capabilityFor(
-  descriptor: AgentToolActionDescriptor,
-  operations: LibraryMutationOperation[],
-): AgentActionCapability {
-  return operations.length
-    ? CAPABILITY_BY_OPERATION[operations[0].type] || descriptor.capability
-    : descriptor.capability;
-}
-
-function requestedTargetsFor(
-  descriptor: AgentToolActionDescriptor,
-  operations: LibraryMutationOperation[],
-  input: unknown,
-): string[] {
-  const itemTargets = operations.flatMap(operationItemIds).map(itemTarget);
-  if (itemTargets.length) return uniqueStrings(itemTargets);
+function explicitReadActions(input: unknown): AgentActionProposal[] {
   if (
-    descriptor.kind === "artifact_state" &&
     input &&
-    typeof input === "object"
+    typeof input === "object" &&
+    (input as { mode?: unknown }).mode === "full"
   ) {
-    const filePath = (input as { filePath?: unknown }).filePath;
-    return typeof filePath === "string" && filePath.trim()
-      ? [`file:${filePath.trim()}`]
-      : [];
+    return [
+      {
+        id: "read_full:0",
+        proofDomain: "zotero_state",
+        capability: "zotero.read",
+        operation: "read_full",
+        source: "full_read",
+        requestedTargets: [],
+        destinationCollectionIds: [],
+      },
+    ];
   }
   return [];
 }
@@ -296,22 +170,7 @@ function verifiedFactsForInput(input: unknown): string[] {
   if (!input || typeof input !== "object") return [];
   const record = input as Record<string, unknown>;
   if (record.mode === "full") return ["read_mode:full"];
-  return record.delegateInput
-    ? verifiedFactsForInput(record.delegateInput)
-    : [];
-}
-
-function itemTags(item: Zotero.Item | null): string[] {
-  const values = item?.getTags?.() || [];
-  return values
-    .map((entry: unknown) =>
-      typeof entry === "string"
-        ? entry
-        : typeof (entry as { tag?: unknown })?.tag === "string"
-          ? (entry as { tag: string }).tag
-          : "",
-    )
-    .filter(Boolean);
+  return [];
 }
 
 function itemCollections(item: Zotero.Item | null): number[] {
@@ -346,14 +205,25 @@ export type NoteWriteVerification =
   | { targets: null; reason: string };
 
 export function verifyNoteWriteTarget(
-  descriptor: Extract<AgentToolActionDescriptor, { kind: "semantic_state" }>,
+  proposal: AgentActionProposal,
   content: unknown,
   gateway: ActionContractGateway,
 ): NoteWriteVerification {
-  const action = descriptor.action;
-  if (action?.kind !== "note_write") {
+  if (
+    proposal.operation !== "note_create" &&
+    proposal.operation !== "note_edit" &&
+    proposal.operation !== "note_append" &&
+    proposal.operation !== "save_note"
+  ) {
     return { targets: null, reason: "The tool has no note-write descriptor." };
   }
+  const mode =
+    proposal.parameters?.noteMode ||
+    (proposal.operation === "note_edit"
+      ? "edit"
+      : proposal.operation === "note_append"
+        ? "append"
+        : "create");
   const result = nestedOperationResult(content);
   const noteId = Number(result?.noteId);
   if (!(noteId > 0)) {
@@ -375,25 +245,28 @@ export function verifyNoteWriteTarget(
       reason: `Zotero item ${noteId} is not a live note after mutation.`,
     };
   }
-  if (action.targetNoteId && Number(action.targetNoteId) !== Number(note.id)) {
-    return {
-      targets: null,
-      reason: `The mutation affected note ${note.id}, not requested note ${action.targetNoteId}.`,
-    };
-  }
   if (
-    action.mode === "create" &&
-    action.targetItemId &&
-    Number(note.parentID) !== Number(action.targetItemId)
+    proposal.parameters?.targetNoteId &&
+    Number(proposal.parameters.targetNoteId) !== Number(note.id)
   ) {
     return {
       targets: null,
-      reason: `Created note ${noteId} is not attached to requested item ${action.targetItemId}.`,
+      reason: `The mutation affected note ${note.id}, not requested note ${proposal.parameters.targetNoteId}.`,
     };
   }
   if (
-    action.destinationCollectionIds.length &&
-    !action.destinationCollectionIds.every((collectionId) =>
+    mode === "create" &&
+    proposal.parameters?.targetItemId &&
+    Number(note.parentID) !== Number(proposal.parameters.targetItemId)
+  ) {
+    return {
+      targets: null,
+      reason: `Created note ${noteId} is not attached to requested item ${proposal.parameters.targetItemId}.`,
+    };
+  }
+  if (
+    proposal.destinationCollectionIds.length &&
+    !proposal.destinationCollectionIds.every((collectionId) =>
       itemCollections(note).includes(collectionId),
     )
   ) {
@@ -402,11 +275,11 @@ export function verifyNoteWriteTarget(
       reason: `Created note ${noteId} is missing one or more requested collection memberships.`,
     };
   }
-  if (action.expectedText?.trim()) {
+  if (proposal.parameters?.expectedText?.trim()) {
     const actual = normalizeNoteText(String(note.getNote?.() || ""));
-    const expected = normalizeNoteText(action.expectedText);
+    const expected = normalizeNoteText(proposal.parameters.expectedText);
     const textMatches =
-      action.mode === "edit" ? actual === expected : actual.includes(expected);
+      mode === "edit" ? actual === expected : actual.includes(expected);
     if (!textMatches) {
       return {
         targets: null,
@@ -417,272 +290,36 @@ export function verifyNoteWriteTarget(
   return { targets: [itemTarget(noteId)] };
 }
 
-function assignmentTags(
-  operation: Extract<LibraryMutationOperation, { type: "apply_tags" }>,
-  itemId: number,
-): string[] {
-  return (
-    operation.assignments?.find((entry) => entry.itemId === itemId)?.tags ||
-    operation.tags ||
-    []
-  );
-}
-
-function moveTargetCollection(
-  operation: Extract<LibraryMutationOperation, { type: "move_to_collection" }>,
-  itemId: number,
-): number | undefined {
-  return (
-    operation.assignments?.find((entry) => entry.itemId === itemId)
-      ?.targetCollectionId || operation.targetCollectionId
-  );
-}
-
-export function targetSatisfied(
-  operation: LibraryMutationOperation,
-  itemId: number,
-  gateway: ActionContractGateway,
-): boolean | null {
-  const item = gateway.getItem(itemId);
-  switch (operation.type) {
-    case "apply_tags": {
-      const actual = new Set(itemTags(item));
-      return assignmentTags(operation, itemId).every((tag) => actual.has(tag));
-    }
-    case "remove_tags": {
-      const actual = new Set(itemTags(item));
-      return operation.tags.every((tag) => !actual.has(tag));
-    }
-    case "set_item_tags": {
-      const expected = operation.assignments.find(
-        (entry) => entry.itemId === itemId,
-      )?.tags;
-      if (!expected) return null;
-      const actual = [...itemTags(item)].sort();
-      return JSON.stringify(actual) === JSON.stringify([...expected].sort());
-    }
-    case "update_metadata": {
-      const snapshot = gateway.getEditableArticleMetadata(item);
-      if (!snapshot) return false;
-      return Object.entries(operation.metadata).every(([field, value]) => {
-        if (field === "creators") {
-          return JSON.stringify(snapshot.creators) === JSON.stringify(value);
-        }
-        return snapshot.fields[field] === String(value ?? "");
-      });
-    }
-    case "move_to_collection": {
-      const target = moveTargetCollection(operation, itemId);
-      if (!target) return null;
-      const memberships = itemCollections(item);
-      if (!memberships.includes(target)) return false;
-      if (operation.mode !== "move") return true;
-      return operation.from === "all"
-        ? memberships.length === 1
-        : !memberships.includes(Number(operation.from));
-    }
-    case "remove_from_collection":
-      return !itemCollections(item).includes(operation.collectionId);
-    case "set_item_collections": {
-      const expected = operation.assignments.find(
-        (entry) => entry.itemId === itemId,
-      )?.collectionIds;
-      if (!expected) return null;
-      return (
-        JSON.stringify(itemCollections(item).sort()) ===
-        JSON.stringify([...expected].sort())
-      );
-    }
-    case "trash_items":
-      return Boolean(
-        (item as (Zotero.Item & { deleted?: boolean }) | null)?.deleted,
-      );
-    case "restore_from_trash":
-      return item
-        ? !(item as Zotero.Item & { deleted?: boolean }).deleted
-        : false;
-    case "delete_attachment":
-      return (
-        !item || Boolean((item as Zotero.Item & { deleted?: boolean }).deleted)
-      );
-    case "rename_attachment": {
-      if (!item) return false;
-      const attachment = item as Zotero.Item & {
-        getFilename?: () => string;
-      };
-      return (
-        attachment.getFilename?.() === operation.newName ||
-        attachment.getField?.("title") === operation.newName
-      );
-    }
-    case "relink_attachment": {
-      if (!item) return false;
-      const actualPath = (
-        item as Zotero.Item & { getFilePath?: () => string | false }
-      ).getFilePath?.();
-      return actualPath === operation.newPath;
-    }
-    default:
-      return null;
-  }
-}
-
-export function targetSatisfiedFromResult(
-  operation: LibraryMutationOperation,
-  itemId: number,
-  content: unknown,
-  gateway: ActionContractGateway,
-): boolean | null {
-  const result = nestedOperationResult(content);
-  if (!result) return null;
-  if (operation.type === "save_notes_batch") {
-    const notes = Array.isArray(result.notes) ? result.notes : [];
-    const row = notes.find(
-      (entry) =>
-        entry &&
-        typeof entry === "object" &&
-        Number((entry as { targetItemId?: unknown }).targetItemId) === itemId,
-    ) as { status?: unknown; noteId?: unknown } | undefined;
-    const noteId = Number(row?.noteId);
-    return row?.status === "created" && noteId > 0
-      ? Boolean(gateway.getItem(noteId))
-      : false;
-  }
-  return null;
-}
-
-export function createdSemanticTargets(
-  operations: LibraryMutationOperation[],
-  content: unknown,
-  gateway: ActionContractGateway,
-): string[] | null {
-  if (operations.length !== 1) return null;
-  const operation = operations[0];
-  const result = nestedOperationResult(content);
-  if (!result) return null;
-  if (operation.type === "save_note") {
-    const noteId = Number(result.noteId);
-    if (!noteId || !gateway.getItem(noteId)) return null;
-    const expectedCollections = operation.collections || [];
-    if (
-      expectedCollections.length &&
-      !expectedCollections.every((collectionId) =>
-        itemCollections(gateway.getItem(noteId)).includes(collectionId),
-      )
-    ) {
-      return null;
-    }
-    return [itemTarget(noteId)];
-  }
-  if (operation.type === "create_items") {
-    const rows = Array.isArray(result.items) ? result.items : [];
-    const itemIds = rows
-      .filter(
-        (row) =>
-          row &&
-          typeof row === "object" &&
-          (row as { status?: unknown }).status === "created",
-      )
-      .map((row) => Number((row as { itemId?: unknown }).itemId))
-      .filter((itemId) => itemId > 0 && Boolean(gateway.getItem(itemId)));
-    return itemIds.length === operation.items.length
-      ? itemIds.map(itemTarget)
-      : null;
-  }
-  if (operation.type === "import_identifiers") {
-    const itemIds = Array.isArray(result.itemIds)
-      ? result.itemIds
-          .map(Number)
-          .filter((itemId) => itemId > 0 && Boolean(gateway.getItem(itemId)))
-      : [];
-    if (itemIds.length !== operation.identifiers.length) return null;
-    if (
-      operation.targetCollectionId &&
-      !itemIds.every((itemId) =>
-        itemCollections(gateway.getItem(itemId)).includes(
-          operation.targetCollectionId!,
-        ),
-      )
-    ) {
-      return null;
-    }
-    return itemIds.map(itemTarget);
-  }
-  if (operation.type === "import_local_files") {
-    const rows = Array.isArray(result.items) ? result.items : [];
-    const itemIds = rows
-      .filter(
-        (row) =>
-          row &&
-          typeof row === "object" &&
-          (row as { status?: unknown }).status === "imported",
-      )
-      .map((row) => Number((row as { itemId?: unknown }).itemId))
-      .filter((itemId) => itemId > 0 && Boolean(gateway.getItem(itemId)));
-    if (itemIds.length !== operation.filePaths.length) return null;
-    if (
-      operation.targetCollectionId &&
-      !itemIds.every((itemId) =>
-        itemCollections(gateway.getItem(itemId)).includes(
-          operation.targetCollectionId!,
-        ),
-      )
-    ) {
-      return null;
-    }
-    return itemIds.map(itemTarget);
-  }
-  return null;
-}
-
-export function prepareActionExecution(
+export async function prepareActionExecution(
   tool: AgentToolDefinition<any, any>,
   input: unknown,
-  gateway: ActionContractGateway,
-): PreparedActionExecution {
-  const descriptor = inferDescriptor(tool, input);
+  _gateway: ActionContractGateway,
+  context?: import("../types").AgentToolContext,
+): Promise<PreparedActionExecution> {
   const operations = extractLibraryMutationOperations(input);
-  const capability = capabilityFor(descriptor, operations);
-  const noteAction =
-    descriptor.kind === "semantic_state" &&
-    descriptor.action?.kind === "note_write"
-      ? descriptor.action
-      : null;
-  const requestedTargets = requestedTargetsFor(descriptor, operations, input);
-  if (!requestedTargets.length && noteAction) {
-    const noteTargetId =
-      noteAction.targetNoteId ||
-      (noteAction.mode === "create" ? noteAction.targetItemId : undefined);
-    if (noteTargetId) requestedTargets.push(itemTarget(noteTargetId));
-  }
+  const described = tool.describeAction
+    ? await tool.describeAction(input, context)
+    : undefined;
+  const proposals =
+    described ||
+    (operations.length
+      ? describeLibraryMutationActions(input)
+      : explicitReadActions(input));
+  const requestedTargets = uniqueStrings(
+    proposals.flatMap((proposal) => proposal.requestedTargets),
+  );
   const destinationCollectionIds = uniqueNumbers([
-    ...operations.flatMap(operationDestinationCollectionIds),
-    ...(noteAction?.destinationCollectionIds || []),
+    ...proposals.flatMap((proposal) => proposal.destinationCollectionIds),
   ]);
   const verifiedFacts = verifiedFactsForInput(input);
-  const alreadySatisfiedTargets: string[] = [];
-  for (const target of requestedTargets) {
-    const itemId = targetItemId(target);
-    if (!itemId) continue;
-    const relevant = operations.filter((operation) =>
-      operationItemIds(operation).includes(itemId),
-    );
-    if (
-      relevant.length &&
-      relevant.every(
-        (operation) => targetSatisfied(operation, itemId, gateway) === true,
-      )
-    ) {
-      alreadySatisfiedTargets.push(target);
-    }
-  }
   return {
-    descriptor,
-    capability,
+    mutability: tool.spec.mutability,
+    hasExplicitAdapter: Boolean(tool.describeAction) || operations.length > 0,
+    proposals,
     operations,
     requestedTargets,
     destinationCollectionIds,
-    alreadySatisfiedTargets,
+    alreadySatisfiedTargets: [],
     verifiedFacts,
   };
 }

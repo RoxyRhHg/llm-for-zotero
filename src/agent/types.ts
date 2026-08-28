@@ -23,7 +23,9 @@ import type {
 import type { ContextCachePlan } from "../contextCache/manager";
 import type {
   AgentActionContract,
+  AgentActionEvidence,
   AgentActionIntent,
+  AgentActionProgressLedger,
   AgentActionReceipt,
   AgentToolActionDescriptor,
 } from "./contracts/types";
@@ -31,8 +33,14 @@ import type {
 export type {
   AgentActionCapability,
   AgentActionContract,
+  AgentActionEvidence,
   AgentActionIntent,
   AgentActionObligation,
+  AgentActionOperation,
+  AgentActionParameters,
+  AgentActionProofDomain,
+  AgentActionProgressLedger,
+  AgentActionProposal,
   AgentActionReceipt,
   AgentToolActionDescriptor,
 } from "./contracts/types";
@@ -318,7 +326,7 @@ export type AgentEvent =
       name: string;
       ok: boolean;
       effect?: AgentToolEffect;
-      receipt: AgentActionReceipt;
+      actionReceipts: AgentActionReceipt[];
       content: unknown;
       artifacts?: AgentToolArtifact[];
     }
@@ -543,6 +551,8 @@ export type ClassifiedTurnIntent = {
   externalSearchIntent?: "none" | "web" | "literature" | "both";
   wantedSections: Array<"methods" | "results" | "limitations">;
   queryLanguage?: string;
+  writeDisposition?: "none" | "required" | "uncertain";
+  actionInterpretationSource?: "classifier" | "deterministic_fallback";
   actionIntents: AgentActionIntent[];
 };
 
@@ -553,6 +563,8 @@ export type AgentRuntimeRequest = AgentRequest & {
   classifiedIntent?: ClassifiedTurnIntent;
   /** Internal per-turn action obligations. Persisted with transcript events. */
   actionContract?: AgentActionContract;
+  /** Mutable completion state kept separate from the immutable contract. */
+  actionProgress?: AgentActionProgressLedger;
   item?: Zotero.Item | null;
   history?: ChatMessage[];
   authMode?: ModelProviderAuthMode;
@@ -666,7 +678,7 @@ export type AgentToolResult = {
   name: string;
   ok: boolean;
   effect?: AgentToolEffect;
-  receipt: AgentActionReceipt;
+  actionReceipts: AgentActionReceipt[];
   content: unknown;
   artifacts?: AgentToolArtifact[];
 };
@@ -703,6 +715,7 @@ export type AgentToolExecutionOutput<TResult = unknown> =
       content: TResult;
       artifacts?: AgentToolArtifact[];
       effect?: AgentToolEffect;
+      actionEvidence?: AgentActionEvidence[];
     };
 
 /** Explicit execution contract for tools whose validated operation can write. */
@@ -710,6 +723,7 @@ export type AgentWriteToolOutput<TResult = unknown> = {
   content: TResult;
   effect: AgentToolEffect;
   artifacts?: AgentToolArtifact[];
+  actionEvidence?: AgentActionEvidence[];
 };
 
 export type AgentJournalStepOutcome = {
@@ -756,6 +770,8 @@ export type AgentToolContext = {
   journalToolName?: string;
   /** Internal parent action used by composite tools such as library_batch. */
   journalActionScope?: AgentJournalActionScope;
+  /** Persist the current contract ledger at a durable composite checkpoint. */
+  checkpointActionProgress?: () => Promise<void>;
 };
 
 export type AgentToolInputValidation<T> =
@@ -855,7 +871,10 @@ export type AgentToolDefinition<TInput = unknown, TResult = unknown> = {
   isAvailable?: (request: AgentRuntimeRequest) => boolean;
   guidance?: AgentToolGuidance;
   presentation?: AgentToolPresentation;
-  describeAction?: (input: TInput) => AgentToolActionDescriptor;
+  describeAction?: (
+    input: TInput,
+    context?: AgentToolContext,
+  ) => AgentToolActionDescriptor[] | Promise<AgentToolActionDescriptor[]>;
   validate: (args: unknown) => AgentToolInputValidation<TInput>;
   execute: (
     input: TInput,

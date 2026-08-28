@@ -1,33 +1,41 @@
 import type {
   AgentActionContract,
+  AgentActionEvidence,
   AgentActionObligation,
+  AgentActionParameters,
+  AgentActionProgressLedger,
+  AgentActionProposal,
   AgentActionReceipt,
   AgentRuntimeRequest,
   AgentToolDefinition,
   AgentToolEffect,
+  AgentToolContext,
 } from "../types";
 import {
-  createdSemanticTargets,
   itemTarget,
   normalizePath,
-  verifyNoteWriteTarget,
-  operationItemIds,
-  operationDestinationCollectionIds,
-  operationTags,
   prepareActionExecution,
-  targetItemId,
-  targetSatisfied,
-  targetSatisfiedFromResult,
+  verifyNoteWriteTarget,
   type ActionContractGateway,
   type PreparedActionExecution,
 } from "./actionOperationEvidence";
-import { listScopeTargetIds, resolveScope } from "./actionScope";
+import {
+  listCurrentLibraryTargetIds,
+  listScopeTargetIds,
+  resolveScope,
+} from "./actionScope";
+import { canonicalJsonEqual } from "../services/libraryMutation/canonicalJson";
+import { mutationPostconditionIsSatisfied } from "../services/libraryMutation/handlerOperations";
+import { innermostToolResult, toolResultString } from "./toolResultEnvelope";
 
 export type {
   ActionContractGateway,
   PreparedActionExecution,
 } from "./actionOperationEvidence";
-export { extractLibraryMutationOperations } from "./actionOperationEvidence";
+export {
+  describeLibraryMutationActions,
+  extractLibraryMutationOperations,
+} from "./actionOperationEvidence";
 
 export type ScopeValidationFailure = {
   message: string;
@@ -37,244 +45,468 @@ export type ScopeValidationFailure = {
   missingTargets: string[];
 };
 
+function createContractId(request: AgentRuntimeRequest): string {
+  return `action-contract:${request.conversationKey}:${Date.now()}:${Math.random()
+    .toString(36)
+    .slice(2, 10)}`;
+}
+
+function receiptKey(receipt: AgentActionReceipt): string {
+  return [
+    receipt.obligationId || "unmatched",
+    receipt.proposalId,
+    receipt.evidenceRef || receipt.id,
+  ].join("|");
+}
+
+function sameArrayValues(
+  left: readonly unknown[],
+  right: readonly unknown[],
+): boolean {
+  const normalize = (values: readonly unknown[]) =>
+    [...new Set(values)].sort((a, b) => String(a).localeCompare(String(b)));
+  return JSON.stringify(normalize(left)) === JSON.stringify(normalize(right));
+}
+
+function parametersMatch(
+  expected: AgentActionParameters | undefined,
+  actual: AgentActionParameters | undefined,
+): boolean {
+  if (!expected) return true;
+  const actualValue = actual || {};
+  return Object.entries(expected).every(([key, value]) => {
+    if (value === undefined) return true;
+    const proposed = actualValue[key as keyof AgentActionParameters];
+    return Array.isArray(value)
+      ? Array.isArray(proposed) && sameArrayValues(value, proposed)
+      : proposed === value;
+  });
+}
+
+function matchingObligations(
+  contract: AgentActionContract,
+  proposal: AgentActionProposal,
+): AgentActionObligation[] {
+  return contract.obligations.filter(
+    (obligation) =>
+      obligation.operation === proposal.operation &&
+      obligation.proofDomain === proposal.proofDomain &&
+      parametersMatch(obligation.parameters, proposal.parameters),
+  );
+}
+
+function failure(
+  message: string,
+  contract: AgentActionContract,
+  prepared: PreparedActionExecution,
+  rejectedTargets: string[] = prepared.requestedTargets,
+  missingTargets: string[] = contract.obligations.map(
+    (obligation) => obligation.operation,
+  ),
+): ScopeValidationFailure {
+  return {
+    message,
+    expectedCount: contract.obligations.length,
+    proposedCount: prepared.proposals.length,
+    rejectedTargets,
+    missingTargets,
+  };
+}
+
+function readEvidenceRef(content: unknown): string | undefined {
+  return toolResultString(content, ["actionId", "journalStepId"]);
+}
+
+function evidenceTargets(evidence: AgentActionEvidence): string[] {
+  return [
+    ...(evidence.postState.items || []).map((item) => `item:${item.itemId}`),
+    ...(evidence.postState.collections || []).map(
+      (collection) => `collection:${collection.collectionId}`,
+    ),
+    ...(evidence.postState.savedSearches || []).map(
+      (search) => `saved-search:${search.savedSearchId}`,
+    ),
+  ];
+}
+
+function matchingNativeEvidence(
+  proposal: AgentActionProposal,
+  evidence: AgentActionEvidence[] | undefined,
+): AgentActionEvidence | undefined {
+  return evidence?.find(
+    (entry) =>
+      entry.proofDomain === "zotero_state" &&
+      proposal.operationValue !== undefined &&
+      canonicalJsonEqual(entry.operationValue, proposal.operationValue),
+  );
+}
+
+function fileEvidence(
+  proposal: AgentActionProposal,
+  content: unknown,
+): {
+  verified: boolean;
+  target: string;
+  evidenceRef?: string;
+  reason?: string;
+} {
+  const record = innermostToolResult(content);
+  const filePath = String(
+    record.filePath || proposal.parameters?.filePath || "",
+  );
+  const actualHash =
+    typeof record.contentHash === "string" ? record.contentHash : "";
+  const expectedHash =
+    proposal.expectedContentHash ||
+    proposal.parameters?.contentHash ||
+    (typeof record.expectedContentHash === "string"
+      ? record.expectedContentHash
+      : "");
+  const target = filePath ? `file:${filePath}` : "file:unknown";
+  if (!filePath || record.exists !== true || !actualHash) {
+    return {
+      verified: false,
+      target,
+      reason:
+        "The written file was not read back with an exact path and content hash.",
+    };
+  }
+  if (expectedHash && actualHash !== expectedHash) {
+    return {
+      verified: false,
+      target,
+      reason: `File readback hash ${actualHash} did not match ${expectedHash}.`,
+    };
+  }
+  return { verified: true, target, evidenceRef: `sha256:${actualHash}` };
+}
+
 export class ActionContractService {
   constructor(private readonly gateway: ActionContractGateway) {}
 
   async createContract(
     request: AgentRuntimeRequest,
-  ): Promise<AgentActionContract | null> {
+  ): Promise<AgentActionContract> {
     const intents = request.classifiedIntent?.actionIntents || [];
-    if (!intents.length) return null;
-    const obligations: AgentActionObligation[] = [];
+    const writeDisposition =
+      request.classifiedIntent?.writeDisposition ||
+      (intents.length ? "required" : "none");
+    if (writeDisposition === "required" && !intents.length) {
+      throw new Error(
+        "Action contract construction failed: write intent had no valid typed obligations.",
+      );
+    }
+    if (
+      writeDisposition === "none" &&
+      intents.some((intent) => intent.operation !== "read_full")
+    ) {
+      throw new Error(
+        "Action contract construction failed: no-write intent contained mutation obligations.",
+      );
+    }
+    const contractId = createContractId(request);
+    const resolved: AgentActionObligation[] = [];
     for (const intent of intents) {
-      obligations.push(...(await resolveScope(this.gateway, request, intent)));
+      resolved.push(...(await resolveScope(this.gateway, request, intent)));
     }
     return {
-      version: 1,
-      state: "pending",
-      obligations,
-      correctionCount: 0,
+      version: 2,
+      id: contractId,
+      writeDisposition,
+      interpretationSource:
+        request.classifiedIntent?.actionInterpretationSource ||
+        "deterministic_fallback",
+      obligations: resolved.map((obligation, index) => ({
+        ...obligation,
+        id: `${contractId}:obligation:${index}`,
+      })),
     };
+  }
+
+  createProgress(contract: AgentActionContract): AgentActionProgressLedger {
+    return {
+      version: 1,
+      contractId: contract.id,
+      state: "pending",
+      correctionCount: 0,
+      obligations: contract.obligations.map((obligation) => ({
+        obligationId: obligation.id,
+        status: "open",
+        verifiedTargetIds: [],
+        unresolvedTargetIds:
+          obligation.targetBoundary && obligation.scopeRole !== "destination"
+            ? obligation.targetBoundary.frozenTargetIds.map(itemTarget)
+            : [],
+        journalStepIds: [],
+        failureReasons: [],
+      })),
+      appliedReceiptKeys: [],
+      updatedAt: Date.now(),
+    };
+  }
+
+  applyReceipts(
+    progress: AgentActionProgressLedger,
+    receipts: AgentActionReceipt[],
+  ): void {
+    for (const receipt of receipts) {
+      const obligation = progress.obligations.find(
+        (entry) => entry.obligationId === receipt.obligationId,
+      );
+      if (!obligation) continue;
+      if (
+        obligation.status === "cancelled" ||
+        obligation.status === "fulfilled" ||
+        obligation.status === "already_satisfied"
+      ) {
+        continue;
+      }
+      const key = receiptKey(receipt);
+      if (progress.appliedReceiptKeys.includes(key)) continue;
+      progress.appliedReceiptKeys.push(key);
+      const verifiedTargets = [
+        ...receipt.appliedTargets,
+        ...receipt.alreadySatisfiedTargets,
+      ];
+      obligation.verifiedTargetIds = [
+        ...new Set([...obligation.verifiedTargetIds, ...verifiedTargets]),
+      ];
+      obligation.unresolvedTargetIds = obligation.unresolvedTargetIds.filter(
+        (target) => !verifiedTargets.includes(target),
+      );
+      if (receipt.evidenceRef) {
+        obligation.journalStepIds = [
+          ...new Set([...obligation.journalStepIds, receipt.evidenceRef]),
+        ];
+      }
+      obligation.failureReasons = [
+        ...new Set([...obligation.failureReasons, ...receipt.reasons]),
+      ];
+      if (receipt.status === "cancelled") {
+        obligation.status = "cancelled";
+      } else if (receipt.status === "failed") {
+        obligation.status = "failed";
+      } else if (
+        receipt.status === "applied" ||
+        receipt.status === "already_satisfied" ||
+        receipt.status === "observed"
+      ) {
+        obligation.status = obligation.unresolvedTargetIds.length
+          ? "partially_fulfilled"
+          : receipt.status === "already_satisfied"
+            ? "already_satisfied"
+            : "fulfilled";
+      } else if (verifiedTargets.length) {
+        obligation.status = "partially_fulfilled";
+      }
+    }
+    progress.updatedAt = Date.now();
   }
 
   async prepare(
     tool: AgentToolDefinition<any, any>,
     input: unknown,
+    context?: AgentToolContext,
   ): Promise<PreparedActionExecution> {
-    return prepareActionExecution(tool, input, this.gateway);
+    return await prepareActionExecution(tool, input, this.gateway, context);
   }
 
   async validateScope(
     contract: AgentActionContract | undefined,
     prepared: PreparedActionExecution,
+    options: {
+      allowPartialCoverage?: boolean;
+      concreteWrite?: boolean;
+      progress?: AgentActionProgressLedger;
+    } = {},
   ): Promise<ScopeValidationFailure | null> {
     if (!contract) return null;
-    if (prepared.descriptor.kind === "execution_only") {
-      const explicitlyRequested = contract.obligations.some(
-        (obligation) => obligation.capability === prepared.capability,
+    if (
+      prepared.mutability === "write" &&
+      !prepared.proposals.length &&
+      (!prepared.hasExplicitAdapter || options.concreteWrite)
+    ) {
+      return failure(
+        "Write-capable invocation rejected: the tool did not produce a typed action proposal.",
+        contract,
+        prepared,
       );
-      if (!explicitlyRequested) {
-        return {
-          message: `Execution-only capability ${prepared.capability} is outside this action contract and cannot verify the requested Zotero state.`,
-          expectedCount: contract.obligations.length,
-          proposedCount: 1,
-          rejectedTargets: [prepared.capability],
-          missingTargets: contract.obligations.map(
-            (obligation) => obligation.capability,
-          ),
-        };
-      }
-      return null;
     }
-    if (prepared.descriptor.kind !== "semantic_state") return null;
-    const capabilityObligations = contract.obligations.filter(
-      (obligation) => obligation.capability === prepared.capability,
+    if (!prepared.proposals.length) return null;
+    const hasWriteProposal = prepared.proposals.some(
+      (proposal) => proposal.operation !== "read_full",
     );
-    for (const obligation of capabilityObligations) {
-      const prefix = obligation.constraints?.tagPrefix;
-      if (!prefix) continue;
-      const tags = prepared.operations.flatMap(operationTags);
-      const rejectedTags = tags.filter((tag) => !tag.startsWith(prefix));
-      if (rejectedTags.length) {
-        return {
-          message: `Action constraint rejected before confirmation: ${rejectedTags.length} tag(s) do not start with required prefix "${prefix}".`,
-          expectedCount: tags.length,
-          proposedCount: tags.length,
-          rejectedTargets: rejectedTags.map((tag) => `tag:${tag}`),
-          missingTargets: [],
-        };
-      }
+    if (hasWriteProposal && contract.writeDisposition !== "required") {
+      return failure(
+        contract.writeDisposition === "uncertain"
+          ? "Write blocked because the user intent is uncertain and requires clarification."
+          : "Write blocked because this request authorizes no mutations.",
+        contract,
+        prepared,
+      );
     }
-    const obligations = capabilityObligations.filter(
-      (obligation) => obligation.scope,
-    );
-    if (!obligations.length) return null;
-    const destinationObligations = obligations.filter(
-      (obligation) => obligation.scopeRole === "destination",
-    );
-    if (destinationObligations.length) {
-      for (const obligation of destinationObligations) {
-        const current = this.gateway.getCollectionSummary(
-          obligation.scope!.collectionId,
+    if (!contract.obligations.length) {
+      return failure(
+        "Write blocked because the required-write contract contains no valid obligations.",
+        contract,
+        prepared,
+      );
+    }
+
+    for (const proposal of prepared.proposals) {
+      const matches = matchingObligations(contract, proposal);
+      if (!matches.length) {
+        return failure(
+          `Action ${proposal.operation} in ${proposal.proofDomain} does not match any authorized obligation.`,
+          contract,
+          prepared,
+          proposal.requestedTargets.length
+            ? proposal.requestedTargets
+            : [proposal.operation],
         );
-        if (
-          !current ||
-          normalizePath(current.path || current.name) !==
-            normalizePath(obligation.scope!.collectionPath)
-        ) {
-          return {
-            message:
-              "Destination collection changed after planning; refresh and retry before mutating.",
-            expectedCount: 1,
-            proposedCount: prepared.destinationCollectionIds.length,
-            rejectedTargets: [],
-            missingTargets: [`collection:${obligation.scope!.collectionId}`],
-          };
-        }
       }
-      const expectedCollections = new Set(
-        destinationObligations.map(
-          (obligation) => obligation.scope!.collectionId,
-        ),
-      );
-      const proposedCollections = new Set(prepared.destinationCollectionIds);
-      const rejectedCollections = [...proposedCollections].filter(
-        (collectionId) => !expectedCollections.has(collectionId),
-      );
-      const missingCollections = [...expectedCollections].filter(
-        (collectionId) => !proposedCollections.has(collectionId),
-      );
-      if (rejectedCollections.length || missingCollections.length) {
-        return {
-          message: `Action destination rejected before confirmation: expected exact collection ID(s) ${[
-            ...expectedCollections,
-          ].join(", ")}, proposed ${
-            [...proposedCollections].join(", ") || "none"
-          }.`,
-          expectedCount: expectedCollections.size,
-          proposedCount: proposedCollections.size,
-          rejectedTargets: rejectedCollections.map(
-            (collectionId) => `collection:${collectionId}`,
-          ),
-          missingTargets: missingCollections.map(
-            (collectionId) => `collection:${collectionId}`,
-          ),
-        };
-      }
-    }
-    const moveObligations = capabilityObligations.filter(
-      (obligation) => obligation.constraints?.collectionMode === "move",
-    );
-    if (moveObligations.length) {
-      const sourceCollectionIds = new Set(
-        moveObligations
-          .filter((obligation) => obligation.scopeRole !== "destination")
-          .map((obligation) => obligation.scope?.collectionId)
-          .filter((collectionId): collectionId is number =>
-            Boolean(collectionId),
-          ),
-      );
-      const destinationCollectionIds = new Set(
-        moveObligations
-          .filter((obligation) => obligation.scopeRole === "destination")
-          .map((obligation) => obligation.scope?.collectionId)
-          .filter((collectionId): collectionId is number =>
-            Boolean(collectionId),
-          ),
-      );
-      const validMove = prepared.operations.some((operation) => {
-        if (
-          operation.type !== "move_to_collection" ||
-          operation.mode !== "move"
-        ) {
-          return false;
-        }
-        if (
-          operation.from !== "all" &&
-          !sourceCollectionIds.has(Number(operation.from))
-        ) {
-          return false;
-        }
-        const proposedDestinations = new Set(
-          operationDestinationCollectionIds(operation),
-        );
+      const openMatches = matches.filter((obligation) => {
+        const status = options.progress?.obligations.find(
+          (entry) => entry.obligationId === obligation.id,
+        )?.status;
         return (
-          proposedDestinations.size > 0 &&
-          [...proposedDestinations].every((collectionId) =>
-            destinationCollectionIds.has(collectionId),
-          )
+          status !== "fulfilled" &&
+          status !== "already_satisfied" &&
+          status !== "cancelled"
         );
       });
-      if (!validMove) {
-        return {
-          message:
-            "True move required before confirmation: use one move_to_collection operation with mode:'move', the exact source collection ID, and the exact destination collection ID.",
-          expectedCount:
-            sourceCollectionIds.size + destinationCollectionIds.size,
-          proposedCount: prepared.operations.length,
-          rejectedTargets: prepared.requestedTargets,
-          missingTargets: [
-            ...[...sourceCollectionIds].map(
-              (collectionId) => `source-collection:${collectionId}`,
-            ),
-            ...[...destinationCollectionIds].map(
-              (collectionId) => `destination-collection:${collectionId}`,
-            ),
-          ],
-        };
+      if (!openMatches.length) {
+        const cancelled = matches.some(
+          (obligation) =>
+            options.progress?.obligations.find(
+              (entry) => entry.obligationId === obligation.id,
+            )?.status === "cancelled",
+        );
+        return failure(
+          cancelled
+            ? `Action ${proposal.operation} was cancelled and cannot be retried without a new user request.`
+            : `Action ${proposal.operation} is already verified and cannot be executed again.`,
+          contract,
+          prepared,
+          proposal.requestedTargets,
+          [],
+        );
+      }
+      for (const obligation of openMatches) {
+        const prefix = obligation.constraints?.tagPrefix;
+        const tags = proposal.parameters?.tags || [];
+        if (prefix && tags.some((tag) => !tag.startsWith(prefix))) {
+          return failure(
+            `Action constraint rejected: every tag must start with "${prefix}".`,
+            contract,
+            prepared,
+            tags
+              .filter((tag) => !tag.startsWith(prefix))
+              .map((tag) => `tag:${tag}`),
+            [],
+          );
+        }
+        if (!obligation.targetBoundary) continue;
+        const scope = obligation.scope;
+        const boundary = obligation.targetBoundary;
+        const currentTargets =
+          boundary.kind === "collection" && scope
+            ? await listScopeTargetIds(this.gateway, {
+                libraryID: scope.libraryID,
+                collectionId: scope.collectionId,
+                collectionPath: scope.collectionPath,
+                targetKind: obligation.targetKind,
+                includeDescendants: scope.includeDescendants,
+              })
+            : boundary.kind === "library"
+              ? await listCurrentLibraryTargetIds(this.gateway, {
+                  libraryID: boundary.libraryID,
+                  targetKind: obligation.targetKind,
+                })
+              : boundary.frozenTargetIds.filter((itemId) =>
+                  Boolean(this.gateway.getItem(itemId)),
+                );
+        if (
+          !sameArrayValues(
+            currentTargets.map(String),
+            boundary.frozenTargetIds.map(String),
+          )
+        ) {
+          return failure(
+            "Frozen target scope changed after planning; refresh and retry before mutating.",
+            contract,
+            prepared,
+            [],
+            boundary.frozenTargetIds.map(itemTarget),
+          );
+        }
+        if (obligation.scopeRole === "destination" && scope) {
+          if (!proposal.destinationCollectionIds.includes(scope.collectionId)) {
+            return failure(
+              `Action destination must be exact collection ${scope.collectionId}.`,
+              contract,
+              prepared,
+              proposal.destinationCollectionIds.map((id) => `collection:${id}`),
+              [`collection:${scope.collectionId}`],
+            );
+          }
+          continue;
+        }
+        const expected = new Set(boundary.frozenTargetIds.map(itemTarget));
+        const rejected = proposal.requestedTargets.filter(
+          (target) => target.startsWith("item:") && !expected.has(target),
+        );
+        if (rejected.length) {
+          return failure(
+            "Action scope rejected: proposed targets fall outside the frozen boundary.",
+            contract,
+            prepared,
+            rejected,
+            [],
+          );
+        }
       }
     }
-    const sourceObligations = obligations.filter(
-      (obligation) => obligation.scopeRole !== "destination",
-    );
-    if (!sourceObligations.length || !prepared.requestedTargets.length) {
-      return null;
-    }
-    const expectedTargets: string[] = [];
-    for (const obligation of sourceObligations) {
-      const scope = obligation.scope!;
-      const current = await listScopeTargetIds(this.gateway, {
-        libraryID: scope.libraryID,
-        collectionId: scope.collectionId,
-        collectionPath: scope.collectionPath,
-        targetKind: obligation.targetKind,
-        includeDescendants: scope.includeDescendants,
-      });
-      const frozen = [...scope.frozenTargetIds].sort((a, b) => a - b);
-      const refreshed = [...current].sort((a, b) => a - b);
-      if (JSON.stringify(frozen) !== JSON.stringify(refreshed)) {
-        return {
-          message: `Collection scope changed after planning; refresh and retry before mutating. Expected ${frozen.length} direct members, now found ${refreshed.length}.`,
-          expectedCount: frozen.length,
-          proposedCount: prepared.requestedTargets.length,
-          rejectedTargets: [],
-          missingTargets: frozen.map(itemTarget),
-        };
+
+    for (const obligation of contract.obligations) {
+      const progressStatus = options.progress?.obligations.find(
+        (entry) => entry.obligationId === obligation.id,
+      )?.status;
+      if (
+        progressStatus === "fulfilled" ||
+        progressStatus === "already_satisfied" ||
+        progressStatus === "cancelled" ||
+        !obligation.targetBoundary ||
+        obligation.scopeRole === "destination" ||
+        options.allowPartialCoverage
+      ) {
+        continue;
       }
-      expectedTargets.push(...frozen.map(itemTarget));
+      const proposed = new Set(
+        prepared.proposals
+          .filter((proposal) =>
+            matchingObligations(contract, proposal).includes(obligation),
+          )
+          .flatMap((proposal) => proposal.requestedTargets),
+      );
+      const missing = obligation.targetBoundary.frozenTargetIds
+        .map(itemTarget)
+        .filter((target) => !proposed.has(target));
+      if (missing.length) {
+        return failure(
+          "Action coverage rejected: every frozen target must be authorized before the batch starts.",
+          contract,
+          prepared,
+          [],
+          missing,
+        );
+      }
     }
-    const expected = new Set(expectedTargets);
-    const proposed = new Set(prepared.requestedTargets);
-    const rejectedTargets = [...proposed].filter(
-      (target) => !expected.has(target),
-    );
-    const requiresAll = sourceObligations.some(
-      (obligation) => obligation.coverage === "all",
-    );
-    const missingTargets = requiresAll
-      ? [...expected].filter((target) => !proposed.has(target))
-      : [];
-    if (!rejectedTargets.length && !missingTargets.length) return null;
-    return {
-      message: `Action scope rejected before confirmation: expected ${expected.size} direct member target(s), proposed ${proposed.size}.`,
-      expectedCount: expected.size,
-      proposedCount: proposed.size,
-      rejectedTargets,
-      missingTargets,
-    };
+    return null;
   }
 
   finalize(
+    contract: AgentActionContract | undefined,
     prepared: PreparedActionExecution,
     params: {
       ok: boolean;
@@ -282,21 +514,52 @@ export class ActionContractService {
       cancelled?: boolean;
       reason?: string;
       content?: unknown;
+      actionEvidence?: AgentActionEvidence[];
+    },
+  ): AgentActionReceipt[] {
+    return prepared.proposals.flatMap((proposal) => {
+      const obligations = contract
+        ? matchingObligations(contract, proposal)
+        : [undefined];
+      return (obligations.length ? obligations : [undefined]).map(
+        (obligation) => this.finalizeProposal(proposal, obligation, params),
+      );
+    });
+  }
+
+  private finalizeProposal(
+    proposal: AgentActionProposal,
+    obligation: AgentActionObligation | undefined,
+    params: {
+      ok: boolean;
+      effect?: AgentToolEffect;
+      cancelled?: boolean;
+      reason?: string;
+      content?: unknown;
+      actionEvidence?: AgentActionEvidence[];
     },
   ): AgentActionReceipt {
+    const evidenceRef = readEvidenceRef(params.content);
     const base = {
-      version: 1 as const,
-      descriptorKind: prepared.descriptor.kind,
-      capability: prepared.capability,
-      requestedTargets: prepared.requestedTargets,
+      version: 2 as const,
+      id: `${proposal.id}:${obligation?.id || "unmatched"}:${evidenceRef || "result"}`,
+      obligationId: obligation?.id,
+      proposalId: proposal.id,
+      proofDomain: proposal.proofDomain,
+      capability: proposal.capability,
+      operation: proposal.operation,
+      requestedTargets: proposal.requestedTargets,
       rejectedTargets: [] as string[],
+      normalizedParameters: proposal.parameters,
       reasons: params.reason ? [params.reason] : [],
-      verifiedFacts: prepared.verifiedFacts,
+      verifiedFacts:
+        proposal.operation === "read_full" ? ["read_mode:full"] : [],
+      evidenceRef,
     };
     if (params.cancelled) {
       return {
         ...base,
-        verification: "verified",
+        verification: "not_applicable",
         status: "cancelled",
         appliedTargets: [],
         alreadySatisfiedTargets: [],
@@ -311,7 +574,7 @@ export class ActionContractService {
         alreadySatisfiedTargets: [],
       };
     }
-    if (prepared.descriptor.kind === "execution_only") {
+    if (proposal.proofDomain === "execution") {
       return {
         ...base,
         verification: "execution_only",
@@ -320,26 +583,27 @@ export class ActionContractService {
         alreadySatisfiedTargets: [],
       };
     }
-    if (prepared.descriptor.kind === "artifact_state") {
-      const applied =
-        params.effect === "applied" ? prepared.requestedTargets : [];
+    if (proposal.proofDomain === "file_state") {
+      const proof = fileEvidence(proposal, params.content);
       return {
         ...base,
-        verification: params.effect === undefined ? "unverified" : "verified",
-        status:
-          params.effect === "applied"
-            ? "applied"
-            : params.effect === "none"
-              ? "already_satisfied"
-              : params.effect === "partial"
-                ? "partial"
-                : "unverified",
-        appliedTargets: applied,
+        id: `${base.id}:${proof.evidenceRef || "unverified"}`,
+        evidenceRef: proof.evidenceRef,
+        verification: proof.verified ? "verified" : "unverified",
+        status: proof.verified
+          ? params.effect === "none"
+            ? "already_satisfied"
+            : "applied"
+          : "unverified",
+        requestedTargets: [proof.target],
+        appliedTargets:
+          proof.verified && params.effect !== "none" ? [proof.target] : [],
         alreadySatisfiedTargets:
-          params.effect === "none" ? prepared.requestedTargets : [],
+          proof.verified && params.effect === "none" ? [proof.target] : [],
+        reasons: [...base.reasons, ...(proof.reason ? [proof.reason] : [])],
       };
     }
-    if (prepared.descriptor.source === "zotero_read") {
+    if (proposal.operation === "read_full") {
       return {
         ...base,
         verification: "verified",
@@ -349,126 +613,209 @@ export class ActionContractService {
       };
     }
     if (
-      prepared.descriptor.kind === "semantic_state" &&
-      prepared.descriptor.action?.kind === "note_write"
+      proposal.operation === "note_create" ||
+      proposal.operation === "note_edit" ||
+      proposal.operation === "note_append"
     ) {
-      const noteVerification = verifyNoteWriteTarget(
-        prepared.descriptor,
+      const verification = verifyNoteWriteTarget(
+        proposal,
         params.content,
         this.gateway,
       );
-      if (noteVerification.targets) {
-        return {
-          ...base,
-          verification: "verified",
-          status: "applied",
-          requestedTargets: noteVerification.targets,
-          appliedTargets: noteVerification.targets,
-          alreadySatisfiedTargets: [],
-        };
-      }
+      return verification.targets
+        ? {
+            ...base,
+            verification: "verified",
+            status: params.effect === "none" ? "already_satisfied" : "applied",
+            requestedTargets: verification.targets,
+            appliedTargets:
+              params.effect === "none" ? [] : verification.targets,
+            alreadySatisfiedTargets:
+              params.effect === "none" ? verification.targets : [],
+          }
+        : {
+            ...base,
+            verification: "unverified",
+            status: "unverified",
+            appliedTargets: [],
+            alreadySatisfiedTargets: [],
+            reasons: [...base.reasons, verification.reason],
+          };
+    }
+
+    if (proposal.operation === "settings_update") {
+      const key = proposal.parameters?.settingsKey || "";
+      const state = key ? this.gateway.getSettingNativeState?.(key) : undefined;
+      const verified = Boolean(
+        state?.exists &&
+        JSON.stringify(state.value) === proposal.parameters?.settingsValue,
+      );
+      const target = `setting:${key || "unknown"}`;
+      return {
+        ...base,
+        verification: verified ? "verified" : "unverified",
+        status: verified
+          ? params.effect === "none"
+            ? "already_satisfied"
+            : "applied"
+          : "unverified",
+        requestedTargets: [target],
+        appliedTargets: verified && params.effect !== "none" ? [target] : [],
+        alreadySatisfiedTargets:
+          verified && params.effect === "none" ? [target] : [],
+        rejectedTargets: verified ? [] : [target],
+      };
+    }
+    if (proposal.operation === "annotation_write") {
+      const result = innermostToolResult(params.content);
+      const annotationId = Number(result.annotationId);
+      const annotation = annotationId
+        ? this.gateway.getItem(annotationId)
+        : null;
+      const verified = Boolean(
+        annotation &&
+        annotation.isAnnotation?.() === true &&
+        Number(annotation.parentID) === proposal.parameters?.targetItemId,
+      );
+      const target = annotationId
+        ? `item:${annotationId}`
+        : proposal.requestedTargets[0] || "annotation:unknown";
+      return {
+        ...base,
+        verification: verified ? "verified" : "unverified",
+        status: verified ? "applied" : "unverified",
+        requestedTargets: [target],
+        appliedTargets: verified ? [target] : [],
+        alreadySatisfiedTargets: [],
+        rejectedTargets: verified ? [] : [target],
+      };
+    }
+    if (proposal.operation === "undo" || proposal.operation === "revert") {
+      const result = innermostToolResult(params.content);
+      const noWork =
+        result.status === "nothing_reversible" ||
+        (Number(result.reverted) === 0 &&
+          Number(result.partiallyReverted) === 0 &&
+          params.effect === "none");
+      const verified =
+        noWork ||
+        (proposal.operation === "undo"
+          ? result.status === "undone"
+          : Number(result.reverted) > 0 &&
+            Number(result.partiallyReverted) === 0 &&
+            Array.isArray(result.actionIds));
+      return {
+        ...base,
+        verification: verified ? "verified" : "unverified",
+        status: verified
+          ? noWork
+            ? "already_satisfied"
+            : "applied"
+          : "unverified",
+        appliedTargets: verified && !noWork ? proposal.requestedTargets : [],
+        alreadySatisfiedTargets:
+          verified && noWork ? proposal.requestedTargets : [],
+        rejectedTargets: verified ? [] : proposal.requestedTargets,
+        evidenceRef:
+          proposal.operation === "undo" && typeof result.actionId === "string"
+            ? result.actionId
+            : base.evidenceRef,
+      };
+    }
+
+    const operation = proposal.operationValue;
+    if (!operation) {
       return {
         ...base,
         verification: "unverified",
         status: "unverified",
         appliedTargets: [],
         alreadySatisfiedTargets: [],
-        reasons: [...base.reasons, noteVerification.reason],
+        reasons: [
+          ...base.reasons,
+          "No native Zotero post-state verifier is registered for this action.",
+        ],
       };
     }
-    if (!prepared.requestedTargets.length) {
-      const createdTargets = createdSemanticTargets(
-        prepared.operations,
-        params.content,
-        this.gateway,
-      );
-      if (createdTargets?.length) {
-        return {
-          ...base,
-          verification: "verified",
-          status: "applied",
-          requestedTargets: createdTargets,
-          appliedTargets: createdTargets,
-          alreadySatisfiedTargets: [],
-        };
-      }
-    }
-    const appliedTargets: string[] = [];
-    const alreadySatisfiedTargets: string[] = [];
-    const unverifiedTargets: string[] = [];
-    for (const target of prepared.requestedTargets) {
-      const itemId = targetItemId(target);
-      const relevant = itemId
-        ? prepared.operations.filter((operation) =>
-            operationItemIds(operation).includes(itemId),
-          )
+    const evidence = matchingNativeEvidence(proposal, params.actionEvidence);
+    const verified = Boolean(
+      evidence &&
+      mutationPostconditionIsSatisfied(operation, evidence.postState),
+    );
+    const targets = proposal.requestedTargets.length
+      ? proposal.requestedTargets
+      : evidence
+        ? evidenceTargets(evidence)
         : [];
-      const verified =
-        itemId && relevant.length
-          ? relevant.every(
-              (operation) =>
-                targetSatisfied(operation, itemId, this.gateway) === true ||
-                targetSatisfiedFromResult(
-                  operation,
-                  itemId,
-                  params.content,
-                  this.gateway,
-                ) === true,
-            )
-          : false;
-      if (!verified) {
-        unverifiedTargets.push(target);
-      } else if (prepared.alreadySatisfiedTargets.includes(target)) {
-        alreadySatisfiedTargets.push(target);
-      } else {
-        appliedTargets.push(target);
-      }
-    }
-    const verifiedCount =
-      appliedTargets.length + alreadySatisfiedTargets.length;
-    const verification = unverifiedTargets.length ? "unverified" : "verified";
-    const status =
-      verifiedCount === prepared.requestedTargets.length && verifiedCount > 0
-        ? appliedTargets.length
-          ? "applied"
-          : "already_satisfied"
-        : verifiedCount > 0
-          ? "partial"
-          : "unverified";
+    const wasAlreadySatisfied = Boolean(
+      evidence &&
+      mutationPostconditionIsSatisfied(operation, evidence.preState),
+    );
+    const alreadySatisfied =
+      verified && (wasAlreadySatisfied || params.effect === "none");
     return {
       ...base,
-      verification,
-      status,
-      appliedTargets,
-      alreadySatisfiedTargets,
-      rejectedTargets: unverifiedTargets,
+      evidenceRef: evidence?.journalStepId || base.evidenceRef,
+      verification: verified ? "verified" : "unverified",
+      status: verified
+        ? alreadySatisfied
+          ? "already_satisfied"
+          : "applied"
+        : "unverified",
+      requestedTargets: targets,
+      appliedTargets: verified && !alreadySatisfied ? targets : [],
+      alreadySatisfiedTargets: alreadySatisfied ? targets : [],
+      rejectedTargets: verified ? [] : targets,
       reasons: [
         ...base.reasons,
-        ...(unverifiedTargets.length
-          ? [
-              `Postcondition could not be verified for ${unverifiedTargets.join(", ")}.`,
-            ]
-          : []),
+        ...(verified
+          ? []
+          : [
+              evidence
+                ? `The mutation handler rejected the captured native post-state for ${operation.type}.`
+                : `No captured native post-state was attached for ${operation.type}.`,
+            ]),
       ],
     };
   }
 
-  rejectionReceipt(
+  rejectionReceipts(
+    contract: AgentActionContract | undefined,
     prepared: PreparedActionExecution,
-    failure: ScopeValidationFailure,
-  ): AgentActionReceipt {
-    return {
-      version: 1,
-      descriptorKind: prepared.descriptor.kind,
-      capability: prepared.capability,
-      verification: "verified",
+    validationFailure: ScopeValidationFailure,
+  ): AgentActionReceipt[] {
+    const proposals = prepared.proposals.length
+      ? prepared.proposals
+      : [
+          {
+            id: "missing-proposal",
+            proofDomain: "zotero_state" as const,
+            capability: "zotero.read" as const,
+            operation: "read_full" as const,
+            source: "full_read" as const,
+            requestedTargets: [] as string[],
+            destinationCollectionIds: [] as number[],
+          },
+        ];
+    return proposals.map((proposal) => ({
+      version: 2,
+      id: `${proposal.id}:rejected`,
+      proposalId: proposal.id,
+      proofDomain: proposal.proofDomain,
+      capability: proposal.capability,
+      operation: proposal.operation,
+      verification: "not_applicable",
       status: "failed",
-      requestedTargets: prepared.requestedTargets,
+      requestedTargets: proposal.requestedTargets,
       appliedTargets: [],
       alreadySatisfiedTargets: [],
-      rejectedTargets: failure.rejectedTargets,
-      reasons: [failure.message],
-      verifiedFacts: prepared.verifiedFacts,
-    };
+      rejectedTargets: validationFailure.rejectedTargets,
+      normalizedParameters: proposal.parameters,
+      reasons: [validationFailure.message],
+      verifiedFacts: [],
+      obligationId: contract
+        ? matchingObligations(contract, proposal)[0]?.id
+        : undefined,
+    }));
   }
 }

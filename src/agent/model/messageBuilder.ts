@@ -2,6 +2,7 @@ import { renderLibraryOverviewSection } from "../context/libraryOverview";
 
 import type {
   AgentContentInputCapabilities,
+  AgentActionObligation,
   AgentModelMessage,
   AgentRuntimeRequest,
   AgentToolDefinition,
@@ -130,6 +131,15 @@ export function normalizeHistoryMessages(
     }));
 }
 
+function describeFrozenTargets(obligation: AgentActionObligation): string {
+  const boundary = obligation.targetBoundary;
+  if (!boundary) return "";
+  if (boundary.frozenTargetIds.length <= 50) {
+    return `frozen item IDs [${boundary.frozenTargetIds.join(", ")}]`;
+  }
+  return `${boundary.frozenTargetIds.length} frozen targets (scope digest ${boundary.scopeDigest})`;
+}
+
 function buildFullUserMessage(
   request: AgentRuntimeRequest,
   options: {
@@ -156,8 +166,12 @@ function buildFullUserMessage(
       const scope = obligation.scope
         ? obligation.scopeRole === "destination"
           ? ` exact destination collection "${obligation.scope.collectionPath}" (ID ${obligation.scope.collectionId})`
-          : ` exact source collection "${obligation.scope.collectionPath}", direct members only, frozen item IDs [${obligation.scope.frozenTargetIds.join(", ")}]`
-        : "";
+          : ` exact source collection "${obligation.scope.collectionPath}", direct members only, ${describeFrozenTargets(obligation)}`
+        : obligation.targetBoundary?.kind === "library"
+          ? ` frozen whole-library scope, ${describeFrozenTargets(obligation)}`
+          : obligation.targetBoundary?.kind === "selection"
+            ? ` frozen selected scope, ${describeFrozenTargets(obligation)}`
+            : "";
       const constraint = obligation.constraints?.tagPrefix
         ? `, required tag prefix "${obligation.constraints.tagPrefix}"`
         : "";
@@ -559,6 +573,12 @@ function buildWriteNoteFileInstruction(
     return (
       'TURN RULE: The user is asking for an Obsidian/file-based note. Successful completion requires calling `file_io` with `action: "write"` and Markdown content. ' +
       "Do not finish by placing the full note body in chat. If the notes directory is not configured or the target path cannot be resolved, give a brief setup error instead of dumping the note body."
+    );
+  }
+  if (destination === "both") {
+    return (
+      "TURN RULE: The user explicitly requested both a Zotero note and a filesystem export. " +
+      'Use `note_write` for the Zotero note and `file_io` with `action: "write"` for the external Markdown file. Both independently verified results are required before finishing.'
     );
   }
   return "";

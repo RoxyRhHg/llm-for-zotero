@@ -26,6 +26,7 @@ import {
   updateJournalAction,
 } from "../../store/changeJournal";
 import { ok, fail, validateObject, normalizePositiveInt } from "../shared";
+import { capabilityForLibraryMutation } from "../../services/libraryMutation/handlerOperations";
 
 type RunBatchInput = {
   kind: "run";
@@ -74,6 +75,48 @@ const DURABLE_BATCH_JOBS = new Set([
   "audit_library",
 ]);
 
+function operationForBatchJob(job: string) {
+  return job === "auto_tag"
+    ? ("apply_tags" as const)
+    : job === "organize_unfiled"
+      ? ("move_to_collection" as const)
+      : job === "audit_library"
+        ? ("update_metadata" as const)
+        : null;
+}
+
+function frozenContractTargets(
+  job: string,
+  context: import("../../types").AgentToolContext,
+): number[] | null {
+  const operation = operationForBatchJob(job);
+  if (!operation) return null;
+  const obligation = context.request.actionContract?.obligations.find(
+    (entry) =>
+      entry.operation === operation && entry.scopeRole !== "destination",
+  );
+  return obligation?.targetBoundary
+    ? [...obligation.targetBoundary.frozenTargetIds]
+    : null;
+}
+
+function bindFrozenTargets(
+  jobArgs: Record<string, unknown>,
+  frozenItemIds: number[],
+): Record<string, unknown> {
+  const {
+    scope: _scope,
+    collectionId: _collectionId,
+    collectionIds: _collectionIds,
+    itemIds: _itemIds,
+    tagNames: _tagNames,
+    tagScopes: _tagScopes,
+    _batchItemIds: _previousBatchItemIds,
+    ...retained
+  } = jobArgs;
+  return { ...retained, _batchItemIds: frozenItemIds };
+}
+
 /**
  * Runs and resumes durable library-wide jobs.
  *
@@ -92,7 +135,76 @@ export function createLibraryBatchTool(deps: {
   const now = deps.now ?? (() => Date.now());
   const store = deps.batchJobStore ?? defaultBatchJobStore;
 
+  const describeBatchOperation = (
+    job: string,
+    jobArgs: Record<string, unknown>,
+    identity: string,
+    context?: import("../../types").AgentToolContext,
+  ) => {
+    const operation = operationForBatchJob(job);
+    if (!operation) return [];
+    const requestedItemIds = Array.isArray(jobArgs.itemIds)
+      ? jobArgs.itemIds
+          .map(Number)
+          .filter((itemId) => Number.isInteger(itemId) && itemId > 0)
+      : [];
+    const obligation = context?.request.actionContract?.obligations.find(
+      (entry) =>
+        entry.operation === operation && entry.scopeRole !== "destination",
+    );
+    const progress = context?.request.actionProgress?.obligations.find(
+      (entry) => entry.obligationId === obligation?.id,
+    );
+    const progressItemIds = (progress?.unresolvedTargetIds || [])
+      .map((target) => Number(target.match(/^item:(\d+)$/)?.[1]))
+      .filter((itemId) => Number.isInteger(itemId) && itemId > 0);
+    const itemIds = progressItemIds.length
+      ? progressItemIds
+      : obligation?.targetBoundary?.frozenTargetIds || requestedItemIds;
+    const targetCollectionId = normalizePositiveInt(jobArgs.targetCollectionId);
+    return [
+      {
+        id: `${operation}:library_batch:${identity}`,
+        proofDomain: "zotero_state" as const,
+        capability: capabilityForLibraryMutation(operation),
+        operation,
+        source: "library_mutation" as const,
+        parameters: targetCollectionId
+          ? { destinationCollectionId: targetCollectionId }
+          : undefined,
+        requestedTargets: itemIds.map((itemId) => `item:${itemId}`),
+        destinationCollectionIds: targetCollectionId
+          ? [targetCollectionId]
+          : [],
+      },
+    ];
+  };
+
   return {
+    describeAction: async (input, context) => {
+      if (input.kind === "list") return [];
+      if (input.kind === "run") {
+        return describeBatchOperation(
+          input.job,
+          input.jobArgs,
+          input.job,
+          context,
+        );
+      }
+      const job = await store.getBatchJob(input.resumeJobId);
+      let args: Record<string, unknown> = {};
+      if (job) {
+        try {
+          const parsed = JSON.parse(job.inputJson);
+          if (validateObject<Record<string, unknown>>(parsed)) args = parsed;
+        } catch {
+          args = {};
+        }
+      }
+      return job
+        ? describeBatchOperation(job.action, args, job.jobId, context)
+        : [];
+    },
     spec: {
       name: "library_batch",
       description:
@@ -332,6 +444,13 @@ export function createLibraryBatchTool(deps: {
         now,
         store,
       });
+      if (!prepared.resumed) {
+        const frozenItemIds = frozenContractTargets(prepared.job, context);
+        if (frozenItemIds) {
+          prepared.jobArgs = bindFrozenTargets(prepared.jobArgs, frozenItemIds);
+          prepared.totalCount = frozenItemIds.length;
+        }
+      }
       const action = deps.actionRegistry.getAction(prepared.job);
       if (!action) {
         await store.finishBatchJob({
@@ -442,6 +561,7 @@ export function createLibraryBatchTool(deps: {
           totalCount,
           now: now(),
         });
+        await context.checkpointActionProgress?.();
         checkpointSeen = true;
         lastCursor = cursor;
         lastAppliedCount = appliedCount;

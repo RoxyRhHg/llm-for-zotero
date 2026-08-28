@@ -431,6 +431,21 @@ export function createFileIOTool(): AgentWriteToolDefinition<
   unknown
 > {
   return {
+    describeAction: (input) =>
+      input.action === "write"
+        ? [
+            {
+              id: `file_write:${input.filePath}`,
+              proofDomain: "file_state",
+              capability: "file.write",
+              operation: "file_write",
+              source: "file_io",
+              parameters: { filePath: input.filePath },
+              requestedTargets: [`file:${input.filePath}`],
+              destinationCollectionIds: [],
+            },
+          ]
+        : [],
     spec: {
       name: "file_io",
       description:
@@ -874,11 +889,16 @@ export function createFileIOTool(): AgentWriteToolDefinition<
             nextContent,
             input.encoding || "utf-8",
           );
+          const readbackBytes = await readFileBytes(input.filePath);
+          const readbackChecksum = await sha256Bytes(readbackBytes);
           return {
             result: {
               action: "write",
               filePath: input.filePath,
               bytesWritten: nextBytes.byteLength,
+              exists: true,
+              expectedContentHash: nextChecksum,
+              contentHash: readbackChecksum,
             },
             expectedPostcondition: {
               kind: "file",

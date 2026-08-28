@@ -23,6 +23,7 @@ import { zoteroChangeDispatcher } from "../../../services/zoteroChangeDispatcher
 import { LibraryMutationService } from "../../services/libraryMutationService";
 import { ZoteroGateway } from "../../services/zoteroGateway";
 import { parseInverseValue } from "../../services/changeReverter";
+import { fingerprintText } from "../../contracts/actionOperationEvidence";
 
 // ── Types ───────────────────────────────────────────────────────────────────
 
@@ -784,6 +785,20 @@ export function createZoteroScriptTool(
   runtimeOptions: ZoteroScriptRuntimeOptions = {},
 ): AgentWriteToolDefinition<ZoteroScriptInput, unknown> {
   return {
+    describeAction: (input) => [
+      {
+        id: `zotero_script_execute:${fingerprintText(input.script)}`,
+        proofDomain: "execution",
+        capability: "zotero.script",
+        operation: "zotero_script_execute",
+        source: "zotero_script",
+        parameters: {
+          commandFingerprint: fingerprintText(input.script),
+        },
+        requestedTargets: [],
+        destinationCollectionIds: [],
+      },
+    ],
     spec: {
       name: "zotero_script",
       description:

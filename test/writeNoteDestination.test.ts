@@ -40,6 +40,15 @@ describe("write note destination classifier", function () {
     );
   });
 
+  it("preserves explicit mixed Zotero-note and file-export requests", function () {
+    assert.equal(
+      classifyWriteNoteDestination(
+        "create a Zotero note and also export it to my Obsidian vault",
+      ),
+      "both",
+    );
+  });
+
   it("does not turn ordinary paper requests into note destination rules", function () {
     assert.equal(classifyWriteNoteDestination("summarize this paper"), "none");
   });

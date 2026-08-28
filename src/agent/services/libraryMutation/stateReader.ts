@@ -7,92 +7,15 @@ import type {
   MutationItemState,
   RelateItemsOperation,
 } from "./contracts";
-import { mutationUsesDeferredInverse } from "./handlerRegistry";
+import {
+  createdObjectIdsForLibraryMutation,
+  mutationUsesDeferredInverse,
+  targetItemIdsForLibraryMutation,
+} from "./handlerOperations";
 
 function normalizeLibraryID(value: unknown): number {
   const numeric = Number(value);
   return Number.isFinite(numeric) && numeric > 0 ? Math.floor(numeric) : 0;
-}
-
-function operationItemIds(operation: LibraryMutationOperation): number[] {
-  const record = operation as unknown as Record<string, unknown>;
-  const ids: number[] = [];
-  const add = (value: unknown): void => {
-    const id = Math.floor(Number(value));
-    if (Number.isFinite(id) && id > 0 && !ids.includes(id)) ids.push(id);
-  };
-  add(record.itemId);
-  add(record.targetItemId);
-  add(record.masterItemId);
-  add(record.attachmentId);
-  for (const key of ["itemIds", "otherItemIds"]) {
-    const values = record[key];
-    if (Array.isArray(values)) values.forEach(add);
-  }
-  const assignments = record.assignments;
-  if (Array.isArray(assignments)) {
-    for (const assignment of assignments) {
-      if (assignment && typeof assignment === "object") {
-        add((assignment as Record<string, unknown>).itemId);
-      }
-    }
-  }
-  return ids;
-}
-
-function resultCreatedItemIds(value: unknown): number[] {
-  const ids = new Set<number>();
-  const visit = (candidate: unknown, depth: number): void => {
-    if (depth > 6 || candidate === null || candidate === undefined) return;
-    if (Array.isArray(candidate)) {
-      candidate.forEach((entry) => visit(entry, depth + 1));
-      return;
-    }
-    if (typeof candidate !== "object") return;
-    const record = candidate as Record<string, unknown>;
-    for (const key of ["itemId", "noteId", "annotationId"]) {
-      const id = Math.floor(Number(record[key]));
-      if (Number.isFinite(id) && id > 0) ids.add(id);
-    }
-    if (Array.isArray(record.itemIds)) {
-      for (const value of record.itemIds) {
-        const id = Math.floor(Number(value));
-        if (Number.isFinite(id) && id > 0) ids.add(id);
-      }
-    }
-    for (const nested of Object.values(record)) visit(nested, depth + 1);
-  };
-  visit(value, 0);
-  return [...ids];
-}
-
-function resultObjectIds(
-  value: unknown,
-  singularKeys: readonly string[],
-  pluralKeys: readonly string[],
-): number[] {
-  const ids = new Set<number>();
-  const add = (candidate: unknown): void => {
-    const id = Math.floor(Number(candidate));
-    if (Number.isFinite(id) && id > 0) ids.add(id);
-  };
-  const visit = (candidate: unknown, depth: number): void => {
-    if (depth > 6 || candidate === null || candidate === undefined) return;
-    if (Array.isArray(candidate)) {
-      candidate.forEach((entry) => visit(entry, depth + 1));
-      return;
-    }
-    if (typeof candidate !== "object") return;
-    const record = candidate as Record<string, unknown>;
-    singularKeys.forEach((key) => add(record[key]));
-    for (const key of pluralKeys) {
-      const values = record[key];
-      if (Array.isArray(values)) values.forEach(add);
-    }
-    Object.values(record).forEach((entry) => visit(entry, depth + 1));
-  };
-  visit(value, 0);
-  return [...ids].sort((left, right) => left - right);
 }
 
 function readCollectionChildIds(
@@ -294,13 +217,16 @@ export class MutationStateReader {
     context: AgentToolContext,
     executionResult?: unknown,
   ): Promise<LibraryMutationState> {
-    let itemIds = operationItemIds(operation);
+    let itemIds = targetItemIdsForLibraryMutation(operation);
+    const createdIds =
+      executionResult === undefined
+        ? { itemIds: [], collectionIds: [], savedSearchIds: [] }
+        : createdObjectIdsForLibraryMutation(operation, executionResult);
     if (executionResult !== undefined) {
-      const createdItemIds = resultCreatedItemIds(executionResult);
       itemIds =
-        mutationUsesDeferredInverse(operation) && createdItemIds.length
-          ? createdItemIds
-          : Array.from(new Set([...itemIds, ...createdItemIds]));
+        mutationUsesDeferredInverse(operation) && createdIds.itemIds.length
+          ? createdIds.itemIds
+          : Array.from(new Set([...itemIds, ...createdIds.itemIds]));
     }
     if (operation.type === "update_metadata" && !itemIds.length) {
       const target = this.zoteroGateway.resolveMetadataItem({
@@ -451,7 +377,8 @@ export class MutationStateReader {
           ).sort((left, right) => left - right);
         }
         if (item.isNote?.()) {
-          state.noteHtmlChecksum = await sha256Text(item.getNote?.() || "");
+          state.noteHtml = item.getNote?.() || "";
+          state.noteHtmlChecksum = await sha256Text(state.noteHtml);
         }
       }
       states.push(state);
@@ -468,12 +395,33 @@ export class MutationStateReader {
       operation.collectionIds?.forEach((id) => collectionIds.add(id));
     }
     if (executionResult !== undefined) {
-      const resultIds = resultObjectIds(
-        executionResult,
-        operation.type === "create_collection" ? ["collectionId"] : [],
-        ["restoredCollectionIds"],
-      );
-      resultIds.forEach((id) => collectionIds.add(id));
+      createdIds.collectionIds.forEach((id) => collectionIds.add(id));
+    }
+    if (
+      operation.type === "create_collection" &&
+      executionResult &&
+      typeof executionResult === "object" &&
+      (executionResult as { reconciliation?: unknown }).reconciliation === true
+    ) {
+      const libraryID = this.zoteroGateway.resolveLibraryID({
+        request: context.request,
+        item: context.item,
+        libraryID: operation.libraryID,
+      });
+      for (const summary of this.zoteroGateway.listCurrentCollectionSummaries(
+        libraryID,
+      )) {
+        if (summary.name !== operation.name) continue;
+        const collection = this.zoteroGateway.getCollection(
+          summary.collectionId,
+        );
+        if (
+          (Number(collection?.parentID) || null) ===
+          (operation.parentCollectionId ?? null)
+        ) {
+          collectionIds.add(summary.collectionId);
+        }
+      }
     }
     const collections = [...collectionIds]
       .sort((left, right) => left - right)
@@ -515,11 +463,7 @@ export class MutationStateReader {
       operation.savedSearchIds?.forEach((id) => savedSearchIds.add(id));
     }
     if (executionResult !== undefined) {
-      resultObjectIds(
-        executionResult,
-        operation.type === "save_saved_search" ? ["savedSearchId"] : [],
-        ["restoredSavedSearchIds"],
-      ).forEach((id) => savedSearchIds.add(id));
+      createdIds.savedSearchIds.forEach((id) => savedSearchIds.add(id));
     }
     const savedSearches = [...savedSearchIds]
       .sort((left, right) => left - right)

@@ -1019,6 +1019,7 @@ describe("primitive agent tools", function () {
     const tool = createFileIOTool();
     const createdDirs = new Set<string>();
     const writes: Array<{ path: string; text: string }> = [];
+    const writtenBytes = new Map<string, Uint8Array>();
     const originalIOUtils = (globalThis as { IOUtils?: unknown }).IOUtils;
     const originalOS = (globalThis as { OS?: unknown }).OS;
     (globalThis as { IOUtils?: unknown }).IOUtils = {
@@ -1035,7 +1036,9 @@ describe("primitive agent tools", function () {
           path,
           text: new TextDecoder().decode(bytes),
         });
+        writtenBytes.set(path, bytes);
       },
+      read: async (path: string) => writtenBytes.get(path) || new Uint8Array(),
     };
     (globalThis as { OS?: unknown }).OS = {
       File: {
@@ -1105,6 +1108,8 @@ describe("primitive agent tools", function () {
       write: async (path: string, bytes: Uint8Array) => {
         fileContent.set(path, new TextDecoder().decode(bytes));
       },
+      read: async (path: string) =>
+        new TextEncoder().encode(fileContent.get(path) || ""),
       makeDirectory: async () => undefined,
     };
     const context: AgentToolContext = {
@@ -1156,6 +1161,7 @@ describe("primitive agent tools", function () {
     const tool = createFileIOTool();
     const encoder = new TextEncoder();
     const writes: string[] = [];
+    const writtenBytes = new Map<string, Uint8Array>();
     const originalIOUtils = (globalThis as { IOUtils?: unknown }).IOUtils;
     const manifestPath = "/tmp/llm-for-zotero-mineru/77/manifest.json";
     const manifest = {
@@ -1189,11 +1195,13 @@ describe("primitive agent tools", function () {
     (globalThis as { IOUtils?: unknown }).IOUtils = {
       exists: async (path: string) => path === manifestPath,
       read: async (path: string) => {
+        if (writtenBytes.has(path)) return writtenBytes.get(path)!;
         if (path !== manifestPath) throw new Error(`Unexpected read: ${path}`);
         return encoder.encode(JSON.stringify(manifest));
       },
-      write: async (path: string) => {
+      write: async (path: string, bytes: Uint8Array) => {
         writes.push(path);
+        writtenBytes.set(path, bytes);
       },
       makeDirectory: async () => undefined,
     };
@@ -1274,6 +1282,7 @@ describe("primitive agent tools", function () {
       { type: "image", img_path: "images/b.jpg", page_idx: 1 },
       { type: "image", img_path: "images/c.jpg", page_idx: 1 },
     ];
+    const writtenBytes = new Map<string, Uint8Array>();
     (globalThis as { IOUtils?: unknown }).IOUtils = {
       exists: async (path: string) =>
         [
@@ -1285,6 +1294,7 @@ describe("primitive agent tools", function () {
           `${cacheDir}/images/c.jpg`,
         ].includes(path),
       read: async (path: string) => {
+        if (writtenBytes.has(path)) return writtenBytes.get(path)!;
         if (path === fullMdPath) return encoder.encode(fullMd);
         if (path === contentListPath) {
           return encoder.encode(JSON.stringify(contentList));
@@ -1293,8 +1303,9 @@ describe("primitive agent tools", function () {
       },
       getChildren: async (path: string) =>
         path === cacheDir ? [contentListPath] : [],
-      write: async (path: string) => {
+      write: async (path: string, bytes: Uint8Array) => {
         writes.push(path);
+        writtenBytes.set(path, bytes);
       },
       makeDirectory: async () => undefined,
     };
@@ -1376,6 +1387,9 @@ describe("primitive agent tools", function () {
           `${cacheDir}/images/c.jpg`,
         ].includes(path),
       read: async (path: string) => {
+        if (fileContent.has(path)) {
+          return encoder.encode(fileContent.get(path) || "");
+        }
         if (path === fullMdPath) return encoder.encode(fullMd);
         if (path === contentListPath) {
           return encoder.encode(JSON.stringify(contentList));
@@ -1569,6 +1583,9 @@ describe("primitive agent tools", function () {
       exists: async (path: string) =>
         path === manifestPath || path === cropCachePath,
       read: async (path: string) => {
+        if (fileContent.has(path)) {
+          return encoder.encode(fileContent.get(path) || "");
+        }
         if (path === manifestPath)
           return encoder.encode(JSON.stringify(manifest));
         if (path === cropCachePath) {
@@ -1659,6 +1676,9 @@ describe("primitive agent tools", function () {
     (globalThis as { IOUtils?: unknown }).IOUtils = {
       exists: async (path: string) => path === manifestPath,
       read: async (path: string) => {
+        if (fileContent.has(path)) {
+          return encoder.encode(fileContent.get(path) || "");
+        }
         if (path !== manifestPath) throw new Error(`Unexpected read: ${path}`);
         return encoder.encode(JSON.stringify(manifest));
       },

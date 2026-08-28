@@ -1,10 +1,11 @@
 import { assert } from "chai";
+import { libraryMutationHandlers } from "../src/agent/services/libraryMutation/handlerRegistry";
+import type { LibraryMutationOperationType } from "../src/agent/services/libraryMutation/handlerDefinition";
 import {
+  createdObjectIdsForLibraryMutation,
   isRegisteredLibraryMutationOperation,
-  libraryMutationHandlers,
-  mutationInverseIsSatisfied,
-  type LibraryMutationOperationType,
-} from "../src/agent/services/libraryMutation/handlerRegistry";
+  mutationPostconditionIsSatisfied,
+} from "../src/agent/services/libraryMutation/handlerOperations";
 import { MutationStateView } from "../src/agent/services/libraryMutation/stateView";
 
 describe("library mutation handler registry", function () {
@@ -44,14 +45,22 @@ describe("library mutation handler registry", function () {
       assert.strictEqual(handler.type, type);
       assert.isFunction(handler.validate);
       assert.isFunction(handler.targetCount);
+      assert.isFunction(handler.targetItemIds);
+      assert.isFunction(handler.actionParameters);
+      assert.isFunction(handler.destinationCollectionIds);
+      assert.isFunction(handler.additionalActionTargets);
+      assert.isFunction(handler.createdItemIds);
+      assert.isFunction(handler.createdCollectionIds);
+      assert.isFunction(handler.createdSavedSearchIds);
       assert.isFunction(handler.affectedCount);
       assert.isFunction(handler.atomize);
       assert.isArray(handler.stateSections);
       assert.isFunction(handler.deferredInverse);
       assert.isFunction(handler.planInverse);
-      assert.isFunction(handler.inverseSatisfied);
+      assert.isFunction(handler.postconditionSatisfied);
       assert.isFunction(handler.execute);
       assert.include(["state-aware", "forward-only"], handler.replay);
+      assert.include(["items", "none"], handler.targetScope);
       assert.include(
         [
           "item-metadata-tags-relations",
@@ -62,6 +71,21 @@ describe("library mutation handler registry", function () {
         handler.executionDomain,
       );
     }
+  });
+
+  it("binds created IDs only from each handler's declared result shape", function () {
+    assert.deepEqual(
+      createdObjectIdsForLibraryMutation(
+        { type: "create_collection", name: "Methods" },
+        {
+          result: {
+            collectionId: 42,
+            unrelated: { itemId: 999, savedSearchId: 888 },
+          },
+        },
+      ),
+      { itemIds: [], collectionIds: [42], savedSearchIds: [] },
+    );
   });
 
   it("rejects inherited and malformed discriminants without throwing", function () {
@@ -112,9 +136,9 @@ describe("library mutation handler registry", function () {
       },
     };
 
-    assert.isTrue(mutationInverseIsSatisfied(operation, state));
+    assert.isTrue(mutationPostconditionIsSatisfied(operation, state));
     assert.isFalse(
-      mutationInverseIsSatisfied(
+      mutationPostconditionIsSatisfied(
         {
           ...operation,
           metadata: {
@@ -177,7 +201,7 @@ describe("library mutation handler registry", function () {
       const samples: number[] = [];
       for (let run = 0; run < 5; run += 1) {
         const started = performance.now();
-        assert.isTrue(mutationInverseIsSatisfied(operation, state));
+        assert.isTrue(mutationPostconditionIsSatisfied(operation, state));
         samples.push(performance.now() - started);
       }
       samples.sort((left, right) => left - right);

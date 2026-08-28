@@ -1,159 +1,30 @@
-import type {
-  LibraryMutationOperation,
-  LibraryMutationState,
-} from "./contracts";
-import type { AgentToolContext } from "../../types";
-import type { ZoteroGateway } from "../zoteroGateway";
-import { forwardExecutors, type ForwardExecution } from "./forwardExecutors";
+import type { LibraryMutationOperation } from "./contracts";
 import { canonicalJsonEqual } from "./canonicalJson";
-import { asMutationStateView, MutationStateView } from "./stateView";
-
-export type LibraryMutationOperationType = LibraryMutationOperation["type"];
-export type LibraryMutationOperationOf<
-  Type extends LibraryMutationOperationType,
-> = Extract<LibraryMutationOperation, { type: Type }>;
-
-export type LibraryMutationHandler<Type extends LibraryMutationOperationType> =
-  Readonly<{
-    type: Type;
-    validate: (value: unknown) => value is LibraryMutationOperationOf<Type>;
-    targetCount: (operation: LibraryMutationOperationOf<Type>) => number;
-    affectedCount: (
-      operation: LibraryMutationOperationOf<Type>,
-      result: unknown,
-    ) => number;
-    atomize: (
-      operation: LibraryMutationOperationOf<Type>,
-    ) => LibraryMutationOperation[];
-    stateSections: readonly (
-      | "items"
-      | "collections"
-      | "savedSearches"
-      | "libraryTags"
-      | "relations"
-    )[];
-    deferredInverse: (operation: LibraryMutationOperationOf<Type>) => boolean;
-    planInverse: (
-      operation: LibraryMutationOperationOf<Type>,
-      state: MutationStateView,
-    ) => Readonly<{
-      inverseOperations?: LibraryMutationOperation[];
-      reason?: string;
-    }>;
-    inverseSatisfied: (
-      operation: LibraryMutationOperationOf<Type>,
-      state: MutationStateView,
-    ) => boolean;
-    execute: (
-      operation: LibraryMutationOperationOf<Type>,
-      context: AgentToolContext,
-      gateway: ZoteroGateway,
-    ) => Promise<ForwardExecution>;
-    replay: "state-aware" | "forward-only";
-    executionDomain:
-      | "item-metadata-tags-relations"
-      | "collection-search-structure"
-      | "notes-lifecycle"
-      | "attachments-imports";
-  }>;
-
-export type LibraryMutationHandlerRegistry = {
-  [Type in LibraryMutationOperationType]: LibraryMutationHandler<Type>;
-};
-
-type HandlerOptions<Type extends LibraryMutationOperationType> = Partial<
-  Pick<
-    LibraryMutationHandler<Type>,
-    | "targetCount"
-    | "affectedCount"
-    | "atomize"
-    | "stateSections"
-    | "deferredInverse"
-    | "planInverse"
-    | "inverseSatisfied"
-    | "execute"
-    | "replay"
-    | "executionDomain"
-  >
->;
-
-const resultCount = (result: unknown, key: string): number => {
-  const value = (result || {}) as Record<string, unknown>;
-  return Math.max(0, Math.floor(Number(value[key]) || 0));
-};
-
-const resultStatus = (result: unknown, status: string): number =>
-  (result as { status?: unknown } | null)?.status === status ? 1 : 0;
-
-function onePer<Operation extends LibraryMutationOperation, Value>(
-  operation: Operation,
-  values: readonly Value[] | undefined,
-  build: (value: Value) => Operation,
-): LibraryMutationOperation[] {
-  return values && values.length > 1 ? values.map(build) : [operation];
-}
-
-function defineHandler<Type extends LibraryMutationOperationType>(
-  type: Type,
-  options: HandlerOptions<Type> = {},
-): LibraryMutationHandler<Type> {
-  return Object.freeze({
-    type,
-    validate: (value: unknown): value is LibraryMutationOperationOf<Type> =>
-      Boolean(
-        value &&
-        typeof value === "object" &&
-        (value as { type?: unknown }).type === type,
-      ),
-    targetCount: options.targetCount || (() => 1),
-    affectedCount: options.affectedCount || (() => 1),
-    atomize: options.atomize || ((operation) => [operation]),
-    stateSections: options.stateSections || [],
-    deferredInverse: options.deferredInverse || (() => false),
-    planInverse: options.planInverse || (() => ({})),
-    inverseSatisfied: options.inverseSatisfied || (() => false),
-    execute:
-      options.execute ||
-      ((operation, context, gateway) =>
-        forwardExecutors[type](operation as never, context, gateway)),
-    replay: options.replay || "forward-only",
-    executionDomain: options.executionDomain || "item-metadata-tags-relations",
-  });
-}
-
-const restoreTagState = (state: MutationStateView) => ({
-  inverseOperations: [
-    {
-      type: "set_item_tags" as const,
-      assignments: (state.items || [])
-        .filter((item) => item.exists)
-        .map((item) => ({ itemId: item.itemId, tags: item.tags || [] })),
-    },
-  ],
-});
-
-const restoreCollectionState = (state: MutationStateView) => ({
-  inverseOperations: [
-    {
-      type: "set_item_collections" as const,
-      assignments: (state.items || [])
-        .filter((item) => item.exists)
-        .map((item) => ({
-          itemId: item.itemId,
-          collectionIds: item.collectionIds || [],
-        })),
-    },
-  ],
-});
-
-const sameMembers = <T>(left: readonly T[], right: readonly T[]) => {
-  const normalize = (values: readonly T[]) =>
-    [...new Set(values)].sort((a, b) => String(a).localeCompare(String(b)));
-  return JSON.stringify(normalize(left)) === JSON.stringify(normalize(right));
-};
+import {
+  defineHandler,
+  type LibraryMutationHandlerRegistry,
+} from "./handlerDefinition";
+import {
+  noteContentMatches,
+  onePer,
+  restoreCollectionState,
+  restoreTagState,
+  resultCount,
+  resultId,
+  resultIds,
+  resultRowIds,
+  resultStatus,
+  sameMembers,
+} from "./handlerUtilities";
 
 export const libraryMutationHandlers = {
   update_metadata: defineHandler("update_metadata", {
+    actionCapability: "zotero.metadata",
+    targetScope: "items",
+    targetItemIds: (operation) => (operation.itemId ? [operation.itemId] : []),
+    actionParameters: (operation) => ({
+      metadataFields: Object.keys(operation.metadata),
+    }),
     stateSections: ["items"],
     replay: "state-aware",
     planInverse: (_operation, state) => {
@@ -173,7 +44,7 @@ export const libraryMutationHandlers = {
           }
         : {};
     },
-    inverseSatisfied: (operation, state) => {
+    postconditionSatisfied: (operation, state) => {
       const current = state.item(Number(operation.itemId));
       if (!current?.exists || !current.fields) return false;
       return Object.entries(operation.metadata).every(([field, value]) =>
@@ -184,10 +55,22 @@ export const libraryMutationHandlers = {
     },
   }),
   apply_tags: defineHandler("apply_tags", {
+    actionCapability: "zotero.tags",
+    targetScope: "items",
+    targetItemIds: (operation) => [
+      ...(operation.itemIds || []),
+      ...(operation.assignments || []).map((entry) => entry.itemId),
+    ],
+    actionParameters: (operation) => ({
+      tags: [
+        ...(operation.tags || []),
+        ...(operation.assignments || []).flatMap((entry) => entry.tags),
+      ],
+    }),
     stateSections: ["items"],
     replay: "state-aware",
     planInverse: (_operation, state) => restoreTagState(state),
-    inverseSatisfied: (operation, state) => {
+    postconditionSatisfied: (operation, state) => {
       const assignments = operation.assignments?.length
         ? operation.assignments
         : (operation.itemIds || []).map((itemId) => ({
@@ -221,10 +104,14 @@ export const libraryMutationHandlers = {
           })),
   }),
   remove_tags: defineHandler("remove_tags", {
+    actionCapability: "zotero.tags",
+    targetScope: "items",
+    targetItemIds: (operation) => operation.itemIds,
+    actionParameters: (operation) => ({ tags: operation.tags }),
     stateSections: ["items"],
     replay: "state-aware",
     planInverse: (_operation, state) => restoreTagState(state),
-    inverseSatisfied: (operation, state) =>
+    postconditionSatisfied: (operation, state) =>
       operation.itemIds.every((itemId) => {
         const current = state.item(itemId);
         const tags = new Set(current?.tags || []);
@@ -241,9 +128,52 @@ export const libraryMutationHandlers = {
       })),
   }),
   move_to_collection: defineHandler("move_to_collection", {
+    actionCapability: "zotero.collections",
+    targetScope: "items",
+    targetItemIds: (operation) => [
+      ...(operation.itemIds || []),
+      ...(operation.assignments || []).map((entry) => entry.itemId),
+    ],
+    destinationCollectionIds: (operation) => [
+      Number(operation.targetCollectionId),
+      ...(operation.assignments || []).map((entry) =>
+        Number(entry.targetCollectionId),
+      ),
+    ],
+    actionParameters: (operation) => ({
+      sourceCollectionId: operation.from,
+      destinationCollectionId:
+        operation.targetCollectionId ||
+        operation.assignments?.[0]?.targetCollectionId,
+    }),
     stateSections: ["items"],
     replay: "state-aware",
     planInverse: (_operation, state) => restoreCollectionState(state),
+    postconditionSatisfied: (operation, state) => {
+      const assignments = operation.assignments?.length
+        ? operation.assignments
+        : (operation.itemIds || []).map((itemId) => ({
+            itemId,
+            targetCollectionId: operation.targetCollectionId,
+          }));
+      return assignments.every((assignment) => {
+        const targetCollectionId =
+          assignment.targetCollectionId || operation.targetCollectionId;
+        const current = state.item(assignment.itemId);
+        if (
+          !current?.exists ||
+          !current.collectionIds ||
+          !targetCollectionId ||
+          !current.collectionIds.includes(targetCollectionId)
+        ) {
+          return false;
+        }
+        if (operation.mode !== "move") return true;
+        return operation.from === "all"
+          ? sameMembers(current.collectionIds, [targetCollectionId])
+          : !current.collectionIds.includes(Number(operation.from));
+      });
+    },
     targetCount: (operation) =>
       new Set(
         operation.assignments?.length
@@ -263,10 +193,16 @@ export const libraryMutationHandlers = {
           })),
   }),
   remove_from_collection: defineHandler("remove_from_collection", {
+    actionCapability: "zotero.collections",
+    targetScope: "items",
+    targetItemIds: (operation) => operation.itemIds,
+    actionParameters: (operation) => ({
+      sourceCollectionId: operation.collectionId,
+    }),
     stateSections: ["items"],
     replay: "state-aware",
     planInverse: (_operation, state) => restoreCollectionState(state),
-    inverseSatisfied: (operation, state) =>
+    postconditionSatisfied: (operation, state) =>
       operation.itemIds.every((itemId) => {
         const current = state.item(itemId);
         return Boolean(
@@ -284,14 +220,42 @@ export const libraryMutationHandlers = {
       })),
   }),
   create_collection: defineHandler("create_collection", {
+    actionCapability: "zotero.collections",
+    targetScope: "none",
+    actionParameters: (operation) => ({
+      collectionName: operation.name,
+      parentCollectionId: operation.parentCollectionId ?? null,
+    }),
+    stateSections: ["collections"],
     deferredInverse: () => true,
+    createdCollectionIds: (result) => resultId(result, "collectionId"),
     executionDomain: "collection-search-structure",
+    postconditionSatisfied: (operation, state) =>
+      Boolean(
+        state.collections?.some(
+          (collection) =>
+            collection.exists &&
+            !collection.deleted &&
+            collection.name === operation.name &&
+            (collection.parentCollectionId ?? null) ===
+              (operation.parentCollectionId ?? null),
+        ),
+      ),
   }),
   set_item_collections: defineHandler("set_item_collections", {
+    actionCapability: "zotero.collections",
+    targetScope: "items",
+    targetItemIds: (operation) =>
+      operation.assignments.map((entry) => entry.itemId),
+    actionParameters: (operation) => ({
+      collectionIds: operation.assignments.flatMap(
+        (entry) => entry.collectionIds,
+      ),
+    }),
     stateSections: ["items"],
     replay: "state-aware",
     planInverse: (_operation, state) => restoreCollectionState(state),
-    inverseSatisfied: (operation, state) =>
+    postconditionSatisfied: (operation, state) =>
       operation.assignments.every((assignment) => {
         const current = state.item(assignment.itemId);
         return Boolean(
@@ -311,8 +275,39 @@ export const libraryMutationHandlers = {
       })),
   }),
   save_notes_batch: defineHandler("save_notes_batch", {
+    actionCapability: "zotero.notes",
+    targetScope: "items",
+    targetItemIds: (operation) =>
+      operation.notes.map((entry) => entry.targetItemId),
+    destinationCollectionIds: (operation) =>
+      operation.notes.flatMap((entry) => entry.collections || []),
+    actionParameters: () => ({ noteMode: "create" }),
+    stateSections: ["items"],
     deferredInverse: () => true,
+    createdItemIds: (result) =>
+      resultRowIds({
+        result,
+        rowsKey: "notes",
+        idKey: "noteId",
+        status: "created",
+      }),
     executionDomain: "notes-lifecycle",
+    postconditionSatisfied: (operation, state) => {
+      const notes = (state.items || []).filter((item) => item.exists);
+      return (
+        notes.length >= operation.notes.length &&
+        operation.notes.every((expected) =>
+          notes.some(
+            (actual) =>
+              actual.parentItemId === expected.targetItemId &&
+              noteContentMatches(actual.noteHtml, expected.content) &&
+              (expected.collections || []).every((collectionId) =>
+                (actual.collectionIds || []).includes(collectionId),
+              ),
+          ),
+        )
+      );
+    },
     targetCount: (operation) => operation.notes.length,
     affectedCount: (_operation, result) => resultCount(result, "createdCount"),
     atomize: (operation) =>
@@ -322,16 +317,39 @@ export const libraryMutationHandlers = {
       })),
   }),
   save_saved_search: defineHandler("save_saved_search", {
+    actionCapability: "zotero.collections",
+    targetScope: "none",
+    actionParameters: (operation) => ({ savedSearchName: operation.name }),
     stateSections: ["savedSearches"],
     deferredInverse: (operation) => !operation.savedSearchId,
+    createdSavedSearchIds: (result) => resultId(result, "savedSearchId"),
     executionDomain: "collection-search-structure",
     planInverse: (operation) => ({
       reason: operation.savedSearchId
         ? "Replacing a saved search requires its complete prior conditions."
         : "The new saved-search ID is assigned only after commit.",
     }),
+    postconditionSatisfied: (operation, state) =>
+      Boolean(
+        state.savedSearches?.some(
+          (search) =>
+            search.exists &&
+            !search.deleted &&
+            search.name === operation.name &&
+            canonicalJsonEqual(search.conditions || [], operation.conditions),
+        ),
+      ),
   }),
   delete_saved_search: defineHandler("delete_saved_search", {
+    actionCapability: "zotero.collections",
+    targetScope: "none",
+    actionParameters: (operation) => ({
+      savedSearchId: operation.savedSearchId,
+      permanent: operation.permanent,
+    }),
+    additionalActionTargets: (operation) => [
+      `saved-search:${operation.savedSearchId}`,
+    ],
     stateSections: ["savedSearches"],
     replay: "state-aware",
     executionDomain: "collection-search-structure",
@@ -346,7 +364,7 @@ export const libraryMutationHandlers = {
               },
             ],
           },
-    inverseSatisfied: (operation, state) => {
+    postconditionSatisfied: (operation, state) => {
       const current = state.savedSearch(operation.savedSearchId);
       return operation.permanent
         ? current?.exists === false
@@ -356,6 +374,16 @@ export const libraryMutationHandlers = {
       (result as { status?: unknown } | null)?.status === "not_found" ? 0 : 1,
   }),
   update_collection: defineHandler("update_collection", {
+    actionCapability: "zotero.collections",
+    targetScope: "none",
+    actionParameters: (operation) => ({
+      collectionId: operation.collectionId,
+      collectionName: operation.name,
+      parentCollectionId: operation.parentCollectionId,
+    }),
+    additionalActionTargets: (operation) => [
+      `collection:${operation.collectionId}`,
+    ],
     stateSections: ["collections"],
     replay: "state-aware",
     executionDomain: "collection-search-structure",
@@ -374,7 +402,7 @@ export const libraryMutationHandlers = {
           }
         : {};
     },
-    inverseSatisfied: (operation, state) => {
+    postconditionSatisfied: (operation, state) => {
       const current = state.collection(operation.collectionId);
       return Boolean(
         current?.exists &&
@@ -387,6 +415,13 @@ export const libraryMutationHandlers = {
     affectedCount: (_operation, result) => resultStatus(result, "updated"),
   }),
   update_library_tag: defineHandler("update_library_tag", {
+    actionCapability: "zotero.tags",
+    targetScope: "none",
+    actionParameters: (operation) => ({
+      semanticAction: operation.action,
+      tag: operation.tag,
+      ...(operation.newTag ? { newTag: operation.newTag } : {}),
+    }),
     stateSections: ["libraryTags"],
     planInverse: (operation, state) => {
       if (operation.action !== "rename" || !operation.newTag) {
@@ -418,13 +453,38 @@ export const libraryMutationHandlers = {
         ],
       };
     },
+    postconditionSatisfied: (operation, state) => {
+      const source = state.libraryTags?.find(
+        (entry) => entry.name === operation.tag.trim(),
+      );
+      if (operation.action === "delete") return source?.exists === false;
+      if (operation.action === "setColor") {
+        return Boolean(
+          source?.exists &&
+          source.color === (operation.color || "") &&
+          (operation.position === undefined ||
+            source.position === operation.position),
+        );
+      }
+      const destination = state.libraryTags?.find(
+        (entry) => entry.name === operation.newTag?.trim(),
+      );
+      return Boolean(source?.exists === false && destination?.exists);
+    },
     affectedCount: (_operation, result) => resultStatus(result, "applied"),
   }),
   set_item_tags: defineHandler("set_item_tags", {
+    actionCapability: "zotero.tags",
+    targetScope: "items",
+    targetItemIds: (operation) =>
+      operation.assignments.map((entry) => entry.itemId),
+    actionParameters: (operation) => ({
+      tags: operation.assignments.flatMap((entry) => entry.tags),
+    }),
     stateSections: ["items"],
     replay: "state-aware",
     planInverse: (_operation, state) => restoreTagState(state),
-    inverseSatisfied: (operation, state) =>
+    postconditionSatisfied: (operation, state) =>
       operation.assignments.every((assignment) => {
         const current = state.item(assignment.itemId);
         return Boolean(
@@ -444,7 +504,40 @@ export const libraryMutationHandlers = {
       })),
   }),
   create_items: defineHandler("create_items", {
+    actionCapability: "zotero.import",
+    targetScope: "none",
+    destinationCollectionIds: (operation) =>
+      operation.items.flatMap((entry) => entry.collections || []),
+    stateSections: ["items"],
     deferredInverse: () => true,
+    createdItemIds: (result) =>
+      resultRowIds({
+        result,
+        rowsKey: "items",
+        idKey: "itemId",
+        status: "created",
+      }),
+    postconditionSatisfied: (operation, state) => {
+      const items = (state.items || []).filter((item) => item.exists);
+      return (
+        items.length >= operation.items.length &&
+        operation.items.every((expected, index) => {
+          const actual = items[index];
+          return Boolean(
+            actual?.exists &&
+            Object.entries(expected.fields || {}).every(
+              ([field, value]) => actual.fields?.[field] === value,
+            ) &&
+            (expected.tags || []).every((tag) =>
+              (actual.tags || []).includes(tag),
+            ) &&
+            (expected.collections || []).every((collectionId) =>
+              (actual.collectionIds || []).includes(collectionId),
+            ),
+          );
+        })
+      );
+    },
     targetCount: (operation) => operation.items.length,
     affectedCount: (_operation, result) =>
       resultCount(result, "changedCount") ||
@@ -456,6 +549,13 @@ export const libraryMutationHandlers = {
       })),
   }),
   reparent_items: defineHandler("reparent_items", {
+    actionCapability: "zotero.metadata",
+    targetScope: "items",
+    targetItemIds: (operation) =>
+      operation.assignments.map((entry) => entry.itemId),
+    actionParameters: (operation) => ({
+      parentItemIds: operation.assignments.map((entry) => entry.parentItemId),
+    }),
     stateSections: ["items"],
     replay: "state-aware",
     planInverse: (_operation, state) => ({
@@ -471,7 +571,7 @@ export const libraryMutationHandlers = {
         },
       ],
     }),
-    inverseSatisfied: (operation, state) =>
+    postconditionSatisfied: (operation, state) =>
       operation.assignments.every((assignment) => {
         const current = state.item(assignment.itemId);
         return Boolean(
@@ -490,6 +590,15 @@ export const libraryMutationHandlers = {
       })),
   }),
   relate_items: defineHandler("relate_items", {
+    actionCapability: "zotero.metadata",
+    targetScope: "items",
+    targetItemIds: (operation) => [
+      operation.itemId,
+      ...operation.relatedItemIds,
+    ],
+    actionParameters: (operation) => ({
+      semanticAction: operation.action,
+    }),
     stateSections: ["relations"],
     replay: "state-aware",
     planInverse: (operation) => ({
@@ -497,7 +606,7 @@ export const libraryMutationHandlers = {
         { ...operation, action: operation.action === "add" ? "remove" : "add" },
       ],
     }),
-    inverseSatisfied: (operation, state) =>
+    postconditionSatisfied: (operation, state) =>
       (state.relations || []).every((relation) =>
         operation.action === "add"
           ? relation.related && relation.reciprocal
@@ -514,6 +623,16 @@ export const libraryMutationHandlers = {
       })),
   }),
   delete_collection: defineHandler("delete_collection", {
+    actionCapability: "zotero.collections",
+    targetScope: "none",
+    actionParameters: (operation) => ({
+      collectionId: operation.collectionId,
+      deleteItems: operation.deleteItems,
+      permanent: operation.permanent,
+    }),
+    additionalActionTargets: (operation) => [
+      `collection:${operation.collectionId}`,
+    ],
     stateSections: ["collections"],
     replay: "state-aware",
     executionDomain: "collection-search-structure",
@@ -528,7 +647,7 @@ export const libraryMutationHandlers = {
               },
             ],
           },
-    inverseSatisfied: (operation, state) => {
+    postconditionSatisfied: (operation, state) => {
       const current = state.collection(operation.collectionId);
       return operation.permanent
         ? current?.exists === false
@@ -536,12 +655,57 @@ export const libraryMutationHandlers = {
     },
   }),
   save_note: defineHandler("save_note", {
+    actionCapability: "zotero.notes",
+    targetScope: "none",
+    targetItemIds: (operation) =>
+      operation.targetItemId ? [operation.targetItemId] : [],
+    destinationCollectionIds: (operation) => operation.collections || [],
+    actionParameters: (operation) => ({
+      noteMode: "create",
+      targetItemId: operation.targetItemId,
+      expectedText: operation.content,
+    }),
+    stateSections: ["items"],
     deferredInverse: () => true,
+    createdItemIds: (result) => resultId(result, "noteId"),
     executionDomain: "notes-lifecycle",
+    postconditionSatisfied: (operation, state) =>
+      Boolean(
+        state.items?.some(
+          (note) =>
+            note.exists &&
+            (operation.targetItemId === undefined ||
+              note.parentItemId === operation.targetItemId) &&
+            noteContentMatches(note.noteHtml, operation.content) &&
+            (operation.collections || []).every((collectionId) =>
+              (note.collectionIds || []).includes(collectionId),
+            ),
+        ),
+      ),
   }),
   import_identifiers: defineHandler("import_identifiers", {
+    actionCapability: "zotero.import",
+    targetScope: "none",
+    destinationCollectionIds: (operation) =>
+      operation.targetCollectionId ? [operation.targetCollectionId] : [],
+    actionParameters: (operation) => ({
+      identifiers: operation.identifiers,
+      destinationCollectionId: operation.targetCollectionId,
+    }),
+    stateSections: ["items"],
     deferredInverse: () => true,
+    createdItemIds: (result) => resultIds(result, "itemIds"),
     executionDomain: "attachments-imports",
+    postconditionSatisfied: (operation, state) => {
+      const items = (state.items || []).filter((item) => item.exists);
+      return (
+        items.length >= operation.identifiers.length &&
+        (!operation.targetCollectionId ||
+          items.every((item) =>
+            (item.collectionIds || []).includes(operation.targetCollectionId!),
+          ))
+      );
+    },
     targetCount: (operation) => operation.identifiers.length,
     affectedCount: (_operation, result) => resultCount(result, "succeeded"),
     atomize: (operation) =>
@@ -551,6 +715,9 @@ export const libraryMutationHandlers = {
       })),
   }),
   trash_items: defineHandler("trash_items", {
+    actionCapability: "zotero.trash",
+    targetScope: "items",
+    targetItemIds: (operation) => operation.itemIds,
     stateSections: ["items"],
     replay: "state-aware",
     executionDomain: "notes-lifecycle",
@@ -564,7 +731,7 @@ export const libraryMutationHandlers = {
         },
       ],
     }),
-    inverseSatisfied: (operation, state) =>
+    postconditionSatisfied: (operation, state) =>
       operation.itemIds.every((itemId) => {
         const current = state.item(itemId);
         return Boolean(current?.exists && current.deleted === true);
@@ -578,6 +745,9 @@ export const libraryMutationHandlers = {
       })),
   }),
   restore_from_trash: defineHandler("restore_from_trash", {
+    actionCapability: "zotero.trash",
+    targetScope: "items",
+    targetItemIds: (operation) => operation.itemIds || [],
     stateSections: ["items", "collections", "savedSearches"],
     replay: "state-aware",
     executionDomain: "notes-lifecycle",
@@ -592,7 +762,7 @@ export const libraryMutationHandlers = {
           }
         : {}),
     }),
-    inverseSatisfied: (operation, state) =>
+    postconditionSatisfied: (operation, state) =>
       (operation.itemIds || []).every((itemId) => {
         const current = state.item(itemId);
         return Boolean(current?.exists && current.deleted === false);
@@ -635,15 +805,31 @@ export const libraryMutationHandlers = {
     },
   }),
   merge_items: defineHandler("merge_items", {
+    actionCapability: "zotero.trash",
+    targetScope: "items",
+    targetItemIds: (operation) => [
+      operation.masterItemId,
+      ...operation.otherItemIds,
+    ],
+    stateSections: ["items"],
     executionDomain: "notes-lifecycle",
     planInverse: () => ({
       reason:
         "Merging can move and deduplicate child objects, so it has no lossless inverse.",
     }),
+    postconditionSatisfied: (operation, state) =>
+      Boolean(state.item(operation.masterItemId)?.exists) &&
+      operation.otherItemIds.every((itemId) => {
+        const item = state.item(itemId);
+        return !item?.exists || item.deleted === true;
+      }),
     targetCount: (operation) => operation.otherItemIds.length,
     affectedCount: (_operation, result) => resultCount(result, "mergedCount"),
   }),
   delete_attachment: defineHandler("delete_attachment", {
+    actionCapability: "zotero.attachments",
+    targetScope: "items",
+    targetItemIds: (operation) => [operation.attachmentId],
     stateSections: ["items"],
     executionDomain: "attachments-imports",
     planInverse: (operation) => ({
@@ -651,9 +837,17 @@ export const libraryMutationHandlers = {
         { type: "restore_from_trash", itemIds: [operation.attachmentId] },
       ],
     }),
+    postconditionSatisfied: (operation, state) => {
+      const attachment = state.item(operation.attachmentId);
+      return !attachment?.exists || attachment.deleted === true;
+    },
     affectedCount: (_operation, result) => resultStatus(result, "deleted"),
   }),
   rename_attachment: defineHandler("rename_attachment", {
+    actionCapability: "zotero.attachments",
+    targetScope: "items",
+    targetItemIds: (operation) => [operation.attachmentId],
+    actionParameters: (operation) => ({ newName: operation.newName }),
     stateSections: ["items"],
     replay: "state-aware",
     executionDomain: "attachments-imports",
@@ -671,7 +865,7 @@ export const libraryMutationHandlers = {
           }
         : {};
     },
-    inverseSatisfied: (operation, state) => {
+    postconditionSatisfied: (operation, state) => {
       const current = state.item(operation.attachmentId);
       return Boolean(
         current?.exists && current.attachmentTitle === operation.newName,
@@ -680,6 +874,10 @@ export const libraryMutationHandlers = {
     affectedCount: (_operation, result) => resultStatus(result, "renamed"),
   }),
   relink_attachment: defineHandler("relink_attachment", {
+    actionCapability: "zotero.attachments",
+    targetScope: "items",
+    targetItemIds: (operation) => [operation.attachmentId],
+    actionParameters: (operation) => ({ newPath: operation.newPath }),
     stateSections: ["items"],
     replay: "state-aware",
     executionDomain: "attachments-imports",
@@ -697,7 +895,7 @@ export const libraryMutationHandlers = {
           }
         : { reason: "The attachment had no resolvable previous path." };
     },
-    inverseSatisfied: (operation, state) => {
+    postconditionSatisfied: (operation, state) => {
       const current = state.item(operation.attachmentId);
       return Boolean(
         current?.exists && current.attachmentPath === operation.newPath,
@@ -706,8 +904,34 @@ export const libraryMutationHandlers = {
     affectedCount: (_operation, result) => resultStatus(result, "relinked"),
   }),
   import_local_files: defineHandler("import_local_files", {
+    actionCapability: "zotero.import",
+    targetScope: "none",
+    destinationCollectionIds: (operation) =>
+      operation.targetCollectionId ? [operation.targetCollectionId] : [],
+    actionParameters: (operation) => ({
+      filePaths: operation.filePaths,
+      destinationCollectionId: operation.targetCollectionId,
+    }),
+    stateSections: ["items"],
     deferredInverse: () => true,
+    createdItemIds: (result) =>
+      resultRowIds({
+        result,
+        rowsKey: "items",
+        idKey: "itemId",
+        status: "imported",
+      }),
     executionDomain: "attachments-imports",
+    postconditionSatisfied: (operation, state) => {
+      const items = (state.items || []).filter((item) => item.exists);
+      return (
+        items.length >= operation.filePaths.length &&
+        (!operation.targetCollectionId ||
+          items.every((item) =>
+            (item.collectionIds || []).includes(operation.targetCollectionId!),
+          ))
+      );
+    },
     targetCount: (operation) => operation.filePaths.length,
     affectedCount: (_operation, result) => resultCount(result, "succeeded"),
     atomize: (operation) =>
@@ -717,93 +941,3 @@ export const libraryMutationHandlers = {
       })),
   }),
 } satisfies LibraryMutationHandlerRegistry;
-
-export function getLibraryMutationHandler<
-  Type extends LibraryMutationOperationType,
->(operation: LibraryMutationOperationOf<Type>): LibraryMutationHandler<Type> {
-  return libraryMutationHandlers[
-    operation.type
-  ] as unknown as LibraryMutationHandler<Type>;
-}
-
-export function mutationTargetCountFromHandler(
-  operation: LibraryMutationOperation,
-): number {
-  return libraryMutationHandlers[operation.type].targetCount(
-    operation as never,
-  );
-}
-
-export function mutationAffectedCountFromHandler(
-  operation: LibraryMutationOperation,
-  result: unknown,
-): number {
-  return libraryMutationHandlers[operation.type].affectedCount(
-    operation as never,
-    result,
-  );
-}
-
-export function atomizeMutationOperationFromHandler(
-  operation: LibraryMutationOperation,
-): LibraryMutationOperation[] {
-  return libraryMutationHandlers[operation.type].atomize(operation as never);
-}
-
-export function mutationUsesDeferredInverse(
-  operation: LibraryMutationOperation,
-): boolean {
-  return libraryMutationHandlers[operation.type].deferredInverse(
-    operation as never,
-  );
-}
-
-export function planMutationInverseFromHandler(
-  operation: LibraryMutationOperation,
-  state: LibraryMutationState | MutationStateView,
-): Readonly<{
-  inverseOperations?: LibraryMutationOperation[];
-  reason?: string;
-}> {
-  return libraryMutationHandlers[operation.type].planInverse(
-    operation as never,
-    asMutationStateView(state),
-  );
-}
-
-export function mutationInverseIsSatisfied(
-  operation: LibraryMutationOperation,
-  state: LibraryMutationState | MutationStateView,
-): boolean {
-  return libraryMutationHandlers[operation.type].inverseSatisfied(
-    operation as never,
-    asMutationStateView(state),
-  );
-}
-
-export function executeMutationFromHandler(
-  operation: LibraryMutationOperation,
-  context: AgentToolContext,
-  gateway: ZoteroGateway,
-): Promise<ForwardExecution> {
-  return libraryMutationHandlers[operation.type].execute(
-    operation as never,
-    context,
-    gateway,
-  );
-}
-
-export function isRegisteredLibraryMutationOperation(
-  value: unknown,
-): value is LibraryMutationOperation {
-  if (!value || typeof value !== "object") return false;
-  const type = (value as { type?: unknown }).type;
-  if (
-    typeof type !== "string" ||
-    !Object.prototype.hasOwnProperty.call(libraryMutationHandlers, type)
-  )
-    return false;
-  return libraryMutationHandlers[type as LibraryMutationOperationType].validate(
-    value,
-  );
-}
