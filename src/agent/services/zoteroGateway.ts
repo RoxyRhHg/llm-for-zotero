@@ -23,7 +23,10 @@ import {
 import { resolvePaperContextRefFromAttachment } from "../../modules/contextPanel/paperAttribution";
 import { invalidateCachedContextText } from "../../modules/contextPanel/pdfContext";
 import { ensureMineruCacheDirForAttachment } from "../../modules/contextPanel/mineruSync";
-import { persistVerifiedNoteHtml } from "../../modules/contextPanel/notePersistence";
+import {
+  persistVerifiedNoteHtml,
+  type CreatedZoteroNoteReceipt,
+} from "../../modules/contextPanel/notePersistence";
 import type { AgentRuntimeRequest } from "../types";
 import { getTurnPapers } from "../context/requestTurnPaperScope";
 import type {
@@ -142,6 +145,7 @@ export type SaveAnswerToNoteResult = {
   status: "created" | "appended" | "standalone_created";
   noteId?: number;
   collections?: number[];
+  createdNoteReceipt?: CreatedZoteroNoteReceipt;
 };
 
 export type CollectionSummary = {
@@ -3857,6 +3861,9 @@ export class ZoteroGateway {
         status: "standalone_created",
         noteId: created.noteId,
         collections: created.collections,
+        ...(created.createdNoteReceipt
+          ? { createdNoteReceipt: created.createdNoteReceipt }
+          : {}),
       };
     }
     if (!params.item) {

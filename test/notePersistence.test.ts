@@ -22,7 +22,12 @@ describe("finalized Zotero note persistence", function () {
   class PersistentNote {
     id = 0;
     libraryID = 1;
+    key = "NOTEKEY";
+    itemTypeID = 1;
     parentID?: number;
+    dateAdded = "";
+    dateModified = "";
+    version = 0;
     noteHtml = "";
     persistedHtml = "";
     saveCalls = 0;
@@ -40,12 +45,38 @@ describe("finalized Zotero note persistence", function () {
       return this.noteHtml;
     }
 
+    isNote(): boolean {
+      return true;
+    }
+
+    isAttachment(): boolean {
+      return false;
+    }
+
+    getNoteTitle(): string {
+      return "Created note";
+    }
+
+    getDisplayTitle(): string {
+      return "Created note";
+    }
+
+    getField(fieldName: string): string {
+      if (fieldName === "dateAdded") return this.dateAdded;
+      if (fieldName === "dateModified") return this.dateModified;
+      if (fieldName === "title") return "Created note";
+      return "";
+    }
+
     async saveTx(options?: {
       notifierQueue?: FakeNotifierQueue;
     }): Promise<number | boolean> {
       this.saveCalls += 1;
       const isNew = !this.id;
       if (isNew) this.id = 41;
+      if (isNew) this.dateAdded = "2026-08-28 14:30:00";
+      this.version += 1;
+      this.dateModified = `2026-08-28 14:30:0${this.version}`;
       if (this.saveCalls !== this.skipPersistOnSaveCall) {
         this.persistedHtml = this.noteHtml;
       }
@@ -92,6 +123,19 @@ describe("finalized Zotero note persistence", function () {
     });
 
     assert.equal(result.noteId, 41);
+    assert.deepEqual(result.createdNoteReceipt, {
+      schemaVersion: 1,
+      operation: "created",
+      note: {
+        itemId: 41,
+        libraryID: 1,
+        key: "NOTEKEY",
+        noteKind: "standalone",
+        dateAdded: "2026-08-28 14:30:00",
+        dateModified: "2026-08-28 14:30:01",
+        version: 1,
+      },
+    });
     assert.equal(note.saveCalls, 1);
     assert.equal(note.persistedHtml, "<p>Complete text note</p>");
     assert.deepEqual(observedHtml, ["<p>Complete text note</p>"]);
@@ -104,7 +148,7 @@ describe("finalized Zotero note persistence", function () {
       observedHtml.push(note.persistedHtml);
     };
 
-    await createFinalizedZoteroNote({
+    const result = await createFinalizedZoteroNote({
       note: note as unknown as Zotero.Item,
       initialHtml: "<p>Complete text without the image</p>",
       finalize: async () =>
@@ -116,9 +160,64 @@ describe("finalized Zotero note persistence", function () {
       note.persistedHtml,
       '<p>Complete text <img data-attachment-key="A1" /></p>',
     );
+    assert.equal(
+      result.createdNoteReceipt?.note.dateModified,
+      "2026-08-28 14:30:02",
+    );
     assert.deepEqual(observedHtml, [
       '<p>Complete text <img data-attachment-key="A1" /></p>',
     ]);
+  });
+
+  it("supplies authoritative dateAdded to final rendering without embedding dateModified", async function () {
+    const note = new PersistentNote();
+    let receivedDateAdded = "";
+
+    const result = await createFinalizedZoteroNote({
+      note: note as unknown as Zotero.Item,
+      initialHtml: "<p>Useful initial note</p>",
+      finalize: async ({ createdNoteMetadata }) => {
+        receivedDateAdded = createdNoteMetadata?.system?.dateAdded || "";
+        return `<p>Created ${receivedDateAdded}</p>`;
+      },
+    });
+
+    assert.equal(receivedDateAdded, "2026-08-28 14:30:00");
+    assert.equal(note.persistedHtml, "<p>Created 2026-08-28 14:30:00</p>");
+    assert.notInclude(
+      note.persistedHtml,
+      result.createdNoteReceipt?.note.dateModified || "not-present",
+    );
+  });
+
+  it("keeps the note when dateAdded is unavailable and omits the receipt", async function () {
+    class MissingMetadataNote extends PersistentNote {
+      getField(fieldName: string): string {
+        if (fieldName === "dateAdded") return "";
+        return super.getField(fieldName);
+      }
+
+      async saveTx(options?: {
+        notifierQueue?: FakeNotifierQueue;
+      }): Promise<number | boolean> {
+        const result = await super.saveTx(options);
+        this.dateAdded = "";
+        return result;
+      }
+    }
+    const note = new MissingMetadataNote();
+
+    const result = await createFinalizedZoteroNote({
+      note: note as unknown as Zotero.Item,
+      initialHtml: "<p>Useful note without metadata</p>",
+    });
+
+    assert.equal(note.persistedHtml, "<p>Useful note without metadata</p>");
+    assert.isUndefined(result.createdNoteReceipt);
+    assert.include(
+      result.warnings,
+      "Authoritative Zotero dateAdded was unavailable for the created note",
+    );
   });
 
   it("detects a silent lost final write and retries after a forced reload", async function () {

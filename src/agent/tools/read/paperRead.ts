@@ -46,6 +46,9 @@ import { resolveFullReadPaperTargets } from "../../../shared/fullReadTargetResol
 import { getTurnPapersWithRoles } from "../../context/requestTurnPaperScope";
 import { detectExplicitFullReadIntent } from "../../../modules/contextPanel/retrievalQueryPlan";
 import { createCodexAppServerExhaustiveReaderSession } from "../../../codexAppServer/exhaustiveReader";
+import { createZoteroMetadataResolver } from "../../../services/zoteroMetadata/resolver";
+import { projectPaperMetadata } from "../../../services/zoteroMetadata/projections";
+import type { ZoteroMetadataResolver } from "../../../services/zoteroMetadata/types";
 
 type PaperReadMode =
   | "overview"
@@ -427,54 +430,32 @@ function normalizeMetadataValue(value: unknown): string {
   return typeof value === "string" ? value.replace(/\s+/g, " ").trim() : "";
 }
 
-function formatCreatorList(value: unknown): string {
-  if (!Array.isArray(value)) return "";
-  const creators = value
-    .map((creator) => {
-      if (!creator || typeof creator !== "object") return "";
-      const record = creator as Record<string, unknown>;
-      const name = normalizeMetadataValue(record.name);
-      if (name) return name;
-      return [record.firstName, record.lastName]
-        .map(normalizeMetadataValue)
-        .filter(Boolean)
-        .join(" ");
-    })
-    .filter(Boolean);
-  return creators.join(", ");
-}
-
 function buildMetadataOverview(params: {
   paperContext: NonNullable<PdfTarget["paperContext"]>;
-  context: AgentToolContext;
-  zoteroGateway: ZoteroGateway;
+  metadataResolver: ZoteroMetadataResolver;
   warning?: string;
 }): unknown | null {
-  const item = params.zoteroGateway.resolveMetadataItem({
-    request: params.context.request,
-    item: params.context.item,
-    paperContext: params.paperContext,
-  });
-  const metadata = params.zoteroGateway.getEditableArticleMetadata(item);
-  const fields = (metadata?.fields || {}) as Record<string, unknown>;
+  const metadata = projectPaperMetadata(
+    params.metadataResolver.resolvePaperMetadata(params.paperContext),
+    params.paperContext,
+  );
   const title =
-    normalizeMetadataValue(metadata?.title) ||
-    normalizeMetadataValue(params.paperContext.title) ||
+    normalizeMetadataValue(metadata.title) ||
     `Paper ${params.paperContext.itemId}`;
-  const authors = formatCreatorList(metadata?.creators);
-  const abstract = normalizeMetadataValue(fields.abstractNote);
+  const authors = normalizeMetadataValue(metadata.creatorDisplay);
+  const abstract = normalizeMetadataValue(metadata.abstract);
   const lines = [
     `Title: ${title}`,
     authors ? `Authors: ${authors}` : "",
-    normalizeMetadataValue(fields.date)
-      ? `Date: ${normalizeMetadataValue(fields.date)}`
+    metadata.publicationDate ? `Date: ${metadata.publicationDate}` : "",
+    metadata.year ? `Year: ${metadata.year}` : "",
+    metadata.containerTitle
+      ? `Container: ${metadata.containerTitle} (Zotero field: ${metadata.containerSourceField})`
       : "",
-    normalizeMetadataValue(fields.publicationTitle)
-      ? `Publication: ${normalizeMetadataValue(fields.publicationTitle)}`
+    metadata.eventTitle
+      ? `Event: ${metadata.eventTitle} (Zotero field: ${metadata.eventSourceField})`
       : "",
-    normalizeMetadataValue(fields.DOI)
-      ? `DOI: ${normalizeMetadataValue(fields.DOI)}`
-      : "",
+    metadata.doi ? `DOI: ${metadata.doi}` : "",
     abstract ? `Abstract: ${abstract}` : "",
   ].filter(Boolean);
   if (!lines.length) return null;
@@ -1282,6 +1263,9 @@ export function createPaperReadTool(
       if (input.mode === "overview") {
         const maxChars = input.maxChars || 6000;
         const results = [];
+        const metadataResolver = createZoteroMetadataResolver({
+          getItem: (itemId) => zoteroGateway.getItem(itemId),
+        });
         for (const paperContext of targets) {
           const mineru = await tryReadMineruOverview(paperContext, maxChars);
           if (mineru && (mineru as { ok?: boolean }).ok !== false) {
@@ -1299,8 +1283,7 @@ export function createPaperReadTool(
             );
             const metadataOverview = buildMetadataOverview({
               paperContext,
-              context,
-              zoteroGateway,
+              metadataResolver,
               warning,
             });
             if (metadataOverview) {

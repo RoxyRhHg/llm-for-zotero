@@ -98,7 +98,12 @@ describe("editCurrentNote create tracking", function () {
   class MockNoteItem {
     id = 0;
     libraryID = 0;
+    key = "NOTEKEY";
+    itemTypeID = 1;
     parentID?: number;
+    dateAdded = "";
+    dateModified = "";
+    version = 0;
     deleted = false;
     readonly saveOptionsHistory: Array<{ notifierQueue?: unknown }> = [];
     wrapOnReload = false;
@@ -112,6 +117,10 @@ describe("editCurrentNote create tracking", function () {
       return true;
     }
 
+    isAttachment() {
+      return false;
+    }
+
     setNote(html: string) {
       this.noteHtml = html;
     }
@@ -120,7 +129,17 @@ describe("editCurrentNote create tracking", function () {
       return this.noteHtml;
     }
 
-    getField(_field: string) {
+    getField(field: string) {
+      if (field === "dateAdded") return this.dateAdded;
+      if (field === "dateModified") return this.dateModified;
+      return "";
+    }
+
+    getNoteTitle() {
+      return "";
+    }
+
+    getDisplayTitle() {
       return "";
     }
 
@@ -128,7 +147,10 @@ describe("editCurrentNote create tracking", function () {
       this.saveOptionsHistory.push(options);
       if (!this.id) {
         this.id = nextNoteId++;
+        this.dateAdded = "2026-08-28 10:00:00";
       }
+      this.version += 1;
+      this.dateModified = `2026-08-28 10:00:0${this.version}`;
       savedItems.set(this.id, this as unknown as Zotero.Item);
       if (this.parentID && !parentNoteIds.includes(this.id)) {
         parentNoteIds.push(this.id);
@@ -280,6 +302,20 @@ describe("editCurrentNote create tracking", function () {
       // exists so the manual (image) branch reports where a note landed,
       // matching the mutation-service branch.
       collections: undefined,
+      createdNoteReceipt: {
+        schemaVersion: 1,
+        operation: "created",
+        note: {
+          itemId: 100,
+          libraryID: 1,
+          key: "NOTEKEY",
+          noteKind: "item",
+          parentItemId: 9,
+          dateAdded: "2026-08-28 10:00:00",
+          dateModified: "2026-08-28 10:00:01",
+          version: 1,
+        },
+      },
     });
 
     const tracked = getTrackedAssistantNoteForParent(9);
@@ -683,7 +719,7 @@ describe("editCurrentNote create tracking", function () {
     ]);
   });
 
-  it("chat-history text export persists complete content in one save", async function () {
+  it("chat-history text export finalizes authoritative creation metadata", async function () {
     await createNoteFromChatHistory(parentItem, [
       {
         role: "user",
@@ -700,7 +736,7 @@ describe("editCurrentNote create tracking", function () {
 
     assert.lengthOf(childNotes(9), 1);
     const note = childNotes(9)[0];
-    assert.lengthOf(note.saveOptionsHistory, 1);
+    assert.lengthOf(note.saveOptionsHistory, 2);
     assert.include(note.getNote(), "What is the main result?");
     assert.include(note.getNote(), "The complete text-only answer.");
     assert.notInclude(note.getNote(), "Preparing chat history export");

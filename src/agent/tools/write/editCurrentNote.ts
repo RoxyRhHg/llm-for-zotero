@@ -1047,6 +1047,9 @@ export function createEditCurrentNoteTool(
                 : undefined,
               noteId,
               title: String(note.getField?.("title") || ""),
+              ...(persisted.createdNoteReceipt
+                ? { createdNoteReceipt: persisted.createdNoteReceipt }
+                : {}),
               ...(persisted.warnings.length
                 ? { warnings: persisted.warnings }
                 : {}),

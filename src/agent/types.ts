@@ -28,6 +28,7 @@ import type {
   UsageStats,
 } from "../shared/llm";
 import type { ContextCachePlan } from "../contextCache/manager";
+import type { ZoteroTurnMetadataContext } from "../services/zoteroMetadata/types";
 import type {
   AgentActionContract,
   AgentActionEvidence,
@@ -609,6 +610,7 @@ export type ResolvedAgentRuntimeRequest = Omit<
   | "localDocuments"
 > & {
   turnPaperScope: TurnPaperScope;
+  zoteroMetadataContext: ZoteroTurnMetadataContext;
   selectedTextContexts?: readonly ResolvedTurnSelectedTextContext[];
   resolvedSelectedTextAnchors?: readonly ResolvedTurnSelectedTextAnchor[];
   localDocuments?: readonly TurnLocalDocument[];

@@ -65,6 +65,7 @@ type ResolvedTurnContextEnvelopeInput = Pick<
   | "selectedTexts"
   | "turnPaperScope"
   | "turnPaperScopeWarnings"
+  | "zoteroMetadataContext"
 > & {
   activePaperTitle?: string;
 };
@@ -75,6 +76,7 @@ export type TurnContextEnvelopeInput =
 
 export type TurnContextEnvelope = Readonly<{
   paperScope: TurnPaperScope;
+  zoteroMetadataContext?: ResolvedAgentRuntimeRequest["zoteroMetadataContext"];
   activeItemId?: number;
   activePaperTitle?: string;
   selectedTextCount: number;
@@ -203,6 +205,10 @@ export function buildTurnContextEnvelope(
 
   return {
     paperScope: paperScopeResult.scope,
+    zoteroMetadataContext:
+      "zoteroMetadataContext" in input
+        ? input.zoteroMetadataContext
+        : undefined,
     activeItemId: normalizeNumber(input.activeItemId),
     activePaperTitle:
       normalizeText(input.activePaperTitle) ||
@@ -246,25 +252,57 @@ export function renderTurnContextEnvelopeForModel(
     ["name", envelope.paperScope.libraryName],
     ["scope", envelope.paperScope.conversationKind],
     ["activeItemId", envelope.activeItemId],
-    ["activePaperTitle", envelope.activePaperTitle || activePaper?.title],
+    [
+      "activePaperTitle",
+      envelope.paperScope.papers.length
+        ? undefined
+        : envelope.activePaperTitle || activePaper?.title,
+    ],
   ]);
   if (libraryFields) lines.push(`Library scope: ${libraryFields}`);
 
   envelope.paperScope.papers.forEach((entry, index) => {
     const paper = entry.paper;
+    const projected = envelope.zoteroMetadataContext?.papers.find(
+      (candidate) =>
+        candidate.itemId === paper.itemId &&
+        candidate.contextItemId === paper.contextItemId,
+    )?.metadata;
+    const contentSource = projected?.contentSource;
     lines.push(
       `Paper ${index + 1}: ${renderFields([
-        ["title", paper.title],
-        ["creator", paper.firstCreator],
-        ["year", paper.year],
+        ["title", projected ? projected.title : paper.title],
+        ["creators", projected ? projected.creatorDisplay : paper.firstCreator],
+        ["publicationDate", projected?.publicationDate],
+        ["year", projected ? projected.year : paper.year],
         ["itemId", paper.itemId],
         ["contextItemId", paper.contextItemId],
-        ["citationKey", paper.citationKey],
+        ["citationKey", projected ? projected.citationKey : paper.citationKey],
+        ["doi", projected?.doi],
+        ["containerTitle", projected?.containerTitle],
+        ["containerSourceField", projected?.containerSourceField],
+        ["eventTitle", projected?.eventTitle],
+        ["eventSourceField", projected?.eventSourceField],
+        ["journalAbbreviation", projected?.journalAbbreviation],
         ["source", entry.roles.map(renderPaperRole).join(", ")],
-        ["attachmentTitle", paper.attachmentTitle],
+        [
+          "contentSourceTitle",
+          projected ? contentSource?.title : paper.attachmentTitle,
+        ],
+        ["contentSourceFilename", contentSource?.filename],
+        ["contentSourceType", contentSource?.contentType],
         ["contentSourceMode", paper.contentSourceMode],
+        [
+          "metadataSource",
+          projected?.source === "stored_fallback"
+            ? "stored fallback; live Zotero item unavailable"
+            : undefined,
+        ],
       ])}`,
     );
+    for (const warning of projected?.warnings || []) {
+      lines.push(`Paper ${index + 1} metadata warning: ${warning.message}`);
+    }
   });
 
   envelope.paperScope.collections.forEach((collection, index) => {
@@ -298,10 +336,19 @@ export function renderTurnContextEnvelopeForModel(
     if (envelope.paperScope.selectedPassagePaperRefs.length) {
       lines.push(
         `Selected text papers: ${envelope.paperScope.selectedPassagePaperRefs
-          .map(
-            (entry) =>
-              `selection=${entry.contextIndex + 1}, title=${safeJsonStringify(entry.paper.title)}, itemId=${entry.paper.itemId}, contextItemId=${entry.paper.contextItemId}`,
-          )
+          .map((entry) => {
+            const projected = envelope.zoteroMetadataContext?.papers.find(
+              (candidate) =>
+                candidate.itemId === entry.paper.itemId &&
+                candidate.contextItemId === entry.paper.contextItemId,
+            )?.metadata;
+            return renderFields([
+              ["selection", entry.contextIndex + 1],
+              ["title", projected ? projected.title : entry.paper.title],
+              ["itemId", entry.paper.itemId],
+              ["contextItemId", entry.paper.contextItemId],
+            ]);
+          })
           .join(" | ")}`,
       );
     }

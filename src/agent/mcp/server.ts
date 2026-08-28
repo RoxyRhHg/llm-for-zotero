@@ -36,7 +36,10 @@ import type {
   PreparedToolExecution,
   ToolSpec,
 } from "../types";
-import { resolveAgentRuntimeRequest } from "../context/resolvedAgentRequest";
+import {
+  resolveAgentRuntimeRequest,
+  resolveZoteroTurnMetadataContext,
+} from "../context/resolvedAgentRequest";
 import {
   getActiveTurnPaper,
   type TurnPaperRole,
@@ -1620,6 +1623,9 @@ function createToolContext(
     ? {
         ...requestBase,
         turnPaperScope: scope.turnPaperScope,
+        zoteroMetadataContext: resolveZoteroTurnMetadataContext(
+          scope.turnPaperScope,
+        ),
         turnPaperScopeWarnings: scope.turnPaperScopeWarnings,
       }
     : resolveAgentRuntimeRequest(

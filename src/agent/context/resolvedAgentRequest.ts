@@ -7,6 +7,10 @@ import {
   type TurnPaperScopeBuildResult,
 } from "./turnPaperScope";
 import type { PaperContextRef } from "../../shared/types";
+import { createZoteroMetadataResolver } from "../../services/zoteroMetadata/resolver";
+import { createZoteroTurnMetadataContext } from "../../services/zoteroMetadata/projections";
+import type { ZoteroTurnMetadataContext } from "../../services/zoteroMetadata/types";
+import type { TurnPaperScope } from "./turnPaperScope";
 
 export type AgentRequestPaperContextResolver = (selector: {
   itemId?: number;
@@ -20,6 +24,30 @@ export class InvalidTurnPaperScopeError extends Error {
     super(result.message);
     this.name = "InvalidTurnPaperScopeError";
   }
+}
+
+export function resolveZoteroTurnMetadataContext(
+  scope: TurnPaperScope,
+): ZoteroTurnMetadataContext {
+  const resolver = createZoteroMetadataResolver();
+  const refs = [
+    ...scope.papers.map(({ paper }) => paper),
+    ...scope.selectedPassagePaperRefs.map(({ paper }) => paper),
+  ];
+  const seen = new Set<string>();
+  return createZoteroTurnMetadataContext(
+    refs
+      .filter((paper) => {
+        const key = `${paper.libraryID}:${paper.itemId}:${paper.contextItemId}`;
+        if (seen.has(key)) return false;
+        seen.add(key);
+        return true;
+      })
+      .map((paper) => ({
+        ref: paper,
+        resolution: resolver.resolvePaperMetadata(paper),
+      })),
+  );
 }
 
 /**
@@ -80,6 +108,7 @@ export function resolveAgentRuntimeRequest(
   return {
     ...rest,
     turnPaperScope: scopeResult.scope,
+    zoteroMetadataContext: resolveZoteroTurnMetadataContext(scopeResult.scope),
     selectedTextContexts: scopeResult.selectedTextContexts.length
       ? scopeResult.selectedTextContexts
       : undefined,

@@ -729,6 +729,37 @@ describe("semantic tool surface", function () {
       {
         listPaperContexts: () => [paperContext],
         resolvePaperContextTarget: () => paperContext,
+        getItem: (itemId: number) =>
+          itemId === 11
+            ? ({
+                id: 11,
+                libraryID: 1,
+                key: "METAONLY",
+                itemTypeID: 1,
+                itemType: "journalArticle",
+                isRegularItem: () => true,
+                isAttachment: () => false,
+                isNote: () => false,
+                getDisplayTitle: () => "Metadata Only Paper",
+                getField: (fieldName: string) =>
+                  ({
+                    title: "Metadata Only Paper",
+                    abstractNote:
+                      "This abstract is enough for a high-level overview.",
+                    publicationTitle: "Journal of Tests",
+                    date: "2014",
+                    DOI: "10.1000/meta",
+                  })[fieldName] || "",
+                getCreatorsJSON: () => [
+                  {
+                    creatorType: "author",
+                    firstName: "Iva",
+                    lastName: "Charest",
+                    fieldMode: 0,
+                  },
+                ],
+              } as unknown as Zotero.Item)
+            : null,
         resolveMetadataItem: () => ({ id: 11 }),
         getEditableArticleMetadata: () => ({
           itemId: 11,
@@ -811,6 +842,34 @@ describe("semantic tool surface", function () {
         {
           listPaperContexts: () => [paperContext],
           resolvePaperContextTarget: () => paperContext,
+          getItem: (itemId: number) =>
+            itemId === 11
+              ? ({
+                  id: 11,
+                  libraryID: 1,
+                  key: "METAAFTERFAILURE",
+                  itemTypeID: 1,
+                  itemType: "journalArticle",
+                  isRegularItem: () => true,
+                  isAttachment: () => false,
+                  isNote: () => false,
+                  getDisplayTitle: () => "Metadata After MinerU Failure",
+                  getField: (fieldName: string) =>
+                    ({
+                      title: "Metadata After MinerU Failure",
+                      abstractNote:
+                        "Abstract fallback should still be available.",
+                    })[fieldName] || "",
+                  getCreatorsJSON: () => [
+                    {
+                      creatorType: "author",
+                      firstName: "Iva",
+                      lastName: "Charest",
+                      fieldMode: 0,
+                    },
+                  ],
+                } as unknown as Zotero.Item)
+              : null,
           resolveMetadataItem: () => ({ id: 11 }),
           getEditableArticleMetadata: () => ({
             itemId: 11,
@@ -873,6 +932,33 @@ describe("semantic tool surface", function () {
       {
         listPaperContexts: () => [paperContext],
         resolvePaperContextTarget: () => paperContext,
+        getItem: (itemId: number) =>
+          itemId === 11
+            ? ({
+                id: 11,
+                libraryID: 1,
+                key: "NOPDF",
+                itemTypeID: 1,
+                itemType: "journalArticle",
+                isRegularItem: () => true,
+                isAttachment: () => false,
+                isNote: () => false,
+                getDisplayTitle: () => "Metadata Only Paper",
+                getField: (fieldName: string) =>
+                  ({
+                    title: "Metadata Only Paper",
+                    abstractNote: "This abstract is all that exists locally.",
+                  })[fieldName] || "",
+                getCreatorsJSON: () => [
+                  {
+                    creatorType: "author",
+                    firstName: "Iva",
+                    lastName: "Charest",
+                    fieldMode: 0,
+                  },
+                ],
+              } as unknown as Zotero.Item)
+            : null,
         resolveMetadataItem: () => ({ id: 11 }),
         getEditableArticleMetadata: () => ({
           itemId: 11,
