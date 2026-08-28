@@ -30,8 +30,7 @@ import {
 import {
   buildCaptureFollowupMessage,
   inferPdfMode,
-  normalizeTarget,
-  normalizeTargets,
+  normalizeExplicitTargetSyntax,
   describeNoDefaultPaperTarget,
   resolveDefaultTargets,
 } from "./pdfToolUtils";
@@ -44,6 +43,7 @@ import {
   type FullReadPaperResult,
 } from "../../../shared/exhaustiveDocumentReader";
 import { resolveFullReadPaperTargets } from "../../../shared/fullReadTargetResolver";
+import { getTurnPapersWithRoles } from "../../context/requestTurnPaperScope";
 import { detectExplicitFullReadIntent } from "../../../modules/contextPanel/retrievalQueryPlan";
 import { createCodexAppServerExhaustiveReaderSession } from "../../../codexAppServer/exhaustiveReader";
 
@@ -167,9 +167,9 @@ function resolveFullReadTargets(params: {
   }
   const requestText = userText || params.input.query || "";
   if (!requestText && explicitTargets.length) return explicitTargets;
-  const selected = dedupePaperContexts(
-    params.context.request.selectedPaperContexts || [],
-  );
+  const selected = dedupePaperContexts([
+    ...getTurnPapersWithRoles(params.context.request, ["selected"]),
+  ]);
   const available = dedupePaperContexts([
     ...params.zoteroGateway.listPaperContexts(params.context.request),
     ...selected,
@@ -895,6 +895,13 @@ export function createPaperReadTool(
       inputSchema: {
         type: "object",
         additionalProperties: false,
+        allOf: [
+          {
+            not: {
+              required: ["target", "targets"],
+            },
+          },
+        ],
         properties: {
           mode: {
             type: "string",
@@ -911,6 +918,8 @@ export function createPaperReadTool(
           },
           target: {
             type: "object",
+            description:
+              "Optional explicit paper or visual target. Omit this property to use the current turn's paper scope.",
             properties: {
               contextItemId: { type: "number" },
               itemId: { type: "number" },
@@ -919,9 +928,19 @@ export function createPaperReadTool(
               name: { type: "string" },
             },
             additionalProperties: false,
+            anyOf: [
+              { required: ["contextItemId"] },
+              { required: ["itemId"] },
+              { required: ["paperContext"] },
+              { required: ["attachmentId"] },
+              { required: ["name"] },
+            ],
           },
           targets: {
             type: "array",
+            minItems: 1,
+            description:
+              "Optional explicit paper targets. Omit this property to use the current turn's paper scope.",
             items: {
               type: "object",
               properties: {
@@ -930,6 +949,11 @@ export function createPaperReadTool(
                 paperContext: PAPER_CONTEXT_REF_SCHEMA,
               },
               additionalProperties: false,
+              anyOf: [
+                { required: ["contextItemId"] },
+                { required: ["itemId"] },
+                { required: ["paperContext"] },
+              ],
             },
           },
           query: { type: "string" },
@@ -1037,17 +1061,38 @@ export function createPaperReadTool(
         return fail("Expected an object");
       }
       const mode = normalizeMode(args.mode);
+      const maxTargets =
+        mode === "overview"
+          ? MAX_OVERVIEW_TARGETS
+          : mode === "full"
+            ? MAX_FULL_TARGETS
+            : MAX_TARGETED_TARGETS;
+      const targetSyntax = normalizeExplicitTargetSyntax({
+        targetProvided: Object.prototype.hasOwnProperty.call(args, "target"),
+        target: args.target,
+        targetsProvided: Object.prototype.hasOwnProperty.call(args, "targets"),
+        targets: args.targets,
+        mode: mode === "visual" || mode === "capture" ? "visual" : "paper",
+        maxCount: maxTargets,
+      });
+      if (targetSyntax.kind === "invalid") {
+        return fail(`${targetSyntax.code}: ${targetSyntax.message}`);
+      }
+      const explicitTarget =
+        targetSyntax.kind === "visual_selector"
+          ? {
+              ...targetSyntax.selector.paperSelector,
+              attachmentId: targetSyntax.selector.attachmentId,
+              name: targetSyntax.selector.name,
+            }
+          : undefined;
       const input: PaperReadInput = {
         mode,
-        target: normalizeTarget(args.target),
-        targets: normalizeTargets(
-          args.targets,
-          mode === "overview"
-            ? MAX_OVERVIEW_TARGETS
-            : mode === "full"
-              ? MAX_FULL_TARGETS
-              : MAX_TARGETED_TARGETS,
-        ),
+        target: explicitTarget,
+        targets:
+          targetSyntax.kind === "paper_selectors"
+            ? [...targetSyntax.selectors]
+            : undefined,
         query: normalizeString(args.query),
         queryVariants: normalizeStringArray(args.queryVariants),
         sections: normalizeStringArray(args.sections),

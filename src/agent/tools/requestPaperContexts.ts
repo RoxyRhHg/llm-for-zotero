@@ -1,5 +1,6 @@
 import type { AgentRuntimeRequest } from "../types";
 import type { PaperContextRef } from "../../shared/types";
+import { getTurnPapers } from "../context/requestTurnPaperScope";
 
 export function collectRequestPaperContexts(
   request: AgentRuntimeRequest,
@@ -47,9 +48,6 @@ export function collectRequestPaperContexts(
     indexByKey.set(key, out.length);
     out.push(entry);
   };
-  for (const entry of request.selectedTextPaperContexts || []) push(entry);
-  for (const entry of request.selectedPaperContexts || []) push(entry);
-  for (const entry of request.fullTextPaperContexts || []) push(entry);
-  for (const entry of request.pinnedPaperContexts || []) push(entry);
+  for (const entry of getTurnPapers(request)) push(entry);
   return out;
 }

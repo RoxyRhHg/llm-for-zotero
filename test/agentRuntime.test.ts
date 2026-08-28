@@ -29,6 +29,7 @@ import {
 import { createToolResultReadTool } from "../src/agent/tools/read/toolResultRead";
 import { createFileIOTool } from "../src/agent/tools/write/fileIO";
 import { createWebSearchTool } from "../src/agent/tools/read/webSearch";
+import { createPaperReadTool } from "../src/agent/tools/read/paperRead";
 import { TAVILY_API_KEY_PREF } from "../src/webAccess/prefs";
 import type { WebAccessProvider } from "../src/webAccess/types";
 import {
@@ -304,6 +305,7 @@ describe("AgentRuntime", function () {
       const outcome = await runtime.runTurn({
         request: {
           conversationKey: 1,
+          libraryID: 1,
           mode: "agent",
           userText: "hello",
           model: "gpt-4o-mini",
@@ -319,6 +321,123 @@ describe("AgentRuntime", function () {
       assert.deepInclude(events[0], {
         type: "fallback",
       });
+    } finally {
+      restoreDb();
+    }
+  });
+
+  it("runs issue #393 from Agent request through an empty-target paper_read call", async function () {
+    const restoreDb = installMockDb();
+    const paperContext = {
+      itemId: 101,
+      contextItemId: 202,
+      title: "Issue 393 paper",
+    };
+    let ensuredPaper: unknown;
+    try {
+      const registry = new AgentToolRegistry();
+      registry.register(
+        createPaperReadTool(
+          {
+            ensurePaperContext: async (paper: unknown) => {
+              ensuredPaper = paper;
+              return {
+                title: paperContext.title,
+                chunks: ["The method used a stable readout."],
+                chunkMeta: [
+                  {
+                    chunkIndex: 0,
+                    text: "The method used a stable readout.",
+                    normalizedText: "the method used a stable readout.",
+                    chunkKind: "body",
+                  },
+                ],
+                chunkStats: [],
+                docFreq: {},
+                avgChunkLength: 0,
+                fullLength: 35,
+              };
+            },
+          } as never,
+          {
+            retrieveEvidence: async () => [
+              {
+                paperContext,
+                chunkIndex: 0,
+                text: "The method used a stable readout.",
+                score: 1,
+                sourceLabel: "Issue 393 paper",
+              },
+            ],
+          } as never,
+          {} as never,
+          {
+            resolvePaperContextTarget: () => paperContext,
+          } as never,
+        ),
+      );
+      const toolCall = {
+        id: "issue-393-paper-read",
+        name: "paper_read",
+        arguments: {
+          mode: "targeted",
+          target: {},
+          query: "Use the actual PDF/full text to explain the method.",
+        },
+      };
+      const runtime = new AgentRuntime({
+        registry,
+        adapterFactory: () =>
+          new MockAdapter(
+            [
+              {
+                kind: "tool_calls",
+                calls: [toolCall],
+                assistantMessage: {
+                  role: "assistant",
+                  content: "",
+                  tool_calls: [toolCall],
+                },
+              },
+              {
+                kind: "final",
+                text: "The paper uses a stable readout.",
+                assistantMessage: {
+                  role: "assistant",
+                  content: "The paper uses a stable readout.",
+                },
+              },
+            ],
+            { streaming: false, toolCalls: true, multimodal: false },
+          ),
+      });
+      const events: AgentEvent[] = [];
+      const outcome = await runtime.runTurn({
+        request: {
+          conversationKey: 393,
+          libraryID: 1,
+          conversationKind: "paper",
+          mode: "agent",
+          userText: "Use the actual PDF/full text to explain the method.",
+          activeItemId: paperContext.itemId,
+          selectedPaperContexts: [paperContext],
+          model: "gpt-5.4",
+          apiBase: "",
+          apiKey: "test",
+        },
+        onEvent: (event) => events.push(event),
+      });
+
+      assert.equal(outcome.kind, "completed");
+      assert.deepInclude(ensuredPaper as Record<string, unknown>, paperContext);
+      assert.isFalse(
+        events.some(
+          (event) =>
+            event.type === "tool_result" &&
+            event.name === "paper_read" &&
+            !event.ok,
+        ),
+      );
     } finally {
       restoreDb();
     }
@@ -356,6 +475,7 @@ describe("AgentRuntime", function () {
       await runtime.runTurn({
         request: {
           conversationKey: 1,
+          libraryID: 1,
           mode: "agent",
           userText: "help me understand this paper",
           selectedPaperContexts: [
@@ -1486,6 +1606,7 @@ describe("AgentRuntime", function () {
       const outcome = await runtime.runTurn({
         request: {
           conversationKey: 7_940_001,
+          libraryID: 1,
           mode: "agent",
           userText: "read selected PDF",
           model: "gpt-5.4",

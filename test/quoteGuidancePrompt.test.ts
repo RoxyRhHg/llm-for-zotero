@@ -21,8 +21,12 @@ import {
 } from "../src/shared/instructionContracts";
 import { BALANCED_EVIDENCE_GUIDANCE } from "../src/shared/quoteGuidance";
 import { DEFAULT_SYSTEM_PROMPT } from "../src/utils/llmDefaults";
-import type { AgentRuntimeRequest } from "../src/agent/types";
+import type {
+  AgentRuntimeRequest,
+  AgentRuntimeRequestInput,
+} from "../src/agent/types";
 import type { PaperContextRef } from "../src/shared/types";
+import { resolvedAgentRequest } from "./helpers/resolvedAgentRequest";
 
 const BALANCED_EVIDENCE_PHRASES = [
   "important paper-specific claims checkable",
@@ -75,17 +79,21 @@ function paper(itemId = 11): PaperContextRef {
   };
 }
 
-function request(): AgentRuntimeRequest {
+function request(
+  overrides: Partial<AgentRuntimeRequestInput> = {},
+): AgentRuntimeRequest {
   const paperContext = paper();
-  return {
+  return resolvedAgentRequest({
     conversationKey: 909,
     mode: "agent",
     userText: "Explain the method.",
     activeItemId: paperContext.itemId,
     libraryID: 1,
+    conversationKind: "paper",
     selectedPaperContexts: [paperContext],
     fullTextPaperContexts: [paperContext, paper(21)],
-  };
+    ...overrides,
+  });
 }
 
 function readSkill(relativePath: string): string {
@@ -220,23 +228,27 @@ describe("quote guidance prompts", function () {
       title: "Figure Paper",
       mineruCacheDir: "/tmp/llm-for-zotero-mineru/12",
     };
-    const plainRequest = {
-      ...request(),
+    const plainRequest = request({
       userText: "Explain the main result.",
       selectedPaperContexts: [paperContext],
       fullTextPaperContexts: [],
-    };
+    });
     const unmatched = await buildAgentInitialMessages(plainRequest, [], []);
     const conceptualGraphQuestion = await buildAgentInitialMessages(
-      {
-        ...plainRequest,
+      request({
         userText: "Explain graph neural networks and image representations.",
-      },
+        selectedPaperContexts: [paperContext],
+        fullTextPaperContexts: [],
+      }),
       [],
       [],
     );
     const intentMatched = await buildAgentInitialMessages(
-      { ...plainRequest, userText: "Explain Figure 1." },
+      request({
+        userText: "Explain Figure 1.",
+        selectedPaperContexts: [paperContext],
+        fullTextPaperContexts: [],
+      }),
       [],
       [],
     );

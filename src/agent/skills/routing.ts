@@ -260,8 +260,8 @@ function hasPaperTarget(request: SkillRoutingRequest): boolean {
 
 function hasLibraryScopeTarget(request: SkillRoutingRequest): boolean {
   return Boolean(
-    request.selectedCollectionContexts?.length ||
-    request.selectedTagContexts?.length ||
+    request.turnPaperScope.collections.length ||
+    request.turnPaperScope.tags.length ||
     LIBRARY_SCOPE_TARGET_PATTERN.test(request.userText || ""),
   );
 }
@@ -298,8 +298,8 @@ function computeContextForcedSkillIds(
     forced.add(SIMPLE_PAPER_QA_SKILL_ID);
   }
   if (
-    (request.selectedCollectionContexts?.length ||
-      request.selectedTagContexts?.length) &&
+    (request.turnPaperScope.collections.length ||
+      request.turnPaperScope.tags.length) &&
     (COLLECTION_ANALYSIS_INTENT_PATTERN.test(request.userText || "") ||
       request.classifiedIntent?.retrievalIntent === "summarize")
   ) {

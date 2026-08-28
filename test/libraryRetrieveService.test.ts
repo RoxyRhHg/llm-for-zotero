@@ -1,6 +1,6 @@
 import { assert } from "chai";
 import {
-  LibraryRetrieveService,
+  LibraryRetrieveService as ResolvedLibraryRetrieveService,
   QUICKSEARCH_MAX_PROBES,
   buildQuicksearchProbes,
 } from "../src/agent/services/libraryRetrieveService";
@@ -15,6 +15,18 @@ import type {
 } from "../src/modules/contextPanel/types";
 import type { PaperContextRef } from "../src/shared/types";
 import { normalizeLibraryRetrieveArgs } from "../src/agent/tools/read/libraryRetrieve";
+import { resolvedAgentRequest } from "./helpers/resolvedAgentRequest";
+
+class LibraryRetrieveService extends ResolvedLibraryRetrieveService {
+  override retrieve(
+    params: Parameters<ResolvedLibraryRetrieveService["retrieve"]>[0],
+  ): ReturnType<ResolvedLibraryRetrieveService["retrieve"]> {
+    return super.retrieve({
+      ...params,
+      request: resolvedAgentRequest(params.request),
+    });
+  }
+}
 
 function makeItem(
   itemId: number,

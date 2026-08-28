@@ -12,7 +12,7 @@ import type {
   AgentPendingAction,
   AgentRunEventRecord,
   AgentRuntimeOutcome,
-  AgentRuntimeRequest,
+  AgentRuntimeRequestInput as AgentRuntimeRequest,
 } from "../../../agent/types";
 import { consumePendingRetentionEvents } from "../../../claudeCode/runtimeRetention";
 import {
@@ -1560,9 +1560,6 @@ export async function sendAgentTurn(
   );
   const normalizedPaperContexts = deps.normalizePaperContexts([
     ...(paperContexts || []),
-    ...selectedTextPaperContextsForMessage.filter(
-      (paper): paper is PaperContextRef => Boolean(paper),
-    ),
   ]);
   const normalizedFullTextPaperContexts = deps.normalizePaperContexts(
     fullTextPaperContexts,

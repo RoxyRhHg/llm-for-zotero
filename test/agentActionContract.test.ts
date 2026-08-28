@@ -5,12 +5,14 @@ import type {
   AgentActionIntent,
   AgentActionEvidence,
   AgentRuntimeRequest,
+  AgentRuntimeRequestInput,
   AgentToolDefinition,
 } from "../src/agent/types";
 import type {
   LibraryMutationOperation,
   LibraryMutationState,
 } from "../src/agent/services/libraryMutation/contracts";
+import { resolvedAgentRequest } from "./helpers/resolvedAgentRequest";
 
 type FakeItemState = {
   tags: string[];
@@ -184,11 +186,12 @@ function requestWithIntents(
   } = {},
 ): AgentRuntimeRequest {
   const selectedCollection = options.selectedCollection ?? 11;
-  return {
+  const input: AgentRuntimeRequestInput = {
     conversationKey: 1,
     mode: "agent",
     userText: options.userText || "test action",
     model: "test",
+    libraryID: 1,
     selectedCollectionContexts:
       selectedCollection > 0
         ? [
@@ -208,6 +211,7 @@ function requestWithIntents(
       actionIntents,
     },
   };
+  return resolvedAgentRequest(input);
 }
 
 function mutationTool(): AgentToolDefinition<any, unknown> {

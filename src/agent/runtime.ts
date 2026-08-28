@@ -21,6 +21,8 @@ import type {
   AgentPendingAction,
   AgentRuntimeOutcome,
   AgentRuntimeRequest,
+  AgentRuntimeRequestInput,
+  ResolvedAgentRuntimeRequest,
   AgentToolCall,
   AgentToolArtifact,
   AgentToolContext,
@@ -31,6 +33,14 @@ import type {
   AgentActionProgressLedger,
   AgentRunRecord,
 } from "./types";
+import {
+  resolveAgentRuntimeRequest,
+  type AgentRequestPaperContextResolver,
+} from "./context/resolvedAgentRequest";
+import {
+  getTurnPapersWithRoles,
+  getTurnPaperScopeFromRequest,
+} from "./context/requestTurnPaperScope";
 import type { AgentModelAdapter } from "./model/adapter";
 import type {
   AgentAdapterToolCallResult,
@@ -127,7 +137,8 @@ const TOOL_RESULT_READ_TOOL_NAME = "tool_result_read";
 
 type AgentRuntimeDeps = {
   registry: AgentToolRegistry;
-  adapterFactory: (request: AgentRuntimeRequest) => AgentModelAdapter;
+  adapterFactory: (request: ResolvedAgentRuntimeRequest) => AgentModelAdapter;
+  paperContextResolver?: AgentRequestPaperContextResolver;
   now?: () => number;
 };
 
@@ -746,6 +757,7 @@ function buildToolProgressFingerprint(record: {
 export class AgentRuntime {
   private readonly registry: AgentToolRegistry;
   private readonly adapterFactory: AgentRuntimeDeps["adapterFactory"];
+  private readonly paperContextResolver?: AgentRequestPaperContextResolver;
   private readonly now: () => number;
   private readonly pendingConfirmations = new Map<
     string,
@@ -755,6 +767,7 @@ export class AgentRuntime {
   constructor(deps: AgentRuntimeDeps) {
     this.registry = deps.registry;
     this.adapterFactory = deps.adapterFactory;
+    this.paperContextResolver = deps.paperContextResolver;
     this.now = deps.now || (() => Date.now());
   }
 
@@ -776,8 +789,13 @@ export class AgentRuntime {
     return this.registry.unregister(name);
   }
 
-  getCapabilities(request: AgentRuntimeRequest) {
-    return this.adapterFactory(request).getCapabilities(request);
+  getCapabilities(request: AgentRuntimeRequestInput) {
+    const resolved = resolveAgentRuntimeRequest(request, {
+      resolvePaperContext: this.paperContextResolver,
+    });
+    return this.adapterFactory(resolved).getCapabilities(
+      resolved as unknown as AgentRuntimeRequest,
+    );
   }
 
   /**
@@ -821,12 +839,14 @@ export class AgentRuntime {
   }
 
   async runTurn(params: {
-    request: AgentRuntimeRequest;
+    request: AgentRuntimeRequestInput;
     onEvent?: (event: AgentEvent) => void | Promise<void>;
     onStart?: (runId: string) => void | Promise<void>;
     signal?: AbortSignal;
   }): Promise<AgentRuntimeOutcome> {
-    const request = params.request;
+    const request = resolveAgentRuntimeRequest(params.request, {
+      resolvePaperContext: this.paperContextResolver,
+    });
     const writeAllowed = () =>
       !areConversationWritesFrozen(request.conversationKey) &&
       (request.conversationGeneration === undefined ||
@@ -859,12 +879,12 @@ export class AgentRuntime {
       // profile when a provider does not expose a catalog.
     }
     validateLocalPdfDocumentBatch({
-      pdfPaperContexts: request.pdfPaperContexts,
-      localDocuments: request.localDocuments,
+      pdfPaperContexts: getTurnPapersWithRoles(request, ["raw_pdf"]),
+      localDocuments: request.localDocuments?.map((entry) => entry.resource),
     });
     const pathLease = acquireLocalDocumentPathLease(
       request.conversationKey,
-      request.localDocuments,
+      request.localDocuments?.map((entry) => entry.resource),
     );
     let webSourceRunId: string | undefined;
     try {
@@ -1188,9 +1208,7 @@ export class AgentRuntime {
       const hasPaperReadScope =
         request.conversationKind === "paper" ||
         Boolean(request.activeItemId) ||
-        Boolean(request.selectedPaperContexts?.length) ||
-        Boolean(request.fullTextPaperContexts?.length) ||
-        Boolean(request.pinnedPaperContexts?.length);
+        request.turnPaperScope.papers.length > 0;
       if (requestIntent.requiresFullPaperRead && hasPaperReadScope) {
         if (!request.classifiedIntent) {
           request.classifiedIntent = {
@@ -1271,11 +1289,12 @@ export class AgentRuntime {
         providerType: "agent_context_envelope",
         payload: {
           resourceSignature: resourceContextPlan.resourceSignature,
-          selectedPaperCount: request.selectedPaperContexts?.length || 0,
-          fullTextPaperCount: request.fullTextPaperContexts?.length || 0,
-          selectedCollectionCount:
-            request.selectedCollectionContexts?.length || 0,
-          selectedTagCount: request.selectedTagContexts?.length || 0,
+          selectedPaperCount: getTurnPapersWithRoles(request, ["selected"])
+            .length,
+          fullTextPaperCount: getTurnPapersWithRoles(request, ["full_text"])
+            .length,
+          selectedCollectionCount: request.turnPaperScope.collections.length,
+          selectedTagCount: request.turnPaperScope.tags.length,
           attachmentCount: request.attachments?.length || 0,
           screenshotCount: request.screenshots?.length || 0,
         },
@@ -2261,8 +2280,8 @@ export class AgentRuntime {
             // branch — unlike the full-read guard, a degraded answer with
             // disclosed coverage beats an aborted run).
             const libraryScoped = Boolean(
-              request.selectedCollectionContexts?.length ||
-              request.selectedTagContexts?.length,
+              request.turnPaperScope.collections.length ||
+              request.turnPaperScope.tags.length,
             );
             if (
               libraryScoped &&

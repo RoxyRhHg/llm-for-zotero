@@ -1,14 +1,16 @@
 import { assert } from "chai";
 import { createSearchLiteratureOnlineTool } from "../src/agent/tools/read/searchLiteratureOnline";
 import type { AgentToolContext } from "../src/agent/types";
+import { resolvedAgentRequest } from "./helpers/resolvedAgentRequest";
 
 describe("search_literature_online tool", function () {
   const baseContext: AgentToolContext = {
-    request: {
+    request: resolvedAgentRequest({
       conversationKey: 11,
       mode: "agent",
       userText: "Find related papers",
-    },
+      libraryID: 1,
+    }),
     item: null,
     currentAnswerText: "",
     modelName: "gpt-5.4",

@@ -29,12 +29,20 @@ import type {
   AgentConfirmationResolution,
   AgentPendingAction,
   AgentRuntimeRequest,
+  AgentRuntimeRequestInput,
   AgentToolArtifact,
   AgentToolContext,
   ExhaustiveReadBackend,
   PreparedToolExecution,
   ToolSpec,
 } from "../types";
+import { resolveAgentRuntimeRequest } from "../context/resolvedAgentRequest";
+import {
+  getActiveTurnPaper,
+  type TurnPaperRole,
+  type TurnPaperScope,
+  type TurnPaperScopeWarning,
+} from "../context/turnPaperScope";
 import {
   MCP_METHODS,
   RPC_ERRORS,
@@ -156,7 +164,7 @@ const MCP_TOOLS_WITH_OWN_CONFIRMATION_POLICY = new Set([
   "zotero_script",
 ]);
 
-export type ZoteroMcpActiveScope = {
+type ZoteroMcpScopeMetadata = {
   profileSignature?: string;
   conversationKey?: number;
   instanceID?: string;
@@ -180,19 +188,62 @@ export type ZoteroMcpActiveScope = {
     ExhaustiveReadBackend,
     "codex_responses" | "unavailable"
   >;
-  paperContext?: PaperContextRef;
-  selectedPaperContexts?: PaperContextRef[];
-  pdfPaperContexts?: PaperContextRef[];
-  fullTextPaperContexts?: PaperContextRef[];
-  pinnedPaperContexts?: PaperContextRef[];
-  selectedCollectionContexts?: CollectionContextRef[];
-  selectedTagContexts?: TagContextRef[];
 };
+
+export type ZoteroMcpPaperScopeInput =
+  | {
+      turnPaperScope: TurnPaperScope;
+      turnPaperScopeWarnings?: readonly TurnPaperScopeWarning[];
+      paperContext?: never;
+      selectedPaperContexts?: never;
+      pdfPaperContexts?: never;
+      fullTextPaperContexts?: never;
+      pinnedPaperContexts?: never;
+      selectedCollectionContexts?: never;
+      selectedTagContexts?: never;
+    }
+  | {
+      turnPaperScope?: never;
+      turnPaperScopeWarnings?: never;
+      paperContext?: PaperContextRef;
+      selectedPaperContexts?: PaperContextRef[];
+      pdfPaperContexts?: PaperContextRef[];
+      fullTextPaperContexts?: PaperContextRef[];
+      pinnedPaperContexts?: PaperContextRef[];
+      selectedCollectionContexts?: CollectionContextRef[];
+      selectedTagContexts?: TagContextRef[];
+    };
+
+export type ZoteroMcpActiveScope = ZoteroMcpScopeMetadata &
+  ZoteroMcpPaperScopeInput;
 
 type McpServerDeps = {
   toolRegistry: AgentToolRegistry;
   zoteroGateway: ZoteroGateway;
 };
+
+function getMcpScopePapers(
+  scope: ZoteroMcpActiveScope | null,
+  roles?: readonly TurnPaperRole[],
+): PaperContextRef[] {
+  if (scope?.turnPaperScope) {
+    return scope.turnPaperScope.papers
+      .filter(
+        (entry) => !roles || entry.roles.some((role) => roles.includes(role)),
+      )
+      .map((entry) => entry.paper);
+  }
+  if (!scope) return [];
+  const legacyByRole: Array<[TurnPaperRole, PaperContextRef[] | undefined]> = [
+    ["selected", normalizePaperContexts(scope.selectedPaperContexts)],
+    ["raw_pdf", normalizePaperContexts(scope.pdfPaperContexts)],
+    ["full_text", normalizePaperContexts(scope.fullTextPaperContexts)],
+    ["pinned", normalizePaperContexts(scope.pinnedPaperContexts)],
+  ];
+  return legacyByRole
+    .filter(([role]) => !roles || roles.includes(role))
+    .flatMap(([, papers]) => papers || []);
+}
 
 type EndpointOptions = {
   method: string;
@@ -614,14 +665,48 @@ function normalizeReasoningConfig(
 function normalizeActiveScope(
   scope: ZoteroMcpActiveScope,
 ): ZoteroMcpActiveScope {
+  const rawScope = scope as ZoteroMcpActiveScope & Record<string, unknown>;
+  const hasLegacyPaperScope = [
+    "paperContext",
+    "selectedPaperContexts",
+    "pdfPaperContexts",
+    "fullTextPaperContexts",
+    "pinnedPaperContexts",
+    "selectedCollectionContexts",
+    "selectedTagContexts",
+  ].some((field) => rawScope[field] !== undefined);
+  if (scope.turnPaperScope && hasLegacyPaperScope) {
+    throw new Error(
+      "conflicting_paper_scope: send turnPaperScope or legacy paper arrays, not both.",
+    );
+  }
   const paperContext = normalizePaperContext(scope.paperContext);
+  const canonicalActivePaper = scope.turnPaperScope
+    ? getActiveTurnPaper(scope.turnPaperScope)
+    : undefined;
   const conversationKey = normalizePositiveInt(scope.conversationKey);
   const paperItemID =
-    normalizePositiveInt(scope.paperItemID) || paperContext?.itemId;
+    normalizePositiveInt(scope.paperItemID) ||
+    canonicalActivePaper?.itemId ||
+    paperContext?.itemId;
   const activeContextItemId =
     normalizePositiveInt(scope.activeContextItemId) ||
+    canonicalActivePaper?.contextItemId ||
     paperContext?.contextItemId;
-  return {
+  const metadataLibraryID = normalizePositiveInt(scope.libraryID);
+  const canonicalLibraryID = normalizePositiveInt(
+    scope.turnPaperScope?.libraryID,
+  );
+  if (
+    metadataLibraryID &&
+    canonicalLibraryID &&
+    metadataLibraryID !== canonicalLibraryID
+  ) {
+    throw new Error(
+      "conflicting_paper_scope: turnPaperScope belongs to a different Zotero library.",
+    );
+  }
+  const metadata: ZoteroMcpScopeMetadata = {
     profileSignature: normalizeText(scope.profileSignature, 128),
     conversationKey,
     instanceID: normalizeText(scope.instanceID, 128),
@@ -630,8 +715,10 @@ function normalizeActiveScope(
         ? Math.max(0, Math.floor(Number(scope.conversationGeneration)))
         : getConversationWriteGeneration(conversationKey)
       : undefined,
-    libraryID: normalizePositiveInt(scope.libraryID),
-    kind: scope.kind === "paper" ? "paper" : "global",
+    libraryID: canonicalLibraryID || metadataLibraryID,
+    kind:
+      scope.turnPaperScope?.conversationKind ||
+      (scope.kind === "paper" ? "paper" : "global"),
     paperItemID,
     activeItemId:
       normalizePositiveInt(scope.activeItemId) || paperItemID || undefined,
@@ -650,6 +737,16 @@ function normalizeActiveScope(
       scope.exhaustiveReadBackend === "codex_responses"
         ? "codex_responses"
         : "unavailable",
+  };
+  if (scope.turnPaperScope) {
+    return {
+      ...metadata,
+      turnPaperScope: scope.turnPaperScope,
+      turnPaperScopeWarnings: scope.turnPaperScopeWarnings,
+    };
+  }
+  return {
+    ...metadata,
     paperContext,
     selectedPaperContexts: normalizePaperContexts(scope.selectedPaperContexts),
     pdfPaperContexts: (
@@ -952,7 +1049,7 @@ function shouldBlockRawPdfRetrieval(params: {
   scope: ZoteroMcpActiveScope | null;
 }): boolean {
   if (!RAW_PDF_RETRIEVAL_TOOL_NAMES.has(params.toolName)) return false;
-  const rawPdfs = normalizePaperContexts(params.scope?.pdfPaperContexts) || [];
+  const rawPdfs = getMcpScopePapers(params.scope, ["raw_pdf"]);
   if (!rawPdfs.length) return false;
   const isLibraryAttachmentEnumeration =
     params.toolName === "library_read" &&
@@ -996,11 +1093,15 @@ function shouldBlockRawPdfRetrieval(params: {
     // exact non-PDF paper identity.
     return true;
   }
-  const explicitTextContexts = [
-    ...(normalizePaperContexts(params.scope?.selectedPaperContexts) || []),
-    ...(normalizePaperContexts(params.scope?.fullTextPaperContexts) || []),
-    ...(normalizePaperContexts(params.scope?.pinnedPaperContexts) || []),
-  ].filter((paper) => paper.contentSourceMode !== "pdf");
+  const explicitTextContexts = params.scope?.turnPaperScope
+    ? params.scope.turnPaperScope.papers
+        .filter((entry) => !entry.roles.includes("raw_pdf"))
+        .map((entry) => entry.paper)
+    : getMcpScopePapers(params.scope, [
+        "selected",
+        "full_text",
+        "pinned",
+      ]).filter((paper) => paper.contentSourceMode !== "pdf");
   const explicitTextKeys = new Set(
     explicitTextContexts.map(
       (paper) => `${paper.itemId}:${paper.contextItemId}`,
@@ -1130,7 +1231,7 @@ function getMcpToolAnnotations(
 }
 
 function hasRawPdfScope(scope: ZoteroMcpActiveScope | null): boolean {
-  return Boolean(normalizePaperContexts(scope?.pdfPaperContexts)?.length);
+  return getMcpScopePapers(scope, ["raw_pdf"]).length > 0;
 }
 
 function isMcpToolVisibleInScope(
@@ -1259,6 +1360,12 @@ function resolveScopePaperContext(
   scope: ZoteroMcpActiveScope | null,
 ): PaperContextRef | undefined {
   if (!scope) return undefined;
+  if (scope.turnPaperScope) {
+    return (
+      getActiveTurnPaper(scope.turnPaperScope) ||
+      scope.turnPaperScope.papers[0]?.paper
+    );
+  }
   const paperContext = normalizePaperContext(scope.paperContext);
   if (paperContext) return paperContext;
   const itemId = normalizePositiveInt(scope.paperItemID || scope.activeItemId);
@@ -1438,6 +1545,7 @@ function findZoteroMcpConfirmationHandler(
 function createToolContext(
   rawArgs: unknown,
   headers?: Record<string, string>,
+  zoteroGateway?: ZoteroGateway,
 ): AgentToolContext {
   const scopeArgs = extractMcpScopeArgs(rawArgs);
   const scope = resolveScopedMcpScope(headers);
@@ -1478,12 +1586,12 @@ function createToolContext(
   const activeNoteContext = resolveScopeActiveNoteContext(scope);
   const exhaustiveReadBackend =
     scope?.exhaustiveReadBackend === "codex_responses"
-      ? "codex_responses"
-      : "unavailable";
-  const request: AgentRuntimeRequest = {
+      ? ("codex_responses" as const)
+      : ("unavailable" as const);
+  const requestBase = {
     conversationKey: scope?.conversationKey || 0,
     conversationGeneration: scope?.conversationGeneration,
-    mode: "agent",
+    mode: "agent" as const,
     userText:
       normalizeText(
         normalizeRecord(rawArgs).question || normalizeRecord(rawArgs).text,
@@ -1498,26 +1606,48 @@ function createToolContext(
     apiBase: scope?.codexPath,
     authMode:
       exhaustiveReadBackend === "codex_responses"
-        ? "codex_app_server"
+        ? ("codex_app_server" as const)
         : undefined,
     providerProtocol:
       exhaustiveReadBackend === "codex_responses"
-        ? "codex_responses"
+        ? ("codex_responses" as const)
         : undefined,
     reasoning: scope?.reasoning,
     exhaustiveReadBackend,
-    selectedPaperContexts:
-      selectedPaperContexts ||
-      (!hasExplicitPaperScope && paperContext ? [paperContext] : undefined),
-    pdfPaperContexts: pdfPaperContexts.length ? pdfPaperContexts : undefined,
-    fullTextPaperContexts:
-      fullTextPaperContexts ||
-      (!hasExplicitPaperScope && paperContext ? [paperContext] : undefined),
-    pinnedPaperContexts,
-    selectedCollectionContexts: scope?.selectedCollectionContexts,
-    selectedTagContexts: scope?.selectedTagContexts,
     activeNoteContext,
   };
+  const request: AgentRuntimeRequest = scope?.turnPaperScope
+    ? {
+        ...requestBase,
+        turnPaperScope: scope.turnPaperScope,
+        turnPaperScopeWarnings: scope.turnPaperScopeWarnings,
+      }
+    : resolveAgentRuntimeRequest(
+        {
+          ...requestBase,
+          selectedPaperContexts:
+            selectedPaperContexts ||
+            (!hasExplicitPaperScope && paperContext
+              ? [paperContext]
+              : undefined),
+          pdfPaperContexts: pdfPaperContexts.length
+            ? pdfPaperContexts
+            : undefined,
+          fullTextPaperContexts:
+            fullTextPaperContexts ||
+            (!hasExplicitPaperScope && paperContext
+              ? [paperContext]
+              : undefined),
+          pinnedPaperContexts,
+          selectedCollectionContexts: scope?.selectedCollectionContexts,
+          selectedTagContexts: scope?.selectedTagContexts,
+        } satisfies AgentRuntimeRequestInput,
+        {
+          resolvePaperContext: zoteroGateway
+            ? (selector) => zoteroGateway.resolvePaperContextTarget(selector)
+            : undefined,
+        },
+      );
   return {
     request,
     item,
@@ -1793,7 +1923,7 @@ async function handleToolsCall(
         name,
         arguments: scopeArgs.toolArgs,
       },
-      createToolContext(rawArgs, headers),
+      createToolContext(rawArgs, headers, deps.zoteroGateway),
       {
         forceConfirmation:
           tool.spec.mutability === "write" &&

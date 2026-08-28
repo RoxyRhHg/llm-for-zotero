@@ -279,13 +279,22 @@ describe("Codex native skills", function () {
     assert.equal(request.authMode, "codex_app_server");
     assert.equal(request.providerProtocol, "codex_responses");
     assert.equal(request.activeItemId, 42);
-    assert.deepEqual(request.selectedPaperContexts, [
-      {
-        itemId: 42,
-        contextItemId: 99,
-        title: "Native Skills Paper",
-      },
-    ]);
+    assert.deepEqual(
+      request.turnPaperScope.papers.map(({ paper, roles }) => ({
+        itemId: paper.itemId,
+        contextItemId: paper.contextItemId,
+        title: paper.title,
+        roles,
+      })),
+      [
+        {
+          itemId: 42,
+          contextItemId: 99,
+          title: "Native Skills Paper",
+          roles: ["active"],
+        },
+      ],
+    );
     assert.equal(request.activeNoteContext?.noteId, 55);
     assert.deepEqual(request.selectedTexts, ["Figure caption"]);
     assert.deepEqual(request.screenshots, ["data:image/png;base64,AAAA"]);
@@ -333,13 +342,14 @@ describe("Codex native skills", function () {
     );
 
     assert.deepEqual(
-      request.pdfPaperContexts?.map((paper) => [
-        paper.itemId,
-        paper.contextItemId,
-      ]),
+      request.turnPaperScope.papers
+        .filter((entry) => entry.roles.includes("raw_pdf"))
+        .map(({ paper }) => [paper.itemId, paper.contextItemId]),
       [[42, 99]],
     );
-    assert.deepEqual(request.localDocuments, [localDocument]);
+    assert.deepEqual(request.localDocuments, [
+      { paperKey: "7:42:99", resource: localDocument },
+    ]);
     assert.include(block, "Call paper_read overview.");
     assert.include(block, "overrides conflicting paper-reading routes");
     assert.notInclude(

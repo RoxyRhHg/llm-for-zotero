@@ -4,8 +4,10 @@ import { buildAgentInitialMessages } from "../src/agent/model/messageBuilder";
 import { createBuiltInToolRegistry } from "../src/agent/tools";
 import type {
   AgentRuntimeRequest,
+  AgentRuntimeRequestInput,
   AgentToolDefinition,
 } from "../src/agent/types";
+import { resolvedAgentRequest } from "./helpers/resolvedAgentRequest";
 
 function registry() {
   return createBuiltInToolRegistry({
@@ -19,13 +21,14 @@ function registry() {
 function request(
   userText: string,
   externalSearchIntent?: NonNullable<
-    AgentRuntimeRequest["classifiedIntent"]
+    AgentRuntimeRequestInput["classifiedIntent"]
   >["externalSearchIntent"],
 ): AgentRuntimeRequest {
-  return {
+  return resolvedAgentRequest({
     conversationKey: Math.floor(Math.random() * 1_000_000),
     mode: "agent",
     userText,
+    libraryID: 1,
     ...(externalSearchIntent
       ? {
           classifiedIntent: {
@@ -36,7 +39,7 @@ function request(
           },
         }
       : {}),
-  };
+  });
 }
 
 function guidanceTools(): {

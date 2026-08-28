@@ -281,12 +281,10 @@ function collectRequestPaperContexts(
   request: AgentRuntimeRequest,
 ): PaperContextRef[] {
   return [
-    ...(request.selectedTextPaperContexts || []).filter(
-      (entry): entry is PaperContextRef => Boolean(entry),
+    ...request.turnPaperScope.selectedPassagePaperRefs.map(
+      (entry) => entry.paper,
     ),
-    ...(request.selectedPaperContexts || []),
-    ...(request.fullTextPaperContexts || []),
-    ...(request.pinnedPaperContexts || []),
+    ...request.turnPaperScope.papers.map((entry) => entry.paper),
   ];
 }
 
@@ -1094,7 +1092,11 @@ export function planAgentContextCache(params: {
     mode: "full",
     strategy: "agent-stable-resources",
     contextText: params.stableContextText,
-    paperContexts: params.request.selectedPaperContexts,
-    fullTextPaperContexts: params.request.fullTextPaperContexts,
+    paperContexts: params.request.turnPaperScope.papers
+      .filter((entry) => entry.roles.includes("selected"))
+      .map((entry) => entry.paper),
+    fullTextPaperContexts: params.request.turnPaperScope.papers
+      .filter((entry) => entry.roles.includes("full_text"))
+      .map((entry) => entry.paper),
   });
 }

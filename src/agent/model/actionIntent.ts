@@ -326,16 +326,16 @@ function requestedCoverage(text: string): AgentActionIntent["coverage"] {
 }
 
 function requestedCollectionScope(
-  request: Pick<AgentRuntimeRequest, "userText" | "selectedCollectionContexts">,
+  request: Pick<AgentRuntimeRequest, "userText" | "turnPaperScope">,
 ): AgentActionIntent["scope"] | undefined {
   const text = request.userText || "";
   const named = text.match(
     /\b(?:collection|folder)\s+(?:named\s+)?["“']([^"”']+)["”']/i,
   )?.[1];
-  if (!named && !request.selectedCollectionContexts?.length) return undefined;
+  if (!named && !request.turnPaperScope.collections.length) return undefined;
   return {
     kind: "collection",
-    ...(named && !request.selectedCollectionContexts?.length
+    ...(named && !request.turnPaperScope.collections.length
       ? { path: named.trim() }
       : {}),
     includeDescendants:
@@ -377,7 +377,7 @@ function mutationRequestIsExplicit(text: string): boolean {
 
 /** High-confidence fallback used only when the classifier call fails. */
 export function inferActionIntentsFromRequest(
-  request: Pick<AgentRuntimeRequest, "userText" | "selectedCollectionContexts">,
+  request: Pick<AgentRuntimeRequest, "userText" | "turnPaperScope">,
 ): AgentActionIntent[] {
   const text = (request.userText || "").trim();
   if (!text) return [];

@@ -2,7 +2,7 @@ import type { AgentRuntime } from "../agent/runtime";
 import type {
   AgentEvent,
   AgentRuntimeOutcome,
-  AgentRuntimeRequest,
+  AgentRuntimeRequestInput as AgentRuntimeRequest,
 } from "../agent/types";
 import type {
   ClaudeConversationKind,

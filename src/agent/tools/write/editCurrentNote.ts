@@ -316,9 +316,7 @@ function buildAppendedNoteText(
 
 function getUniqueInScopePaperItemIds(context: AgentToolContext): number[] {
   const ids = [
-    ...(context.request.selectedPaperContexts || []),
-    ...(context.request.fullTextPaperContexts || []),
-    ...(context.request.pinnedPaperContexts || []),
+    ...context.request.turnPaperScope.papers.map((entry) => entry.paper),
   ]
     .map((entry) => normalizePositiveInt(entry?.itemId))
     .filter((entry): entry is number => Boolean(entry));

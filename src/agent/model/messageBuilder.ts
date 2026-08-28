@@ -35,6 +35,7 @@ import {
 } from "../context/resourceContextPlan";
 import { buildAgentCoverageContextBlock } from "../context/coverageLedger";
 import { buildVisibleTurnContextBlock } from "../context/turnContextEnvelope";
+import { getSelectedPassagePaper } from "../context/turnPaperScope";
 import {
   hasAgentContentInputs,
   normalizeAgentContentInputs,
@@ -204,7 +205,10 @@ function buildFullUserMessage(
     selectedTextContexts: request.selectedTextContexts,
     selectedTexts: request.selectedTexts,
     selectedTextSources: request.selectedTextSources,
-    selectedTextPaperContexts: request.selectedTextPaperContexts,
+    selectedTextPaperContexts: (request.selectedTextContexts || []).map(
+      (_context, index) =>
+        getSelectedPassagePaper(request.turnPaperScope, index),
+    ),
     selectedTextNoteContexts: request.selectedTextNoteContexts,
   });
   const selectedTexts = selectedTextContexts.map((context) => context.text);
@@ -212,7 +216,7 @@ function buildFullUserMessage(
     (context) => context.source,
   );
   const selectedTextPaperContexts = selectedTextContexts.map(
-    (context) => context.paperContext,
+    (_context, index) => getSelectedPassagePaper(request.turnPaperScope, index),
   );
   const anchorsByIndex = new Map(
     (request.resolvedSelectedTextAnchors || []).map((anchor) => [
@@ -272,7 +276,7 @@ function buildFullUserMessage(
     );
     const anchorContext = renderSelectedTextAnchorContext({
       selectedTextContexts,
-      anchors: request.resolvedSelectedTextAnchors || [],
+      anchors: [...(request.resolvedSelectedTextAnchors || [])],
     });
     if (anchorContext) contextLines.push(anchorContext);
   }
@@ -458,7 +462,9 @@ function buildTurnGuidanceBlock(instructions: string[]): string {
 }
 
 function buildAutoReadInstruction(request: AgentRuntimeRequest): string {
-  const fullTextPapers = request.fullTextPaperContexts || [];
+  const fullTextPapers = request.turnPaperScope.papers
+    .filter((entry) => entry.roles.includes("full_text"))
+    .map((entry) => entry.paper);
   if (!fullTextPapers.length) return "";
   if (detectExplicitFullReadIntent(request.userText || "")) {
     return (
@@ -487,11 +493,7 @@ function buildAutoReadInstruction(request: AgentRuntimeRequest): string {
 }
 
 function getInScopePaperContexts(request: AgentRuntimeRequest) {
-  return [
-    ...(request.selectedPaperContexts || []),
-    ...(request.fullTextPaperContexts || []),
-    ...(request.pinnedPaperContexts || []),
-  ];
+  return request.turnPaperScope.papers.map((entry) => entry.paper);
 }
 
 function hasFigureTaskIntent(
@@ -590,11 +592,9 @@ function buildForcedSkillWholeLibraryInstruction(
   if (!request.forcedSkillIds?.length) return "";
   if (request.conversationKind === "paper") return "";
   const hasExplicitContext = Boolean(
-    request.selectedPaperContexts?.length ||
-    request.fullTextPaperContexts?.length ||
-    request.pinnedPaperContexts?.length ||
-    request.selectedCollectionContexts?.length ||
-    request.selectedTagContexts?.length ||
+    request.turnPaperScope.papers.length ||
+    request.turnPaperScope.collections.length ||
+    request.turnPaperScope.tags.length ||
     request.selectedTextSources?.length ||
     request.attachments?.length ||
     request.screenshots?.length,

@@ -14,6 +14,7 @@ import {
   resolveSvgFigureRasterSize,
 } from "../src/modules/contextPanel/figureExport";
 import type { AgentToolContext } from "../src/agent/types";
+import { resolvedAgentRequest } from "./helpers/resolvedAgentRequest";
 import { revertActions } from "../src/agent/services/changeReverter";
 import {
   initAgentChangeJournal,
@@ -340,9 +341,10 @@ describe("editCurrentNote create tracking", function () {
         },
         {
           ...baseContext,
-          request: {
+          request: resolvedAgentRequest({
             ...baseContext.request,
             activeItemId: undefined,
+            libraryID: 1,
             selectedPaperContexts: [
               {
                 itemId: 9,
@@ -350,7 +352,7 @@ describe("editCurrentNote create tracking", function () {
                 title: "Parent Paper",
               },
             ],
-          },
+          }),
         },
       )
     ).content;

@@ -11,6 +11,7 @@ import {
 import { createQueryLibraryTool } from "../src/agent/tools/read/queryLibrary";
 import { buildAgentInitialMessages } from "../src/agent/model/messageBuilder";
 import type { AgentToolContext } from "../src/agent/types";
+import { resolvedAgentRequest } from "./helpers/resolvedAgentRequest";
 
 /**
  * The system prompt described the user's machine in concrete detail — shell,
@@ -311,12 +312,12 @@ describe("library overview stays out of the cached prefix", function () {
     } as never);
 
     const messages = await buildAgentInitialMessages(
-      {
+      resolvedAgentRequest({
         conversationKey: 1,
         mode: "agent",
         userText: "what is in my library",
         libraryID: 1,
-      } as never,
+      }),
       [],
       [],
     );

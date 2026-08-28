@@ -7,25 +7,41 @@ import {
   inferActionIntentsFromRequest,
   parseClassifiedTurnIntent,
 } from "../src/agent/model/skillClassifier";
+import type { AgentRuntimeRequestInput } from "../src/agent/types";
+import { resolvedAgentRequest } from "./helpers/resolvedAgentRequest";
+
+function request(
+  input: Partial<AgentRuntimeRequestInput>,
+): ReturnType<typeof resolvedAgentRequest> {
+  return resolvedAgentRequest({
+    conversationKey: 1,
+    mode: "agent",
+    libraryID: 1,
+    userText: "",
+    ...input,
+  });
+}
 
 describe("Agent action intent", function () {
   it("fails closed when required intent has no valid obligations", async function () {
     const service = new ActionContractService({} as ActionContractGateway);
     let message = "";
     try {
-      await service.createContract({
-        conversationKey: 1,
-        mode: "agent",
-        model: "test",
-        userText: "Apply the requested mutation.",
-        classifiedIntent: {
-          retrievalIntent: "none",
-          wantedSections: [],
-          writeDisposition: "required",
-          actionInterpretationSource: "classifier",
-          actionIntents: [],
-        },
-      });
+      await service.createContract(
+        request({
+          conversationKey: 1,
+          mode: "agent",
+          model: "test",
+          userText: "Apply the requested mutation.",
+          classifiedIntent: {
+            retrievalIntent: "none",
+            wantedSections: [],
+            writeDisposition: "required",
+            actionInterpretationSource: "classifier",
+            actionIntents: [],
+          },
+        }),
+      );
     } catch (error) {
       message = error instanceof Error ? error.message : String(error);
     }
@@ -40,7 +56,10 @@ describe("Agent action intent", function () {
       "How could I tag these papers later?",
     ];
     for (const userText of prompts) {
-      assert.deepEqual(inferActionIntentsFromRequest({ userText }), []);
+      assert.deepEqual(
+        inferActionIntentsFromRequest(request({ userText })),
+        [],
+      );
     }
   });
 
@@ -68,22 +87,28 @@ describe("Agent action intent", function () {
   });
 
   it("infers only high-confidence imperative operations on classifier failure", function () {
-    const add = inferActionIntentsFromRequest({
-      userText: 'Add the tag "topic:drift" to every paper.',
-    });
+    const add = inferActionIntentsFromRequest(
+      request({
+        userText: 'Add the tag "topic:drift" to every paper.',
+      }),
+    );
     assert.equal(add[0]?.operation, "apply_tags");
     assert.deepEqual(add[0]?.parameters?.tags, ["topic:drift"]);
 
-    const create = inferActionIntentsFromRequest({
-      userText: 'Create collection "Methods".',
-    });
+    const create = inferActionIntentsFromRequest(
+      request({
+        userText: 'Create collection "Methods".',
+      }),
+    );
     assert.equal(create[0]?.operation, "create_collection");
     assert.equal(create[0]?.parameters?.collectionName, "Methods");
 
-    const mixed = inferActionIntentsFromRequest({
-      userText:
-        'Create a standalone Zotero note and independently export a Markdown file at "/tmp/acv2-vault/ACV2 Mixed.md".',
-    });
+    const mixed = inferActionIntentsFromRequest(
+      request({
+        userText:
+          'Create a standalone Zotero note and independently export a Markdown file at "/tmp/acv2-vault/ACV2 Mixed.md".',
+      }),
+    );
     assert.deepEqual(
       mixed.map((intent) => intent.operation),
       ["note_create", "file_write"],

@@ -493,23 +493,21 @@ function collectRequestResourceKeys(request: AgentRuntimeRequest): Set<string> {
     add(itemResourceKey(note.parentItemId));
   }
   const paperContexts = [
-    ...(request.selectedTextPaperContexts || []).filter(
-      (entry): entry is PaperContextRef => Boolean(entry),
+    ...request.turnPaperScope.selectedPassagePaperRefs.map(
+      (entry) => entry.paper,
     ),
-    ...(request.selectedPaperContexts || []),
-    ...(request.fullTextPaperContexts || []),
-    ...(request.pinnedPaperContexts || []),
+    ...request.turnPaperScope.papers.map((entry) => entry.paper),
   ];
   for (const paper of paperContexts) {
     add(paperResourceKey(paper));
     add(itemResourceKey(paper.itemId));
     add(attachmentResourceKey(paper.contextItemId));
   }
-  for (const collection of request.selectedCollectionContexts || []) {
+  for (const collection of request.turnPaperScope.collections) {
     add(collectionResourceKey(collection));
     add(libraryResourceKey(collection.libraryID));
   }
-  for (const tag of request.selectedTagContexts || []) {
+  for (const tag of request.turnPaperScope.tags) {
     add(tagResourceKey(tag));
     add(libraryResourceKey(tag.libraryID));
   }
@@ -755,9 +753,7 @@ function buildFileIoCoverageEntries(
   const normalizedPath = filePath.replace(/\\/g, "/");
   const fileName = normalizedPath.split("/").pop() || normalizedPath;
   const matchingPaper = [
-    ...(activity.request.selectedPaperContexts || []),
-    ...(activity.request.fullTextPaperContexts || []),
-    ...(activity.request.pinnedPaperContexts || []),
+    ...activity.request.turnPaperScope.papers.map((entry) => entry.paper),
   ].find((paper) => {
     const cacheDir = normalizeText(paper.mineruCacheDir, 1024).replace(
       /\\/g,

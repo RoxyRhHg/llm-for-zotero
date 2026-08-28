@@ -25,6 +25,7 @@ import { invalidateCachedContextText } from "../../modules/contextPanel/pdfConte
 import { ensureMineruCacheDirForAttachment } from "../../modules/contextPanel/mineruSync";
 import { persistVerifiedNoteHtml } from "../../modules/contextPanel/notePersistence";
 import type { AgentRuntimeRequest } from "../types";
+import { getTurnPapers } from "../context/requestTurnPaperScope";
 import type {
   GeneratedChatImage,
   PaperContentSourceMode,
@@ -1843,31 +1844,7 @@ export class ZoteroGateway {
   }
 
   listPaperContexts(request: AgentRuntimeRequest): PaperContextRef[] {
-    const out = [
-      ...normalizePaperContexts(request.selectedPaperContexts),
-      ...normalizePaperContexts(request.fullTextPaperContexts),
-      ...normalizePaperContexts(request.pinnedPaperContexts),
-    ];
-    const allowAmbientActivePaper =
-      request.conversationKind !== "global" &&
-      !request.selectedCollectionContexts?.length &&
-      !request.selectedTagContexts?.length;
-    if (!allowAmbientActivePaper) {
-      return out;
-    }
-    const activeItem = this.getItem(request.activeItemId);
-    const activeContext = this.getActivePaperContext(activeItem);
-    if (activeContext) {
-      const key = `${activeContext.itemId}:${activeContext.contextItemId}`;
-      if (
-        !out.some(
-          (entry) => entry && `${entry.itemId}:${entry.contextItemId}` === key,
-        )
-      ) {
-        out.unshift(activeContext);
-      }
-    }
-    return out;
+    return normalizePaperContexts([...getTurnPapers(request)]);
   }
 
   async browseCollections(params: { libraryID: number }): Promise<{

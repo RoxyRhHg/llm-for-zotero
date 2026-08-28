@@ -224,7 +224,7 @@ describe("Codex app-server native client", function () {
       contextItemId: 32,
       title: "UNC paper",
       name: "third.pdf",
-      absolutePath: "\\\\\\\\server\\\\share\\\\third.pdf",
+      absolutePath: "\\\\server\\share\\third.pdf",
     });
 
     const context = buildCodexNativeVisibleTurnContextBlockForTests({
@@ -239,9 +239,9 @@ describe("Codex app-server native client", function () {
       },
     });
 
-    const firstLine = `1. sourceKey=${first.document.sourceKey}, itemId=10, contextItemId=12, title=${JSON.stringify(first.document.title)}, name=${JSON.stringify(first.document.name)}, path=${JSON.stringify(first.document.absolutePath)}`;
-    const secondLine = `2. sourceKey=${second.document.sourceKey}, itemId=20, contextItemId=22, title=${JSON.stringify(second.document.title)}, name=${JSON.stringify(second.document.name)}, path=${JSON.stringify(second.document.absolutePath)}`;
-    const thirdLine = `3. sourceKey=${third.document.sourceKey}, itemId=30, contextItemId=32, title=${JSON.stringify(third.document.title)}, name=${JSON.stringify(third.document.name)}, path=${JSON.stringify(third.document.absolutePath)}`;
+    const firstLine = `1. paperKey=1:10:12, sourceKey=${first.document.sourceKey}, title=${JSON.stringify(first.document.title)}, name=${JSON.stringify(first.document.name)}, path=${JSON.stringify(first.document.absolutePath)}`;
+    const secondLine = `2. paperKey=1:20:22, sourceKey=${second.document.sourceKey}, title=${JSON.stringify(second.document.title)}, name=${JSON.stringify(second.document.name)}, path=${JSON.stringify(second.document.absolutePath)}`;
+    const thirdLine = `3. paperKey=1:30:32, sourceKey=${third.document.sourceKey}, title=${JSON.stringify(third.document.title)}, name=${JSON.stringify(third.document.name)}, path=${JSON.stringify(third.document.absolutePath)}`;
     assert.include(context, firstLine);
     assert.include(context, secondLine);
     assert.include(context, thirdLine);
@@ -1793,7 +1793,7 @@ describe("Codex app-server native client", function () {
     assert.include(block, 'name="Representation Drift"');
     assert.include(block, "Tag 1");
     assert.include(block, 'name="Learning"');
-    assert.include(block, '"the second paper"');
+    assert.include(block, '"these papers"');
   });
 
   it("puts current two-paper context in developer instructions without user-prefix duplication", async function () {
@@ -2816,14 +2816,31 @@ describe("Codex app-server native client", function () {
       },
     });
 
-    assert.deepEqual(scope.selectedPaperContexts, [selectedPaper]);
-    assert.deepEqual(scope.fullTextPaperContexts, [fullTextPaper]);
-    assert.deepEqual(scope.pinnedPaperContexts, [pinnedPaper]);
-    assert.deepEqual(scope.selectedCollectionContexts, [
+    assert.deepEqual(scope.turnPaperScope?.papers, [
+      {
+        paper: { ...selectedPaper, libraryID: 1 },
+        roles: ["selected"],
+      },
+      {
+        paper: { ...fullTextPaper, libraryID: 1, citationKey: undefined },
+        roles: ["full_text"],
+      },
+      {
+        paper: { ...pinnedPaper, libraryID: 1, citationKey: undefined },
+        roles: ["pinned"],
+      },
+    ]);
+    assert.deepEqual(scope.turnPaperScope?.collections, [
       { collectionId: 9, libraryID: 1, name: "Native Collection" },
     ]);
-    assert.deepEqual(scope.selectedTagContexts, [
-      { name: "Stable", normalizedName: "stable", libraryID: 1 },
+    assert.deepEqual(scope.turnPaperScope?.tags, [
+      {
+        name: "Stable",
+        normalizedName: "stable",
+        libraryID: 1,
+        scope: undefined,
+        includeAutomatic: undefined,
+      },
     ]);
     assert.equal(scope.model, "gpt-5.5");
     assert.equal(scope.codexPath, "/tmp/codex-native");

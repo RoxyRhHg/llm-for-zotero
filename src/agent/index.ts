@@ -22,7 +22,7 @@ import { registerMcpServer, unregisterMcpServer } from "./mcp/server";
 import type {
   AgentConfirmationResolution,
   AgentEvent,
-  AgentRuntimeRequest,
+  AgentRuntimeRequestInput,
   AgentToolDefinition,
 } from "./types";
 import {
@@ -93,6 +93,8 @@ async function createAgentSubsystemRuntime(
   const nextRuntime = new AgentRuntime({
     registry: toolRegistry,
     adapterFactory: (request) => createAgentModelAdapter(request),
+    paperContextResolver: (selector) =>
+      zoteroGateway.resolvePaperContextTarget(selector),
   });
   const actionRegistry = createBuiltInActionRegistry();
 
@@ -193,7 +195,7 @@ export function getAgentApi() {
   return {
     // ── Core turn API ──────────────────────────────────────────────────────
     runTurn: (
-      request: AgentRuntimeRequest,
+      request: AgentRuntimeRequestInput,
       onEvent?: (event: AgentEvent) => void | Promise<void>,
     ) =>
       getAgentRuntime().runTurn({
@@ -211,7 +213,7 @@ export function getAgentApi() {
     listTools: () => getAgentRuntime().listTools(),
     getToolDefinition: (name: string) =>
       getAgentRuntime().getToolDefinition(name),
-    getCapabilities: (request: AgentRuntimeRequest) =>
+    getCapabilities: (request: AgentRuntimeRequestInput) =>
       getAgentRuntime().getCapabilities(request),
     getRunTrace: (runId: string) => getAgentRunTrace(runId),
     resolveConfirmation: (

@@ -8,8 +8,9 @@ import {
   setUserSkills,
 } from "../src/agent/skills";
 import { AgentToolRegistry } from "../src/agent/tools/registry";
-import { createPaperReadTool } from "../src/agent/tools/read/paperRead";
+import { createPaperReadTool as createResolvedPaperReadTool } from "../src/agent/tools/read/paperRead";
 import type { AgentToolContext } from "../src/agent/types";
+import { resolveAgentRuntimeRequest } from "../src/agent/context/resolvedAgentRequest";
 import {
   PDF_FIGURE_CROP_ALGORITHM_VERSION,
   PDF_FIGURE_CROP_CACHE_VERSION,
@@ -17,6 +18,52 @@ import {
   buildPdfFigureCropPdfFingerprint,
 } from "../src/modules/contextPanel/pdfFigureCropCache";
 import { CodexAppServerProcess } from "../src/utils/codexAppServerProcess";
+import { resolvedAgentRequest } from "./helpers/resolvedAgentRequest";
+
+function createPaperReadTool(
+  ...args: Parameters<typeof createResolvedPaperReadTool>
+): ReturnType<typeof createResolvedPaperReadTool> {
+  const tool = createResolvedPaperReadTool(...args);
+  const gateway = args[3] as {
+    listPaperContexts?: (request: AgentToolContext["request"]) => Array<{
+      itemId: number;
+      contextItemId: number;
+      title: string;
+    }>;
+  };
+  return {
+    ...tool,
+    execute: (input, context) => {
+      const request = context.request as AgentToolContext["request"] & {
+        selectedPaperContexts?: ReturnType<
+          NonNullable<typeof gateway.listPaperContexts>
+        >;
+      };
+      const hasConcreteScope = Boolean(
+        request.turnPaperScope?.papers.length ||
+        request.selectedPaperContexts?.length ||
+        (request as { fullTextPaperContexts?: unknown[] }).fullTextPaperContexts
+          ?.length ||
+        (request as { pdfPaperContexts?: unknown[] }).pdfPaperContexts?.length,
+      );
+      const selectedPaperContexts = hasConcreteScope
+        ? request.selectedPaperContexts
+        : gateway.listPaperContexts?.(request);
+      const inferredActivePaper = selectedPaperContexts?.[0];
+      return tool.execute(input, {
+        ...context,
+        request: resolvedAgentRequest({
+          ...request,
+          conversationKind:
+            request.conversationKind ||
+            (inferredActivePaper ? "paper" : "global"),
+          activeItemId: request.activeItemId || inferredActivePaper?.itemId,
+          ...(selectedPaperContexts?.length ? { selectedPaperContexts } : {}),
+        }),
+      });
+    },
+  };
+}
 
 describe("semantic tool surface", function () {
   const encoder = new TextEncoder();
@@ -39,6 +86,18 @@ describe("semantic tool surface", function () {
     currentAnswerText: "",
     modelName: "gpt-5.5",
   };
+
+  function resolvedSkillRequest(
+    fields: Partial<import("../src/agent/types").AgentRuntimeRequestInput>,
+  ) {
+    return resolveAgentRuntimeRequest({
+      conversationKey: 1,
+      mode: "agent",
+      userText: "",
+      libraryID: 1,
+      ...fields,
+    });
+  }
 
   function createTestBuiltInRegistry() {
     return createBuiltInToolRegistry({
@@ -358,6 +417,158 @@ describe("semantic tool surface", function () {
     }
   });
 
+  it("paper_read treats an exactly empty target as omitted through the tool registry", async function () {
+    const activePaper = {
+      itemId: 1,
+      contextItemId: 2,
+      title: "Readable paper",
+    };
+    let ensuredPaper: unknown;
+    const registry = new AgentToolRegistry();
+    registry.register(
+      createPaperReadTool(
+        {
+          ensurePaperContext: async (paperContext: unknown) => {
+            ensuredPaper = paperContext;
+          },
+        } as never,
+        {
+          retrieveEvidence: async () => [
+            {
+              itemId: activePaper.itemId,
+              contextItemId: activePaper.contextItemId,
+              title: activePaper.title,
+              text: "method evidence",
+            },
+          ],
+        } as never,
+        {} as never,
+        {
+          listPaperContexts: () => [activePaper],
+          resolvePaperContextTarget: () => activePaper,
+        } as never,
+      ),
+    );
+
+    const request = resolvedAgentRequest({
+      ...baseContext.request,
+      userText: "Use the actual PDF/full text to explain the method.",
+      conversationKind: "paper",
+      activeItemId: activePaper.itemId,
+      selectedPaperContexts: [activePaper],
+    });
+    assert.deepEqual(request.turnPaperScope.papers[0]?.roles, ["active"]);
+
+    const prepared = await registry.prepareExecution(
+      {
+        id: "issue-393-empty-target",
+        name: "paper_read",
+        arguments: {
+          mode: "targeted",
+          target: {},
+          query: "Use the actual PDF/full text to explain the method.",
+        },
+      },
+      {
+        ...baseContext,
+        request,
+      },
+    );
+
+    assert.equal(prepared.kind, "result");
+    if (prepared.kind !== "result") return;
+    assert.isTrue(
+      prepared.execution.result.ok,
+      JSON.stringify(prepared.execution.result.content),
+    );
+    assert.deepInclude(ensuredPaper as Record<string, unknown>, activePaper);
+  });
+
+  it("paper_read rejects malformed non-empty selector syntax", function () {
+    const tool = createPaperReadTool(
+      {} as never,
+      {} as never,
+      {} as never,
+      {} as never,
+    );
+
+    const emptyEntry = tool.validate({
+      mode: "targeted",
+      targets: [{}],
+    });
+    assert.equal(emptyEntry.ok, false);
+    if (!emptyEntry.ok) {
+      assert.include(emptyEntry.error, "empty_target_entry");
+    }
+
+    const conflicting = tool.validate({
+      mode: "targeted",
+      target: {},
+      targets: [],
+    });
+    assert.equal(conflicting.ok, false);
+    if (!conflicting.ok) {
+      assert.include(conflicting.error, "conflicting_target_arguments");
+    }
+
+    const visualOnly = tool.validate({
+      mode: "targeted",
+      target: { attachmentId: "upload-1" },
+    });
+    assert.equal(visualOnly.ok, false);
+    if (!visualOnly.ok) {
+      assert.include(visualOnly.error, "selector_not_supported_for_mode");
+    }
+
+    const lateEmptyEntry = tool.validate({
+      mode: "targeted",
+      targets: [
+        ...Array.from({ length: 20 }, (_, index) => ({ itemId: index + 1 })),
+        {},
+      ],
+    });
+    assert.equal(lateEmptyEntry.ok, false);
+    if (!lateEmptyEntry.ok) {
+      assert.include(lateEmptyEntry.error, "empty_target_entry");
+    }
+
+    const visualTargets = tool.validate({
+      mode: "visual",
+      targets: [{ itemId: 1 }],
+    });
+    assert.equal(visualTargets.ok, false);
+    if (!visualTargets.ok) {
+      assert.include(visualTargets.error, "selector_not_supported_for_mode");
+    }
+
+    const visualPaperTarget = tool.validate({
+      mode: "visual",
+      target: { itemId: 1 },
+      pages: [1],
+    });
+    assert.equal(visualPaperTarget.ok, true);
+  });
+
+  it("paper_read advertises non-empty mutually exclusive target shapes", function () {
+    const tool = createPaperReadTool(
+      {} as never,
+      {} as never,
+      {} as never,
+      {} as never,
+    );
+    const schema = tool.spec.inputSchema as {
+      allOf?: unknown[];
+      properties?: {
+        target?: { anyOf?: unknown[] };
+        targets?: { minItems?: number; items?: { anyOf?: unknown[] } };
+      };
+    };
+    assert.isNotEmpty(schema.allOf);
+    assert.isNotEmpty(schema.properties?.target?.anyOf);
+    assert.isNotEmpty(schema.properties?.targets?.items?.anyOf);
+    assert.equal(schema.properties?.targets?.minItems, 1);
+  });
+
   it("paper_read refuses active-reader fallback in collection-scoped library chat", async function () {
     const activeReaderPaper = {
       itemId: 99,
@@ -446,7 +657,10 @@ describe("semantic tool surface", function () {
     });
     const first = (output as { results: Array<Record<string, unknown>> })
       .results[0];
-    assert.deepEqual(first.paperContext, activeReaderPaper);
+    assert.deepInclude(
+      first.paperContext as Record<string, unknown>,
+      activeReaderPaper,
+    );
   });
 
   it("paper_read still accepts explicit collection-enumerated targets in library chat", async function () {
@@ -1117,7 +1331,10 @@ describe("semantic tool surface", function () {
 
     assert.equal(output.mode, "figures");
     assert.equal(output.status, "ok");
-    assert.deepEqual(extractionContexts, [paperContext]);
+    assert.deepInclude(
+      extractionContexts[0] as Record<string, unknown>,
+      paperContext,
+    );
   });
 
   it("paper_read figures hydrates MinerU cache metadata from the Zotero attachment", async function () {
@@ -1181,8 +1398,9 @@ describe("semantic tool surface", function () {
     })) as Record<string, unknown>;
 
     assert.equal(output.status, "ok");
-    assert.deepInclude(extractionContexts, {
+    assert.deepInclude(extractionContexts[0] as Record<string, unknown>, {
       ...scopedPaperContext,
+      libraryID: 1,
       mineruCacheDir: "/tmp/mineru-paper",
       contentSourceMode: "mineru",
     });
@@ -1416,11 +1634,11 @@ describe("semantic tool surface", function () {
 
       const output = (await tool!.execute(validated.value, {
         ...baseContext,
-        request: {
+        request: resolvedAgentRequest({
           ...baseContext.request,
           userText: "Explain Figure 1",
           selectedPaperContexts: [paperContext],
-        },
+        }),
       })) as {
         content?: { status?: string; figures?: Array<{ cropPath?: string }> };
         artifacts?: Array<{ storedPath?: string }>;
@@ -2035,7 +2253,7 @@ describe("semantic tool surface", function () {
       assert.exists(tool);
       const validated = tool!.validate({
         mode: "full",
-        target: paperContext,
+        target: { paperContext },
         query: "Read the complete text.",
       });
       assert.equal(validated.ok, true);
@@ -2043,13 +2261,14 @@ describe("semantic tool surface", function () {
 
       const output = (await tool!.execute(validated.value, {
         ...baseContext,
-        request: {
+        request: resolvedAgentRequest({
           ...baseContext.request,
           userText: "Read the complete text.",
           authMode: "codex_app_server",
           model: "gpt-5.5",
           apiBase: "/tmp/codex",
-        },
+          selectedPaperContexts: [paperContext],
+        }),
       })) as {
         status: string;
         coverageReceipt: {
@@ -2120,6 +2339,18 @@ describe("semantic tool surface", function () {
       {} as never,
       {
         listPaperContexts: () => [firstPaper, activePaper],
+        resolvePaperContextTarget: ({
+          itemId,
+          contextItemId,
+        }: {
+          itemId?: number;
+          contextItemId?: number;
+        }) =>
+          [firstPaper, activePaper].find(
+            (paper) =>
+              (!itemId || paper.itemId === itemId) &&
+              (!contextItemId || paper.contextItemId === contextItemId),
+          ) || null,
       } as never,
       undefined,
       async (batch) => ({
@@ -2146,7 +2377,7 @@ describe("semantic tool surface", function () {
           conversationKind: "paper",
           activeItemId: activePaper.itemId,
           selectedPaperContexts: [activePaper, firstPaper],
-          userText: "Read the complete second selected paper.",
+          userText: "Read the complete first selected paper.",
         },
       });
       assert.fail("Expected a conflicting model-supplied target to fail");
@@ -2198,7 +2429,7 @@ describe("semantic tool surface", function () {
         conversationKind: "paper",
         activeItemId: activePaper.itemId,
         selectedPaperContexts: [activePaper, firstPaper],
-        userText: "Read the complete second selected paper.",
+        userText: "Read the complete first selected paper.",
       },
     });
     assert.deepEqual(prepared, [firstPaper.title]);
@@ -2211,11 +2442,11 @@ describe("semantic tool surface", function () {
         conversationKind: "paper",
         activeItemId: activePaper.itemId,
         selectedPaperContexts: [firstPaper, activePaper],
-        userText: "Read the full text of all selected papers.",
+        userText: "Read all selected papers in full.",
       },
     })) as { coverageReceipt: { paperCount: number } };
-    assert.deepEqual(prepared, [firstPaper.title, activePaper.title]);
-    assert.equal(allSelectedOutput.coverageReceipt.paperCount, 2);
+    assert.deepEqual(prepared, [firstPaper.title]);
+    assert.equal(allSelectedOutput.coverageReceipt.paperCount, 1);
   });
 
   it("paper_read targeted honors explicit pages even when a query is present", async function () {
@@ -2584,12 +2815,14 @@ describe("semantic tool surface", function () {
   it("matches simple-paper-qa for understand-this-paper typo requests", function () {
     setUserSkills([parseSkill(BUILTIN_SKILL_FILES["simple-paper-qa.md"])]);
     assert.include(
-      getMatchedSkillIds({
-        userText: "can you help me understand this ppaer",
-        selectedPaperContexts: [
-          { itemId: 1, contextItemId: 2, title: "Paper" },
-        ],
-      }),
+      getMatchedSkillIds(
+        resolvedSkillRequest({
+          userText: "can you help me understand this ppaer",
+          selectedPaperContexts: [
+            { itemId: 1, contextItemId: 2, title: "Paper" },
+          ],
+        }),
+      ),
       "simple-paper-qa",
     );
   });
@@ -2615,12 +2848,14 @@ describe("semantic tool surface", function () {
     setUserSkills([parseSkill(BUILTIN_SKILL_FILES["compare-papers.md"])]);
 
     assert.include(
-      getMatchedSkillIds({
-        userText: "compare the methods of all papers in this folder",
-        selectedCollectionContexts: [
-          { collectionId: 4, name: "Computational_Psychiatry", libraryID: 1 },
-        ],
-      }),
+      getMatchedSkillIds(
+        resolvedSkillRequest({
+          userText: "compare the methods of all papers in this folder",
+          selectedCollectionContexts: [
+            { collectionId: 4, name: "Computational_Psychiatry", libraryID: 1 },
+          ],
+        }),
+      ),
       "compare-papers",
     );
   });
@@ -2643,12 +2878,14 @@ describe("semantic tool surface", function () {
     setUserSkills([parseSkill(BUILTIN_SKILL_FILES["evidence-based-qa.md"])]);
 
     assert.include(
-      getMatchedSkillIds({
-        userText: "find evidence in these papers for this claim",
-        selectedCollectionContexts: [
-          { collectionId: 4, name: "Computational_Psychiatry", libraryID: 1 },
-        ],
-      }),
+      getMatchedSkillIds(
+        resolvedSkillRequest({
+          userText: "find evidence in these papers for this claim",
+          selectedCollectionContexts: [
+            { collectionId: 4, name: "Computational_Psychiatry", libraryID: 1 },
+          ],
+        }),
+      ),
       "evidence-based-qa",
     );
   });

@@ -3,7 +3,31 @@ import {
   inferExplicitNoteIntent,
   inferNoteIntent,
 } from "../src/agent/skills/noteIntent";
-import { resolveSkillRouting } from "../src/agent/skills/routing";
+import { resolveSkillRouting as resolveSkillRoutingResolved } from "../src/agent/skills/routing";
+import type { AgentRuntimeRequestInput } from "../src/agent/types";
+import { resolvedAgentRequest } from "./helpers/resolvedAgentRequest";
+
+function resolveSkillRouting(
+  input: AgentRuntimeRequestInput,
+  ...args: Tail<Parameters<typeof resolveSkillRoutingResolved>>
+): ReturnType<typeof resolveSkillRoutingResolved> {
+  return resolveSkillRoutingResolved(
+    resolvedAgentRequest({
+      conversationKey: 1,
+      mode: "agent",
+      libraryID: 1,
+      ...input,
+    }),
+    ...args,
+  );
+}
+
+type Tail<T extends readonly unknown[]> = T extends readonly [
+  unknown,
+  ...infer R,
+]
+  ? R
+  : never;
 import type { AgentSkill } from "../src/agent/skills/skillLoader";
 
 function makeSkill(id: string, pattern: RegExp): AgentSkill {

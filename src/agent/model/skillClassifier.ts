@@ -235,18 +235,19 @@ function buildClassifierPrompt(
     context.push(`- Selected text snippets: ${request.selectedTexts.length}`);
   if (request.screenshots?.length)
     context.push(`- Screenshots attached: ${request.screenshots.length}`);
-  if (request.fullTextPaperContexts?.length)
+  const fullTextPaperCount = request.turnPaperScope.papers.filter((entry) =>
+    entry.roles.includes("full_text"),
+  ).length;
+  if (fullTextPaperCount)
+    context.push(`- Full-text papers marked: ${fullTextPaperCount}`);
+  if (request.turnPaperScope.collections.length) {
     context.push(
-      `- Full-text papers marked: ${request.fullTextPaperContexts.length}`,
-    );
-  if (request.selectedCollectionContexts?.length) {
-    context.push(
-      `- Selected collection scopes: ${request.selectedCollectionContexts.length}`,
+      `- Selected collection scopes: ${request.turnPaperScope.collections.length}`,
     );
   }
-  if (request.selectedTagContexts?.length) {
+  if (request.turnPaperScope.tags.length) {
     context.push(
-      `- Selected tag scopes: ${request.selectedTagContexts.length}`,
+      `- Selected tag scopes: ${request.turnPaperScope.tags.length}`,
     );
   }
 

@@ -120,7 +120,9 @@ async function resolveUnscopedBoundary(
     kind = "selection";
     frozenTargetIds = uniqueNumbers([
       Number(intent.parameters?.targetItemId),
-      ...(request.selectedPaperContexts || []).map((paper) => paper.itemId),
+      ...request.turnPaperScope.papers
+        .filter((entry) => entry.roles.includes("selected"))
+        .map((entry) => entry.paper.itemId),
       Number(request.activeItemId),
     ]).slice(0, intent.coverage === "one" ? 1 : undefined);
     if (!frozenTargetIds.length) return undefined;
@@ -148,7 +150,7 @@ export async function resolveScope(
     intent.operation === "delete_collection";
   if (collectionLifecycle && !intent.scope) {
     const requestedId = intent.parameters?.collectionId;
-    const selected = request.selectedCollectionContexts || [];
+    const selected = request.turnPaperScope.collections;
     const selectedId =
       selected.length === 1 ? selected[0].collectionId : undefined;
     const collectionId = requestedId || selectedId;
@@ -206,7 +208,7 @@ export async function resolveScope(
       ];
     }
     if (!intent.scope) {
-      const selected = request.selectedCollectionContexts || [];
+      const selected = request.turnPaperScope.collections;
       if (selected.length !== 1) {
         throw new Error(
           "A nested collection creation requires one exact parent collection.",
@@ -255,7 +257,7 @@ export async function resolveScope(
       },
     ];
   }
-  const selected = request.selectedCollectionContexts || [];
+  const selected = request.turnPaperScope.collections;
   const requestedPath = normalizePath(intent.scope.path);
   let summaries: CollectionSummary[];
   if (requestedPath) {

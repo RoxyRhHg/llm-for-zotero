@@ -72,6 +72,8 @@ describe("external bridge session-info fallback", function () {
       conversationKey: 42,
       mode: "agent",
       userText: "read it",
+      libraryID: 1,
+      pdfPaperContexts: [{ itemId: 10, contextItemId: 20, title: "Paper" }],
       localDocuments,
     });
 
@@ -150,6 +152,7 @@ describe("external bridge session-info fallback", function () {
       conversationKey: 1,
       mode: "agent",
       userText: "Use the selected papers.",
+      libraryID: 1,
       selectedPaperContexts: papers,
       fullTextPaperContexts: papers,
       pinnedPaperContexts: papers,

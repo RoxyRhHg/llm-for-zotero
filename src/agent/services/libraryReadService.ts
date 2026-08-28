@@ -36,8 +36,8 @@ function uniqueNumbers(values: number[]): number[] {
 function canUseActiveItemFallback(request: AgentRuntimeRequest): boolean {
   return (
     request.conversationKind !== "global" &&
-    !request.selectedCollectionContexts?.length &&
-    !request.selectedTagContexts?.length
+    !request.turnPaperScope.collections.length &&
+    !request.turnPaperScope.tags.length
   );
 }
 

@@ -1,12 +1,38 @@
 import { assert } from "chai";
 import {
   canUseSkillClassifierModel,
-  detectTurnIntent,
+  detectTurnIntent as detectTurnIntentResolved,
   parseClassifiedTurnIntent,
   parseClassifierResponse,
 } from "../src/agent/model/skillClassifier";
-import { resolveSkillRouting } from "../src/agent/skills/routing";
+import { resolveSkillRouting as resolveSkillRoutingResolved } from "../src/agent/skills/routing";
 import type { AgentSkill } from "../src/agent/skills/skillLoader";
+import type { AgentRuntimeRequestInput } from "../src/agent/types";
+import { resolvedAgentRequest } from "./helpers/resolvedAgentRequest";
+
+function normalizeRequest(input: AgentRuntimeRequestInput) {
+  return resolvedAgentRequest({
+    conversationKey: 1,
+    mode: "agent",
+    libraryID: 1,
+    ...input,
+  });
+}
+
+async function detectTurnIntent(
+  ...args: Parameters<typeof detectTurnIntentResolved>
+): ReturnType<typeof detectTurnIntentResolved> {
+  return detectTurnIntentResolved(normalizeRequest(args[0]), ...args.slice(1));
+}
+
+function resolveSkillRouting(
+  ...args: Parameters<typeof resolveSkillRoutingResolved>
+): ReturnType<typeof resolveSkillRoutingResolved> {
+  return resolveSkillRoutingResolved(
+    normalizeRequest(args[0]),
+    ...args.slice(1),
+  );
+}
 
 const SKILLS: AgentSkill[] = [
   {

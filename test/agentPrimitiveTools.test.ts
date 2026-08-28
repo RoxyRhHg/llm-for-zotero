@@ -1,5 +1,5 @@
 import { assert } from "chai";
-import { buildAgentInitialMessages } from "../src/agent/model/messageBuilder";
+import { buildAgentInitialMessages as buildAgentInitialMessagesResolved } from "../src/agent/model/messageBuilder";
 import { EDITABLE_ARTICLE_METADATA_FIELDS } from "../src/agent/services/zoteroGateway";
 import { AgentToolRegistry } from "../src/agent/tools/registry";
 import { PdfService } from "../src/agent/services/pdfService";
@@ -17,10 +17,30 @@ import { createUpdateMetadataTool } from "../src/agent/tools/write/updateMetadat
 import { createRunCommandTool } from "../src/agent/tools/write/runCommand";
 import { createZoteroScriptTool } from "../src/agent/tools/write/zoteroScript";
 import { getNotesDirectoryConfig } from "../src/utils/notesDirectoryConfig";
-import type { AgentModelMessage, AgentToolContext } from "../src/agent/types";
+import type {
+  AgentModelMessage,
+  AgentRuntimeRequest,
+  AgentRuntimeRequestInput,
+  AgentToolContext,
+} from "../src/agent/types";
 import type { PaperContextRef } from "../src/shared/types";
 import type { PdfContext } from "../src/modules/contextPanel/types";
 import { PAPER_CITATION_CONTRACT } from "../src/shared/instructionContracts";
+import { resolvedAgentRequest } from "./helpers/resolvedAgentRequest";
+
+async function buildAgentInitialMessages(
+  request: AgentRuntimeRequestInput | AgentRuntimeRequest,
+  tools: Parameters<typeof buildAgentInitialMessagesResolved>[1],
+  history: Parameters<typeof buildAgentInitialMessagesResolved>[2],
+) {
+  return buildAgentInitialMessagesResolved(
+    "turnPaperScope" in request
+      ? request
+      : resolvedAgentRequest({ libraryID: 1, ...request }),
+    tools,
+    history,
+  );
+}
 
 function makeMetadataSnapshot(itemId: number, title: string) {
   return {
@@ -174,13 +194,13 @@ const originalZotero = globalScope.Zotero;
 
 describe("primitive agent tools", function () {
   const baseContext: AgentToolContext = {
-    request: {
+    request: resolvedAgentRequest({
       conversationKey: 42,
       mode: "agent",
       userText: "organize the library",
       activeItemId: 9,
       libraryID: 1,
-    },
+    }),
     item: null,
     currentAnswerText: "",
     modelName: "gpt-5.4",
@@ -843,11 +863,11 @@ describe("primitive agent tools", function () {
 
       const codexResult = await tool.execute(validated.value, {
         ...baseContext,
-        request: {
+        request: resolvedAgentRequest({
           ...baseContext.request,
           authMode: "codex_app_server",
           fullTextPaperContexts: [paperContext],
-        },
+        }),
       });
       const codexContent = (codexResult as { content: Record<string, unknown> })
         .content;
@@ -864,11 +884,11 @@ describe("primitive agent tools", function () {
 
       const normalResult = await tool.execute(validated.value, {
         ...baseContext,
-        request: {
+        request: resolvedAgentRequest({
           ...baseContext.request,
           authMode: "api_key",
           fullTextPaperContexts: [paperContext],
-        },
+        }),
       });
       const normalContent = (
         normalResult as { content: Record<string, unknown> }
@@ -1407,12 +1427,12 @@ describe("primitive agent tools", function () {
     };
     const context: AgentToolContext = {
       ...baseContext,
-      request: {
+      request: resolvedAgentRequest({
         ...baseContext.request,
         conversationKey: 43_012,
         authMode: "codex_app_server",
         fullTextPaperContexts: [paperContext],
-      },
+      }),
     };
 
     try {
@@ -1463,11 +1483,11 @@ describe("primitive agent tools", function () {
     };
     const context: AgentToolContext = {
       ...baseContext,
-      request: {
+      request: resolvedAgentRequest({
         ...baseContext.request,
         selectedTextPaperContexts: [selectedTextContext],
         selectedPaperContexts: [selectedPaperContext],
-      },
+      }),
     };
 
     try {
@@ -2305,7 +2325,7 @@ describe("primitive agent tools", function () {
       new FakePdfService(
         makePdfContext(["Abstract text.", "Introduction text."]),
       ),
-      {} as never,
+      { resolvePaperContextTarget: () => paperContext } as never,
     );
     const validated = tool.validate({
       target: { paperContext },
@@ -2473,11 +2493,9 @@ describe("primitive agent tools", function () {
           },
         ] as never,
     );
-    const tool = createSearchPaperTool(
-      retrievalService,
-      pdfService,
-      {} as never,
-    );
+    const tool = createSearchPaperTool(retrievalService, pdfService, {
+      resolvePaperContextTarget: () => paperContext,
+    } as never);
     const validated = tool.validate({
       target: { paperContext },
       question: "evidence",

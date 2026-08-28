@@ -398,7 +398,7 @@ import type {
   AgentEvent,
   AgentPendingAction,
   AgentRunEventRecord,
-  AgentRuntimeRequest,
+  AgentRuntimeRequestInput as AgentRuntimeRequest,
   AgentToolArtifact,
 } from "../../agent/types";
 import {

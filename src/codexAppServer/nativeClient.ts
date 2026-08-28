@@ -75,6 +75,7 @@ import {
   type CodexNativeMcpSetupStatus,
 } from "./mcpSetup";
 import {
+  buildCodexNativeSkillRequest,
   resolveExplicitCodexNativeSkillIds,
   resolveCodexNativeSkills,
   type CodexNativeSkillContext,
@@ -1320,20 +1321,36 @@ function buildCodexNativeScopedMcpScope(params: {
   reasoning?: ReasoningConfig;
   skillContext?: CodexNativeSkillContext;
 }): ZoteroMcpActiveScope {
+  const resolvedRequest = buildCodexNativeSkillRequest({
+    scope: params.scope,
+    userText: params.userText,
+    model: params.model || "",
+    apiBase: params.codexPath,
+    skillContext: params.skillContext,
+  });
   return {
-    ...params.scope,
     profileSignature: params.profileSignature,
+    conversationKey: params.scope.conversationKey,
+    instanceID: params.scope.instanceID,
+    conversationGeneration: params.scope.conversationGeneration,
+    libraryID: params.scope.libraryID,
+    kind: params.scope.kind,
+    paperItemID: params.scope.paperItemID,
+    activeItemId: params.scope.activeItemId,
+    activeContextItemId: params.scope.activeContextItemId,
+    activeNoteId: params.scope.activeNoteId,
+    activeNoteKind: params.scope.activeNoteKind,
+    activeNoteTitle: params.scope.activeNoteTitle,
+    activeNoteParentItemId: params.scope.activeNoteParentItemId,
+    libraryName: params.scope.libraryName,
+    title: params.scope.title || params.scope.paperTitle,
     userText: params.userText,
     model: params.model,
     codexPath: params.codexPath,
     reasoning: params.reasoning,
     exhaustiveReadBackend: "codex_responses",
-    selectedPaperContexts: params.skillContext?.selectedPaperContexts,
-    pdfPaperContexts: params.skillContext?.pdfPaperContexts,
-    fullTextPaperContexts: params.skillContext?.fullTextPaperContexts,
-    pinnedPaperContexts: params.skillContext?.pinnedPaperContexts,
-    selectedCollectionContexts: params.skillContext?.selectedCollectionContexts,
-    selectedTagContexts: params.skillContext?.selectedTagContexts,
+    turnPaperScope: resolvedRequest.turnPaperScope,
+    turnPaperScopeWarnings: resolvedRequest.turnPaperScopeWarnings,
   };
 }
 

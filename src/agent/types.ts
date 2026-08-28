@@ -14,6 +14,13 @@ import type {
   SelectedTextSource,
   TagContextRef,
 } from "../shared/types";
+import type {
+  ResolvedTurnSelectedTextAnchor,
+  ResolvedTurnSelectedTextContext,
+  TurnLocalDocument,
+  TurnPaperScope,
+  TurnPaperScopeWarning,
+} from "./context/turnPaperScope";
 import type { WebSourceAnchor } from "../webAccess/types";
 import type {
   ChatMessage,
@@ -556,7 +563,7 @@ export type ClassifiedTurnIntent = {
   actionIntents: AgentActionIntent[];
 };
 
-export type AgentRuntimeRequest = AgentRequest & {
+export type AgentRuntimeRequestInput = AgentRequest & {
   /** Generation captured when this turn started; Clear advances it. */
   conversationGeneration?: number;
   /** Set by the runtime after per-turn classification; absent on fallback. */
@@ -583,6 +590,33 @@ export type AgentRuntimeRequest = AgentRequest & {
    */
   exhaustiveReadBackend?: ExhaustiveReadBackend;
 };
+
+export type LegacyPaperContextField =
+  | "selectedPaperContexts"
+  | "pdfPaperContexts"
+  | "fullTextPaperContexts"
+  | "citationPaperContexts"
+  | "pinnedPaperContexts"
+  | "selectedCollectionContexts"
+  | "selectedTagContexts"
+  | "selectedTextPaperContexts";
+
+export type ResolvedAgentRuntimeRequest = Omit<
+  AgentRuntimeRequestInput,
+  | LegacyPaperContextField
+  | "selectedTextContexts"
+  | "resolvedSelectedTextAnchors"
+  | "localDocuments"
+> & {
+  turnPaperScope: TurnPaperScope;
+  selectedTextContexts?: readonly ResolvedTurnSelectedTextContext[];
+  resolvedSelectedTextAnchors?: readonly ResolvedTurnSelectedTextAnchor[];
+  localDocuments?: readonly TurnLocalDocument[];
+  turnPaperScopeWarnings?: readonly TurnPaperScopeWarning[];
+};
+
+/** Canonical request consumed after the one-way runtime boundary. */
+export type AgentRuntimeRequest = ResolvedAgentRuntimeRequest;
 
 export type AgentAttachmentReadableVia =
   | "read_attachment"

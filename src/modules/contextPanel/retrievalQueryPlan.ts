@@ -259,7 +259,7 @@ function hasCompoundNounAfterDocument(value: string): boolean {
 
 function hasEnglishFullDocumentModifierIntent(normalized: string): boolean {
   const commandPattern =
-    /\b(?:read|use|analy[sz]e|review|process|send|provide)\b[^;.!?。！？；\n]{0,64}?\b(?:the\s+)?(?:entire|whole|complete|full)\b/gi;
+    /\b(?:read|use|analy[sz]e|review|process|send|provide)\b[^;.!?。！？；\n]{0,64}?\b(?:the\s+)?(entire|whole|complete|full)\b/gi;
   for (const match of normalized.matchAll(commandPattern)) {
     if (!isAffirmativeFullReadCommandAt(normalized, match.index || 0)) continue;
     if (excludesEnglishFullRead(match[0])) continue;
@@ -271,6 +271,14 @@ function hasEnglishFullDocumentModifierIntent(normalized: string): boolean {
       /\b(?:papers?|articles?|documents?|texts?|pdfs?)\b/i,
     );
     if (!documentMatch || documentMatch.index === undefined) continue;
+    if (
+      match[1]?.toLocaleLowerCase() === "full" &&
+      /^texts?$/i.test(documentMatch[0])
+    ) {
+      // "Full text" selects document evidence. It does not by itself ask to
+      // process every chunk of the document.
+      continue;
+    }
     const selector = tail.slice(0, documentMatch.index);
     if (selectorTreatsDocumentAsContainer(selector)) continue;
     const afterDocument = tail.slice(
@@ -446,6 +454,46 @@ export function detectExplicitFullReadIntent(query: string): boolean {
     hasJapaneseFullDocumentIntent(normalized) ||
     hasKoreanFullDocumentIntent(normalized)
   );
+}
+
+export type PaperEvidenceSource =
+  | "metadata"
+  | "document_text"
+  | "rendered_pages";
+
+export type PaperReadCoverage = "overview" | "targeted" | "exhaustive";
+
+export type PaperReadIntent = Readonly<{
+  source: PaperEvidenceSource;
+  coverage: PaperReadCoverage;
+}>;
+
+/**
+ * Keep the requested evidence source independent from how comprehensively the
+ * document should be processed. In particular, "full text" means document
+ * evidence, not an exhaustive read.
+ */
+export function classifyPaperReadIntent(query: string): PaperReadIntent {
+  const normalized = normalizeQueryText(query).toLocaleLowerCase();
+  const source: PaperEvidenceSource =
+    /\b(?:rendered?\s+(?:pdf\s+)?pages?|page\s+(?:layout|image|render|screenshot)|(?:layout|image|render|screenshot)\s+of\s+(?:pdf\s+)?pages?|pdf\s+(?:layout|render|screenshot))\b/i.test(
+      normalized,
+    )
+      ? "rendered_pages"
+      : /\b(?:metadata|bibliographic|catalog)\b/i.test(normalized) &&
+          !/\b(?:pdf|full[-\s]?text|paper\s+text|document\s+text)\b/i.test(
+            normalized,
+          )
+        ? "metadata"
+        : "document_text";
+  const coverage: PaperReadCoverage = detectExplicitFullReadIntent(normalized)
+    ? "exhaustive"
+    : /\b(?:summari[sz]e|summary|overview|main\s+(?:message|points?)|key\s+points?)\b/i.test(
+          normalized,
+        )
+      ? "overview"
+      : "targeted";
+  return { source, coverage };
 }
 
 export function reconcilePlannerReadIntent(

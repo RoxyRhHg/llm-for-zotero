@@ -12,6 +12,7 @@ import {
 import type { AgentToolContext } from "../src/agent/types";
 import type { BatchJobRecord } from "../src/agent/store/batchJobStore";
 import { ChangeJournalTestDb } from "./helpers/changeJournalTestDb";
+import { resolvedAgentRequest } from "./helpers/resolvedAgentRequest";
 
 /**
  * The batch engine was a complete propose/paginate/apply system that the
@@ -35,7 +36,7 @@ describe("library_batch", function () {
   });
 
   const context: AgentToolContext = {
-    request: {
+    request: resolvedAgentRequest({
       conversationKey: 9,
       mode: "agent",
       userText: "tag my whole library",
@@ -43,7 +44,7 @@ describe("library_batch", function () {
       model: "gpt-4o-mini",
       apiBase: "https://api.openai.com/v1/chat/completions",
       apiKey: "test",
-    },
+    }),
     item: null,
     currentAnswerText: "",
     modelName: "test-model",
