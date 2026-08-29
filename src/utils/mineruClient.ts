@@ -44,6 +44,8 @@ const REQUEST_TIMEOUT_MS = 60000;
 const LOCAL_PARSE_TIMEOUT_MS = 0;
 const LOCAL_PROGRESS_INTERVAL_MS = 3000;
 const LOCAL_BUSY_RETRY_DELAYS_MS = [5000, 15000, 30000, 60000, 120000] as const;
+const MAX_MINERU_UPLOAD_FILENAME_BYTES = 80;
+const MINERU_FILENAME_HASH_HEX_LENGTH = 12;
 
 export type MinerUExtractedFile = MinerUZipFile;
 
@@ -669,6 +671,53 @@ function getSafePdfFileName(pdfPath: string): string {
   return rawName.replace(/[^\x20-\x7E]/g, "_") || "paper.pdf";
 }
 
+function utf8ByteLength(value: string): number {
+  return new TextEncoder().encode(value).byteLength;
+}
+
+function truncateUtf8(value: string, maxBytes: number): string {
+  if (maxBytes <= 0) return "";
+  const encoder = new TextEncoder();
+  let byteLength = 0;
+  let result = "";
+  for (const character of value) {
+    const characterByteLength = encoder.encode(character).byteLength;
+    if (byteLength + characterByteLength > maxBytes) break;
+    result += character;
+    byteLength += characterByteLength;
+  }
+  return result;
+}
+
+async function getShortFileNameHash(value: string): Promise<string> {
+  const cryptoObject = (globalThis as { crypto?: Crypto }).crypto;
+  if (!cryptoObject?.subtle) {
+    throw new Error("SHA-256 is unavailable for MinerU filename normalization");
+  }
+  const bytes = new TextEncoder().encode(value);
+  const digest = await cryptoObject.subtle.digest("SHA-256", bytes.buffer);
+  return Array.from(new Uint8Array(digest))
+    .map((byte) => byte.toString(16).padStart(2, "0"))
+    .join("")
+    .slice(0, MINERU_FILENAME_HASH_HEX_LENGTH);
+}
+
+async function getSafeMineruUploadFileName(pdfPath: string): Promise<string> {
+  const rawName = pdfPath.split(/[\\/]/).pop() || "paper.pdf";
+  const safeName = getSafePdfFileName(pdfPath);
+  if (utf8ByteLength(safeName) <= MAX_MINERU_UPLOAD_FILENAME_BYTES) {
+    return safeName;
+  }
+
+  const safeStem = safeName.replace(/\.pdf$/i, "");
+  const hash = await getShortFileNameHash(rawName);
+  const suffix = `_${hash}.pdf`;
+  const prefixBudget =
+    MAX_MINERU_UPLOAD_FILENAME_BYTES - utf8ByteLength(suffix);
+  const prefix = truncateUtf8(safeStem, prefixBudget);
+  return `${prefix}${suffix}`;
+}
+
 function joinApiPath(baseUrl: string, path: string): string {
   return `${normalizeMineruLocalApiBase(baseUrl)}${path}`;
 }
@@ -979,7 +1028,7 @@ async function parsePdfViaLocalFileParse(
     return null;
   }
 
-  const fileName = getSafePdfFileName(pdfPath);
+  const fileName = await getSafeMineruUploadFileName(pdfPath);
   const sizeMB = (pdfBytes.length / (1024 * 1024)).toFixed(1);
 
   throwIfAborted(signal);
