@@ -737,13 +737,24 @@ describe("AgentRuntime", function () {
 
       assert.equal(outcome.kind, "completed");
       if (outcome.kind !== "completed") return;
-      assert.include(outcome.text, "Saved.");
-      assert.include(outcome.text, "note_create — applied");
+      assert.equal(
+        outcome.text,
+        "Saved.\n\n[Action status: note_create — applied 1/1; verified; proof:zotero_state]",
+      );
       assert.isTrue(events.some((event) => event.type === "tool_call"));
       assert.isTrue(events.some((event) => event.type === "tool_result"));
-      const toolResultEvent = events.find(
+      const toolResultIndex = events.findIndex(
         (event) => event.type === "tool_result",
       );
+      const toolResultEvent = events[toolResultIndex];
+      const postToolContractIndex = events.findIndex(
+        (event, index) =>
+          index > toolResultIndex &&
+          event.type === "provider_event" &&
+          event.providerType === "agent_action_contract",
+      );
+      assert.isAtLeast(toolResultIndex, 0);
+      assert.isAbove(postToolContractIndex, toolResultIndex);
       assert.deepEqual(
         toolResultEvent && toolResultEvent.type === "tool_result"
           ? toolResultEvent.content
@@ -5280,12 +5291,21 @@ describe("shallow guard round-limit safety", function () {
         },
       } as never);
 
+      let stepIndex = 0;
+      let correctionRequestMessages: AgentModelMessage[] = [];
       const runtime = new AgentRuntime({
         registry,
-        adapterFactory: () =>
-          new MockAdapter(
-            [
-              {
+        adapterFactory: () => ({
+          getCapabilities: () => ({
+            streaming: true,
+            toolCalls: true,
+            multimodal: false,
+          }),
+          supportsTools: () => true,
+          async runStep(params: AgentStepParams): Promise<AgentModelStep> {
+            stepIndex += 1;
+            if (stepIndex === 1) {
+              return {
                 kind: "tool_calls",
                 calls: [
                   {
@@ -5295,29 +5315,39 @@ describe("shallow guard round-limit safety", function () {
                   },
                 ],
                 assistantMessage: { role: "assistant", content: "" },
-              },
-              {
+              };
+            }
+            if (stepIndex === 2) {
+              await params.onTextDelta?.(
+                "Filed both papers into Neuroscience.",
+              );
+              return {
                 kind: "final",
                 text: "Filed both papers into Neuroscience.",
                 assistantMessage: {
                   role: "assistant",
                   content: "Filed both papers into Neuroscience.",
                 },
+              };
+            }
+            correctionRequestMessages = params.messages.map((message) => ({
+              ...message,
+            }));
+            return {
+              kind: "final",
+              text: "Nothing changed — both items are the wrong type to file.",
+              assistantMessage: {
+                role: "assistant",
+                content:
+                  "Nothing changed — both items are the wrong type to file.",
               },
-              {
-                kind: "final",
-                text: "Nothing changed — both items are the wrong type to file.",
-                assistantMessage: {
-                  role: "assistant",
-                  content:
-                    "Nothing changed — both items are the wrong type to file.",
-                },
-              },
-            ],
-            { streaming: false, toolCalls: true, multimodal: false },
-          ),
+            };
+          },
+        }),
       });
 
+      const events: AgentEvent[] = [];
+      let rollbackProgress: Record<string, unknown> | null = null;
       const outcome = await runtime.runTurn({
         request: {
           conversationKey: 991,
@@ -5328,7 +5358,29 @@ describe("shallow guard round-limit safety", function () {
           apiKey: "test",
           libraryID: 1,
         },
-        onEvent: () => undefined,
+        onEvent: (event) => {
+          events.push(event);
+          if (event.type !== "message_rollback") return;
+          const terminalSnapshot = [...events]
+            .reverse()
+            .find(
+              (candidate) =>
+                candidate.type === "provider_event" &&
+                candidate.providerType === "agent_action_contract" &&
+                typeof candidate.payload?.state === "string",
+            );
+          rollbackProgress =
+            terminalSnapshot?.type === "provider_event"
+              ? (terminalSnapshot.payload?.progress as Record<string, unknown>)
+              : null;
+          assert.equal(rollbackProgress?.correctionCount, 0);
+          assert.equal(
+            rollbackProgress?.state,
+            terminalSnapshot?.type === "provider_event"
+              ? terminalSnapshot.payload?.state
+              : undefined,
+          );
+        },
       });
 
       assert.equal(outcome.kind, "completed");
@@ -5339,6 +5391,54 @@ describe("shallow guard round-limit safety", function () {
         "the first, false claim must not be what the user is left with",
       );
       assert.include(outcome.text, "write was blocked");
+      assert.exists(rollbackProgress);
+
+      const falseFinalIndexes = correctionRequestMessages
+        .map((message, index) =>
+          message.role === "assistant" &&
+          message.content === "Filed both papers into Neuroscience."
+            ? index
+            : -1,
+        )
+        .filter((index) => index >= 0);
+      assert.lengthOf(falseFinalIndexes, 1);
+      const falseFinalIndex = falseFinalIndexes[0];
+      assert.isAtLeast(falseFinalIndex, 0);
+      assert.equal(
+        correctionRequestMessages[falseFinalIndex + 1]?.role,
+        "user",
+      );
+      assert.match(
+        String(correctionRequestMessages[falseFinalIndex + 1]?.content || ""),
+        /^Correction for this turn:/,
+      );
+      assert.equal(
+        correctionRequestMessages.filter(
+          (message) =>
+            message.role === "user" &&
+            String(message.content || "").startsWith(
+              "Correction for this turn:",
+            ),
+        ).length,
+        1,
+      );
+
+      const terminalContractSnapshots = events.filter(
+        (event) =>
+          event.type === "provider_event" &&
+          event.providerType === "agent_action_contract" &&
+          typeof event.payload?.state === "string",
+      );
+      assert.lengthOf(terminalContractSnapshots, 2);
+      assert.deepEqual(
+        terminalContractSnapshots.map((event) =>
+          event.type === "provider_event"
+            ? (event.payload?.progress as { correctionCount?: number })
+                ?.correctionCount
+            : undefined,
+        ),
+        [0, 1],
+      );
     } finally {
       restoreDb();
     }
