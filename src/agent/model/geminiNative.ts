@@ -307,26 +307,11 @@ function isGeminiFunctionCallPart(part: GeminiPart): boolean {
   return Boolean(part.functionCall && typeof part.functionCall === "object");
 }
 
-function isGeminiFunctionResponsePart(part: GeminiPart): boolean {
-  return Boolean(
-    part.functionResponse && typeof part.functionResponse === "object",
-  );
-}
-
 function getGeminiFunctionCallName(part: GeminiPart): string {
   if (!isGeminiFunctionCallPart(part)) return "";
   const functionCall = part.functionCall as { name?: unknown };
   return typeof functionCall.name === "string" && functionCall.name.trim()
     ? functionCall.name.trim()
-    : "";
-}
-
-function getGeminiFunctionResponseName(part: GeminiPart): string {
-  if (!isGeminiFunctionResponsePart(part)) return "";
-  const functionResponse = part.functionResponse as { name?: unknown };
-  return typeof functionResponse.name === "string" &&
-    functionResponse.name.trim()
-    ? functionResponse.name.trim()
     : "";
 }
 
@@ -397,26 +382,11 @@ function buildLooseToolResultSummaryMessage(
   };
 }
 
-function cloneGeminiMessage(message: GeminiMessage): GeminiMessage {
-  return {
-    role: message.role,
-    parts: message.parts.map((part) => ({ ...part })),
-  };
-}
-
 function getFunctionCallNamesFromMessage(
   message: GeminiMessage | undefined,
 ): string[] {
   if (!message || message.role !== "model") return [];
   return message.parts.map(getGeminiFunctionCallName).filter(Boolean);
-}
-
-function getFunctionResponseNames(
-  messages: readonly GeminiMessage[],
-): string[] {
-  return messages.flatMap((message) =>
-    message.parts.map(getGeminiFunctionResponseName).filter(Boolean),
-  );
 }
 
 function splitToolMessagesByPreviousFunctionCalls(
@@ -442,59 +412,6 @@ function splitToolMessagesByPreviousFunctionCalls(
     unmatched.push(message);
   }
   return { matched, unmatched };
-}
-
-function filterGeminiFunctionCallsByExpectedNames(
-  parts: readonly GeminiPart[],
-  expectedNames: readonly string[],
-): { parts: GeminiPart[]; matchedCount: number } {
-  let expectedIndex = 0;
-  const filtered = parts.filter((part) => {
-    if (!isGeminiFunctionCallPart(part)) return true;
-    const name = getGeminiFunctionCallName(part);
-    if (
-      expectedIndex < expectedNames.length &&
-      name === expectedNames[expectedIndex]
-    ) {
-      expectedIndex += 1;
-      return true;
-    }
-    return false;
-  });
-  return {
-    parts: filtered.map((part) => ({ ...part })),
-    matchedCount: expectedIndex,
-  };
-}
-
-function reconcileCachedGeminiConversationForContinuation(
-  cachedMessages: readonly GeminiMessage[],
-  fallbackBaseMessages: readonly GeminiMessage[],
-  continuationMessages: readonly GeminiMessage[],
-): GeminiMessage[] {
-  const expectedNames = getFunctionResponseNames(continuationMessages);
-  if (!expectedNames.length) {
-    return cachedMessages.map((message) => cloneGeminiMessage(message));
-  }
-
-  for (let index = cachedMessages.length - 1; index >= 0; index -= 1) {
-    const message = cachedMessages[index];
-    if (message.role !== "model") continue;
-    if (!message.parts.some(isGeminiFunctionCallPart)) continue;
-
-    const filtered = filterGeminiFunctionCallsByExpectedNames(
-      message.parts,
-      expectedNames,
-    );
-    if (filtered.matchedCount !== expectedNames.length) break;
-    return cachedMessages.map((entry, entryIndex) =>
-      entryIndex === index
-        ? { role: "model", parts: filtered.parts }
-        : cloneGeminiMessage(entry),
-    );
-  }
-
-  return fallbackBaseMessages.map((message) => cloneGeminiMessage(message));
 }
 
 async function buildInitialGeminiMessages(
@@ -797,20 +714,7 @@ export class GeminiNativeAgentAdapter implements AgentModelAdapter {
       : [];
     const continuation =
       await buildGeminiContinuationMessages(continuationSource);
-    const fallbackBaseMessages = continuation.length
-      ? initial.contents.slice(
-          0,
-          Math.max(0, initial.contents.length - continuation.length),
-        )
-      : initial.contents;
-    const conversationBase =
-      continuation.length && cachedConversationMessages
-        ? reconcileCachedGeminiConversationForContinuation(
-            cachedConversationMessages,
-            fallbackBaseMessages,
-            continuation,
-          )
-        : cachedConversationMessages || initial.contents;
+    const conversationBase = cachedConversationMessages || initial.contents;
     const contents = continuation.length
       ? [...conversationBase, ...continuation]
       : conversationBase;

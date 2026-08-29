@@ -275,14 +275,15 @@ export function createToolResultReadTool(): AgentToolDefinition<
     spec: {
       name: "tool_result_read",
       description:
-        "Read a bounded section from a prior Agent tool result that was compacted under context pressure. Use only when a compacted tool message provides a toolResultHandle and omitted rows/snippets are needed for the current answer.",
+        "Read a bounded section from a prior Agent tool result preserved behind a handle. Use when a semantic/context checkpoint provides handle=trh_... or a compacted tool message provides toolResultHandle, and omitted rows or snippets are needed for the current answer.",
       inputSchema: {
         type: "object",
         additionalProperties: false,
         properties: {
           handle: {
             type: "string",
-            description: "The toolResultHandle from a compacted tool message.",
+            description:
+              "The trh_... handle from a semantic/context checkpoint or compacted tool message.",
           },
           path: {
             type: "string",

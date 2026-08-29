@@ -16,6 +16,7 @@ import {
 
 type ZoteroDb = {
   queryAsync: (sql: string, params?: unknown[]) => Promise<unknown>;
+  executeTransaction: <T>(task: () => Promise<T>) => Promise<T>;
 };
 
 export type AgentTranscriptSegment = {
@@ -405,35 +406,39 @@ export async function loadLatestAgentTranscriptSegment(
 
 async function persistTranscriptSegment(
   segment: AgentTranscriptSegment,
-): Promise<void> {
+): Promise<"persisted" | "unavailable" | "failed"> {
   const dbReady = await ensureAgentTranscriptStore();
   const db = getDb();
-  if (!dbReady || !db) return;
+  if (!dbReady || !db) return "unavailable";
   try {
-    await db.queryAsync(
-      `DELETE FROM ${TRANSCRIPT_TABLE}
-       WHERE conversation_key = ?
-         AND compatibility_key = ?`,
-      [segment.conversationKey, segment.compatibilityKey],
-    );
-    const createdAt = Date.now();
-    for (let index = 0; index < segment.messages.length; index += 1) {
+    await db.executeTransaction(async () => {
       await db.queryAsync(
-        `INSERT INTO ${TRANSCRIPT_TABLE}
-          (conversation_key, compatibility_key, sequence, message_json, compacted_at, created_at)
-         VALUES (?, ?, ?, ?, ?, ?)`,
-        [
-          segment.conversationKey,
-          segment.compatibilityKey,
-          index,
-          stableJson(segment.messages[index]),
-          segment.compactedAt || null,
-          createdAt,
-        ],
+        `DELETE FROM ${TRANSCRIPT_TABLE}
+         WHERE conversation_key = ?
+           AND compatibility_key = ?`,
+        [segment.conversationKey, segment.compatibilityKey],
       );
-    }
+      const createdAt = Date.now();
+      for (let index = 0; index < segment.messages.length; index += 1) {
+        await db.queryAsync(
+          `INSERT INTO ${TRANSCRIPT_TABLE}
+            (conversation_key, compatibility_key, sequence, message_json, compacted_at, created_at)
+           VALUES (?, ?, ?, ?, ?, ?)`,
+          [
+            segment.conversationKey,
+            segment.compatibilityKey,
+            index,
+            stableJson(segment.messages[index]),
+            segment.compactedAt || null,
+            createdAt,
+          ],
+        );
+      }
+    });
+    return "persisted";
   } catch (error) {
     logTranscriptStoreError("LLM Agent: Failed to persist transcript", error);
+    return "failed";
   }
 }
 
@@ -445,14 +450,14 @@ export async function replaceAgentTranscriptSegment(
     ...segment,
     messages: normalizeMessages(segment.messages),
   };
-  transcriptByKey.set(
-    segmentKey(normalized.conversationKey, normalized.compatibilityKey),
-    normalized,
+  const persistence = await persistTranscriptSegment(normalized);
+  if (persistence === "failed") return;
+  const key = segmentKey(
+    normalized.conversationKey,
+    normalized.compatibilityKey,
   );
-  hydratedKeys.add(
-    segmentKey(normalized.conversationKey, normalized.compatibilityKey),
-  );
-  await persistTranscriptSegment(normalized);
+  transcriptByKey.set(key, normalized);
+  hydratedKeys.add(key);
 }
 
 export async function appendAgentTranscriptMessages(params: {

@@ -20,7 +20,6 @@ import { buildAgentModelCapabilities } from "./contentCapabilities";
 import {
   buildResponsesContinuationInput,
   buildResponsesInitialInput,
-  limitNormalizedResponsesStep,
   type ResponsesPayload,
   normalizeResponsesStepFromPayload,
   parseResponsesStepStream,
@@ -152,18 +151,16 @@ export class OpenAIResponsesAgentAdapter implements AgentModelAdapter {
       },
       signal: params.signal,
     });
-    const normalized = limitNormalizedResponsesStep(
-      response.body
-        ? await parseResponsesStepStream(
-            response.body,
-            params.onTextDelta,
-            params.onReasoning,
-            params.onUsage,
-          )
-        : normalizeResponsesStepFromPayload(
-            (await response.json()) as ResponsesPayload,
-          ),
-    );
+    const normalized = response.body
+      ? await parseResponsesStepStream(
+          response.body,
+          params.onTextDelta,
+          params.onReasoning,
+          params.onUsage,
+        )
+      : normalizeResponsesStepFromPayload(
+          (await response.json()) as ResponsesPayload,
+        );
     this.conversationItems = [...inputItems, ...normalized.outputItems];
     if (normalized.toolCalls.length) {
       return {

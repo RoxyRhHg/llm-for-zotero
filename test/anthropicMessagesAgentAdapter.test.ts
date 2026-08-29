@@ -682,7 +682,7 @@ describe("AnthropicMessagesAgentAdapter", function () {
     assert.equal(bodyMessages[3]?.content?.[0]?.text, "Use those results now");
   });
 
-  it("filters cached native tool uses to the executed continuation ids", async function () {
+  it("preserves the complete cached native tool step on continuation", async function () {
     const adapter = new AnthropicMessagesAgentAdapter();
     const requestBodies: Record<string, unknown>[] = [];
     let callCount = 0;
@@ -736,22 +736,22 @@ describe("AnthropicMessagesAgentAdapter", function () {
     assert.equal(firstStep.kind, "tool_calls");
     if (firstStep.kind !== "tool_calls") return;
 
-    const executedToolResult: AgentModelMessage = {
+    const firstToolResult: AgentModelMessage = {
       role: "tool",
       tool_call_id: "toolu_1",
       name: "read_paper",
       content: '{"matches":["a"]}',
     };
+    const secondToolResult: AgentModelMessage = {
+      role: "tool",
+      tool_call_id: "toolu_2",
+      name: "read_paper",
+      content: '{"matches":["b"]}',
+    };
     await adapter.runStep({
       request: makeRequest(),
-      messages: [
-        {
-          ...firstStep.assistantMessage,
-          tool_calls: firstStep.calls.slice(0, 1),
-        },
-        executedToolResult,
-      ],
-      continuationMessages: [executedToolResult],
+      messages: [firstStep.assistantMessage, firstToolResult, secondToolResult],
+      continuationMessages: [firstToolResult, secondToolResult],
       tools,
     });
 
@@ -768,14 +768,17 @@ describe("AnthropicMessagesAgentAdapter", function () {
       assistantContent
         .filter((block) => block.type === "tool_use")
         .map((block) => block.id),
-      ["toolu_1"],
+      ["toolu_1", "toolu_2"],
     );
     assert.deepEqual(
       secondRequestMessages[2]?.content?.map((block) => ({
         type: block.type,
         tool_use_id: block.tool_use_id,
       })),
-      [{ type: "tool_result", tool_use_id: "toolu_1" }],
+      [
+        { type: "tool_result", tool_use_id: "toolu_1" },
+        { type: "tool_result", tool_use_id: "toolu_2" },
+      ],
     );
   });
 
@@ -811,15 +814,24 @@ describe("AnthropicMessagesAgentAdapter", function () {
                         input: { query: "methods" },
                       },
                     ]
-                  : [
-                      {
-                        type: "text",
-                        text:
-                          callCount === 2
-                            ? "Premature comparison."
-                            : "Corrected comparison.",
-                      },
-                    ],
+                  : callCount === 2
+                    ? [
+                        {
+                          type: "thinking",
+                          thinking: "Need more evidence.",
+                          signature: "sig-final-reasoning",
+                        },
+                        {
+                          type: "text",
+                          text: "Premature comparison.",
+                        },
+                      ]
+                    : [
+                        {
+                          type: "text",
+                          text: "Corrected comparison.",
+                        },
+                      ],
             }),
             text: async () => "",
           };
@@ -853,6 +865,10 @@ describe("AnthropicMessagesAgentAdapter", function () {
     });
     assert.equal(secondStep.kind, "final");
     if (secondStep.kind !== "final") return;
+    assert.notInclude(
+      JSON.stringify(secondStep.assistantMessage),
+      "sig-final-reasoning",
+    );
     const correctionMessage: AgentModelMessage = {
       role: "user",
       content: "Correction for this turn: retrieve body evidence first.",
@@ -884,8 +900,13 @@ describe("AnthropicMessagesAgentAdapter", function () {
     );
     assert.equal(thirdRequestMessages[1]?.content?.[0]?.type, "tool_use");
     assert.equal(thirdRequestMessages[2]?.content?.[0]?.type, "tool_result");
+    assert.deepEqual(thirdRequestMessages[3]?.content?.[0], {
+      type: "thinking",
+      thinking: "Need more evidence.",
+      signature: "sig-final-reasoning",
+    });
     assert.equal(
-      thirdRequestMessages[3]?.content?.[0]?.text,
+      thirdRequestMessages[3]?.content?.[1]?.text,
       "Premature comparison.",
     );
     assert.equal(

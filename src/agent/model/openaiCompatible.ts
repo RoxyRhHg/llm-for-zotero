@@ -42,6 +42,19 @@ type ChatCompletionChoice = {
   };
 };
 
+type OpenAIChatRequestMessage = {
+  role: AgentModelMessage["role"];
+  content: string | unknown[];
+  reasoning_content?: string;
+  tool_call_id?: string;
+  name?: string;
+  tool_calls?: Array<{
+    id: string;
+    type: "function";
+    function: { name: string; arguments: string };
+  }>;
+};
+
 function isDeepseekChatModel(modelName?: string): boolean {
   const normalized = (modelName || "").trim().toLowerCase();
   if (!normalized) return false;
@@ -79,8 +92,10 @@ function hasPdfFileRef(message: AgentModelMessage): boolean {
   );
 }
 
-async function buildMessagesPayload(messages: AgentModelMessage[]) {
-  const result = [];
+async function buildMessagesPayload(
+  messages: AgentModelMessage[],
+): Promise<OpenAIChatRequestMessage[]> {
+  const result: OpenAIChatRequestMessage[] = [];
   for (const message of messages) {
     if (message.role === "tool") {
       result.push({
@@ -130,16 +145,9 @@ async function buildMessagesPayload(messages: AgentModelMessage[]) {
       }
       content = parts;
     }
-    const reasoningContent =
-      message.role === "assistant" &&
-      typeof message.reasoning_content === "string" &&
-      message.reasoning_content.trim()
-        ? { reasoning_content: message.reasoning_content }
-        : {};
     result.push({
       role: message.role,
       content,
-      ...reasoningContent,
       ...(message.role === "assistant" &&
       Array.isArray(message.tool_calls) &&
       message.tool_calls.length
@@ -157,6 +165,36 @@ async function buildMessagesPayload(messages: AgentModelMessage[]) {
     });
   }
   return result;
+}
+
+function buildNativeAssistantMessage(params: {
+  modelName?: string;
+  text: string;
+  reasoningText: string;
+  reasoningContentText: string;
+  toolCalls: AgentToolCall[];
+}): OpenAIChatRequestMessage {
+  return {
+    role: "assistant",
+    content: params.text,
+    ...buildReasoningContentForContinuation(
+      params.modelName,
+      params.reasoningText,
+      params.reasoningContentText,
+    ),
+    ...(params.toolCalls.length
+      ? {
+          tool_calls: params.toolCalls.map((call) => ({
+            id: call.id,
+            type: "function" as const,
+            function: {
+              name: call.name,
+              arguments: JSON.stringify(call.arguments ?? {}),
+            },
+          })),
+        }
+      : {}),
+  };
 }
 
 function normalizeToolCalls(
@@ -333,6 +371,8 @@ function isStreamingResponse(response: Response): boolean {
 }
 
 export class OpenAIChatCompatAgentAdapter implements AgentModelAdapter {
+  private conversationMessages: OpenAIChatRequestMessage[] | null = null;
+
   getCapabilities(request: AgentRuntimeRequest): AgentModelCapabilities {
     return buildAgentModelCapabilities({
       streaming: true,
@@ -347,6 +387,10 @@ export class OpenAIChatCompatAgentAdapter implements AgentModelAdapter {
     return this.getCapabilities(request).toolCalls;
   }
 
+  resetState(): void {
+    this.conversationMessages = null;
+  }
+
   async runStep(params: AgentStepParams): Promise<AgentModelStep> {
     const request = params.request;
     const auth = await resolveRequestAuthState({
@@ -359,7 +403,12 @@ export class OpenAIChatCompatAgentAdapter implements AgentModelAdapter {
       apiBase: request.apiBase || "",
       authMode: request.authMode,
     });
-    const resolvedMessages = await buildMessagesPayload(params.messages);
+    const resolvedMessages = this.conversationMessages
+      ? [
+          ...this.conversationMessages,
+          ...(await buildMessagesPayload(params.continuationMessages || [])),
+        ]
+      : await buildMessagesPayload(params.messages);
     const response = await postWithReasoningFallback({
       url,
       auth,
@@ -432,6 +481,16 @@ export class OpenAIChatCompatAgentAdapter implements AgentModelAdapter {
         params.onReasoning,
         params.onUsage,
       );
+      this.conversationMessages = [
+        ...resolvedMessages,
+        buildNativeAssistantMessage({
+          modelName: request.model,
+          text: result.text,
+          reasoningText: result.reasoningText,
+          reasoningContentText: result.reasoningContentText,
+          toolCalls: result.toolCalls,
+        }),
+      ];
       if (result.toolCalls.length) {
         return {
           kind: "tool_calls",
@@ -439,11 +498,6 @@ export class OpenAIChatCompatAgentAdapter implements AgentModelAdapter {
           assistantMessage: {
             role: "assistant",
             content: result.text,
-            ...buildReasoningContentForContinuation(
-              request.model,
-              result.reasoningText,
-              result.reasoningContentText,
-            ),
             tool_calls: result.toolCalls,
           },
         };
@@ -498,28 +552,34 @@ export class OpenAIChatCompatAgentAdapter implements AgentModelAdapter {
       await params.onReasoning({ details: reasoningText });
     }
     const toolCalls = normalizeToolCalls(message?.tool_calls);
+    const text = typeof message?.content === "string" ? message.content : "";
+    this.conversationMessages = [
+      ...resolvedMessages,
+      buildNativeAssistantMessage({
+        modelName: request.model,
+        text,
+        reasoningText,
+        reasoningContentText,
+        toolCalls,
+      }),
+    ];
     if (toolCalls.length) {
       return {
         kind: "tool_calls",
         calls: toolCalls,
         assistantMessage: {
           role: "assistant",
-          content: typeof message?.content === "string" ? message.content : "",
-          ...buildReasoningContentForContinuation(
-            request.model,
-            reasoningText,
-            reasoningContentText,
-          ),
+          content: text,
           tool_calls: toolCalls,
         },
       };
     }
     return {
       kind: "final",
-      text: typeof message?.content === "string" ? message.content : "",
+      text,
       assistantMessage: {
         role: "assistant",
-        content: typeof message?.content === "string" ? message.content : "",
+        content: text,
       },
     };
   }

@@ -1,7 +1,6 @@
 import { assert } from "chai";
 import {
   CodexResponsesAgentAdapter,
-  limitNormalizedResponsesStep,
   normalizeStepFromPayload,
   parseResponsesStepStream,
 } from "../src/agent/model/codexResponses";
@@ -116,20 +115,34 @@ describe("CodexResponsesAgentAdapter", function () {
                         arguments: '{"query":"methods"}',
                       },
                     ]
-                  : [
-                      {
-                        type: "message",
-                        content: [
-                          {
-                            type: "output_text",
-                            text:
-                              callCount === 2
-                                ? "Premature comparison."
-                                : "Corrected comparison.",
-                          },
-                        ],
-                      },
-                    ],
+                  : callCount === 2
+                    ? [
+                        {
+                          id: "rs_final",
+                          type: "reasoning",
+                          encrypted_content: "enc_final_reasoning",
+                        },
+                        {
+                          type: "message",
+                          content: [
+                            {
+                              type: "output_text",
+                              text: "Premature comparison.",
+                            },
+                          ],
+                        },
+                      ]
+                    : [
+                        {
+                          type: "message",
+                          content: [
+                            {
+                              type: "output_text",
+                              text: "Corrected comparison.",
+                            },
+                          ],
+                        },
+                      ],
             }),
             text: async () => "",
           };
@@ -172,6 +185,10 @@ describe("CodexResponsesAgentAdapter", function () {
     });
     assert.equal(secondStep.kind, "final");
     if (secondStep.kind !== "final") return;
+    assert.notInclude(
+      JSON.stringify(secondStep.assistantMessage),
+      "enc_final_reasoning",
+    );
     const correctionMessage: AgentModelMessage = {
       role: "user",
       content: "Correction for this turn: retrieve body evidence first.",
@@ -211,6 +228,11 @@ describe("CodexResponsesAgentAdapter", function () {
     assert.isAbove(finalAnswerIndex, functionOutputIndex);
     assert.equal(correctionIndex, thirdInput.length - 1);
     assert.isAbove(correctionIndex, finalAnswerIndex);
+    assert.deepInclude(thirdInput, {
+      id: "rs_final",
+      type: "reasoning",
+      encrypted_content: "enc_final_reasoning",
+    });
   }
 
   it("supports tool calling for codex auth requests", function () {
@@ -267,63 +289,60 @@ describe("CodexResponsesAgentAdapter", function () {
     assert.equal(step.text, "Final answer.");
   });
 
-  it("keeps responses tool calls and output items aligned when capped", function () {
-    const step = limitNormalizedResponsesStep(
-      normalizeStepFromPayload({
-        id: "resp_789",
-        output: [
-          {
-            id: "fc_1",
-            type: "function_call",
-            call_id: "call_1",
-            name: "tool_a",
-            arguments: "{}",
-          },
-          {
-            id: "fc_2",
-            type: "function_call",
-            call_id: "call_2",
-            name: "tool_b",
-            arguments: "{}",
-          },
-          {
-            id: "fc_3",
-            type: "function_call",
-            call_id: "call_3",
-            name: "tool_c",
-            arguments: "{}",
-          },
-          {
-            id: "fc_4",
-            type: "function_call",
-            call_id: "call_4",
-            name: "tool_d",
-            arguments: "{}",
-          },
-          {
-            id: "fc_5",
-            type: "function_call",
-            call_id: "call_5",
-            name: "tool_e",
-            arguments: "{}",
-          },
-          {
-            type: "message",
-            content: [
-              {
-                type: "output_text",
-                text: "Working on it.",
-              },
-            ],
-          },
-        ],
-      }),
-      4,
-    );
+  it("preserves a complete native responses step for runtime overflow handling", function () {
+    const step = normalizeStepFromPayload({
+      id: "resp_789",
+      output: [
+        {
+          id: "fc_1",
+          type: "function_call",
+          call_id: "call_1",
+          name: "tool_a",
+          arguments: "{}",
+        },
+        {
+          id: "fc_2",
+          type: "function_call",
+          call_id: "call_2",
+          name: "tool_b",
+          arguments: "{}",
+        },
+        {
+          id: "fc_3",
+          type: "function_call",
+          call_id: "call_3",
+          name: "tool_c",
+          arguments: "{}",
+        },
+        {
+          id: "fc_4",
+          type: "function_call",
+          call_id: "call_4",
+          name: "tool_d",
+          arguments: "{}",
+        },
+        {
+          id: "fc_5",
+          type: "function_call",
+          call_id: "call_5",
+          name: "tool_e",
+          arguments: "{}",
+        },
+        {
+          type: "message",
+          content: [
+            {
+              type: "output_text",
+              text: "Working on it.",
+            },
+          ],
+        },
+      ],
+    });
 
     assert.deepEqual(
       step.toolCalls.map((call) => call.id),
-      ["call_1", "call_2", "call_3", "call_4"],
+      ["call_1", "call_2", "call_3", "call_4", "call_5"],
     );
     assert.deepEqual(
       step.outputItems
@@ -334,7 +353,7 @@ describe("CodexResponsesAgentAdapter", function () {
             (item as { type?: unknown }).type === "function_call",
         )
         .map((item) => (item as { call_id?: unknown }).call_id),
-      ["call_1", "call_2", "call_3", "call_4"],
+      ["call_1", "call_2", "call_3", "call_4", "call_5"],
     );
     assert.equal(step.text, "Working on it.");
   });

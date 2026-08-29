@@ -19,6 +19,7 @@ import { clearAgentTranscriptStore } from "../src/agent/store/transcriptStore";
 import {
   clearAgentToolResultHandleStore,
   createAgentToolResultHandleRecord,
+  getAgentToolResultHandle,
   upsertAgentToolResultHandles,
 } from "../src/agent/store/toolResultHandles";
 import { AgentToolRegistry } from "../src/agent/tools/registry";
@@ -1412,10 +1413,11 @@ describe("AgentRuntime", function () {
     }
   });
 
-  it("keeps assistant tool calls aligned with executed tool outputs when capped", async function () {
+  it("rejects an oversized native tool step whole and retries from a semantic checkpoint", async function () {
     const restoreDb = installMockDb();
     try {
       const registry = new AgentToolRegistry();
+      let executionCount = 0;
       registry.register({
         spec: {
           name: "read_context",
@@ -1425,12 +1427,15 @@ describe("AgentRuntime", function () {
           requiresConfirmation: false,
         },
         validate: () => ({ ok: true, value: {} }),
-        execute: async () => ({
-          ok: true,
-        }),
+        execute: async () => {
+          executionCount += 1;
+          return { ok: true };
+        },
       });
 
-      let sawConsistentFollowup = false;
+      let modelStep = 0;
+      let resetCount = 0;
+      let sawBoundedFollowup = false;
       const overLimitCallCount = MAX_AGENT_TOOL_CALLS_PER_ROUND + 1;
       const runtime = new AgentRuntime({
         registry,
@@ -1441,60 +1446,72 @@ describe("AgentRuntime", function () {
             multimodal: false,
           }),
           supportsTools: () => true,
+          resetState: () => {
+            resetCount += 1;
+          },
           async runStep(params: AgentStepParams): Promise<AgentModelStep> {
-            if (!sawConsistentFollowup) {
-              const priorAssistant = params.messages.findLast(
-                (message) =>
-                  message.role === "assistant" &&
-                  Array.isArray(message.tool_calls) &&
-                  message.tool_calls.length > 0,
+            modelStep += 1;
+            if (modelStep === 1) {
+              const calls = Array.from(
+                { length: overLimitCallCount },
+                (_unused, index) => ({
+                  id: `call-${index + 1}`,
+                  name: "read_context",
+                  arguments: {},
+                }),
               );
-              if (
-                !priorAssistant ||
-                !Array.isArray(priorAssistant.tool_calls)
-              ) {
-                return {
-                  kind: "tool_calls",
-                  calls: Array.from(
-                    { length: overLimitCallCount },
-                    (_unused, index) => index + 1,
-                  ).map((index) => ({
-                    id: `call-${index}`,
-                    name: "read_context",
-                    arguments: {},
-                  })),
-                  assistantMessage: {
-                    role: "assistant",
-                    content: "",
-                    tool_calls: Array.from(
-                      { length: overLimitCallCount },
-                      (_unused, index) => index + 1,
-                    ).map((index) => ({
-                      id: `call-${index}`,
-                      name: "read_context",
-                      arguments: {},
-                    })),
-                  },
-                };
-              }
-              const toolMessages = params.messages.filter(
-                (message) => message.role === "tool",
-              );
-              sawConsistentFollowup =
-                priorAssistant.tool_calls.length ===
-                  MAX_AGENT_TOOL_CALLS_PER_ROUND &&
-                toolMessages.length === MAX_AGENT_TOOL_CALLS_PER_ROUND &&
-                toolMessages.every(
-                  (message, index) =>
-                    message.tool_call_id === `call-${index + 1}`,
-                );
+              return {
+                kind: "tool_calls",
+                calls,
+                assistantMessage: {
+                  role: "assistant",
+                  content: "",
+                  tool_calls: calls,
+                },
+              };
             }
+            if (modelStep === 2) {
+              assert.isTrue(
+                params.messages.every(
+                  (message) =>
+                    message.role === "system" || message.role === "user",
+                ),
+              );
+              assert.include(
+                params.messages
+                  .map((message) =>
+                    typeof message.content === "string" ? message.content : "",
+                  )
+                  .join("\n"),
+                `at most ${MAX_AGENT_TOOL_CALLS_PER_ROUND} tool calls`,
+              );
+              const call = {
+                id: "bounded-call",
+                name: "read_context",
+                arguments: {},
+              };
+              return {
+                kind: "tool_calls",
+                calls: [call],
+                assistantMessage: {
+                  role: "assistant",
+                  content: "",
+                  tool_calls: [call],
+                },
+              };
+            }
+            const toolMessages = params.messages.filter(
+              (message) => message.role === "tool",
+            );
+            sawBoundedFollowup =
+              toolMessages.length === 1 &&
+              toolMessages[0].tool_call_id === "bounded-call";
             return {
               kind: "final",
-              text: sawConsistentFollowup ? "Done." : "Inconsistent.",
+              text: sawBoundedFollowup ? "Done." : "Inconsistent.",
               assistantMessage: {
                 role: "assistant",
-                content: sawConsistentFollowup ? "Done." : "Inconsistent.",
+                content: sawBoundedFollowup ? "Done." : "Inconsistent.",
               },
             };
           },
@@ -1515,7 +1532,9 @@ describe("AgentRuntime", function () {
       assert.equal(outcome.kind, "completed");
       if (outcome.kind !== "completed") return;
       assert.equal(outcome.text, "Done.");
-      assert.isTrue(sawConsistentFollowup);
+      assert.isTrue(sawBoundedFollowup);
+      assert.equal(executionCount, 1);
+      assert.equal(resetCount, 1);
     } finally {
       restoreDb();
     }
@@ -1653,6 +1672,109 @@ describe("AgentRuntime", function () {
       assert.include(serialized, "[raw_pdf_path:zotero-pdf:10:11]");
       assert.include(serialized, '"type":"message_delta"');
       assert.include(serialized, '"type":"reasoning"');
+    } finally {
+      restoreDb();
+    }
+  });
+
+  it("redacts local document paths from durable tool-result handles", async function () {
+    const restoreDb = installMockDb();
+    const conversationKey = 7_940_002;
+    const rawPath = "/private/papers/durable-selected.pdf";
+    try {
+      const registry = new AgentToolRegistry();
+      registry.register({
+        spec: {
+          name: "read_local_path",
+          description: "read",
+          inputSchema: { type: "object" },
+          mutability: "read",
+          requiresConfirmation: false,
+        },
+        validate: () => ({ ok: true, value: {} }),
+        execute: async () => ({ sourcePath: rawPath, text: "Evidence" }),
+      });
+      let stepIndex = 0;
+      const runtime = new AgentRuntime({
+        registry,
+        adapterFactory: () => ({
+          getCapabilities: () => ({
+            streaming: false,
+            toolCalls: true,
+            multimodal: false,
+          }),
+          supportsTools: () => true,
+          async runStep(): Promise<AgentModelStep> {
+            stepIndex += 1;
+            if (stepIndex === 1) {
+              const call = {
+                id: "durable-path-call",
+                name: "read_local_path",
+                arguments: {},
+              };
+              return {
+                kind: "tool_calls",
+                calls: [call],
+                assistantMessage: {
+                  role: "assistant",
+                  content: "",
+                  tool_calls: [call],
+                },
+              };
+            }
+            return {
+              kind: "final",
+              text: "Done.",
+              assistantMessage: { role: "assistant", content: "Done." },
+            };
+          },
+        }),
+      });
+
+      await runtime.runTurn({
+        request: {
+          conversationKey,
+          libraryID: 1,
+          mode: "agent",
+          userText: "Read the selected PDF.",
+          model: "gpt-5.4",
+          apiBase: "https://api.openai.com/v1/responses",
+          apiKey: "test",
+          pdfPaperContexts: [
+            {
+              itemId: 20,
+              contextItemId: 21,
+              title: "Selected",
+              contentSourceMode: "pdf",
+            },
+          ],
+          localDocuments: [
+            {
+              kind: "local_pdf",
+              sourceKey: "zotero-pdf:20:21",
+              itemId: 20,
+              contextItemId: 21,
+              title: "Selected",
+              name: "durable-selected.pdf",
+              mimeType: "application/pdf",
+              absolutePath: rawPath,
+            },
+          ],
+        },
+      });
+
+      const transcript = readPersistedTranscript(restoreDb, conversationKey);
+      const handle = JSON.stringify(transcript).match(
+        /handle=(trh_[a-z0-9]+)/i,
+      )?.[1];
+      assert.match(handle || "", /^trh_/);
+      const record = await getAgentToolResultHandle({
+        conversationKey,
+        handle: handle || "",
+      });
+      const serialized = JSON.stringify(record);
+      assert.notInclude(serialized, rawPath);
+      assert.include(serialized, "[raw_pdf_path:zotero-pdf:20:21]");
     } finally {
       restoreDb();
     }
@@ -2207,6 +2329,160 @@ describe("AgentRuntime", function () {
     }
   });
 
+  it("continues a rejected final without replaying the preceding tool result", async function () {
+    const restoreDb = installMockDb();
+    try {
+      const registry = new AgentToolRegistry();
+      registry.register({
+        spec: {
+          name: "paper_read",
+          description: "read paper",
+          inputSchema: { type: "object" },
+          mutability: "read",
+          requiresConfirmation: false,
+        },
+        validate: (args: unknown) => ({ ok: true, value: args }),
+        execute: async (input) => ({
+          mode: (input as { mode?: unknown }).mode,
+          status: "complete",
+          coverageReceipt: {
+            complete: true,
+            processedChunks: 2,
+            totalChunks: 2,
+          },
+        }),
+      });
+
+      let stepIndex = 0;
+      const continuationDeltas: AgentModelMessage[][] = [];
+      const runtime = new AgentRuntime({
+        registry,
+        adapterFactory: () => ({
+          getCapabilities: () => ({
+            streaming: true,
+            toolCalls: true,
+            multimodal: false,
+            fileInputs: false,
+            reasoning: true,
+          }),
+          supportsTools: () => true,
+          async runStep(params: AgentStepParams): Promise<AgentModelStep> {
+            continuationDeltas.push([...(params.continuationMessages || [])]);
+            stepIndex += 1;
+            if (stepIndex === 1) {
+              return {
+                kind: "tool_calls",
+                calls: [
+                  {
+                    id: "call-overview-read",
+                    name: "paper_read",
+                    arguments: { mode: "overview" },
+                  },
+                ],
+                assistantMessage: {
+                  role: "assistant",
+                  content: "",
+                  tool_calls: [
+                    {
+                      id: "call-overview-read",
+                      name: "paper_read",
+                      arguments: { mode: "overview" },
+                    },
+                  ],
+                },
+              };
+            }
+            if (stepIndex === 2) {
+              return {
+                kind: "final",
+                text: "Premature answer from overview evidence.",
+                assistantMessage: {
+                  role: "assistant",
+                  content: "Premature answer from overview evidence.",
+                },
+              };
+            }
+            if (stepIndex === 3) {
+              return {
+                kind: "tool_calls",
+                calls: [
+                  {
+                    id: "call-full-read-after-correction",
+                    name: "paper_read",
+                    arguments: { mode: "full" },
+                  },
+                ],
+                assistantMessage: {
+                  role: "assistant",
+                  content: "",
+                  tool_calls: [
+                    {
+                      id: "call-full-read-after-correction",
+                      name: "paper_read",
+                      arguments: { mode: "full" },
+                    },
+                  ],
+                },
+              };
+            }
+            return {
+              kind: "final",
+              text: "Grounded answer after the full read.",
+              assistantMessage: {
+                role: "assistant",
+                content: "Grounded answer after the full read.",
+              },
+            };
+          },
+        }),
+      });
+
+      const outcome = await runtime.runTurn({
+        request: {
+          conversationKey: 10,
+          mode: "agent",
+          conversationKind: "paper",
+          activeItemId: 42,
+          userText: "Read the complete paper before answering.",
+          model: "deepseek-v4-pro",
+          apiBase: "https://api.deepseek.com/anthropic",
+          apiKey: "test",
+        },
+      });
+
+      assert.equal(outcome.kind, "completed");
+      if (outcome.kind !== "completed") return;
+      assert.include(outcome.text, "Grounded answer after the full read.");
+      assert.lengthOf(continuationDeltas, 4);
+      assert.deepEqual(
+        continuationDeltas[1].map((message) => message.role),
+        ["tool"],
+      );
+      assert.deepEqual(
+        continuationDeltas[2].map((message) => message.role),
+        ["user"],
+      );
+      assert.notInclude(
+        JSON.stringify(continuationDeltas[2]),
+        "call-overview-read",
+      );
+      assert.include(
+        JSON.stringify(continuationDeltas[2]),
+        "open typed obligation(s)",
+      );
+      assert.deepEqual(
+        continuationDeltas[3].map((message) => message.role),
+        ["tool"],
+      );
+      assert.include(
+        JSON.stringify(continuationDeltas[3]),
+        "call-full-read-after-correction",
+      );
+    } finally {
+      restoreDb();
+    }
+  });
+
   it("does not force file writes after a standalone Zotero note request is satisfied", async function () {
     const restoreDb = installMockDb();
     try {
@@ -2667,6 +2943,11 @@ describe("AgentRuntime", function () {
           { round: 2, details: "Writing the answer." },
         ],
       );
+      const persisted = readPersistedTranscript(restoreDb, 1);
+      assert.notInclude(JSON.stringify(persisted), "Inspecting the request.");
+      assert.notInclude(JSON.stringify(persisted), "Writing the answer.");
+      const finalEvent = events.findLast((event) => event.type === "final");
+      assert.notInclude(JSON.stringify(finalEvent), "Writing the answer.");
     } finally {
       restoreDb();
     }
@@ -3262,7 +3543,21 @@ describe("AgentRuntime", function () {
             }
             const serialized = JSON.stringify(persisted);
             assert.include(serialized, "checkpoint-call");
-            assert.include(serialized, "durable result");
+            assert.include(
+              serialized,
+              "Agent semantic continuation checkpoint",
+            );
+            assert.notInclude(serialized, "durable result");
+            const handle = serialized.match(/handle=(trh_[a-z0-9]+)/i)?.[1];
+            assert.match(handle || "", /^trh_/);
+            const storedResult = await getAgentToolResultHandle({
+              conversationKey,
+              handle: handle || "",
+            });
+            assert.include(
+              JSON.stringify(storedResult?.content),
+              "durable result",
+            );
             throw new Error("simulated process interruption");
           },
         }),
@@ -3487,28 +3782,19 @@ describe("AgentRuntime", function () {
       });
 
       const serialized = JSON.stringify(secondMessages);
-      const priorUserTranscriptMessages = secondMessages.filter(
+      const priorSemanticCheckpoints = secondMessages.filter(
         (message) =>
           message.role === "user" &&
-          message.content === "User request:\nremember alpha",
+          typeof message.content === "string" &&
+          message.content.includes("Agent semantic continuation checkpoint"),
       );
-      const priorAssistantTranscriptMessages = secondMessages.filter(
-        (message) =>
-          message.role === "assistant" &&
-          message.content === "Alpha is preserved.",
+      assert.lengthOf(priorSemanticCheckpoints, 1, serialized);
+      assert.notInclude(
+        secondMessages.map((message) => message.role),
+        "assistant",
       );
-      assert.lengthOf(priorUserTranscriptMessages, 1, serialized);
-      assert.lengthOf(priorAssistantTranscriptMessages, 1, serialized);
-      assert.equal(
-        serialized.split("remember alpha").length - 1,
-        2,
-        serialized,
-      );
-      assert.equal(
-        serialized.split("Alpha is preserved.").length - 1,
-        2,
-        serialized,
-      );
+      assert.include(serialized, "remember alpha");
+      assert.include(serialized, "Alpha is preserved.");
       assert.include(secondToolNames, "tool_result_read");
     } finally {
       restoreDb();
@@ -3846,7 +4132,7 @@ describe("AgentRuntime", function () {
     }
   });
 
-  it("compacts the reusable transcript when /compact is requested", async function () {
+  it("treats a durable semantic transaction checkpoint as already compacted", async function () {
     const restoreDb = installMockDb();
     try {
       const request: AgentRuntimeRequest = {
@@ -3985,7 +4271,9 @@ describe("AgentRuntime", function () {
       });
 
       assert.equal(compactOutcome.kind, "completed");
-      assert.isTrue(
+      if (compactOutcome.kind !== "completed") return;
+      assert.equal(compactOutcome.text, "Nothing to compact yet");
+      assert.isFalse(
         compactEvents.some(
           (event) =>
             event.type === "context_compacted" && event.automatic === false,
@@ -4026,7 +4314,7 @@ describe("AgentRuntime", function () {
 
       assert.include(
         JSON.stringify(followupMessages),
-        "Agent transcript compact checkpoint",
+        "Agent semantic continuation checkpoint",
       );
       assert.match(JSON.stringify(followupMessages), /trh_[a-z0-9]+/i);
     } finally {
@@ -4295,22 +4583,20 @@ describe("AgentRuntime", function () {
           : undefined,
         1,
       );
-      const toolMessage = synthesisMessages.find(
-        (message) => message.role === "tool",
+      const checkpoint = synthesisMessages.find(
+        (message) =>
+          message.role === "user" &&
+          typeof message.content === "string" &&
+          message.content.includes("Agent semantic continuation checkpoint"),
       );
-      assert.equal(toolMessage?.role, "tool");
-      const modelFacing = JSON.parse(
-        (toolMessage as { content: string }).content,
-      );
-      assert.isTrue(modelFacing.modelContextCompacted);
-      assert.equal(modelFacing.totalCount, 160);
-      assert.equal(modelFacing.filters.collectionId, 42);
-      assert.isBelow(modelFacing.results.length, 160);
-      assert.match(modelFacing.toolResultHandle, /^trh_/);
+      assert.equal(checkpoint?.role, "user");
+      const checkpointText = String(checkpoint?.content || "");
+      assert.include(checkpointText, "query_library");
+      assert.match(checkpointText, /handle=trh_[a-z0-9]+/i);
       assert.isAtLeast(toolNamesByStep.length, 2);
       assert.notInclude(toolNamesByStep[0], "tool_result_read");
       assert.include(toolNamesByStep[1], "tool_result_read");
-      assert.notInclude(JSON.stringify(modelFacing), "A".repeat(200));
+      assert.notInclude(checkpointText, "A".repeat(200));
     } finally {
       restoreDb();
     }
@@ -4394,15 +4680,19 @@ describe("AgentRuntime", function () {
             };
           }
           if (stepIndex === 2) {
-            const compactedToolMessage = params.messages.find(
+            const checkpoint = params.messages.find(
               (message) =>
-                message.role === "tool" && message.name === "query_library",
+                message.role === "user" &&
+                typeof message.content === "string" &&
+                message.content.includes(
+                  "Agent semantic continuation checkpoint",
+                ),
             );
-            assert.equal(compactedToolMessage?.role, "tool");
-            const modelFacing = JSON.parse(
-              (compactedToolMessage as { content: string }).content,
+            assert.equal(checkpoint?.role, "user");
+            const match = String(checkpoint?.content || "").match(
+              /handle=(trh_[a-z0-9]+)/i,
             );
-            storedHandle = modelFacing.toolResultHandle;
+            storedHandle = match?.[1] || "";
             assert.match(storedHandle, /^trh_/);
             return {
               kind: "tool_calls",
@@ -4566,8 +4856,11 @@ describe("AgentRuntime", function () {
         validate: () => ({ ok: true, value: {} }),
         execute: async () => fullResult,
       });
+      registry.register(createToolResultReadTool());
 
+      let stepIndex = 0;
       let synthesisMessages: AgentModelMessage[] = [];
+      let storedHandle = "";
       const adapter: AgentModelAdapter = {
         getCapabilities: () => ({
           streaming: false,
@@ -4578,8 +4871,8 @@ describe("AgentRuntime", function () {
         }),
         supportsTools: () => true,
         async runStep(params: AgentStepParams): Promise<AgentModelStep> {
-          if (!synthesisMessages.length) {
-            synthesisMessages = params.messages;
+          stepIndex += 1;
+          if (stepIndex === 1) {
             return {
               kind: "tool_calls",
               calls: [
@@ -4599,6 +4892,40 @@ describe("AgentRuntime", function () {
                     arguments: { query: "representational drift" },
                   },
                 ],
+              },
+            };
+          }
+          if (stepIndex === 2) {
+            const checkpoint = params.messages.find(
+              (message) =>
+                message.role === "user" &&
+                typeof message.content === "string" &&
+                message.content.includes(
+                  "Agent semantic continuation checkpoint",
+                ),
+            );
+            const match = String(checkpoint?.content || "").match(
+              /handle=(trh_[a-z0-9]+)/i,
+            );
+            storedHandle = match?.[1] || "";
+            assert.match(storedHandle, /^trh_/);
+            const call = {
+              id: "call-read-evidence",
+              name: "tool_result_read",
+              arguments: {
+                handle: storedHandle,
+                path: "snippets",
+                offset: 0,
+                limit: 1,
+              },
+            };
+            return {
+              kind: "tool_calls",
+              calls: [call],
+              assistantMessage: {
+                role: "assistant",
+                content: "",
+                tool_calls: [call],
               },
             };
           }
@@ -4631,22 +4958,19 @@ describe("AgentRuntime", function () {
 
       assert.equal(outcome.kind, "completed");
       const toolMessage = synthesisMessages.find(
-        (message) => message.role === "tool",
+        (message) =>
+          message.role === "tool" && message.name === "tool_result_read",
       );
       assert.equal(toolMessage?.role, "tool");
-      const modelFacing = JSON.parse(
-        (toolMessage as { content: string }).content,
-      );
-      assert.isTrue(modelFacing.modelContextCompacted);
-      assert.match(modelFacing.toolResultHandle, /^trh_/);
-      const serialized = JSON.stringify(modelFacing);
-      assert.include(serialized, "queryCoverage");
-      assert.include(modelFacing.snippets[0].text, "Evidence snippet 0");
-      assert.equal(modelFacing.snippets[0].itemId, "20000");
-      assert.equal(modelFacing.snippets[0].contextItemId, "30000");
-      assert.equal(modelFacing.snippets[0].matchMethod, "bm25");
-      assert.equal(modelFacing.snippets[0].paperContext.itemId, "20000");
-      assert.equal(modelFacing.snippets[0].paperContext.contextItemId, "30000");
+      const restored = JSON.parse((toolMessage as { content: string }).content);
+      assert.equal(restored.handle, storedHandle);
+      assert.equal(restored.path, "snippets");
+      assert.equal(restored.returnedCount, 1);
+      assert.include(restored.items[0].snippet, "Evidence snippet 0");
+      assert.equal(restored.items[0].snippetId, "lr_20000_30000_0_bm25");
+      assert.equal(restored.items[0].itemId, "20000");
+      assert.equal(restored.items[0].contextItemId, "30000");
+      assert.equal(restored.items[0].matchMethod, "bm25");
     } finally {
       restoreDb();
     }
@@ -4656,7 +4980,31 @@ describe("AgentRuntime", function () {
     const restoreDb = installMockDb();
     try {
       let resetCount = 0;
+      let stepIndex = 0;
       let inspectedMessages: AgentModelMessage[] = [];
+      const registry = new AgentToolRegistry();
+      registry.register({
+        spec: {
+          name: "query_library",
+          description: "read",
+          inputSchema: { type: "object" },
+          mutability: "read",
+          requiresConfirmation: false,
+        },
+        validate: () => ({ ok: true, value: {} }),
+        execute: async () => ({
+          entity: "items",
+          mode: "list",
+          totalCount: 200,
+          returnedCount: 200,
+          results: Array.from({ length: 200 }, (_, index) => ({
+            itemId: index + 1,
+            title: `Large row ${index}`,
+            abstract: "B".repeat(1_000),
+          })),
+        }),
+      });
+      registry.register(createToolResultReadTool());
       const adapter: AgentModelAdapter = {
         getCapabilities: () => ({
           streaming: false,
@@ -4670,7 +5018,24 @@ describe("AgentRuntime", function () {
           resetCount += 1;
         },
         async runStep(params: AgentStepParams): Promise<AgentModelStep> {
+          stepIndex += 1;
           inspectedMessages = params.messages;
+          if (stepIndex === 1) {
+            const call = {
+              id: "large-read-call",
+              name: "query_library",
+              arguments: { entity: "items", mode: "list" },
+            };
+            return {
+              kind: "tool_calls",
+              calls: [call],
+              assistantMessage: {
+                role: "assistant",
+                content: "",
+                tool_calls: [call],
+              },
+            };
+          }
           return {
             kind: "final",
             text: "Done.",
@@ -4682,7 +5047,7 @@ describe("AgentRuntime", function () {
         },
       };
       const runtime = new AgentRuntime({
-        registry: new AgentToolRegistry(),
+        registry,
         adapterFactory: () => adapter,
       });
       const outcome = await runtime.runTurn({
@@ -4694,10 +5059,6 @@ describe("AgentRuntime", function () {
           apiBase: "https://api.anthropic.com/v1/messages",
           apiKey: "test",
           advanced: { inputTokenCap: 8_000 },
-          history: [
-            { role: "user", content: "old question" },
-            { role: "assistant", content: "B".repeat(80_000) },
-          ],
         },
       });
 
@@ -4705,6 +5066,118 @@ describe("AgentRuntime", function () {
       assert.isAtLeast(resetCount, 1);
       assert.notInclude(JSON.stringify(inspectedMessages), "B".repeat(1000));
       assert.include(JSON.stringify(inspectedMessages), "current request");
+      assert.include(
+        JSON.stringify(inspectedMessages),
+        "Agent semantic continuation checkpoint",
+      );
+    } finally {
+      restoreDb();
+    }
+  });
+
+  it("checkpoints cached provider state when reported replay usage exceeds the send budget", async function () {
+    const restoreDb = installMockDb();
+    try {
+      const registry = new AgentToolRegistry();
+      registry.register({
+        spec: {
+          name: "small_read",
+          description: "read",
+          inputSchema: { type: "object" },
+          mutability: "read",
+          requiresConfirmation: false,
+        },
+        validate: () => ({ ok: true, value: {} }),
+        execute: async () => ({ value: "small result" }),
+      });
+      registry.register(createToolResultReadTool());
+
+      let stepIndex = 0;
+      let resetCount = 0;
+      let secondStepMessages: AgentModelMessage[] = [];
+      const events: AgentEvent[] = [];
+      const runtime = new AgentRuntime({
+        registry,
+        adapterFactory: () => ({
+          getCapabilities: () => ({
+            streaming: false,
+            toolCalls: true,
+            multimodal: false,
+            fileInputs: false,
+            reasoning: true,
+          }),
+          supportsTools: () => true,
+          resetState: () => {
+            resetCount += 1;
+          },
+          async runStep(params: AgentStepParams): Promise<AgentModelStep> {
+            stepIndex += 1;
+            if (stepIndex === 1) {
+              await params.onUsage?.({
+                promptTokens: 90_000,
+                completionTokens: 10_000,
+                totalTokens: 100_000,
+              });
+              const call = {
+                id: "small-read-call",
+                name: "small_read",
+                arguments: {},
+              };
+              return {
+                kind: "tool_calls",
+                calls: [call],
+                assistantMessage: {
+                  role: "assistant",
+                  content: "",
+                  tool_calls: [call],
+                },
+              };
+            }
+            secondStepMessages = params.messages;
+            return {
+              kind: "final",
+              text: "Done after checkpoint.",
+              assistantMessage: {
+                role: "assistant",
+                content: "Done after checkpoint.",
+              },
+            };
+          },
+        }),
+      });
+
+      const outcome = await runtime.runTurn({
+        request: {
+          conversationKey: 1212,
+          mode: "agent",
+          userText: "Use the small result.",
+          model: "deepseek-v4-pro",
+          apiBase: "https://api.deepseek.com/anthropic",
+          apiKey: "test",
+          advanced: { inputTokenCap: 8_000 },
+        },
+        onEvent: (event) => events.push(event),
+      });
+
+      assert.equal(outcome.kind, "completed");
+      assert.equal(resetCount, 1);
+      assert.isTrue(
+        secondStepMessages.every(
+          (message) => message.role === "system" || message.role === "user",
+        ),
+      );
+      assert.include(
+        JSON.stringify(secondStepMessages),
+        "Agent semantic continuation checkpoint",
+      );
+      assert.isTrue(
+        events.some(
+          (event) =>
+            event.type === "provider_event" &&
+            event.providerType === "agent_context_budget" &&
+            event.payload?.action === "checkpoint_provider_replay_usage",
+        ),
+      );
     } finally {
       restoreDb();
     }
@@ -4873,10 +5346,13 @@ describe("web attribution runtime guard", function () {
       );
       assert.notInclude(outcome.text, "llm-web-source");
       const transcript = readPersistedTranscript(restoreDb, 921);
-      const finalAssistant = transcript.findLast(
-        (message) => message.role === "assistant",
+      assert.lengthOf(transcript, 1);
+      assert.equal(transcript[0]?.role, "user");
+      assert.include(
+        String(transcript[0]?.content || ""),
+        "A supported current claim.",
       );
-      assert.equal(finalAssistant?.content, "A supported current claim.");
+      assert.notInclude(JSON.stringify(transcript), "llm-web-source");
     } finally {
       restoreDb();
     }

@@ -17,7 +17,6 @@ import { resolveRequestContentInputs } from "./messageBuilder";
 import {
   buildResponsesContinuationInput,
   buildResponsesInitialInput,
-  limitNormalizedResponsesStep,
   type ResponsesPayload,
   normalizeResponsesStepFromPayload,
   parseResponsesStepStream,
@@ -39,7 +38,6 @@ function isCodexAuthRequest(request: AgentRuntimeRequest): boolean {
 }
 
 export {
-  limitNormalizedResponsesStep,
   normalizeResponsesStepFromPayload as normalizeStepFromPayload,
   parseResponsesStepStream,
 } from "./responsesShared";
@@ -160,18 +158,16 @@ export class CodexResponsesAgentAdapter implements AgentModelAdapter {
       },
       signal: params.signal,
     });
-    const normalized = limitNormalizedResponsesStep(
-      response.body
-        ? await parseResponsesStepStream(
-            response.body,
-            params.onTextDelta,
-            params.onReasoning,
-            params.onUsage,
-          )
-        : normalizeResponsesStepFromPayload(
-            (await response.json()) as ResponsesPayload,
-          ),
-    );
+    const normalized = response.body
+      ? await parseResponsesStepStream(
+          response.body,
+          params.onTextDelta,
+          params.onReasoning,
+          params.onUsage,
+        )
+      : normalizeResponsesStepFromPayload(
+          (await response.json()) as ResponsesPayload,
+        );
 
     this.conversationItems = [...inputItems, ...normalized.outputItems];
 

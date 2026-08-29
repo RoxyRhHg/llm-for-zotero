@@ -596,7 +596,7 @@ describe("GeminiNativeAgentAdapter", function () {
     );
   });
 
-  it("filters cached Gemini function calls to executed continuation responses", async function () {
+  it("preserves the complete cached Gemini function step on continuation", async function () {
     const adapter = new GeminiNativeAgentAdapter();
     const requestBodies: Record<string, unknown>[] = [];
     let callCount = 0;
@@ -671,22 +671,22 @@ describe("GeminiNativeAgentAdapter", function () {
     assert.equal(firstStep.kind, "tool_calls");
     if (firstStep.kind !== "tool_calls") return;
 
-    const executedToolResult: AgentModelMessage = {
+    const firstToolResult: AgentModelMessage = {
       role: "tool",
       tool_call_id: firstStep.calls[0].id,
       name: firstStep.calls[0].name,
       content: '{"results":[{"itemId":101}]}',
     };
+    const secondToolResult: AgentModelMessage = {
+      role: "tool",
+      tool_call_id: firstStep.calls[1].id,
+      name: firstStep.calls[1].name,
+      content: '{"results":[{"itemId":102}]}',
+    };
     await adapter.runStep({
       request: makeRequest(),
-      messages: [
-        {
-          ...firstStep.assistantMessage,
-          tool_calls: firstStep.calls.slice(0, 1),
-        },
-        executedToolResult,
-      ],
-      continuationMessages: [executedToolResult],
+      messages: [firstStep.assistantMessage, firstToolResult, secondToolResult],
+      continuationMessages: [firstToolResult, secondToolResult],
       tools,
     });
 
@@ -706,14 +706,14 @@ describe("GeminiNativeAgentAdapter", function () {
         .map((part) => part.functionCall as Record<string, unknown>)
         .filter(Boolean)
         .map((call) => call.args),
-      [{ filters: { collectionId: 55 } }],
+      [{ filters: { collectionId: 55 } }, { filters: { collectionId: 56 } }],
     );
     assert.deepEqual(
       secondContents[2]?.parts
         ?.map((part) => part.functionResponse as Record<string, unknown>)
         .filter(Boolean)
         .map((response) => response.response),
-      [{ results: [{ itemId: 101 }] }],
+      [{ results: [{ itemId: 101 }] }, { results: [{ itemId: 102 }] }],
     );
   });
 
@@ -752,14 +752,20 @@ describe("GeminiNativeAgentAdapter", function () {
                               },
                             },
                           ]
-                        : [
-                            {
-                              text:
-                                callCount === 2
-                                  ? "Premature comparison."
-                                  : "Corrected comparison.",
-                            },
-                          ],
+                        : callCount === 2
+                          ? [
+                              {
+                                text: "Need more evidence.",
+                                thought: true,
+                                thoughtSignature: "sig-final-reasoning",
+                              },
+                              { text: "Premature comparison." },
+                            ]
+                          : [
+                              {
+                                text: "Corrected comparison.",
+                              },
+                            ],
                   },
                 },
               ],
@@ -793,6 +799,10 @@ describe("GeminiNativeAgentAdapter", function () {
     });
     assert.equal(secondStep.kind, "final");
     if (secondStep.kind !== "final") return;
+    assert.notInclude(
+      JSON.stringify(secondStep.assistantMessage),
+      "sig-final-reasoning",
+    );
     const correctionMessage: AgentModelMessage = {
       role: "user",
       content: "Correction for this turn: retrieve body evidence first.",
@@ -822,7 +832,12 @@ describe("GeminiNativeAgentAdapter", function () {
     assert.lengthOf(functionResponses, 1);
     assert.property(thirdContents[1]?.parts?.[0] || {}, "functionCall");
     assert.property(thirdContents[2]?.parts?.[0] || {}, "functionResponse");
-    assert.equal(thirdContents[3]?.parts?.[0]?.text, "Premature comparison.");
+    assert.deepEqual(thirdContents[3]?.parts?.[0], {
+      text: "Need more evidence.",
+      thought: true,
+      thoughtSignature: "sig-final-reasoning",
+    });
+    assert.equal(thirdContents[3]?.parts?.[1]?.text, "Premature comparison.");
     assert.equal(
       thirdContents[4]?.parts?.[0]?.text,
       "Correction for this turn: retrieve body evidence first.",

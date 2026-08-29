@@ -16,6 +16,7 @@ import type {
   AgentModelContentPart,
   AgentConfirmationResolution,
   AgentEvent,
+  AgentAssistantMessage,
   AgentModelMessage,
   AgentModelStep,
   AgentPendingAction,
@@ -28,6 +29,8 @@ import type {
   AgentToolContext,
   AgentToolResult,
   AgentToolEffect,
+  AgentToolMessage,
+  AgentUserMessage,
   AgentRunRecord,
 } from "./types";
 import {
@@ -67,11 +70,8 @@ import {
   readLatestActionContractCheckpoint,
   type ActionContractCheckpoint,
 } from "./contracts/actionContractRunSession";
-import {
-  findLibraryRetrieveShallowSignal,
-  isEvidenceSeekingTurn,
-  transcriptShowsEvidenceReads,
-} from "./model/libraryAnswerGuard";
+import { AgentRunContinuationSession } from "./continuation/runContinuationSession";
+import { AgentFinalAnswerController } from "./finalization/finalAnswerController";
 import { getAllSkills, getMatchedSkillIds } from "./skills";
 import {
   buildAgentResourceContextPlan,
@@ -91,7 +91,11 @@ import {
   buildAgentContextBudgetState,
   resolveAgentContextBudgetPolicy,
 } from "./context/budgetPolicy";
-import { compactAgentTranscript } from "./context/transcriptCompactor";
+import {
+  buildAgentSemanticCheckpoint,
+  compactAgentTranscript,
+  readAgentSemanticCheckpointRootGoal,
+} from "./context/transcriptCompactor";
 import {
   AgentEventLocalDocumentStreamRedactor,
   acquireLocalDocumentPathLease,
@@ -102,6 +106,7 @@ import { ensureModelCapabilities } from "../modelCapabilities";
 import {
   AgentPromptBudgetError,
   enforceAgentPromptBudget,
+  resolveAgentPromptBudgetLimits,
 } from "./context/promptBudget";
 import {
   appendAgentRunEvent,
@@ -118,6 +123,7 @@ import {
 import {
   hasAgentToolResultHandles,
   hydrateAgentToolResultHandles,
+  type AgentToolResultHandleRecord,
   upsertAgentToolResultHandles,
 } from "./store/toolResultHandles";
 import {
@@ -125,10 +131,7 @@ import {
   isConversationWriteGenerationCurrent,
   withConversationWriteLock,
 } from "../shared/conversationWriteFence";
-import {
-  assessWebAttribution,
-  type WebAttributionAssessment,
-} from "../webAccess/attribution";
+import type { WebAttributionAssessment } from "../webAccess/attribution";
 import { clearWebSourcesForRun } from "../webAccess/runSources";
 
 const TOOL_RESULT_READ_TOOL_NAME = "tool_result_read";
@@ -576,6 +579,12 @@ function readLatestTranscriptGoal(
   for (let index = messages.length - 1; index >= 0; index -= 1) {
     const message = messages[index];
     if (message.role !== "user") continue;
+    const checkpointGoal = readAgentSemanticCheckpointRootGoal(message);
+    if (checkpointGoal) {
+      return checkpointGoal.length > 600
+        ? `${checkpointGoal.slice(0, 597)}...`
+        : checkpointGoal;
+    }
     const goal = normalizeTranscriptUserText(
       transcriptContentToPlainText(message.content),
     );
@@ -866,6 +875,13 @@ export class AgentRuntime {
       const turnPathRedactor = new LocalDocumentPathStreamRedactor(
         request.conversationKey,
       );
+      const persistToolResultHandles = async (
+        records: AgentToolResultHandleRecord[],
+      ): Promise<void> => {
+        if (!records.length) return;
+        const sanitized = turnPathRedactor.redactTerminalValue(records);
+        await persistIfLive(() => upsertAgentToolResultHandles(sanitized));
+      };
       let eventSeq = 0;
       let currentAnswerText = "";
       const item = request.item || null;
@@ -999,6 +1015,45 @@ export class AgentRuntime {
           : [recoveryMessage];
       }
 
+      if (
+        transcriptMessagesForPrompt.some(
+          (message) => message.role === "assistant" || message.role === "tool",
+        )
+      ) {
+        const legacyBudget = buildAgentContextBudgetState({
+          messages: transcriptMessagesForPrompt,
+          model: request.model,
+          inputTokenCap: request.advanced?.inputTokenCap,
+          apiBase: request.apiBase,
+          providerProtocol: request.providerProtocol,
+          authMode: request.authMode,
+          profileOverride: request.advanced?.profileOverride,
+          recentlyCompacted: false,
+        });
+        const semantic = buildAgentSemanticCheckpoint({
+          messages: transcriptMessagesForPrompt,
+          summaryTokens: legacyBudget.summaryTokens,
+          conversationKey: request.conversationKey,
+          resourceSignature: resourceContextPlan.resourceSignature,
+        });
+        const checkpoint: AgentUserMessage = {
+          ...semantic.checkpoint,
+          content: turnPathRedactor.redactTerminalText(
+            semantic.checkpoint.content,
+          ),
+        };
+        await persistToolResultHandles(semantic.handleRecords);
+        transcriptMessagesForPrompt = [checkpoint];
+        transcriptSegment = {
+          ...transcriptSegment,
+          messages: [checkpoint],
+          compactedAt: this.now(),
+        };
+        await persistIfLive(() =>
+          replaceAgentTranscriptSegment(transcriptSegment),
+        );
+      }
+
       if (isManualCompactRequest(request)) {
         const policy = resolveAgentContextBudgetPolicy();
         const budget = buildAgentContextBudgetState({
@@ -1028,9 +1083,7 @@ export class AgentRuntime {
             messages: compacted.messages,
             compactedAt: this.now(),
           };
-          await persistIfLive(() =>
-            upsertAgentToolResultHandles(compacted.handleRecords),
-          );
+          await persistToolResultHandles(compacted.handleRecords);
           if (compacted.handleRecords.length) toolResultReadAvailable = true;
           await persistIfLive(() =>
             replaceAgentTranscriptSegment(
@@ -1075,6 +1128,15 @@ export class AgentRuntime {
             ),
           }),
         );
+        if (writeAllowed()) {
+          transcriptSegment = {
+            ...transcriptSegment,
+            messages: [
+              ...transcriptSegment.messages,
+              ...turnStartTranscriptMessages,
+            ],
+          };
+        }
       }
 
       // Intent/skill selection runs ONCE per user turn, before the system
@@ -1259,7 +1321,7 @@ export class AgentRuntime {
           },
         });
       }
-      let continuationMessages: AgentModelMessage[] = [];
+      const continuationSession = new AgentRunContinuationSession(messages);
 
       const budgetState = buildAgentContextBudgetState({
         messages,
@@ -1271,6 +1333,14 @@ export class AgentRuntime {
         profileOverride: request.advanced?.profileOverride,
         recentlyCompacted: Boolean(transcriptSegment.compactedAt),
       });
+      const providerReplaySoftLimit = resolveAgentPromptBudgetLimits({
+        model: request.model,
+        inputTokenCap: request.advanced?.inputTokenCap,
+        apiBase: request.apiBase,
+        providerProtocol: request.providerProtocol,
+        authMode: request.authMode,
+        profileOverride: request.advanced?.profileOverride,
+      }).softLimitTokens;
       if (budgetState.shouldCompact && transcriptMessagesForPrompt.length) {
         await emit({ type: "status", text: "Compacting context…" });
         const compacted = compactAgentTranscript({
@@ -1293,9 +1363,7 @@ export class AgentRuntime {
                 : [...compacted.messages, currentUserTranscriptMessage],
             compactedAt: this.now(),
           };
-          await persistIfLive(() =>
-            upsertAgentToolResultHandles(compacted.handleRecords),
-          );
+          await persistToolResultHandles(compacted.handleRecords);
           if (compacted.handleRecords.length) toolResultReadAvailable = true;
           await persistIfLive(() =>
             replaceAgentTranscriptSegment(
@@ -1321,22 +1389,70 @@ export class AgentRuntime {
         }
       }
       const newTranscriptMessages: AgentModelMessage[] = [];
-      let persistedTranscriptMessageCount = 0;
-      const persistTranscriptCheckpoint = async (): Promise<void> => {
-        const pending = newTranscriptMessages.slice(
-          persistedTranscriptMessageCount,
-        );
-        if (!pending.length) return;
-        await persistIfLive(() =>
-          appendAgentTranscriptMessages({
-            conversationKey: request.conversationKey,
-            compatibilityKey: transcriptCompatibilityKey,
-            messages: turnPathRedactor.redactTerminalValue(pending),
-          }),
-        );
-        if (writeAllowed()) {
-          persistedTranscriptMessageCount = newTranscriptMessages.length;
+      let latestProviderReplayTokens = 0;
+      const commitSemanticCheckpoint = async (params: {
+        sourceMessages: AgentModelMessage[];
+        preservedHandleRecords?: AgentToolResultHandleRecord[];
+        retryInstruction?: string;
+        activateHandleReader?: boolean;
+      }): Promise<AgentUserMessage> => {
+        const semantic = buildAgentSemanticCheckpoint({
+          messages: params.sourceMessages,
+          summaryTokens: budgetState.summaryTokens,
+          conversationKey: request.conversationKey,
+          resourceSignature: resourceContextPlan.resourceSignature,
+          preservedHandleRecords: params.preservedHandleRecords,
+        });
+        const checkpoint: AgentUserMessage = {
+          ...semantic.checkpoint,
+          content: [
+            turnPathRedactor.redactTerminalText(semantic.checkpoint.content),
+            params.retryInstruction
+              ? turnPathRedactor.redactTerminalText(params.retryInstruction)
+              : "",
+          ]
+            .filter(Boolean)
+            .join("\n\n"),
+        };
+        await persistToolResultHandles(semantic.handleRecords);
+        if (params.activateHandleReader && semantic.handleRecords.length) {
+          toolResultReadAvailable = true;
         }
+        const nextSegment = {
+          ...transcriptSegment,
+          messages: [checkpoint],
+          compactedAt: this.now(),
+        };
+        await persistIfLive(() => replaceAgentTranscriptSegment(nextSegment));
+        if (writeAllowed()) transcriptSegment = nextSegment;
+        return checkpoint;
+      };
+      const persistTranscriptCheckpoint = async (): Promise<void> => {
+        if (!newTranscriptMessages.length) return;
+        await commitSemanticCheckpoint({
+          sourceMessages: [
+            ...transcriptSegment.messages,
+            ...newTranscriptMessages,
+          ],
+        });
+        if (!writeAllowed()) return;
+        newTranscriptMessages.splice(0, newTranscriptMessages.length);
+      };
+      const restartFromSemanticCheckpoint = async (params: {
+        sourceMessages: AgentModelMessage[];
+        handleRecords?: AgentToolResultHandleRecord[];
+        retryInstruction?: string;
+      }): Promise<void> => {
+        const checkpoint = await commitSemanticCheckpoint({
+          sourceMessages: params.sourceMessages,
+          preservedHandleRecords: params.handleRecords,
+          retryInstruction: params.retryInstruction,
+          activateHandleReader: true,
+        });
+        continuationSession.replaceWithCheckpoint(checkpoint);
+        newTranscriptMessages.splice(0, newTranscriptMessages.length);
+        latestProviderReplayTokens = 0;
+        adapter.resetState?.();
       };
 
       for (const skillId of matchedSkills) {
@@ -1348,8 +1464,12 @@ export class AgentRuntime {
       const { maxRounds, maxToolCallsPerRound } = resolveAgentLimits(
         intent.isBulkOperation,
       );
-      let shallowLibraryCorrectionUsed = false;
-      let webAttributionCorrectionUsed = false;
+      const finalAnswerController = new AgentFinalAnswerController(
+        request,
+        actionContractSession,
+        transcriptMessagesForPrompt,
+      );
+      let toolCallOverflowCorrectionUsed = false;
       const shouldFlushStreamBuffer = (value: string): boolean => {
         if (!value) return false;
         if (value.length >= 8) return true;
@@ -1503,6 +1623,19 @@ export class AgentRuntime {
           stepStreamedText = "";
           stepPendingDelta = "";
         };
+        if (latestProviderReplayTokens > providerReplaySoftLimit) {
+          const replayTokens = latestProviderReplayTokens;
+          await restartFromSemanticCheckpoint({ sourceMessages: messages });
+          await emit({
+            type: "provider_event",
+            providerType: "agent_context_budget",
+            payload: {
+              action: "checkpoint_provider_replay_usage",
+              providerReplayTokens: replayTokens,
+              softLimitTokens: providerReplaySoftLimit,
+            },
+          });
+        }
         const preflight = enforceAgentPromptBudget({
           messages,
           model: request.model,
@@ -1515,12 +1648,10 @@ export class AgentRuntime {
           resourceSignature: resourceContextPlan.resourceSignature,
         });
         if (preflight.changed) {
-          await persistIfLive(() =>
-            upsertAgentToolResultHandles(preflight.handleRecords),
-          );
-          if (preflight.handleRecords.length) toolResultReadAvailable = true;
-          messages.splice(0, messages.length, ...preflight.messages);
-          adapter.resetState?.();
+          await restartFromSemanticCheckpoint({
+            sourceMessages: preflight.messages,
+            handleRecords: preflight.handleRecords,
+          });
           await emit({
             type: "provider_event",
             providerType: "agent_context_budget",
@@ -1555,10 +1686,11 @@ export class AgentRuntime {
             contextWindow: stepContextWindow,
           });
         }
+        const modelInput = continuationSession.inputForNextStep();
         const step = await adapter.runStep({
           request,
-          messages,
-          continuationMessages: [...continuationMessages],
+          messages: modelInput.messages,
+          continuationMessages: modelInput.continuationMessages,
           tools: stepToolSpecs,
           signal: params.signal,
           onTextDelta: async (delta) => {
@@ -1643,6 +1775,11 @@ export class AgentRuntime {
               usageRecord.cacheProvider.trim()
                 ? usageRecord.cacheProvider.trim()
                 : undefined;
+            latestProviderReplayTokens = Math.max(
+              latestProviderReplayTokens,
+              totalTokens,
+              typeof contextTokens === "number" ? contextTokens : 0,
+            );
             if (
               totalTokens <= 0 &&
               promptTokens <= 0 &&
@@ -1712,7 +1849,7 @@ export class AgentRuntime {
             return buildAdapterToolCallResult(outcome);
           },
         });
-        continuationMessages = [];
+        continuationSession.commitProviderResponse();
         await flushStepDelta();
         return {
           step,
@@ -2120,91 +2257,6 @@ export class AgentRuntime {
           }
           const { step, stepStreamedText } = stepResult;
           if (step.kind === "final") {
-            const actionContractDecision =
-              await actionContractSession.evaluateFinal({
-                canCorrect: segmentRound < maxRounds,
-              });
-            if (actionContractDecision.kind !== "accept") {
-              await rollbackCommittedStreamedText(stepStreamedText);
-              actionContractSession.commitRejectedFinal(actionContractDecision);
-              if (actionContractDecision.kind === "correct") {
-                const assistantCorrectionMessage: AgentModelMessage =
-                  step.assistantMessage ?? {
-                    role: "assistant",
-                    content: step.text || stepStreamedText,
-                  };
-                const userCorrectionMessage: AgentModelMessage = {
-                  role: "user",
-                  content: actionContractDecision.correction,
-                };
-                messages.push(
-                  assistantCorrectionMessage,
-                  userCorrectionMessage,
-                );
-                continuationMessages.push(userCorrectionMessage);
-                newTranscriptMessages.push(
-                  assistantCorrectionMessage,
-                  userCorrectionMessage,
-                );
-                continue;
-              }
-              return completeRun(actionContractDecision.failure, "failed");
-            }
-            // Shallow-answer guard: a collection/tag-scoped evidence question
-            // must not finalize without library evidence. One correction turn,
-            // then the next final is accepted unconditionally (no failure
-            // branch — unlike the full-read guard, a degraded answer with
-            // disclosed coverage beats an aborted run).
-            const libraryScoped = Boolean(
-              request.turnPaperScope.collections.length ||
-              request.turnPaperScope.tags.length,
-            );
-            if (
-              libraryScoped &&
-              !shallowLibraryCorrectionUsed &&
-              // On the last round a correction could never be acted on — the
-              // loop would exit into the round-exhaustion failure, discarding
-              // a usable streamed answer.
-              segmentRound < maxRounds &&
-              isEvidenceSeekingTurn(request) &&
-              // Follow-up turns legitimately answer from evidence gathered in
-              // earlier turns; do not roll those back.
-              !transcriptShowsEvidenceReads(transcriptMessagesForPrompt)
-            ) {
-              const shallowSignal =
-                findLibraryRetrieveShallowSignal(toolExecutionRecords);
-              const classifiedRetrieval =
-                request.classifiedIntent?.retrievalIntent;
-              const answeredShallow =
-                !shallowSignal.ranRetrieveFamily ||
-                (shallowSignal.lastRetrieveShallow &&
-                  (classifiedRetrieval === "summarize" ||
-                    classifiedRetrieval === "verify"));
-              if (answeredShallow) {
-                shallowLibraryCorrectionUsed = true;
-                await rollbackCommittedStreamedText(stepStreamedText);
-                const assistantCorrectionMessage: AgentModelMessage =
-                  step.assistantMessage ?? {
-                    role: "assistant",
-                    content: step.text || stepStreamedText,
-                  };
-                const userCorrectionMessage: AgentModelMessage = {
-                  role: "user",
-                  content:
-                    "Correction for this turn: the question targets the selected collection/tag scope and needs library evidence. Call `library_retrieve` scoped to the selected collections/tags now (intent:'summarize' for synthesis or theme questions, 'enumerate' for which-papers questions; depth:'evidence'), then answer from the returned evidence. Include the coverage line (papers planned / body evidence read / metadata-only) in the final answer; if coverage is partial, name what is missing instead of generalizing.",
-                };
-                messages.push(
-                  assistantCorrectionMessage,
-                  userCorrectionMessage,
-                );
-                newTranscriptMessages.push(
-                  assistantCorrectionMessage,
-                  userCorrectionMessage,
-                );
-                continuationMessages.push(userCorrectionMessage);
-                continue;
-              }
-            }
             const returnedText = step.text || "";
             const streamedTextOffset = stepStreamedText
               ? returnedText.indexOf(stepStreamedText)
@@ -2214,39 +2266,44 @@ export class AgentRuntime {
                 ? returnedText.slice(streamedTextOffset)
                 : stepStreamedText
               : returnedText || currentAnswerText || "No response.";
-            const webAttribution = assessWebAttribution(
-              turnPathRedactor.redactTerminalText(rawModelFinalText),
+            const finalDecision = await finalAnswerController.evaluate({
+              candidateText:
+                turnPathRedactor.redactTerminalText(rawModelFinalText),
+              canCorrect: segmentRound < maxRounds,
               toolExecutionRecords,
-            );
-            if (webAttribution.status === "invalid") {
+            });
+            if (finalDecision.kind !== "accept") {
               await rollbackCommittedStreamedText(stepStreamedText);
-              if (!webAttributionCorrectionUsed && segmentRound < maxRounds) {
-                webAttributionCorrectionUsed = true;
-                const assistantCorrectionMessage: AgentModelMessage = {
-                  role: "assistant",
-                  content: webAttribution.cleanText,
+              if (finalDecision.kind === "correct") {
+                const assistantCorrectionMessage: AgentAssistantMessage = {
+                  ...(step.assistantMessage ?? {
+                    role: "assistant" as const,
+                    content: step.text || stepStreamedText,
+                  }),
+                  ...(typeof finalDecision.assistantContent === "string"
+                    ? { content: finalDecision.assistantContent }
+                    : {}),
                 };
-                const userCorrectionMessage: AgentModelMessage = {
+                const userCorrectionMessage: AgentUserMessage = {
                   role: "user",
-                  content: webAttribution.correctionPrompt,
+                  content: finalDecision.correction,
                 };
-                messages.push(
-                  assistantCorrectionMessage,
-                  userCorrectionMessage,
-                );
-                continuationMessages.push(userCorrectionMessage);
                 newTranscriptMessages.push(
-                  assistantCorrectionMessage,
-                  userCorrectionMessage,
+                  ...continuationSession.appendFinalCorrection({
+                    assistantMessage: assistantCorrectionMessage,
+                    correctionMessage: userCorrectionMessage,
+                  }),
                 );
+                await persistTranscriptCheckpoint();
                 continue;
               }
-              return completeRun(
-                "I used web access for this task, but could not safely attach valid paragraph-level sources to the answer.",
-                "failed",
-              );
+              return completeRun(finalDecision.userMessage, "failed");
             }
-            return emitFinalStep(step, stepStreamedText, webAttribution);
+            return emitFinalStep(
+              step,
+              stepStreamedText,
+              finalDecision.webAttribution,
+            );
           }
 
           // The step returned tool_calls, not a final answer.  Any text the
@@ -2255,22 +2312,44 @@ export class AgentRuntime {
           // the agent trace but NOT in the final chat answer.  Roll it back.
           await rollbackCommittedStreamedText(stepStreamedText);
 
-          const calls = step.calls.slice(0, maxToolCallsPerRound);
-          const assistantToolMessage: AgentModelMessage = {
-            ...step.assistantMessage,
-            tool_calls: Array.isArray(step.assistantMessage.tool_calls)
-              ? step.assistantMessage.tool_calls.slice(0, maxToolCallsPerRound)
-              : step.assistantMessage.tool_calls,
-          };
-          messages.push(assistantToolMessage);
+          if (step.calls.length > maxToolCallsPerRound) {
+            const overflowMessage = `The model returned ${step.calls.length} tool calls in one step, exceeding the safe limit of ${maxToolCallsPerRound}. None of those calls were executed.`;
+            if (toolCallOverflowCorrectionUsed || segmentRound >= maxRounds) {
+              return completeRun(
+                `${overflowMessage} Please narrow the request and try again.`,
+                "failed",
+              );
+            }
+            toolCallOverflowCorrectionUsed = true;
+            await restartFromSemanticCheckpoint({
+              sourceMessages: messages,
+              retryInstruction: `${overflowMessage} Retry with a complete new step containing at most ${maxToolCallsPerRound} tool calls. Do not assume that any result exists for the rejected calls.`,
+            });
+            await emit({
+              type: "provider_event",
+              providerType: "agent_tool_call_overflow",
+              payload: {
+                action: "checkpoint_and_retry",
+                returnedToolCalls: step.calls.length,
+                maxToolCallsPerRound,
+              },
+            });
+            continue;
+          }
+
+          const calls = step.calls;
+          const assistantToolMessage: AgentAssistantMessage =
+            step.assistantMessage;
           if (!calls.length) break;
+          continuationSession.beginToolStep(assistantToolMessage);
           newTranscriptMessages.push(assistantToolMessage);
-          const roundToolMessages: AgentModelMessage[] = [];
+          const roundToolMessages: AgentToolMessage[] = [];
           const roundFollowupMessages: AgentModelMessage[] = [];
           const appendRoundContinuation = () => {
-            const delta = [...roundToolMessages, ...roundFollowupMessages];
-            messages.push(...delta);
-            continuationMessages.push(...delta);
+            const delta = continuationSession.completeToolStep({
+              toolMessages: roundToolMessages,
+              followupMessages: roundFollowupMessages,
+            });
             newTranscriptMessages.push(...delta);
           };
           for (const call of calls) {
@@ -2278,7 +2357,7 @@ export class AgentRuntime {
               modelCallId: call.id,
             });
             if (outcome.delivery) {
-              const toolMessage: AgentModelMessage = {
+              const toolMessage: AgentToolMessage = {
                 role: "tool",
                 tool_call_id: outcome.delivery.callId,
                 name: outcome.delivery.name,
