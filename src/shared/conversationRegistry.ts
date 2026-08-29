@@ -33,8 +33,19 @@ export type ConversationRegistryRow = Required<
   profileSignature: string;
   paperItemID: number | null;
   valid: boolean;
+  isPaperRestoreTarget?: boolean;
   invalidReason?: string;
 };
+
+export type PaperRestoreTargetInvalidation = Pick<
+  ConversationRegistryRow,
+  | "instanceID"
+  | "conversationKey"
+  | "system"
+  | "profileSignature"
+  | "libraryID"
+  | "paperItemID"
+>;
 
 export type ConversationScopeValidationReason =
   | "invalid_target"
@@ -72,8 +83,25 @@ const CONVERSATION_REGISTRY_SCOPE_INDEX =
   "llm_for_zotero_conversation_registry_scope_idx";
 const CONVERSATION_REGISTRY_LEGACY_KEY_INDEX =
   "llm_for_zotero_conversation_registry_legacy_key_idx";
+const CONVERSATION_REGISTRY_PAPER_RESTORE_TARGET_INDEX =
+  "llm_for_zotero_unique_paper_restore_target";
 const CONVERSATION_DELETION_TOMBSTONES_TABLE =
   "llm_for_zotero_conversation_deletion_tombstones";
+
+let paperRestoreTargetInvalidationListener:
+  | ((target: PaperRestoreTargetInvalidation) => void)
+  | null = null;
+
+export function registerPaperRestoreTargetInvalidationListener(
+  listener: (target: PaperRestoreTargetInvalidation) => void,
+): () => void {
+  paperRestoreTargetInvalidationListener = listener;
+  return () => {
+    if (paperRestoreTargetInvalidationListener === listener) {
+      paperRestoreTargetInvalidationListener = null;
+    }
+  };
+}
 
 const CATALOG_TABLES: Record<
   `${ConversationSystem}:${RegistryConversationKind}`,
@@ -340,9 +368,24 @@ async function createConversationRegistryTable(): Promise<void> {
       updated_at INTEGER NOT NULL,
       title TEXT,
       valid INTEGER NOT NULL DEFAULT 1,
-      invalid_reason TEXT
+      invalid_reason TEXT,
+      is_paper_restore_target INTEGER NOT NULL DEFAULT 0
+        CHECK(is_paper_restore_target IN (0, 1))
     )`,
   );
+}
+
+async function ensurePaperRestoreTargetColumn(): Promise<void> {
+  const db = getZoteroDb();
+  if (!db?.queryAsync) return;
+  const columns = await getTableColumns(CONVERSATION_REGISTRY_TABLE);
+  if (!columns.has("is_paper_restore_target")) {
+    await db.queryAsync(
+      `ALTER TABLE ${CONVERSATION_REGISTRY_TABLE}
+       ADD COLUMN is_paper_restore_target INTEGER NOT NULL DEFAULT 0
+         CHECK(is_paper_restore_target IN (0, 1))`,
+    );
+  }
 }
 
 async function ensureRegistryInstanceIDs(): Promise<void> {
@@ -609,6 +652,7 @@ async function initConversationRegistryStoreUncached(): Promise<void> {
     return;
   }
   await ensureRegistryInstanceIDs();
+  await ensurePaperRestoreTargetColumn();
   // Legacy builds made the recyclable numeric key unique.  That constraint is
   // incompatible with immutable instances: a later conversation is allowed
   // to reuse the key after the old instance has been deleted.  Drop the old
@@ -629,6 +673,14 @@ async function initConversationRegistryStoreUncached(): Promise<void> {
     `CREATE INDEX IF NOT EXISTS ${CONVERSATION_REGISTRY_SCOPE_INDEX}
      ON ${CONVERSATION_REGISTRY_TABLE}
        (profile_signature, system, kind, library_id, paper_item_id, updated_at DESC)`,
+  );
+  await db.queryAsync(
+    `CREATE UNIQUE INDEX IF NOT EXISTS ${CONVERSATION_REGISTRY_PAPER_RESTORE_TARGET_INDEX}
+     ON ${CONVERSATION_REGISTRY_TABLE}
+       (profile_signature, system, library_id, paper_item_id)
+     WHERE kind = 'paper'
+       AND paper_item_id IS NOT NULL
+       AND is_paper_restore_target = 1`,
   );
 }
 
@@ -812,13 +864,42 @@ export async function invalidateRegisteredConversationScope(
   const db = getZoteroDb();
   if (!db?.queryAsync) return;
   await initConversationRegistryStore();
+  const selectedRows = (await db.queryAsync(
+    `SELECT instance_id AS instanceID,
+            legacy_conversation_key AS conversationKey,
+            system,
+            profile_signature AS profileSignature,
+            library_id AS libraryID,
+            paper_item_id AS paperItemID
+     FROM ${CONVERSATION_REGISTRY_TABLE}
+     WHERE legacy_conversation_key = ?
+       AND is_paper_restore_target = 1`,
+    [normalizedKey],
+  )) as Array<Record<string, unknown>> | undefined;
   await db.queryAsync(
     `UPDATE ${CONVERSATION_REGISTRY_TABLE}
      SET valid = 0,
-         invalid_reason = ?
+         invalid_reason = ?,
+         is_paper_restore_target = 0
      WHERE legacy_conversation_key = ?`,
     [normalizeText(reason, 256) || "invalid scope", normalizedKey],
   );
+  for (const row of selectedRows || []) {
+    const system = normalizeSystem(row.system);
+    const libraryID = normalizePositiveInt(row.libraryID);
+    const paperItemID = normalizePositiveInt(row.paperItemID);
+    if (!system || !libraryID || !paperItemID) continue;
+    paperRestoreTargetInvalidationListener?.({
+      instanceID: normalizeInstanceID(row.instanceID),
+      conversationKey: normalizedKey,
+      system,
+      profileSignature:
+        normalizeText(row.profileSignature, 128) ||
+        getCurrentProfileSignature(),
+      libraryID,
+      paperItemID,
+    });
+  }
 }
 
 export async function getRegisteredConversationScopeByInstanceID(

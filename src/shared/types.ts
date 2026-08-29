@@ -60,6 +60,8 @@ export type AdvancedModelParams = {
 };
 
 export type PaperContextRef = {
+  /** Stable Zotero library identity when resolved from live Zotero state. */
+  libraryID?: number;
   itemId: number;
   contextItemId: number;
   contentSourceMode?: PaperContentSourceMode;

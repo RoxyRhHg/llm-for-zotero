@@ -16,7 +16,8 @@ import {
   resolveProviderTransportEndpoint,
 } from "./providerTransport";
 import { createAgentModelAdapter } from "../agent/model/factory";
-import type { AgentRuntimeRequest } from "../agent/types";
+import type { AgentRuntimeRequestInput as AgentRuntimeRequest } from "../agent/types";
+import { resolveAgentRuntimeRequest } from "../agent/context/resolvedAgentRequest";
 import {
   destroyCachedCodexAppServerProcess,
   extractCodexAppServerThreadId,
@@ -278,8 +279,9 @@ export function getProviderConnectionCapabilityLabel(params: {
     authMode: params.authMode,
     providerProtocol: params.protocol,
   };
+  const resolvedRequest = resolveAgentRuntimeRequest(request);
   const capabilities =
-    createAgentModelAdapter(request).getCapabilities(request);
+    createAgentModelAdapter(resolvedRequest).getCapabilities(resolvedRequest);
   return describeAgentCapabilityClass(
     getAgentCapabilityClass({
       toolCalls: capabilities.toolCalls,
@@ -355,8 +357,9 @@ export async function runCodexAppServerConnectionTest(params: {
       authMode: "codex_app_server" as const,
       model: params.modelName,
     } as AgentRuntimeRequest;
+    const resolvedRequest = resolveAgentRuntimeRequest(request);
     const capabilities =
-      createAgentModelAdapter(request).getCapabilities(request);
+      createAgentModelAdapter(resolvedRequest).getCapabilities(resolvedRequest);
     const capabilityLabel = describeAgentCapabilityClass(
       getAgentCapabilityClass({
         toolCalls: capabilities.toolCalls,

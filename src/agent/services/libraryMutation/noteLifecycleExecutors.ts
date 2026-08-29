@@ -143,6 +143,9 @@ export const noteLifecycleExecutors = {
           status: saved.status,
           noteId: saved.noteId,
           collections: saved.collections,
+          ...(saved.createdNoteReceipt
+            ? { createdNoteReceipt: saved.createdNoteReceipt }
+            : {}),
         },
       },
       inverse:

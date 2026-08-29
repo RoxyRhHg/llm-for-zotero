@@ -7,6 +7,7 @@ import type {
   ActionExecutionContext,
   ActionProgressEvent,
 } from "./types";
+import { getTurnPapersWithRoles } from "../context/requestTurnPaperScope";
 
 /**
  * Builds an ActionExecutionContext from a tool call.
@@ -73,10 +74,14 @@ export function buildActionExecutionContext(params: {
     requestContext: {
       mode: request.conversationKind === "paper" ? "paper" : "library",
       activeItemId: request.activeItemId,
-      selectedPaperContexts: request.selectedPaperContexts,
-      fullTextPaperContexts: request.fullTextPaperContexts,
-      selectedCollectionContexts: request.selectedCollectionContexts,
-      selectedTagContexts: request.selectedTagContexts,
+      selectedPaperContexts: [...getTurnPapersWithRoles(request, ["selected"])],
+      fullTextPaperContexts: [
+        ...getTurnPapersWithRoles(request, ["full_text"]),
+      ],
+      selectedCollectionContexts: [...request.turnPaperScope.collections],
+      selectedTagContexts: [...request.turnPaperScope.tags],
+      actionContract: request.actionContract,
+      actionProgress: request.actionProgress,
     },
     signal: context.signal,
   };

@@ -15,11 +15,43 @@ import type {
   TagContextRef,
 } from "../shared/types";
 import type {
+  ResolvedTurnSelectedTextAnchor,
+  ResolvedTurnSelectedTextContext,
+  TurnLocalDocument,
+  TurnPaperScope,
+  TurnPaperScopeWarning,
+} from "./context/turnPaperScope";
+import type { WebSourceAnchor } from "../webAccess/types";
+import type {
   ChatMessage,
   ReasoningConfig as LLMReasoningConfig,
   UsageStats,
 } from "../shared/llm";
 import type { ContextCachePlan } from "../contextCache/manager";
+import type { ZoteroTurnMetadataContext } from "../services/zoteroMetadata/types";
+import type {
+  AgentActionContract,
+  AgentActionEvidence,
+  AgentActionIntent,
+  AgentActionProgressLedger,
+  AgentActionReceipt,
+  AgentToolActionDescriptor,
+} from "./contracts/types";
+
+export type {
+  AgentActionCapability,
+  AgentActionContract,
+  AgentActionEvidence,
+  AgentActionIntent,
+  AgentActionObligation,
+  AgentActionOperation,
+  AgentActionParameters,
+  AgentActionProofDomain,
+  AgentActionProgressLedger,
+  AgentActionProposal,
+  AgentActionReceipt,
+  AgentToolActionDescriptor,
+} from "./contracts/types";
 
 export type AgentRequest = {
   conversationKey: number;
@@ -30,6 +62,8 @@ export type AgentRequest = {
   scopeId?: string;
   scopeLabel?: string;
   activeItemId?: number;
+  /** Input-only exact active paper/content-source identity from the UI. */
+  activePaperContext?: PaperContextRef;
   selectedTextContexts?: SelectedTextContext[];
   resolvedSelectedTextAnchors?: ResolvedSelectedTextAnchor[];
   selectedTexts?: string[];
@@ -270,6 +304,11 @@ export type ToolSpec = {
    * shell commands, or direct Zotero scripts.
    */
   tier?: "normal" | "advanced";
+  /**
+   * Advertise the tool only to the in-plugin Agent runtime. External bridges,
+   * MCP, and public tool catalogs must not expose it.
+   */
+  localAgentOnly?: boolean;
 };
 
 export type AgentEvent =
@@ -297,6 +336,7 @@ export type AgentEvent =
       name: string;
       ok: boolean;
       effect?: AgentToolEffect;
+      actionReceipts: AgentActionReceipt[];
       content: unknown;
       artifacts?: AgentToolArtifact[];
     }
@@ -356,7 +396,12 @@ export type AgentEvent =
     }
   | { type: "context_compacted"; automatic?: boolean }
   | { type: "fallback"; reason: string }
-  | { type: "final"; text: string; answerStartedAt?: number };
+  | {
+      type: "final";
+      text: string;
+      answerStartedAt?: number;
+      webSourceAnchors?: WebSourceAnchor[];
+    };
 
 export type AgentRunStatus = "running" | "completed" | "failed" | "cancelled";
 
@@ -392,10 +437,22 @@ export type AgentToolCall = {
 
 export type AgentTraceDetailKind = "text" | "code" | "json" | "url";
 
+export type AgentTraceTimelineIcon = "brain" | "paper" | "website";
+
+export type AgentTraceTimelineRow = {
+  icon: AgentTraceTimelineIcon;
+  /** Public HTTP(S) destination opened through Zotero when the row is clicked. */
+  href?: string;
+  /** Optional public favicon URL. Website rows fall back to the globe icon. */
+  faviconUrl?: string;
+};
+
 export type AgentTraceDetail = {
   label: string;
   value: string;
   kind?: AgentTraceDetailKind;
+  /** Render this detail as one row in the compact connected trace timeline. */
+  timeline?: AgentTraceTimelineRow;
 };
 
 export type AgentTraceChip = {
@@ -461,7 +518,6 @@ export type AgentUserMessage = {
 export type AgentAssistantMessage = {
   role: "assistant";
   content: string | AgentModelContentPart[];
-  reasoning_content?: string;
   tool_calls?: AgentToolCall[];
 };
 
@@ -501,15 +557,24 @@ export type ExhaustiveReadBackend =
  */
 export type ClassifiedTurnIntent = {
   retrievalIntent: "enumerate" | "verify" | "summarize" | "none";
+  paperTargetIntent?: "active" | "added" | "all_visible" | "unspecified";
+  externalSearchIntent?: "none" | "web" | "literature" | "both";
   wantedSections: Array<"methods" | "results" | "limitations">;
   queryLanguage?: string;
+  writeDisposition?: "none" | "required" | "uncertain";
+  actionInterpretationSource?: "classifier" | "deterministic_fallback";
+  actionIntents: AgentActionIntent[];
 };
 
-export type AgentRuntimeRequest = AgentRequest & {
+export type AgentRuntimeRequestInput = AgentRequest & {
   /** Generation captured when this turn started; Clear advances it. */
   conversationGeneration?: number;
   /** Set by the runtime after per-turn classification; absent on fallback. */
   classifiedIntent?: ClassifiedTurnIntent;
+  /** Internal per-turn action obligations. Persisted with transcript events. */
+  actionContract?: AgentActionContract;
+  /** Mutable completion state kept separate from the immutable contract. */
+  actionProgress?: AgentActionProgressLedger;
   item?: Zotero.Item | null;
   history?: ChatMessage[];
   authMode?: ModelProviderAuthMode;
@@ -528,6 +593,35 @@ export type AgentRuntimeRequest = AgentRequest & {
    */
   exhaustiveReadBackend?: ExhaustiveReadBackend;
 };
+
+export type LegacyPaperContextField =
+  | "selectedPaperContexts"
+  | "pdfPaperContexts"
+  | "fullTextPaperContexts"
+  | "citationPaperContexts"
+  | "pinnedPaperContexts"
+  | "selectedCollectionContexts"
+  | "selectedTagContexts"
+  | "selectedTextPaperContexts";
+
+export type ResolvedAgentRuntimeRequest = Omit<
+  AgentRuntimeRequestInput,
+  | LegacyPaperContextField
+  | "activePaperContext"
+  | "selectedTextContexts"
+  | "resolvedSelectedTextAnchors"
+  | "localDocuments"
+> & {
+  turnPaperScope: TurnPaperScope;
+  zoteroMetadataContext: ZoteroTurnMetadataContext;
+  selectedTextContexts?: readonly ResolvedTurnSelectedTextContext[];
+  resolvedSelectedTextAnchors?: readonly ResolvedTurnSelectedTextAnchor[];
+  localDocuments?: readonly TurnLocalDocument[];
+  turnPaperScopeWarnings?: readonly TurnPaperScopeWarning[];
+};
+
+/** Canonical request consumed after the one-way runtime boundary. */
+export type AgentRuntimeRequest = ResolvedAgentRuntimeRequest;
 
 export type AgentAttachmentReadableVia =
   | "read_attachment"
@@ -623,6 +717,7 @@ export type AgentToolResult = {
   name: string;
   ok: boolean;
   effect?: AgentToolEffect;
+  actionReceipts: AgentActionReceipt[];
   content: unknown;
   artifacts?: AgentToolArtifact[];
 };
@@ -659,6 +754,7 @@ export type AgentToolExecutionOutput<TResult = unknown> =
       content: TResult;
       artifacts?: AgentToolArtifact[];
       effect?: AgentToolEffect;
+      actionEvidence?: AgentActionEvidence[];
     };
 
 /** Explicit execution contract for tools whose validated operation can write. */
@@ -666,6 +762,7 @@ export type AgentWriteToolOutput<TResult = unknown> = {
   content: TResult;
   effect: AgentToolEffect;
   artifacts?: AgentToolArtifact[];
+  actionEvidence?: AgentActionEvidence[];
 };
 
 export type AgentJournalStepOutcome = {
@@ -712,6 +809,8 @@ export type AgentToolContext = {
   journalToolName?: string;
   /** Internal parent action used by composite tools such as library_batch. */
   journalActionScope?: AgentJournalActionScope;
+  /** Persist the current contract ledger at a durable composite checkpoint. */
+  checkpointActionProgress?: () => Promise<void>;
 };
 
 export type AgentToolInputValidation<T> =
@@ -719,7 +818,10 @@ export type AgentToolInputValidation<T> =
   | { ok: false; error: string };
 
 export type AgentToolGuidance = {
-  matches: (request: AgentRuntimeRequest) => boolean;
+  matches: (
+    request: AgentRuntimeRequest,
+    context?: { matchedSkillIds: ReadonlyArray<string> },
+  ) => boolean;
   instruction: string;
 };
 
@@ -755,6 +857,8 @@ export type AgentToolResultCard = {
 
 export type AgentToolPresentation = {
   label?: string;
+  /** Optional semantic icon for this tool's compact activity-summary row. */
+  traceIcon?: "library" | "web";
   summaries?: {
     onCall?: AgentToolPresentationSummary;
     onPending?: AgentToolPresentationSummary;
@@ -768,6 +872,16 @@ export type AgentToolPresentation = {
     args: unknown;
     request?: AgentTraceRequestSummary;
   }) => AgentTraceChip[];
+  buildTraceDetails?: (params: {
+    args: unknown;
+    content?: unknown;
+  }) => AgentTraceDetail[];
+  /** Merge a successful result into its expandable call row in the trace. */
+  mergeResultIntoCallTrace?: boolean;
+  buildTraceSummary?: (params: {
+    args: unknown;
+    content?: unknown;
+  }) => string | null;
   /**
    * When provided, the agent trace renders a read-only card list below the
    * tool's success row. Return `null` or an empty array to suppress cards.
@@ -796,6 +910,10 @@ export type AgentToolDefinition<TInput = unknown, TResult = unknown> = {
   isAvailable?: (request: AgentRuntimeRequest) => boolean;
   guidance?: AgentToolGuidance;
   presentation?: AgentToolPresentation;
+  describeAction?: (
+    input: TInput,
+    context?: AgentToolContext,
+  ) => AgentToolActionDescriptor[] | Promise<AgentToolActionDescriptor[]>;
   validate: (args: unknown) => AgentToolInputValidation<TInput>;
   execute: (
     input: TInput,

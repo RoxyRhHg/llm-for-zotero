@@ -244,8 +244,8 @@ function resolveReferenceItemId(
   }
   if (
     context.request.conversationKind === "global" ||
-    context.request.selectedCollectionContexts?.length ||
-    context.request.selectedTagContexts?.length
+    context.request.turnPaperScope.collections.length ||
+    context.request.turnPaperScope.tags.length
   ) {
     return null;
   }

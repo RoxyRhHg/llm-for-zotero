@@ -7,6 +7,7 @@ import {
   buildQuoteSecondaryEvidenceKey,
   buildQuoteSourceIndex,
   buildSelectedTextQuoteCitations,
+  collectDisplayedQuoteVerificationRequests,
   extractQuoteCitationsFromToolContent,
   finalizeAssistantQuoteCitations,
   finalizeAssistantQuoteCitationsCooperatively,
@@ -3062,6 +3063,193 @@ describe("quoteCitations", function () {
     assert.equal(finalized.markdown, markdown);
     assert.notInclude(finalized.markdown, "Not a source quote");
     assert.isEmpty(finalized.quoteCitations);
+  });
+
+  it("pairs exact MinerU math with a unique literal PDF locator", function () {
+    const quote =
+      "Fisher information provides a lower bound on the variance \\(\\sigma_{\\hat{s}}^2\\) of any estimator.";
+    const mineruSource =
+      "Fisher information provides a lower bound on the variance $\\sigma _ { \\hat { s } } ^ { 2 }$ of any estimator.";
+    const pdfSource =
+      "Fisher information provides a lower bound on the variance s^2 of any estimator.";
+    const sourceIndex = buildQuoteSourceIndex({
+      sourceTexts: [
+        {
+          sourceText: mineruSource,
+          sourceLabel: "(Ma & Pouget, 2009)",
+          sourceMatchSource: "context-text",
+          contextItemId: 3852,
+          itemId: 3853,
+          requiresPageHint: true,
+        },
+        {
+          sourceText: pdfSource,
+          sourceLabel: "(Ma & Pouget, 2009)",
+          sourceMatchSource: "pdf-page-text",
+          contextItemId: 3852,
+          itemId: 3853,
+          pageHintIndex: 3,
+          pageHintLabel: "752",
+        },
+      ],
+    });
+
+    const requests = collectDisplayedQuoteVerificationRequests({
+      markdown: `> ${quote}`,
+      sourceIndex,
+    });
+    assert.deepEqual(requests, [
+      {
+        quoteKey: buildQuoteSecondaryEvidenceKey(quote),
+        quoteText: quote,
+        contextItemId: 3852,
+        verificationMode: "inline-math-locator",
+      },
+    ]);
+
+    const finalized = finalizeAssistantQuoteCitations({
+      markdown: `> ${quote}`,
+      sourceIndex,
+      requireBodyEvidenceQuotes: true,
+      secondaryEvidence: [
+        {
+          quoteKey: buildQuoteSecondaryEvidenceKey(quote),
+          contextItemId: 3852,
+          status: "matched",
+          certificate: {
+            documentFingerprint: "population-codes-pdf",
+            pageIndex: 3,
+            pageLabel: "752",
+            sourceMatchText: pdfSource,
+            sourceMatchKind: "normalized-span",
+            sourceMatchPageOccurrence: 0,
+          },
+        },
+      ],
+      quoteSourceReview: { sourceEvidenceComplete: true },
+    });
+
+    assert.match(finalized.markdown, /\[\[quote:Q_[a-z0-9]+\]\]/);
+    assert.lengthOf(finalized.quoteCitations, 1);
+    const citation = finalized.quoteCitations[0];
+    assert.equal(citation.quoteText, quote);
+    assert.equal(citation.sourceMatchText, pdfSource);
+    assert.equal(citation.sourceMatchKind, "normalized-span");
+    assert.equal(citation.sourceMatchSource, "pdf-page-text");
+    assert.equal(citation.sourceFingerprint, "pdfjs:population-codes-pdf");
+    assert.equal(citation.pageHintIndex, 3);
+    assert.equal(citation.pageHintLabel, "752");
+  });
+
+  it("does not let a prose-only PDF locator authenticate altered MinerU content", function () {
+    const sourceQuote =
+      "Fisher information provides a lower bound on the variance \\(\\sigma_{\\hat{s}}^2\\) of any estimator.";
+    const mineruSource =
+      "Fisher information provides a lower bound on the variance $\\sigma _ { \\hat { s } } ^ { 2 }$ of any estimator.";
+    const pdfSource =
+      "Fisher information provides a lower bound on the variance s^2 of any estimator.";
+    const sourceIndex = buildQuoteSourceIndex({
+      sourceTexts: [
+        {
+          sourceText: mineruSource,
+          sourceLabel: "(Ma & Pouget, 2009)",
+          sourceMatchSource: "context-text",
+          contextItemId: 3852,
+          itemId: 3853,
+          requiresPageHint: true,
+        },
+        {
+          sourceText: pdfSource,
+          sourceLabel: "(Ma & Pouget, 2009)",
+          sourceMatchSource: "pdf-page-text",
+          contextItemId: 3852,
+          itemId: 3853,
+          pageHintIndex: 3,
+        },
+      ],
+    });
+
+    for (const quote of [
+      sourceQuote.replace("\\sigma", "\\mu"),
+      sourceQuote.replace("lower", "upper"),
+    ]) {
+      const finalized = finalizeAssistantQuoteCitations({
+        markdown: `> ${quote}`,
+        sourceIndex,
+        secondaryEvidence: [
+          {
+            quoteKey: buildQuoteSecondaryEvidenceKey(quote),
+            contextItemId: 3852,
+            status: "matched",
+            certificate: {
+              documentFingerprint: "population-codes-pdf",
+              pageIndex: 3,
+              sourceMatchText: pdfSource,
+              sourceMatchKind: "normalized-span",
+              sourceMatchPageOccurrence: 0,
+            },
+          },
+        ],
+        quoteSourceReview: { sourceEvidenceComplete: true },
+      });
+
+      assert.isEmpty(finalized.quoteCitations, quote);
+      assert.include(finalized.markdown, "Not a source quote", quote);
+    }
+  });
+
+  it("keeps exact MinerU math unresolved without same-attachment PDF corroboration", function () {
+    const quote =
+      "Fisher information provides a lower bound on the variance \\(\\sigma_{\\hat{s}}^2\\) of any estimator.";
+    const sourceIndex = buildQuoteSourceIndex({
+      sourceTexts: [
+        {
+          sourceText:
+            "Fisher information provides a lower bound on the variance $\\sigma _ { \\hat { s } } ^ { 2 }$ of any estimator.",
+          sourceLabel: "(Ma & Pouget, 2009)",
+          sourceMatchSource: "context-text",
+          contextItemId: 3852,
+          itemId: 3853,
+          requiresPageHint: true,
+        },
+      ],
+    });
+
+    for (const secondaryEvidence of [
+      [
+        {
+          quoteKey: buildQuoteSecondaryEvidenceKey(quote),
+          contextItemId: 9999,
+          status: "matched" as const,
+          certificate: {
+            documentFingerprint: "wrong-attachment",
+            pageIndex: 3,
+            sourceMatchText: quote,
+            sourceMatchKind: "normalized-span" as const,
+            sourceMatchPageOccurrence: 0,
+          },
+        },
+      ],
+      [
+        {
+          quoteKey: buildQuoteSecondaryEvidenceKey(quote),
+          contextItemId: 3852,
+          status: "absent" as const,
+          documentFingerprint: "population-codes-pdf",
+        },
+      ],
+    ]) {
+      const finalized = finalizeAssistantQuoteCitations({
+        markdown: `> ${quote}`,
+        sourceIndex,
+        secondaryEvidence,
+        quoteSourceReview: { sourceEvidenceComplete: true },
+      });
+
+      assert.equal(finalized.markdown, `> ${quote}`);
+      assert.isEmpty(finalized.quoteCitations);
+      assert.notInclude(finalized.markdown, "Not a source quote");
+    }
   });
 
   it("defers an ellipsized quote when every displayed segment has unique source support", function () {

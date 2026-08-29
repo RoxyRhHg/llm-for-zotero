@@ -266,6 +266,8 @@ import {
   getClaudeUserHomeDir,
 } from "../claudeCode/projectSkills";
 import { applyClaudeCodeModePreferenceChange } from "../claudeCode/bootstrapGate";
+import { getTavilyApiKey, setTavilyApiKey } from "../webAccess/prefs";
+import { TavilyClient } from "../webAccess/tavilyClient";
 import {
   getDefaultClaudeManagedInstructionBlock,
   readClaudeProjectManagedInstructionBlock,
@@ -1041,6 +1043,18 @@ export async function registerPrefsScripts(_window: Window | undefined | null) {
   const enableAgentModeInput = doc.querySelector(
     `#${config.addonRef}-enable-agent-mode`,
   ) as HTMLInputElement | null;
+  const tavilyApiKeyInput = doc.querySelector(
+    `#${config.addonRef}-tavily-api-key`,
+  ) as HTMLInputElement | null;
+  const tavilyTestButton = doc.querySelector(
+    `#${config.addonRef}-tavily-test`,
+  ) as HTMLButtonElement | null;
+  const tavilyStatus = doc.querySelector(
+    `#${config.addonRef}-tavily-status`,
+  ) as HTMLSpanElement | null;
+  const tavilyKeyLink = doc.querySelector(
+    `#${config.addonRef}-tavily-key-link`,
+  ) as HTMLAnchorElement | null;
   const codexAppServerEnableSelect = doc.querySelector(
     `#${config.addonRef}-codex-app-server-enable`,
   ) as HTMLSelectElement | null;
@@ -2836,6 +2850,57 @@ export async function registerPrefsScripts(_window: Window | undefined | null) {
         enableAgentModeInput.checked,
         true,
       );
+    });
+  }
+
+  if (tavilyApiKeyInput) {
+    tavilyApiKeyInput.value = getTavilyApiKey();
+    const commitTavilyKey = () => {
+      setTavilyApiKey(tavilyApiKeyInput.value);
+      tavilyApiKeyInput.value = getTavilyApiKey();
+      if (tavilyStatus) {
+        tavilyStatus.style.display = "none";
+        tavilyStatus.textContent = "";
+      }
+    };
+    tavilyApiKeyInput.addEventListener("change", commitTavilyKey);
+    tavilyApiKeyInput.addEventListener("blur", commitTavilyKey);
+  }
+
+  if (tavilyKeyLink) {
+    tavilyKeyLink.addEventListener("click", (event) => {
+      event.preventDefault();
+      Zotero.launchURL("https://app.tavily.com");
+    });
+  }
+
+  if (tavilyTestButton && tavilyStatus) {
+    tavilyTestButton.addEventListener("click", () => {
+      void (async () => {
+        const key = tavilyApiKeyInput?.value.trim() || getTavilyApiKey();
+        tavilyStatus.style.display = "inline";
+        if (!key) {
+          tavilyStatus.style.color = "red";
+          tavilyStatus.textContent = t("Enter a Tavily API key first.");
+          return;
+        }
+        setTavilyApiKey(key);
+        if (tavilyApiKeyInput) tavilyApiKeyInput.value = key;
+        tavilyTestButton.disabled = true;
+        tavilyStatus.style.color = "var(--fill-secondary, #888)";
+        tavilyStatus.textContent = t("Testing…");
+        try {
+          const usage = await new TavilyClient(key).getUsage();
+          tavilyStatus.style.color = "green";
+          tavilyStatus.textContent = `${t("Connected")} · ${usage.plan}`;
+        } catch (error) {
+          tavilyStatus.style.color = "red";
+          tavilyStatus.textContent =
+            error instanceof Error ? error.message : String(error);
+        } finally {
+          tavilyTestButton.disabled = false;
+        }
+      })();
     });
   }
 

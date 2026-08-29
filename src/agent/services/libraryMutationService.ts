@@ -6,7 +6,7 @@ import {
   mutationTargetCountFromHandler,
   mutationUsesDeferredInverse,
   planMutationInverseFromHandler,
-} from "./libraryMutation/handlerRegistry";
+} from "./libraryMutation/handlerOperations";
 import type {
   LibraryMutationExecution,
   LibraryMutationOperation,

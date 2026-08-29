@@ -8,7 +8,11 @@ import type {
   SelectedTextSource,
   TagContextRef,
 } from "../shared/types";
-import type { AgentRuntimeRequest } from "../agent/types";
+import type {
+  AgentRuntimeRequest,
+  AgentRuntimeRequestInput,
+} from "../agent/types";
+import { resolveAgentRuntimeRequest } from "../agent/context/resolvedAgentRequest";
 import type { AgentSkill } from "../agent/skills";
 import { getAllSkills, getMatchedSkillIds } from "../agent/skills";
 import { getSkillCustomizationNotice } from "../agent/skills/managedBlock";
@@ -148,11 +152,9 @@ function isAmbiguousSkillCandidate(request: AgentRuntimeRequest): boolean {
   const hasWorkflowContext = Boolean(
     request.activeNoteContext ||
     request.selectedTexts?.length ||
-    request.selectedPaperContexts?.length ||
-    request.fullTextPaperContexts?.length ||
-    request.pinnedPaperContexts?.length ||
-    request.selectedCollectionContexts?.length ||
-    request.selectedTagContexts?.length ||
+    request.turnPaperScope.papers.length ||
+    request.turnPaperScope.collections.length ||
+    request.turnPaperScope.tags.length ||
     request.screenshots?.length ||
     request.attachments?.length,
   );
@@ -211,11 +213,17 @@ export function buildCodexNativeSkillClassifierCacheKey(params: {
         new Set(request.selectedTextSources || []),
       ).sort(),
       selectedTextCount: request.selectedTexts?.length || 0,
-      selectedPaperCount: request.selectedPaperContexts?.length || 0,
-      fullTextPaperCount: request.fullTextPaperContexts?.length || 0,
-      pinnedPaperCount: request.pinnedPaperContexts?.length || 0,
-      collectionCount: request.selectedCollectionContexts?.length || 0,
-      tagCount: request.selectedTagContexts?.length || 0,
+      selectedPaperCount: request.turnPaperScope.papers.filter((entry) =>
+        entry.roles.includes("selected"),
+      ).length,
+      fullTextPaperCount: request.turnPaperScope.papers.filter((entry) =>
+        entry.roles.includes("full_text"),
+      ).length,
+      pinnedPaperCount: request.turnPaperScope.papers.filter((entry) =>
+        entry.roles.includes("pinned"),
+      ).length,
+      collectionCount: request.turnPaperScope.collections.length,
+      tagCount: request.turnPaperScope.tags.length,
       screenshotCount: request.screenshots?.length || 0,
       attachmentTypes: Array.from(
         new Set(
@@ -276,12 +284,13 @@ export function buildCodexNativeSkillRequest(
 ): AgentRuntimeRequest {
   const { scope, skillContext } = params;
   const scopePapers = buildScopePaperContexts(scope);
-  return {
+  const rawRequest: AgentRuntimeRequestInput = {
     conversationKey: scope.conversationKey,
     mode: "agent",
     userText: params.userText,
     activeItemId: scope.activeItemId || scope.paperItemID,
     libraryID: scope.libraryID,
+    conversationKind: scope.kind === "paper" ? "paper" : "global",
     selectedTextContexts: normalizeList(skillContext?.selectedTextContexts),
     resolvedSelectedTextAnchors: normalizeList(
       skillContext?.resolvedSelectedTextAnchors,
@@ -314,6 +323,7 @@ export function buildCodexNativeSkillRequest(
     activeNoteContext: buildScopeActiveNoteContext(scope),
     modelProviderLabel: "Codex",
   };
+  return resolveAgentRuntimeRequest(rawRequest);
 }
 
 export function buildCodexNativeSkillInstructionBlock(

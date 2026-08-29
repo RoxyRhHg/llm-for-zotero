@@ -1,4 +1,5 @@
 import type {
+  AgentActionParameters,
   AgentJournalActionScope,
   AgentJournalStepOutcome,
   AgentWriteToolDefinition,
@@ -26,6 +27,7 @@ import {
   updateJournalAction,
 } from "../../store/changeJournal";
 import { ok, fail, validateObject, normalizePositiveInt } from "../shared";
+import { capabilityForLibraryMutation } from "../../services/libraryMutation/handlerOperations";
 
 type RunBatchInput = {
   kind: "run";
@@ -74,6 +76,89 @@ const DURABLE_BATCH_JOBS = new Set([
   "audit_library",
 ]);
 
+function operationForBatchJob(job: string) {
+  return job === "auto_tag"
+    ? ("apply_tags" as const)
+    : job === "organize_unfiled"
+      ? ("move_to_collection" as const)
+      : job === "audit_library"
+        ? ("update_metadata" as const)
+        : null;
+}
+
+function unresolvedCollectionContractTargets(
+  job: string,
+  context: import("../../types").AgentToolContext,
+  durableRemainingItemIds?: number[],
+  proposalParameters?: AgentActionParameters,
+): number[] | null {
+  const operation = operationForBatchJob(job);
+  if (!operation) return null;
+  const obligations =
+    context.request.actionContract?.obligations.filter(
+      (entry) =>
+        entry.operation === operation &&
+        entry.proofDomain === "zotero_state" &&
+        entry.scopeRole !== "destination" &&
+        entry.targetBoundary?.kind === "collection" &&
+        entry.targetBoundary.libraryID === context.request.libraryID &&
+        Object.entries(entry.parameters || {}).every(([key, expected]) => {
+          if (expected === undefined) return true;
+          const actual =
+            proposalParameters?.[key as keyof AgentActionParameters];
+          return Array.isArray(expected)
+            ? Array.isArray(actual) &&
+                expected.length === actual.length &&
+                [...expected].every((value) => actual.includes(value as never))
+            : actual === expected;
+        }) &&
+        !(
+          entry.constraints?.collectionMode === "move" &&
+          proposalParameters?.sourceCollectionId === undefined
+        ),
+    ) || [];
+  if (!obligations.length) return null;
+  const unresolved = obligations.flatMap((obligation) => {
+    const progress = context.request.actionProgress?.obligations.find(
+      (entry) => entry.obligationId === obligation.id,
+    );
+    if (
+      progress?.status === "fulfilled" ||
+      progress?.status === "already_satisfied" ||
+      progress?.status === "cancelled"
+    ) {
+      return [];
+    }
+    if (progress) {
+      return progress.unresolvedTargetIds
+        .map((target) => Number(target.match(/^item:(\d+)$/)?.[1]))
+        .filter((itemId) => Number.isInteger(itemId) && itemId > 0);
+    }
+    return obligation.targetBoundary?.frozenTargetIds || [];
+  });
+  const union = [...new Set(unresolved)].sort((left, right) => left - right);
+  if (!durableRemainingItemIds) return union;
+  const durableRemaining = new Set(durableRemainingItemIds);
+  return union.filter((itemId) => durableRemaining.has(itemId));
+}
+
+function bindFrozenTargets(
+  jobArgs: Record<string, unknown>,
+  frozenItemIds: number[],
+): Record<string, unknown> {
+  const {
+    scope: _scope,
+    collectionId: _collectionId,
+    collectionIds: _collectionIds,
+    itemIds: _itemIds,
+    tagNames: _tagNames,
+    tagScopes: _tagScopes,
+    _batchItemIds: _previousBatchItemIds,
+    ...retained
+  } = jobArgs;
+  return { ...retained, _batchItemIds: frozenItemIds };
+}
+
 /**
  * Runs and resumes durable library-wide jobs.
  *
@@ -92,7 +177,91 @@ export function createLibraryBatchTool(deps: {
   const now = deps.now ?? (() => Date.now());
   const store = deps.batchJobStore ?? defaultBatchJobStore;
 
+  const describeBatchOperation = (
+    job: string,
+    jobArgs: Record<string, unknown>,
+    identity: string,
+    context?: import("../../types").AgentToolContext,
+    durableRemainingItemIds?: number[],
+  ) => {
+    const operation = operationForBatchJob(job);
+    if (!operation) return [];
+    const requestedItemIds = Array.isArray(jobArgs.itemIds)
+      ? jobArgs.itemIds
+          .map(Number)
+          .filter((itemId) => Number.isInteger(itemId) && itemId > 0)
+      : [];
+    const targetCollectionId = normalizePositiveInt(jobArgs.targetCollectionId);
+    const proposalParameters = targetCollectionId
+      ? { destinationCollectionId: targetCollectionId }
+      : undefined;
+    const contractTargets = context
+      ? unresolvedCollectionContractTargets(
+          job,
+          context,
+          durableRemainingItemIds,
+          proposalParameters,
+        )
+      : null;
+    const itemIds =
+      contractTargets ?? durableRemainingItemIds ?? requestedItemIds;
+    return [
+      {
+        id: `${operation}:library_batch:${identity}`,
+        proofDomain: "zotero_state" as const,
+        capability: capabilityForLibraryMutation(operation),
+        operation,
+        source: "library_mutation" as const,
+        parameters: proposalParameters,
+        requestedTargets: itemIds.map((itemId) => `item:${itemId}`),
+        destinationCollectionIds: targetCollectionId
+          ? [targetCollectionId]
+          : [],
+      },
+    ];
+  };
+
   return {
+    describeAction: async (input, context) => {
+      if (input.kind === "list") return [];
+      if (input.kind === "run") {
+        return describeBatchOperation(
+          input.job,
+          input.jobArgs,
+          input.job,
+          context,
+        );
+      }
+      const job = await store.getBatchJob(input.resumeJobId);
+      let args: Record<string, unknown> = {};
+      let durableRemainingItemIds: number[] | undefined;
+      if (job) {
+        try {
+          const parsed = JSON.parse(job.inputJson);
+          if (validateObject<Record<string, unknown>>(parsed)) args = parsed;
+        } catch {
+          args = {};
+        }
+        try {
+          const plan = JSON.parse(job.planJson || "{}");
+          if (validateObject<Record<string, unknown>>(plan)) {
+            durableRemainingItemIds =
+              normalizeItemIds(plan.remainingItemIds) || undefined;
+          }
+        } catch {
+          durableRemainingItemIds = undefined;
+        }
+      }
+      return job
+        ? describeBatchOperation(
+            job.action,
+            args,
+            job.jobId,
+            context,
+            durableRemainingItemIds,
+          )
+        : [];
+    },
     spec: {
       name: "library_batch",
       description:
@@ -332,6 +501,25 @@ export function createLibraryBatchTool(deps: {
         now,
         store,
       });
+      const durableRemainingItemIds = prepared.resumed
+        ? normalizeItemIds(prepared.jobArgs._batchItemIds) || []
+        : undefined;
+      const contractTargets = unresolvedCollectionContractTargets(
+        prepared.job,
+        context,
+        durableRemainingItemIds,
+        normalizePositiveInt(prepared.jobArgs.targetCollectionId)
+          ? {
+              destinationCollectionId: normalizePositiveInt(
+                prepared.jobArgs.targetCollectionId,
+              ),
+            }
+          : undefined,
+      );
+      if (contractTargets !== null) {
+        prepared.jobArgs = bindFrozenTargets(prepared.jobArgs, contractTargets);
+        if (!prepared.resumed) prepared.totalCount = contractTargets.length;
+      }
       const action = deps.actionRegistry.getAction(prepared.job);
       if (!action) {
         await store.finishBatchJob({
@@ -442,6 +630,7 @@ export function createLibraryBatchTool(deps: {
           totalCount,
           now: now(),
         });
+        await context.checkpointActionProgress?.();
         checkpointSeen = true;
         lastCursor = cursor;
         lastAppliedCount = appliedCount;

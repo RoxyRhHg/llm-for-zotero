@@ -12,8 +12,13 @@ import { createSearchPaperTool } from "./read/searchPaper";
 import { createViewPdfPagesTool } from "./read/viewPdfPages";
 import { createReadAttachmentTool } from "./read/readAttachment";
 import { clearPdfToolCaches } from "./read/pdfToolUtils";
-import { createSearchLiteratureOnlineTool } from "./read/searchLiteratureOnline";
+import {
+  createSearchLiteratureOnlineTool,
+  matchesLiteratureSearchGuidance,
+} from "./read/searchLiteratureOnline";
 import { createToolResultReadTool } from "./read/toolResultRead";
+import { createWebSearchTool } from "./read/webSearch";
+import { createWebReadTool } from "./read/webRead";
 import { createCiteExportTool } from "./read/citeExport";
 import { createDelegatingTool, createRenamedTool } from "./facade";
 
@@ -49,7 +54,9 @@ import { createZoteroScriptTool } from "./write/zoteroScript";
 import { PdfPageService } from "../services/pdfPageService";
 import { PdfFigureExtractionService } from "../services/pdfFigureExtractionService";
 import type { AgentToolDefinition } from "../types";
+import { inferNoteIntent, WRITE_NOTE_SKILL_ID } from "../skills/noteIntent";
 import { fail, ok, PAPER_CONTEXT_REF_SCHEMA, validateObject } from "./shared";
+import { ActionContractService } from "../contracts/actionContract";
 
 type BuiltInAgentToolDeps = {
   zoteroGateway: ZoteroGateway;
@@ -103,12 +110,9 @@ const LIBRARY_SEARCH_GUIDANCE: ToolGuidance = {
 };
 
 const LITERATURE_SEARCH_GUIDANCE: ToolGuidance = {
-  matches: (request) =>
-    /\b(related papers?|similar papers?|find papers?|search (the )?(internet|online|web|literature)|online search|web search|citations?|references?|papers? (by|from)|publications? (by|from))\b/i.test(
-      request.userText || "",
-    ),
+  matches: matchesLiteratureSearchGuidance,
   instruction:
-    "When the user explicitly asks to search online or search the literature, call literature_search with workflow:'answer' by default, analyze the scholarly results, and answer in chat with explicit source attribution. Use workflow:'review' only when the user wants to import/add papers to Zotero, save selected search results to a note, refine results inside the card, or review metadata changes. If the request is not answerable from scholarly sources, say that limitation instead of pretending general web search is available. Do not use this tool for questions about the content of papers already in context (e.g. counting references, summarizing, explaining)." +
+    "When the request needs external scholarly evidence, call literature_search with workflow:'answer' by default, analyze the results, and answer with explicit source attribution. A mixed request may also use web_search for distinct general-web evidence. Use workflow:'review' only when the user wants to import/add papers to Zotero, save selected search results to a note, refine results inside the card, or review metadata changes. Do not use this tool for questions about the content of papers already in context (e.g. counting references, summarizing, explaining). Preserve the user's language by default." +
     "\n\nSource selection:" +
     "\n- recommendations, references, citations modes -> always use source:'openalex' (only OpenAlex supports these)." +
     "\n- search mode -> source:'openalex' (default, broadest coverage), source:'arxiv' (preprints, CS/ML/physics), or source:'europepmc' (biomedical/life sciences)." +
@@ -120,17 +124,26 @@ const LITERATURE_SEARCH_GUIDANCE: ToolGuidance = {
 
 const LIBRARY_UPDATE_GUIDANCE: ToolGuidance = {
   matches: (request) =>
-    /\b(fix|correct|update|enrich|complete|sync|tag|tags|move|file|folder|collection|collections)\b.*\b(metadata|fields?|title|authors?|doi|year|date|abstract|tag|tags|folder|folders|collection|collections)\b/i.test(
+    /\b(?:tag|untag)\b/i.test(request.userText || "") ||
+    /\b(fix|correct|update|enrich|complete|sync|add|apply|assign|remove|set|replace|rename|merge|move|file|organize|organise)\b.*\b(metadata|fields?|title|authors?|doi|year|date|abstract|tags?|folders?|collections?)\b/i.test(
       request.userText || "",
     ),
   instruction:
-    "For library write operations, the confirmation card is the deliverable; call library_update directly instead of stopping with a prose summary. Use kind:'tags' for tag changes, kind:'collections' for collection membership, and kind:'metadata' for item metadata fields. When the user asks to fix, correct, or enrich metadata from external sources, use literature_search with workflow:'review' and mode:'metadata' first to fetch canonical data, then continue through the review/update flow. Only call library_update with kind:'metadata' directly when the user provides specific field values to set.",
+    "For library write operations, the confirmation card is the deliverable; call library_update directly instead of stopping with a prose summary. Use kind:'tags' for tag changes, kind:'collections' for collection membership, and kind:'metadata' for item metadata fields. Batch one uniform change across all applicable item IDs in a single call. For different per-item changes, use assignments when the schema supports them; use zotero_script only when the semantic tool cannot express the requested computation. When the user asks to fix, correct, or enrich metadata from external sources, use literature_search with workflow:'review' and mode:'metadata' first to fetch canonical data, then continue through the review/update flow. Only call library_update with kind:'metadata' directly when the user provides specific field values to set.",
 };
 
 const NOTE_WRITE_GUIDANCE: ToolGuidance = {
-  matches: () => true,
+  matches: (request, context) =>
+    Boolean(
+      context?.matchedSkillIds.includes(WRITE_NOTE_SKILL_ID) ||
+      request.forcedSkillIds?.includes(WRITE_NOTE_SKILL_ID) ||
+      inferNoteIntent(request) ||
+      request.actionContract?.obligations.some(
+        (obligation) => obligation.capability === "zotero.notes",
+      ),
+    ),
   instruction:
-    "When a Zotero note is already open/current and the user asks to edit, rewrite, revise, polish, or update that note, call note_write with mode:'edit'. NEVER output note text directly in chat. For edits, PREFER patches (find-and-replace pairs) over content (full rewrite). When the user asks to append/add content to an existing note, call note_write with mode:'append' and content; pass targetNoteId when the destination note is known. When the user asks to create/write/save a new item note, call note_write with mode:'create', target:'item', and content; create means a brand-new child note, not appending to the response-save note. For standalone notes, call note_write with mode:'create', target:'standalone', and content. To file a note into a Zotero collection (what users call a folder), pass collections:[<id>] — resolve the name to an id first with library_search({ entity:'collections', mode:'list' }). A collection destination implies a standalone note, since a child note belongs to its parent item and cannot be a collection member. Pass Markdown by default. When the note discusses a specific figure, first call paper_read with mode:'figures' and embed the extracted PDF crop path: `![Figure N](file:///{path})`; it is auto-imported as a Zotero attachment. Treat paper_read mode:'figures' as the authority for figure crop cache reuse/regeneration; use returned crop paths as-is and do not inspect or validate `figure_crops` metadata before writing. When the note discusses a table, use paper_read mode:'targeted' for the table text and surrounding discussion instead of the figure-crop extractor. If paper_read mode:'figures' returns no_figures, mineru_required, error, zero figures, or no image artifact, switch to text-only mode when the user asked for a note: do not include figure images, rendered PDF page screenshots, MinerU source images, or extracted-image placeholders; explicitly state that figure extraction failed or no extracted crops are available, and that explanations are based on captions, figure legends, and surrounding paper text. Do not embed MinerU source image paths for figure notes; user-provided image inputs are unaffected; text-only models may still copy/embed extracted crop paths when crops are available but must not make unsupported visual claims.",
+    "For an open/current Zotero note, use mode:'edit' for revision and prefer patches over a full content replacement. Use mode:'append' for an existing destination note and mode:'create' only for a new child or standalone note. A named Zotero folder means a collection: resolve its ID, create a standalone note, and pass collections:[...]. Pass Markdown unless the user explicitly requests HTML. The requested note must be written with note_write rather than returned as note-ready prose in chat.",
 };
 
 const LIBRARY_IMPORT_GUIDANCE: ToolGuidance = {
@@ -496,7 +509,9 @@ function createLibraryDeleteTool(tools: {
 export function createBuiltInToolRegistry(
   deps: BuiltInAgentToolDeps,
 ): AgentToolRegistry {
-  const registry = new AgentToolRegistry();
+  const registry = new AgentToolRegistry(
+    new ActionContractService(deps.zoteroGateway),
+  );
   const queryLibrary = createQueryLibraryTool(deps.zoteroGateway);
   const readLibrary = createReadLibraryTool(deps.zoteroGateway);
   const libraryRetrieve = createLibraryRetrieveTool(
@@ -553,6 +568,8 @@ export function createBuiltInToolRegistry(
       guidance: LIBRARY_SEARCH_GUIDANCE,
     }),
   );
+  registry.register(createWebSearchTool());
+  registry.register(createWebReadTool());
   registry.register(
     createRenamedTool({
       tool: readLibrary,

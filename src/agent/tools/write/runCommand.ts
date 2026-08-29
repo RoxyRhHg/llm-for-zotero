@@ -14,6 +14,7 @@ import {
 import { ok, fail, validateObject } from "../shared";
 import { executeExternalMutation } from "../../services/mutationCoordinator";
 import { sha256Bytes } from "../../store/journalRecoveryBlobStore";
+import { fingerprintText } from "../../contracts/actionOperationEvidence";
 
 type RunCommandInput = {
   command: string;
@@ -605,6 +606,20 @@ export function createRunCommandTool(): AgentWriteToolDefinition<
   unknown
 > {
   return {
+    describeAction: (input) => [
+      {
+        id: `command_execute:${fingerprintText(input.command)}`,
+        proofDomain: "execution",
+        capability: "command.execute",
+        operation: "command_execute",
+        source: "command",
+        parameters: {
+          commandFingerprint: fingerprintText(input.command),
+        },
+        requestedTargets: [],
+        destinationCollectionIds: [],
+      },
+    ],
     spec: {
       name: "run_command",
       description:

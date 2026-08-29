@@ -20,15 +20,11 @@ import { buildAgentModelCapabilities } from "./contentCapabilities";
 import {
   buildResponsesContinuationInput,
   buildResponsesInitialInput,
-  limitNormalizedResponsesStep,
   type ResponsesPayload,
   normalizeResponsesStepFromPayload,
   parseResponsesStepStream,
 } from "./responsesShared";
-import {
-  buildResponsesFunctionTools,
-  getToolContinuationMessages,
-} from "./shared";
+import { buildResponsesFunctionTools } from "./shared";
 import { resolveRequestContentInputs } from "./messageBuilder";
 
 async function uploadFilePart(
@@ -94,7 +90,7 @@ export class OpenAIResponsesAgentAdapter implements AgentModelAdapter {
       "You are the agent runtime inside a Zotero plugin.";
     const followupInput = this.conversationItems
       ? await buildResponsesContinuationInput(
-          getToolContinuationMessages(params.messages),
+          params.continuationMessages || [],
           {
             resolveFilePart: async (part, signal) =>
               uploadFilePart(part, request, signal),
@@ -155,18 +151,16 @@ export class OpenAIResponsesAgentAdapter implements AgentModelAdapter {
       },
       signal: params.signal,
     });
-    const normalized = limitNormalizedResponsesStep(
-      response.body
-        ? await parseResponsesStepStream(
-            response.body,
-            params.onTextDelta,
-            params.onReasoning,
-            params.onUsage,
-          )
-        : normalizeResponsesStepFromPayload(
-            (await response.json()) as ResponsesPayload,
-          ),
-    );
+    const normalized = response.body
+      ? await parseResponsesStepStream(
+          response.body,
+          params.onTextDelta,
+          params.onReasoning,
+          params.onUsage,
+        )
+      : normalizeResponsesStepFromPayload(
+          (await response.json()) as ResponsesPayload,
+        );
     this.conversationItems = [...inputItems, ...normalized.outputItems];
     if (normalized.toolCalls.length) {
       return {

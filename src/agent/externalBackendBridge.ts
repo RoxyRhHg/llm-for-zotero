@@ -64,7 +64,9 @@ import type {
   AgentModelCapabilities,
   AgentRuntimeOutcome,
   AgentRuntimeRequest,
+  AgentRuntimeRequestInput,
 } from "./types";
+import { resolveAgentRuntimeRequest } from "./context/resolvedAgentRequest";
 import type {
   LocalDocumentResource,
   NoteContextRef,
@@ -79,6 +81,12 @@ import {
   buildTurnContextEnvelope,
   renderTurnContextEnvelopeForModel,
 } from "./context/turnContextEnvelope";
+import {
+  getActiveTurnPaper,
+  getSelectedPassagePaper,
+  listTurnPapersWithRoles,
+  type TurnPaperRole,
+} from "./context/turnPaperScope";
 import { validateLocalPdfDocumentBatch } from "./context/localDocumentBatch";
 import { RAW_PDF_TRANSPORT_POLICY_BLOCK } from "./context/rawPdfTransportPolicy";
 import {
@@ -88,10 +96,14 @@ import {
 } from "./privacy/localDocumentPathRedaction";
 
 export type RunTurnParams = {
-  request: AgentRuntimeRequest;
+  request: AgentRuntimeRequestInput;
   onEvent?: (event: AgentEvent) => void | Promise<void>;
   onStart?: (runId: string) => void | Promise<void>;
   signal?: AbortSignal;
+};
+
+type ResolvedRunTurnParams = Omit<RunTurnParams, "request"> & {
+  request: AgentRuntimeRequest;
 };
 
 type ResolveExternalConfirmation = (
@@ -124,7 +136,7 @@ export type AgentRuntimeLike = Pick<
   | "resolveConfirmation"
   | "getRunTrace"
 > & {
-  getCapabilities(request: AgentRuntimeRequest): AgentModelCapabilities;
+  getCapabilities(request: AgentRuntimeRequestInput): AgentModelCapabilities;
   runTurn(params: RunTurnParams): Promise<AgentRuntimeOutcome>;
   listExternalActionsSync(): Array<{
     name: string;
@@ -441,6 +453,19 @@ type BridgeRuntimeRequest = {
   };
 };
 
+function requestPaperRefs(
+  request: AgentRuntimeRequest,
+  roles: readonly TurnPaperRole[],
+): PaperContextRef[] {
+  return [...listTurnPapersWithRoles(request.turnPaperScope, roles)];
+}
+
+function requestLocalDocuments(
+  request: AgentRuntimeRequest,
+): readonly LocalDocumentResource[] {
+  return (request.localDocuments || []).map((entry) => entry.resource);
+}
+
 const lastRunBridgeContextByConversationKey = new Map<
   number,
   LastRunBridgeContext
@@ -752,17 +777,7 @@ function resolvePaperScopeFromRequest(
   }
 
   if (!paperItemId || paperItemId <= 0) {
-    const allRefs = [
-      ...(Array.isArray(request.selectedPaperContexts)
-        ? request.selectedPaperContexts
-        : []),
-      ...(Array.isArray(request.fullTextPaperContexts)
-        ? request.fullTextPaperContexts
-        : []),
-      ...(Array.isArray(request.pinnedPaperContexts)
-        ? request.pinnedPaperContexts
-        : []),
-    ];
+    const allRefs = request.turnPaperScope.papers.map((entry) => entry.paper);
     const firstRef = allRefs.find(
       (entry) =>
         entry &&
@@ -779,11 +794,14 @@ function resolvePaperScopeFromRequest(
     return null;
   }
 
-  const titleItem = Zotero.Items.get(paperItemId);
+  const titleItem = Zotero?.Items?.get?.(paperItemId);
+  const scopedPaperTitle = request.turnPaperScope.papers.find(
+    (entry) => entry.paper.itemId === paperItemId,
+  )?.paper.title;
   const scopeLabel =
     titleItem?.isRegularItem?.() && typeof titleItem.getField === "function"
       ? String(titleItem.getField("title") || "").trim() || undefined
-      : undefined;
+      : scopedPaperTitle;
 
   const scopeId = `${getClaudeProfileSignature()}:${libraryID ?? 0}:${paperItemId}`;
   return { scopeType: "paper", scopeId, scopeLabel };
@@ -952,7 +970,7 @@ async function streamBridgeLines(
 
 async function runExternalBridgeTurn(
   baseUrl: string,
-  params: RunTurnParams & {
+  params: ResolvedRunTurnParams & {
     contextEnvelope?: ContextEnvelope;
     runtimeRequest?: BridgeRuntimeRequest;
     allowedTools?: string[];
@@ -1030,7 +1048,7 @@ async function runExternalBridgeTurn(
       settingSources: getClaudeSettingSourcesCsvByPref(),
       ...buildAgentPermissionMetadata(),
       customInstruction: buildClaudeBridgeCustomInstruction({
-        rawPdfMode: Boolean(params.request.localDocuments?.length),
+        rawPdfMode: requestLocalDocuments(params.request).length > 0,
       }),
       providerIdentity,
       providerIdentityStack,
@@ -1218,11 +1236,11 @@ function resolveFallbackLibraryId(
   request: AgentRuntimeRequest,
 ): number | undefined {
   const selectedCollectionLibraryId = normalizeCollectionRefs(
-    request.selectedCollectionContexts,
+    request.turnPaperScope.collections,
     1,
   )[0]?.libraryID;
   const selectedTagLibraryId = normalizeTagRefs(
-    request.selectedTagContexts,
+    request.turnPaperScope.tags,
     1,
   )[0]?.libraryID;
   const userLibraryId = normalizePositiveInt(
@@ -1242,27 +1260,9 @@ function buildClaudeZoteroMcpScope(
   request: AgentRuntimeRequest,
   profileSignature: string,
 ): ZoteroMcpActiveScope {
-  const selectedPaperContexts = normalizePaperRefs(
-    request.selectedPaperContexts,
-    MAX_SELECTED_PAPER_CONTEXTS,
-  );
-  const fullTextPaperContexts = normalizePaperRefs(
-    request.fullTextPaperContexts,
-    MAX_FULL_TEXT_PAPER_CONTEXTS,
-  );
-  const pdfPaperContexts = normalizePaperRefs(
-    request.pdfPaperContexts,
-    MAX_SELECTED_PAPER_CONTEXTS,
-  ).map((paper) => ({ ...paper, contentSourceMode: "pdf" as const }));
-  const pinnedPaperContexts = normalizePaperRefs(
-    request.pinnedPaperContexts,
-    MAX_FULL_TEXT_PAPER_CONTEXTS,
-  );
   const selectedPaper =
-    selectedPaperContexts[0] ||
-    fullTextPaperContexts[0] ||
-    pinnedPaperContexts[0] ||
-    pdfPaperContexts[0];
+    getActiveTurnPaper(request.turnPaperScope) ||
+    request.turnPaperScope.papers[0]?.paper;
   const kind = request.conversationKind === "paper" ? "paper" : "global";
   const activeItemId =
     normalizePositiveInt(request.activeItemId) ||
@@ -1291,22 +1291,8 @@ function buildClaudeZoteroMcpScope(
     title: selectedPaper?.title,
     userText: request.userText,
     exhaustiveReadBackend: "unavailable",
-    paperContext: selectedPaper,
-    selectedPaperContexts: selectedPaperContexts.length
-      ? selectedPaperContexts
-      : undefined,
-    pdfPaperContexts: pdfPaperContexts.length ? pdfPaperContexts : undefined,
-    fullTextPaperContexts: fullTextPaperContexts.length
-      ? fullTextPaperContexts
-      : undefined,
-    pinnedPaperContexts: pinnedPaperContexts.length
-      ? pinnedPaperContexts
-      : undefined,
-    selectedCollectionContexts: normalizeCollectionRefs(
-      request.selectedCollectionContexts,
-      20,
-    ),
-    selectedTagContexts: normalizeTagRefs(request.selectedTagContexts, 20),
+    turnPaperScope: request.turnPaperScope,
+    turnPaperScopeWarnings: request.turnPaperScopeWarnings,
   };
 }
 
@@ -1491,7 +1477,10 @@ function buildContextEnvelope(request: AgentRuntimeRequest): ContextEnvelope {
     selectedTextContexts: request.selectedTextContexts,
     selectedTexts: request.selectedTexts,
     selectedTextSources: request.selectedTextSources,
-    selectedTextPaperContexts: request.selectedTextPaperContexts,
+    selectedTextPaperContexts: (request.selectedTextContexts || []).map(
+      (_context, index) =>
+        getSelectedPassagePaper(request.turnPaperScope, index),
+    ),
     selectedTextNoteContexts: request.selectedTextNoteContexts,
   });
   const selectedTexts = selectedTextContexts.map((context) => context.text);
@@ -1527,11 +1516,11 @@ function buildContextEnvelope(request: AgentRuntimeRequest): ContextEnvelope {
     }))
     .filter((row) => row.text);
   const selectedPapers = normalizePaperRefs(
-    request.selectedPaperContexts,
+    requestPaperRefs(request, ["selected"]),
     MAX_SELECTED_PAPER_CONTEXTS,
   );
   const fullTextPapers = normalizePaperRefs(
-    request.fullTextPaperContexts,
+    requestPaperRefs(request, ["full_text"]),
     MAX_FULL_TEXT_PAPER_CONTEXTS,
   ).map((paper) => ({
     itemId: paper.itemId,
@@ -1539,7 +1528,7 @@ function buildContextEnvelope(request: AgentRuntimeRequest): ContextEnvelope {
     title: paper.title,
   }));
   const pinnedPapers = normalizePaperRefs(
-    request.pinnedPaperContexts,
+    requestPaperRefs(request, ["pinned"]),
     MAX_FULL_TEXT_PAPER_CONTEXTS,
   ).map((paper) => ({
     itemId: paper.itemId,
@@ -1547,10 +1536,10 @@ function buildContextEnvelope(request: AgentRuntimeRequest): ContextEnvelope {
     title: paper.title,
   }));
   const selectedCollections = normalizeCollectionRefs(
-    request.selectedCollectionContexts,
+    request.turnPaperScope.collections,
     8,
   );
-  const selectedTags = normalizeTagRefs(request.selectedTagContexts, 8);
+  const selectedTags = normalizeTagRefs(request.turnPaperScope.tags, 8);
   const attachments = (
     Array.isArray(request.attachments) ? request.attachments : []
   )
@@ -1576,21 +1565,11 @@ function buildContextEnvelope(request: AgentRuntimeRequest): ContextEnvelope {
     activeItemId: request.activeItemId,
     libraryID: request.libraryID,
     selectedTextCount: selectedTexts.length,
-    selectedPaperCount: Array.isArray(request.selectedPaperContexts)
-      ? request.selectedPaperContexts.length
-      : 0,
-    selectedCollectionCount: Array.isArray(request.selectedCollectionContexts)
-      ? request.selectedCollectionContexts.length
-      : 0,
-    selectedTagCount: Array.isArray(request.selectedTagContexts)
-      ? request.selectedTagContexts.length
-      : 0,
-    fullTextPaperCount: Array.isArray(request.fullTextPaperContexts)
-      ? request.fullTextPaperContexts.length
-      : 0,
-    pinnedPaperCount: Array.isArray(request.pinnedPaperContexts)
-      ? request.pinnedPaperContexts.length
-      : 0,
+    selectedPaperCount: requestPaperRefs(request, ["selected"]).length,
+    selectedCollectionCount: request.turnPaperScope.collections.length,
+    selectedTagCount: request.turnPaperScope.tags.length,
+    fullTextPaperCount: requestPaperRefs(request, ["full_text"]).length,
+    pinnedPaperCount: requestPaperRefs(request, ["pinned"]).length,
     attachmentCount: Array.isArray(request.attachments)
       ? request.attachments.length
       : 0,
@@ -1801,9 +1780,9 @@ async function buildBridgeRuntimeRequest(
 
   const [selectedPaperContexts, fullTextPaperContexts, pinnedPaperContexts] =
     await Promise.all([
-      enrichPaperContexts(request.selectedPaperContexts),
-      enrichPaperContexts(request.fullTextPaperContexts),
-      enrichPaperContexts(request.pinnedPaperContexts),
+      enrichPaperContexts(requestPaperRefs(request, ["selected"])),
+      enrichPaperContexts(requestPaperRefs(request, ["full_text"])),
+      enrichPaperContexts(requestPaperRefs(request, ["pinned"])),
     ]);
 
   return {
@@ -1838,12 +1817,12 @@ async function buildBridgeRuntimeRequest(
     fullTextPaperContexts,
     pinnedPaperContexts,
     selectedCollectionContexts: normalizeCollectionRefs(
-      request.selectedCollectionContexts,
+      request.turnPaperScope.collections,
       20,
     ),
-    selectedTagContexts: normalizeTagRefs(request.selectedTagContexts, 20),
-    localDocuments: request.localDocuments?.length
-      ? request.localDocuments
+    selectedTagContexts: normalizeTagRefs(request.turnPaperScope.tags, 20),
+    localDocuments: requestLocalDocuments(request).length
+      ? requestLocalDocuments(request)
       : undefined,
     attachments: attachments.length ? attachments : undefined,
     screenshots: screenshots.length ? screenshots : undefined,
@@ -1866,15 +1845,15 @@ async function buildBridgeRuntimeRequest(
 }
 
 export function buildBridgeRuntimeRequestForTests(
-  request: AgentRuntimeRequest,
+  request: AgentRuntimeRequestInput,
 ): Promise<BridgeRuntimeRequest> {
-  return buildBridgeRuntimeRequest(request);
+  return buildBridgeRuntimeRequest(resolveAgentRuntimeRequest(request));
 }
 
 export function buildExternalBridgeContextEnvelopeForTests(
-  request: AgentRuntimeRequest,
+  request: AgentRuntimeRequestInput,
 ) {
-  return buildContextEnvelope(request);
+  return buildContextEnvelope(resolveAgentRuntimeRequest(request));
 }
 
 function signatureForContextEnvelope(envelope: ContextEnvelope): string {
@@ -1919,9 +1898,11 @@ function signatureForContextEnvelope(envelope: ContextEnvelope): string {
 }
 
 export function buildExternalBridgeContextSignatureForTests(
-  request: AgentRuntimeRequest,
+  request: AgentRuntimeRequestInput,
 ): string {
-  return signatureForContextEnvelope(buildContextEnvelope(request));
+  return signatureForContextEnvelope(
+    buildContextEnvelope(resolveAgentRuntimeRequest(request)),
+  );
 }
 
 async function fetchExternalTools(
@@ -2850,7 +2831,11 @@ export function createExternalBackendBridgeRuntime(options: {
       });
       return result;
     },
-    runTurn: async (params: RunTurnParams): Promise<AgentRuntimeOutcome> => {
+    runTurn: async (rawParams: RunTurnParams): Promise<AgentRuntimeOutcome> => {
+      const params: ResolvedRunTurnParams = {
+        ...rawParams,
+        request: resolveAgentRuntimeRequest(rawParams.request),
+      };
       const requestMetadata =
         params.request.metadata && typeof params.request.metadata === "object"
           ? params.request.metadata
@@ -2896,12 +2881,12 @@ export function createExternalBackendBridgeRuntime(options: {
         }
       }
       validateLocalPdfDocumentBatch({
-        pdfPaperContexts: params.request.pdfPaperContexts,
-        localDocuments: params.request.localDocuments,
+        pdfPaperContexts: requestPaperRefs(params.request, ["raw_pdf"]),
+        localDocuments: requestLocalDocuments(params.request),
       });
       const pathLease = acquireLocalDocumentPathLease(
         params.request.conversationKey,
-        params.request.localDocuments,
+        requestLocalDocuments(params.request),
       );
       try {
         const bridgeUrl = normalizeBaseUrl(getBridgeUrl());
@@ -2910,7 +2895,7 @@ export function createExternalBackendBridgeRuntime(options: {
             "Claude bridge URL is empty. Set Bridge URL to http://127.0.0.1:19787.",
           );
         }
-        if (params.request.localDocuments?.length) {
+        if (requestLocalDocuments(params.request).length) {
           await assertClaudeBridgeLocalPdfCapability(bridgeUrl);
         }
         const writeAllowed = () =>
@@ -3046,7 +3031,7 @@ export function createExternalBackendBridgeRuntime(options: {
         let unregisterMcpToolActivity: () => void = () => undefined;
         try {
           if (isNativeZoteroMcpToolsEnabled()) {
-            const rawPdfMode = Boolean(params.request.localDocuments?.length);
+            const rawPdfMode = requestLocalDocuments(params.request).length > 0;
             const profileSignature = getClaudeProfileSignature();
             const mcpScope = buildClaudeZoteroMcpScope(
               params.request,

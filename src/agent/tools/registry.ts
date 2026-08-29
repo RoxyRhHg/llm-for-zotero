@@ -1,5 +1,6 @@
 import type {
   AgentToolArtifact,
+  AgentActionEvidence,
   AgentToolExecutionOutput,
   PreparedToolExecutionOptions,
   AgentRuntimeRequest,
@@ -13,6 +14,14 @@ import type {
 import { isAgentChangeJournalAvailable } from "../store/changeJournal";
 import { isMalformedToolArgumentsDiagnostic } from "../toolArgumentDiagnostics";
 import { getAgentLibraryWriteMode } from "../libraryWriteMode";
+import {
+  ActionContractService,
+  type PreparedActionExecution,
+} from "../contracts/actionContract";
+import {
+  createFallbackToolReceipts,
+  createUnverifiedReceipt,
+} from "../contracts/actionEvaluation";
 
 function createSyntheticErrorResult(
   call: AgentToolCall,
@@ -38,6 +47,7 @@ function createSyntheticErrorResult(
         callId: call.id,
         name: call.name,
         ok: false,
+        actionReceipts: [createUnverifiedReceipt({ reason: message })],
         content: { error: message },
       },
     },
@@ -72,12 +82,14 @@ function normalizeExecutionOutput(value: AgentToolExecutionOutput<any>): {
   content: unknown;
   artifacts?: AgentToolArtifact[];
   effect?: AgentToolEffect;
+  actionEvidence?: AgentActionEvidence[];
 } {
   if (value && typeof value === "object" && !Array.isArray(value)) {
     const record = value as {
       content?: unknown;
       artifacts?: unknown;
       effect?: unknown;
+      actionEvidence?: unknown;
     };
     if (Object.prototype.hasOwnProperty.call(record, "content")) {
       return {
@@ -91,6 +103,9 @@ function normalizeExecutionOutput(value: AgentToolExecutionOutput<any>): {
           record.effect === "none"
             ? record.effect
             : undefined,
+        actionEvidence: Array.isArray(record.actionEvidence)
+          ? (record.actionEvidence as AgentActionEvidence[])
+          : undefined,
       };
     }
   }
@@ -124,6 +139,63 @@ function refuseForLibraryWriteMode(
 export class AgentToolRegistry {
   private readonly tools = new Map<string, AgentToolDefinition<any, any>>();
 
+  constructor(private readonly actionContracts?: ActionContractService) {}
+
+  async createActionContract(
+    request: AgentRuntimeRequest,
+  ): Promise<NonNullable<AgentRuntimeRequest["actionContract"]> | null> {
+    if (this.actionContracts) {
+      return this.actionContracts.createContract(request);
+    }
+    const intents = request.classifiedIntent?.actionIntents || [];
+    if (intents.some((intent) => intent.scope)) {
+      throw new Error(
+        "A collection-scoped action requires the Zotero scope resolver.",
+      );
+    }
+    const id = `action-contract:${request.conversationKey}:${Date.now()}`;
+    return {
+      version: 2,
+      id,
+      writeDisposition:
+        request.classifiedIntent?.writeDisposition ||
+        (intents.length ? "required" : "none"),
+      interpretationSource:
+        request.classifiedIntent?.actionInterpretationSource ||
+        "deterministic_fallback",
+      obligations: intents.map((intent, index) => {
+        const { scope: _scope, ...unscoped } = intent;
+        return {
+          ...unscoped,
+          id: `${id}:obligation:${index}`,
+        };
+      }),
+    };
+  }
+
+  createActionProgress(
+    contract: NonNullable<AgentRuntimeRequest["actionContract"]>,
+  ): NonNullable<AgentRuntimeRequest["actionProgress"]> {
+    if (this.actionContracts)
+      return this.actionContracts.createProgress(contract);
+    return {
+      version: 1,
+      contractId: contract.id,
+      state: "pending",
+      correctionCount: 0,
+      obligations: contract.obligations.map((obligation) => ({
+        obligationId: obligation.id,
+        status: "open",
+        verifiedTargetIds: [],
+        unresolvedTargetIds: [],
+        journalStepIds: [],
+        failureReasons: [],
+      })),
+      appliedReceiptKeys: [],
+      updatedAt: Date.now(),
+    };
+  }
+
   private isModelVisibleTool(tool: AgentToolDefinition<any, any>): boolean {
     return tool.spec.exposure !== "internal";
   }
@@ -147,7 +219,10 @@ export class AgentToolRegistry {
 
   listTools(): ToolSpec[] {
     return Array.from(this.tools.values())
-      .filter((tool) => this.isModelVisibleTool(tool))
+      .filter(
+        (tool) =>
+          this.isModelVisibleTool(tool) && tool.spec.localAgentOnly !== true,
+      )
       .map((tool) => tool.spec);
   }
 
@@ -206,8 +281,8 @@ export class AgentToolRegistry {
     if (!validation.ok) {
       const validationError =
         call.name === "library_search" &&
-        (context.request.selectedCollectionContexts?.length ||
-          context.request.selectedTagContexts?.length) &&
+        (context.request.turnPaperScope.collections.length ||
+          context.request.turnPaperScope.tags.length) &&
         validation.error.includes("entity and mode are required")
           ? `${validation.error} For selected collection/tag scopes, use ` +
             "{ entity:'items', mode:'list', filters:{ collectionId:<collectionId> } } or " +
@@ -218,6 +293,88 @@ export class AgentToolRegistry {
         `Invalid tool input for ${call.name}: ${validationError}`,
       );
     }
+
+    const callerKind = options.callerKind || "model";
+    const enforceActionContract =
+      callerKind === "model" || Boolean(context.journalActionScope);
+
+    const preparedAction =
+      enforceActionContract && this.actionContracts
+        ? await this.actionContracts.prepare(tool, validation.value, context)
+        : undefined;
+    if (preparedAction && context.request.actionContract) {
+      const scopeFailure = await this.actionContracts!.validateScope(
+        context.request.actionContract,
+        preparedAction,
+        {
+          allowPartialCoverage: Boolean(
+            options.callerKind === "action" && context.journalActionScope,
+          ),
+          progress: context.request.actionProgress,
+        },
+      );
+      if (scopeFailure) {
+        return {
+          kind: "result",
+          execution: {
+            tool,
+            input: validation.value,
+            result: {
+              callId: call.id,
+              name: call.name,
+              ok: false,
+              actionReceipts: this.actionContracts!.rejectionReceipts(
+                context.request.actionContract,
+                preparedAction,
+                scopeFailure,
+              ),
+              content: {
+                error: scopeFailure.message,
+                retryable: true,
+                expectedCount: scopeFailure.expectedCount,
+                proposedCount: scopeFailure.proposedCount,
+                rejectedTargets: scopeFailure.rejectedTargets,
+                missingTargets: scopeFailure.missingTargets,
+              },
+            },
+          },
+        };
+      }
+    }
+
+    const finalizeReceipts = (
+      params: {
+        ok: boolean;
+        effect?: AgentToolEffect;
+        cancelled?: boolean;
+        reason?: string;
+        content?: unknown;
+        actionEvidence?: AgentActionEvidence[];
+      },
+      prepared: PreparedActionExecution | undefined = preparedAction,
+    ) => {
+      const receipts =
+        prepared && this.actionContracts
+          ? this.actionContracts.finalize(
+              context.request.actionContract,
+              prepared,
+              params,
+              context.request.actionProgress,
+            )
+          : createFallbackToolReceipts({
+              toolName: call.name,
+              mutability: tool.spec.mutability,
+              input: validation.value,
+              ...params,
+            });
+      if (context.request.actionProgress && this.actionContracts) {
+        this.actionContracts.applyReceipts(
+          context.request.actionProgress,
+          receipts,
+        );
+      }
+      return receipts;
+    };
 
     const runWithInput = async (
       resolvedInput: typeof validation.value,
@@ -230,6 +387,10 @@ export class AgentToolRegistry {
           callId: call.id,
           name: call.name,
           ok: false,
+          actionReceipts: finalizeReceipts({
+            ok: false,
+            reason: "Conversation lifecycle changed before execution.",
+          }),
           content: {
             error:
               "Conversation lifecycle changed before this tool could execute.",
@@ -239,6 +400,51 @@ export class AgentToolRegistry {
       const execute = async () => {
         if (options.isExecutionAllowed && !options.isExecutionAllowed()) {
           return lifecycleError();
+        }
+        const executionPrepared = this.actionContracts
+          ? await this.actionContracts.prepare(
+              tool,
+              resolvedInput,
+              executionContext,
+            )
+          : preparedAction;
+        if (executionPrepared && context.request.actionContract) {
+          const scopeFailure = await this.actionContracts!.validateScope(
+            context.request.actionContract,
+            executionPrepared,
+            {
+              allowPartialCoverage: Boolean(
+                options.callerKind === "action" &&
+                executionContext.journalActionScope,
+              ),
+              concreteWrite: mutationPlan.effect === "write",
+              progress: context.request.actionProgress,
+            },
+          );
+          if (scopeFailure) {
+            return {
+              tool,
+              input: resolvedInput,
+              result: {
+                callId: call.id,
+                name: call.name,
+                ok: false,
+                actionReceipts: this.actionContracts!.rejectionReceipts(
+                  context.request.actionContract,
+                  executionPrepared,
+                  scopeFailure,
+                ),
+                content: {
+                  error: scopeFailure.message,
+                  retryable: true,
+                  expectedCount: scopeFailure.expectedCount,
+                  proposedCount: scopeFailure.proposedCount,
+                  rejectedTargets: scopeFailure.rejectedTargets,
+                  missingTargets: scopeFailure.missingTargets,
+                },
+              },
+            };
+          }
         }
         try {
           const executionOutput = normalizeExecutionOutput(
@@ -258,6 +464,13 @@ export class AgentToolRegistry {
                 callId: call.id,
                 name: call.name,
                 ok: false,
+                actionReceipts: finalizeReceipts(
+                  {
+                    ok: false,
+                    reason: "Tool completed without an explicit write effect.",
+                  },
+                  executionPrepared,
+                ),
                 content: {
                   error: `${call.name} completed without the required explicit write effect. Its outcome is unknown; inspect current state before retrying.`,
                 },
@@ -279,6 +492,18 @@ export class AgentToolRegistry {
                 tool.spec.mutability === "write"
                   ? executionOutput.effect
                   : undefined,
+              actionReceipts: finalizeReceipts(
+                {
+                  ok: true,
+                  effect:
+                    tool.spec.mutability === "write"
+                      ? executionOutput.effect
+                      : undefined,
+                  content: executionOutput.content,
+                  actionEvidence: executionOutput.actionEvidence,
+                },
+                executionPrepared,
+              ),
               content: executionOutput.content,
               artifacts: executionOutput.artifacts,
             },
@@ -294,6 +519,14 @@ export class AgentToolRegistry {
               callId: call.id,
               name: call.name,
               ok: false,
+              actionReceipts: finalizeReceipts(
+                {
+                  ok: false,
+                  reason:
+                    error instanceof Error ? error.message : String(error),
+                },
+                executionPrepared,
+              ),
               content: {
                 error: error instanceof Error ? error.message : String(error),
               },
@@ -321,6 +554,10 @@ export class AgentToolRegistry {
               callId: call.id,
               name: call.name,
               ok: false,
+              actionReceipts: finalizeReceipts({
+                ok: false,
+                reason: `Invalid confirmation input for ${call.name}: ${resolved.error}`,
+              }),
               content: {
                 error: `Invalid confirmation input for ${call.name}: ${resolved.error}`,
               },
@@ -357,6 +594,17 @@ export class AgentToolRegistry {
             effect: "none" as const,
             reversibility: "none" as const,
           };
+    if (
+      enforceActionContract &&
+      context.request.actionContract &&
+      mutationPlan.effect === "write" &&
+      !this.actionContracts
+    ) {
+      return createSyntheticErrorResult(
+        call,
+        `Write blocked: ${call.name} has no configured Action Contract verifier.`,
+      );
+    }
     const writeMode = getAgentLibraryWriteMode();
     const journalUnavailable =
       mutationPlan.effect === "write" && !isAgentChangeJournalAvailable();
@@ -423,6 +671,11 @@ export class AgentToolRegistry {
             callId: call.id,
             name: call.name,
             ok: false,
+            actionReceipts: finalizeReceipts({
+              ok: false,
+              cancelled: true,
+              reason: "User denied action",
+            }),
             content: { error: "User denied action" },
           },
         }),

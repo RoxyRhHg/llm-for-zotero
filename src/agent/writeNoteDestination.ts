@@ -1,6 +1,6 @@
 import { inferExplicitNoteIntent } from "./skills/noteIntent";
 
-export type WriteNoteDestination = "none" | "zotero" | "file";
+export type WriteNoteDestination = "none" | "zotero" | "file" | "both";
 
 function escapeRegex(value: string): string {
   return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
@@ -68,7 +68,7 @@ function hasFileDestinationSignal(
   ) {
     return true;
   }
-  return /\b(?:save|write|export|send|put|create|make)\b[\s\S]{0,120}\b(?:to|into|as|in|under)\b[\s\S]{0,120}\b(?:files?|directories|directory|disk|local)\b/i.test(
+  return /\b(?:save|write|export|send|put|create|make)\b[\s\S]{0,120}\b(?:to|into|as|in|under)\s+(?:(?:an?|the|my|your)\s+)?(?:(?:local|markdown)\s+)?(?:files?|directories|directory|disk)\b/i.test(
     text,
   );
 }
@@ -114,6 +114,17 @@ export function classifyWriteNoteDestination(
 ): WriteNoteDestination {
   const text = (userText || "").trim();
   if (!text) return "none";
+  const fileDestination = hasFileDestinationSignal(
+    text,
+    notesDirectoryNickname,
+  );
+  if (
+    fileDestination &&
+    hasZoteroDestinationSignal(text) &&
+    /\b(?:and|also|then|plus)\b/i.test(text)
+  ) {
+    return "both";
+  }
   // File first, deliberately.
   //
   // Reordering these looked attractive — "put this in Zotero, not Obsidian"
@@ -129,7 +140,7 @@ export function classifyWriteNoteDestination(
   // name appearing somewhere in the sentence. The narrow contrast case is
   // handled below instead.
   if (hasExplicitZoteroOverFileSignal(text)) return "zotero";
-  if (hasFileDestinationSignal(text, notesDirectoryNickname)) return "file";
+  if (fileDestination) return "file";
   if (hasZoteroDestinationSignal(text)) return "zotero";
   if (hasGenericNoteWriteSignal(text)) return "zotero";
   // `hasGenericNoteWriteSignal` is English-only. The multilingual note-intent

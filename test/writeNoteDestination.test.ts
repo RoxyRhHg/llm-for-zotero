@@ -14,6 +14,12 @@ describe("write note destination classifier", function () {
       classifyWriteNoteDestination("create a reading note for this paper"),
       "zotero",
     );
+    assert.equal(
+      classifyWriteNoteDestination(
+        'Create a collection called "Replay". Write a short standalone note into it. Then find papers in my library and file those into "Replay".',
+      ),
+      "zotero",
+    );
   });
 
   it("treats explicit external destinations as file note workflows", function () {
@@ -31,6 +37,15 @@ describe("write note destination classifier", function () {
         "Research Vault",
       ),
       "file",
+    );
+  });
+
+  it("preserves explicit mixed Zotero-note and file-export requests", function () {
+    assert.equal(
+      classifyWriteNoteDestination(
+        "create a Zotero note and also export it to my Obsidian vault",
+      ),
+      "both",
     );
   });
 

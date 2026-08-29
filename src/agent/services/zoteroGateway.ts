@@ -23,8 +23,12 @@ import {
 import { resolvePaperContextRefFromAttachment } from "../../modules/contextPanel/paperAttribution";
 import { invalidateCachedContextText } from "../../modules/contextPanel/pdfContext";
 import { ensureMineruCacheDirForAttachment } from "../../modules/contextPanel/mineruSync";
-import { persistVerifiedNoteHtml } from "../../modules/contextPanel/notePersistence";
+import {
+  persistVerifiedNoteHtml,
+  type CreatedZoteroNoteReceipt,
+} from "../../modules/contextPanel/notePersistence";
 import type { AgentRuntimeRequest } from "../types";
+import { getTurnPapers } from "../context/requestTurnPaperScope";
 import type {
   GeneratedChatImage,
   PaperContentSourceMode,
@@ -40,6 +44,20 @@ import {
   refusalFor,
   type LibraryOperation,
 } from "../capabilities/libraryObjects";
+import type {
+  BatchTagAssignment,
+  EditableArticleCreator,
+  EditableArticleMetadataField,
+  EditableArticleMetadataPatch,
+  EditableArticleMetadataSnapshot,
+} from "./libraryMutation/valueTypes";
+export type {
+  BatchTagAssignment,
+  EditableArticleCreator,
+  EditableArticleMetadataField,
+  EditableArticleMetadataPatch,
+  EditableArticleMetadataSnapshot,
+} from "./libraryMutation/valueTypes";
 
 export const EDITABLE_ARTICLE_METADATA_FIELDS = [
   "title",
@@ -61,31 +79,6 @@ export const EDITABLE_ARTICLE_METADATA_FIELDS = [
   "publisher",
   "place",
 ] as const;
-
-export type EditableArticleMetadataField =
-  (typeof EDITABLE_ARTICLE_METADATA_FIELDS)[number];
-
-export type EditableArticleCreator = {
-  creatorType: string;
-  firstName?: string;
-  lastName?: string;
-  name?: string;
-  fieldMode?: 0 | 1;
-};
-
-export type EditableArticleMetadataPatch = Partial<
-  Record<EditableArticleMetadataField, string>
-> & {
-  creators?: EditableArticleCreator[];
-};
-
-export type EditableArticleMetadataSnapshot = {
-  itemId: number;
-  itemType: string;
-  title: string;
-  fields: Record<EditableArticleMetadataField, string>;
-  creators: EditableArticleCreator[];
-};
 
 export type LibraryPaperTargetAttachment = {
   contextItemId: number;
@@ -152,6 +145,7 @@ export type SaveAnswerToNoteResult = {
   status: "created" | "appended" | "standalone_created";
   noteId?: number;
   collections?: number[];
+  createdNoteReceipt?: CreatedZoteroNoteReceipt;
 };
 
 export type CollectionSummary = {
@@ -168,11 +162,6 @@ export type BatchTagItemResult = {
   addedTags: string[];
   skippedTags: string[];
   reason?: string;
-};
-
-export type BatchTagAssignment = {
-  itemId: number;
-  tags: string[];
 };
 
 export type BatchMoveItemResult = {
@@ -569,10 +558,14 @@ function normalizePaperContexts(
   const seen = new Set<string>();
   for (const entry of entries) {
     if (!entry) continue;
+    const libraryID = Number(entry.libraryID);
     const itemId = Number(entry.itemId);
     const contextItemId = Number(entry.contextItemId);
     if (!Number.isFinite(itemId) || !Number.isFinite(contextItemId)) continue;
     const normalized: PaperContextRef = {
+      ...(Number.isFinite(libraryID) && libraryID > 0
+        ? { libraryID: Math.floor(libraryID) }
+        : {}),
       itemId: Math.floor(itemId),
       contextItemId: Math.floor(contextItemId),
       title: `${entry.title || `Paper ${Math.floor(itemId)}`}`.trim(),
@@ -587,7 +580,7 @@ function normalizePaperContexts(
     if (entry.mineruCacheDir?.trim()) {
       normalized.mineruCacheDir = entry.mineruCacheDir.trim();
     }
-    const key = `${normalized.itemId}:${normalized.contextItemId}`;
+    const key = `${normalized.libraryID || 0}:${normalized.itemId}:${normalized.contextItemId}`;
     if (seen.has(key)) continue;
     seen.add(key);
     out.push(normalized);
@@ -1309,6 +1302,34 @@ export class ZoteroGateway {
     };
   }
 
+  /** Uncached native state used to verify collection mutation receipts. */
+  getCollectionNativeState(collectionId: number): {
+    exists: boolean;
+    name: string;
+    parentCollectionId: number | null;
+    deleted: boolean;
+  } {
+    const collection = this.getCollection(collectionId);
+    return collection
+      ? {
+          exists: true,
+          name: normalizeText(collection.name),
+          parentCollectionId:
+            Number(collection.parentID) > 0
+              ? Number(collection.parentID)
+              : null,
+          deleted: Boolean(
+            (collection as Zotero.Collection & { deleted?: boolean }).deleted,
+          ),
+        }
+      : {
+          exists: false,
+          name: "",
+          parentCollectionId: null,
+          deleted: false,
+        };
+  }
+
   listCollectionSummaries(libraryID: number): CollectionSummary[] {
     const normalizedLibraryID = Number.isFinite(libraryID)
       ? Math.floor(libraryID)
@@ -1334,6 +1355,14 @@ export class ZoteroGateway {
           ),
         );
     }
+    return this.listCurrentCollectionSummaries(normalizedLibraryID);
+  }
+
+  listCurrentCollectionSummaries(libraryID: number): CollectionSummary[] {
+    const normalizedLibraryID = Number.isFinite(libraryID)
+      ? Math.floor(libraryID)
+      : 0;
+    if (!normalizedLibraryID) return [];
     const collections = listLibraryCollections(normalizedLibraryID);
     const pathMap = buildCollectionPathMap(collections);
     return collections
@@ -1355,6 +1384,55 @@ export class ZoteroGateway {
           },
         ),
       );
+  }
+
+  listCurrentCollectionTargetIds(params: {
+    libraryID: number;
+    collectionId: number;
+    targetKind: "papers" | "items";
+  }): number[] {
+    const collection = this.getCollection(params.collectionId);
+    if (!collection || Number(collection.libraryID) !== params.libraryID) {
+      return [];
+    }
+    let memberIds: number[];
+    try {
+      memberIds = collection.getChildItems?.(true, false) || [];
+    } catch (_error) {
+      return [];
+    }
+    const directIds = [
+      ...new Set(
+        memberIds
+          .map(Number)
+          .filter((itemId) => Number.isInteger(itemId) && itemId > 0),
+      ),
+    ];
+    if (params.targetKind === "items") return directIds;
+    return directIds.filter(
+      (itemId) => this.getItem(itemId)?.isRegularItem?.() === true,
+    );
+  }
+
+  async listCurrentLibraryTargetIds(params: {
+    libraryID: number;
+    targetKind: "papers" | "items";
+  }): Promise<number[]> {
+    const items: Zotero.Item[] = await Zotero.Items.getAll(
+      params.libraryID,
+      true,
+      false,
+      false,
+    );
+    return items
+      .filter((item) => {
+        if (params.targetKind === "papers") return item.isRegularItem?.();
+        return Boolean(
+          item.isRegularItem?.() || item.isNote?.() || item.isAttachment?.(),
+        );
+      })
+      .map((item) => item.id)
+      .filter((itemId) => Number.isInteger(itemId) && itemId > 0);
   }
 
   async getAllChildAttachmentInfos(
@@ -1774,31 +1852,7 @@ export class ZoteroGateway {
   }
 
   listPaperContexts(request: AgentRuntimeRequest): PaperContextRef[] {
-    const out = [
-      ...normalizePaperContexts(request.selectedPaperContexts),
-      ...normalizePaperContexts(request.fullTextPaperContexts),
-      ...normalizePaperContexts(request.pinnedPaperContexts),
-    ];
-    const allowAmbientActivePaper =
-      request.conversationKind !== "global" &&
-      !request.selectedCollectionContexts?.length &&
-      !request.selectedTagContexts?.length;
-    if (!allowAmbientActivePaper) {
-      return out;
-    }
-    const activeItem = this.getItem(request.activeItemId);
-    const activeContext = this.getActivePaperContext(activeItem);
-    if (activeContext) {
-      const key = `${activeContext.itemId}:${activeContext.contextItemId}`;
-      if (
-        !out.some(
-          (entry) => entry && `${entry.itemId}:${entry.contextItemId}` === key,
-        )
-      ) {
-        out.unshift(activeContext);
-      }
-    }
-    return out;
+    return normalizePaperContexts([...getTurnPapers(request)]);
   }
 
   async browseCollections(params: { libraryID: number }): Promise<{
@@ -3811,6 +3865,9 @@ export class ZoteroGateway {
         status: "standalone_created",
         noteId: created.noteId,
         collections: created.collections,
+        ...(created.createdNoteReceipt
+          ? { createdNoteReceipt: created.createdNoteReceipt }
+          : {}),
       };
     }
     if (!params.item) {
@@ -4596,6 +4653,13 @@ export class ZoteroGateway {
       }
       return { key, value, type: spec.type, description: spec.description };
     });
+  }
+
+  getSettingNativeState(key: string): { exists: boolean; value: unknown } {
+    const setting = this.listSettings().find((entry) => entry.key === key);
+    return setting
+      ? { exists: true, value: setting.value }
+      : { exists: false, value: undefined };
   }
 
   /** Restore an allowlisted preference without applying user-input coercion. */

@@ -44,6 +44,21 @@ export function createAnnotatePdfTool(
 ): AgentWriteToolDefinition<AnnotateInput, unknown> {
   const mutationService = new LibraryMutationService(zoteroGateway);
   return {
+    describeAction: (input) => [
+      {
+        id: `annotation_write:${input.attachmentId}:${input.pageIndex}`,
+        proofDomain: "zotero_state",
+        capability: "zotero.annotations",
+        operation: "annotation_write",
+        source: "zotero_native",
+        parameters: {
+          targetItemId: input.attachmentId,
+          pageIndex: input.pageIndex,
+        },
+        requestedTargets: [`item:${input.attachmentId}`],
+        destinationCollectionIds: [],
+      },
+    ],
     spec: {
       name: "annotate_pdf",
       description:

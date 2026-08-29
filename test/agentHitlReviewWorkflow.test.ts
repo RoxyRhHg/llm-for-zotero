@@ -131,6 +131,7 @@ function makeRequest(
     conversationKey: 51,
     mode: "agent",
     userText: "Find related papers from the internet",
+    libraryID: 1,
     model: "gpt-5.4",
     apiBase: "https://api.openai.com/v1/responses",
     apiKey: "test",

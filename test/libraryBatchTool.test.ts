@@ -12,6 +12,7 @@ import {
 import type { AgentToolContext } from "../src/agent/types";
 import type { BatchJobRecord } from "../src/agent/store/batchJobStore";
 import { ChangeJournalTestDb } from "./helpers/changeJournalTestDb";
+import { resolvedAgentRequest } from "./helpers/resolvedAgentRequest";
 
 /**
  * The batch engine was a complete propose/paginate/apply system that the
@@ -35,7 +36,7 @@ describe("library_batch", function () {
   });
 
   const context: AgentToolContext = {
-    request: {
+    request: resolvedAgentRequest({
       conversationKey: 9,
       mode: "agent",
       userText: "tag my whole library",
@@ -43,7 +44,7 @@ describe("library_batch", function () {
       model: "gpt-4o-mini",
       apiBase: "https://api.openai.com/v1/chat/completions",
       apiKey: "test",
-    },
+    }),
     item: null,
     currentAnswerText: "",
     modelName: "test-model",
@@ -85,10 +86,15 @@ describe("library_batch", function () {
       value: Parameters<LibraryBatchJobStore["advanceBatchJob"]>[0],
     ) => void;
     onMarkRunning?: (jobId: string) => void;
+    onCreate?: (
+      value: Parameters<LibraryBatchJobStore["createBatchJob"]>[0],
+    ) => void;
     claim?: boolean;
   }): LibraryBatchJobStore {
     return {
-      createBatchJob: async () => undefined,
+      createBatchJob: async (value) => {
+        params?.onCreate?.(value);
+      },
       advanceBatchJob: async (value) => {
         params?.onAdvance?.(value);
       },
@@ -472,6 +478,359 @@ describe("library_batch", function () {
       totalCount: 42,
     });
     assert.deepEqual(advances[0].plan, { remainingItemIds: [101, 102] });
+  });
+
+  it("executes a scoped batch from the contract's frozen targets without duplicating them in the initial job input", async function () {
+    installMode("yolo");
+    let executedInput: Record<string, unknown> = {};
+    let persistedInput: Record<string, unknown> = {};
+    const actionRegistry = new ActionRegistry();
+    actionRegistry.register({
+      name: "auto_tag",
+      description: "Tag papers",
+      inputSchema: { type: "object" },
+      execute: async (input: unknown) => {
+        executedInput = input as Record<string, unknown>;
+        return { ok: true, output: { tagged: 0, processed: 0 } };
+      },
+    } as never);
+    const tool = createLibraryBatchTool({
+      actionRegistry,
+      toolRegistry: {} as never,
+      zoteroGateway: {} as never,
+      now: () => 1000,
+      batchJobStore: makeJobStore({
+        onCreate: (value) => {
+          persistedInput = value.input;
+        },
+      }),
+    });
+    const validated = tool.validate({
+      job: "auto_tag",
+      jobArgs: { scope: "collection", collectionIds: [3], pageSize: 20 },
+    });
+    assert.isTrue(validated.ok);
+    if (!validated.ok) return;
+
+    await tool.execute(validated.value, {
+      ...context,
+      request: {
+        ...context.request,
+        actionContract: {
+          version: 2,
+          id: "contract-frozen",
+          writeDisposition: "required",
+          interpretationSource: "classifier",
+          obligations: [
+            {
+              id: "obligation-frozen",
+              capability: "zotero.tags",
+              operation: "apply_tags",
+              proofDomain: "zotero_state",
+              coverage: "all",
+              targetKind: "papers",
+              scopeRole: "source",
+              scope: {
+                kind: "collection",
+                includeDescendants: false,
+                libraryID: 1,
+                collectionId: 3,
+                collectionPath: "Representation_Drift",
+              },
+              targetBoundary: {
+                kind: "collection",
+                libraryID: 1,
+                frozenTargetIds: [41, 42, 43],
+                scopeDigest: "v1:1:3:direct:41:42:43",
+              },
+            },
+          ],
+        },
+      },
+    });
+
+    assert.deepEqual(executedInput._batchItemIds, [41, 42, 43]);
+    assert.notProperty(executedInput, "scope");
+    assert.notProperty(executedInput, "collectionIds");
+    assert.deepEqual(persistedInput, {
+      scope: "collection",
+      collectionIds: [3],
+      pageSize: 20,
+      startOffset: 0,
+    });
+  });
+
+  it("binds the sorted unresolved union across compatible source-collection obligations", async function () {
+    installMode("yolo");
+    let executedInput: Record<string, unknown> = {};
+    const actionRegistry = new ActionRegistry();
+    actionRegistry.register({
+      name: "auto_tag",
+      description: "Tag papers",
+      inputSchema: { type: "object" },
+      execute: async (input: unknown) => {
+        executedInput = input as Record<string, unknown>;
+        return { ok: true, output: { tagged: 0, processed: 0 } };
+      },
+    } as never);
+    const tool = createLibraryBatchTool({
+      actionRegistry,
+      toolRegistry: {} as never,
+      zoteroGateway: {} as never,
+      now: () => 1000,
+      batchJobStore: makeJobStore(),
+    });
+    const validated = tool.validate({
+      job: "auto_tag",
+      jobArgs: { itemIds: [999], pageSize: 20 },
+    });
+    assert.isTrue(validated.ok);
+    if (!validated.ok) return;
+    const obligations = [
+      { id: "source-2", collectionId: 12, frozenTargetIds: [52, 51] },
+      { id: "source-1", collectionId: 11, frozenTargetIds: [42, 41] },
+    ];
+    await tool.execute(validated.value, {
+      ...context,
+      request: {
+        ...context.request,
+        actionContract: {
+          version: 2,
+          id: "contract-union",
+          writeDisposition: "required",
+          interpretationSource: "classifier",
+          obligations: obligations.map((entry) => ({
+            id: entry.id,
+            capability: "zotero.tags" as const,
+            operation: "apply_tags" as const,
+            proofDomain: "zotero_state" as const,
+            coverage: "all" as const,
+            targetKind: "papers" as const,
+            scopeRole: "source" as const,
+            scope: {
+              kind: "collection" as const,
+              includeDescendants: false,
+              libraryID: 1,
+              collectionId: entry.collectionId,
+              collectionPath: `Collection ${entry.collectionId}`,
+            },
+            targetBoundary: {
+              kind: "collection" as const,
+              libraryID: 1,
+              frozenTargetIds: entry.frozenTargetIds,
+              scopeDigest: `scope:${entry.collectionId}`,
+            },
+          })),
+        },
+        actionProgress: {
+          version: 1,
+          contractId: "contract-union",
+          state: "partial",
+          correctionCount: 0,
+          obligations: [
+            {
+              obligationId: "source-2",
+              status: "open",
+              verifiedTargetIds: [],
+              unresolvedTargetIds: ["item:52", "item:51"],
+              journalStepIds: [],
+              failureReasons: [],
+            },
+            {
+              obligationId: "source-1",
+              status: "fulfilled",
+              verifiedTargetIds: ["item:41", "item:42"],
+              unresolvedTargetIds: [],
+              journalStepIds: ["done"],
+              failureReasons: [],
+            },
+          ],
+          appliedReceiptKeys: [],
+          updatedAt: 1,
+        },
+      },
+    });
+
+    assert.deepEqual(executedInput._batchItemIds, [51, 52]);
+    assert.notProperty(executedInput, "itemIds");
+  });
+
+  it("intersects a resumed durable plan with the current unresolved collection union", async function () {
+    installMode("yolo");
+    const record: BatchJobRecord = {
+      jobId: "batch-auto_tag-intersection",
+      conversationKey: 9,
+      action: "auto_tag",
+      inputJson: JSON.stringify({ itemIds: [31, 32, 33, 34] }),
+      planJson: JSON.stringify({ remainingItemIds: [31, 32, 33] }),
+      cursor: 1,
+      appliedCount: 1,
+      totalCount: 4,
+      status: "failed",
+      createdAt: 10,
+      updatedAt: 20,
+    };
+    let executedInput: Record<string, unknown> = {};
+    const actionRegistry = new ActionRegistry();
+    actionRegistry.register({
+      name: "auto_tag",
+      description: "Tag papers",
+      inputSchema: { type: "object" },
+      execute: async (input: unknown) => {
+        executedInput = input as Record<string, unknown>;
+        return { ok: true, output: { tagged: 0, processed: 0 } };
+      },
+    } as never);
+    const tool = createLibraryBatchTool({
+      actionRegistry,
+      toolRegistry: {} as never,
+      zoteroGateway: {} as never,
+      batchJobStore: makeJobStore({ record }),
+    });
+    const validated = tool.validate({ resumeJobId: record.jobId });
+    assert.isTrue(validated.ok);
+    if (!validated.ok) return;
+    await tool.execute(validated.value, {
+      ...context,
+      request: {
+        ...context.request,
+        actionContract: {
+          version: 2,
+          id: "contract-resume",
+          writeDisposition: "required",
+          interpretationSource: "classifier",
+          obligations: [
+            {
+              id: "source-resume",
+              capability: "zotero.tags",
+              operation: "apply_tags",
+              proofDomain: "zotero_state",
+              coverage: "all",
+              targetKind: "papers",
+              scopeRole: "source",
+              scope: {
+                kind: "collection",
+                includeDescendants: false,
+                libraryID: 1,
+                collectionId: 11,
+                collectionPath: "Collection 11",
+              },
+              targetBoundary: {
+                kind: "collection",
+                libraryID: 1,
+                frozenTargetIds: [32, 34],
+                scopeDigest: "scope:11",
+              },
+            },
+          ],
+        },
+        actionProgress: {
+          version: 1,
+          contractId: "contract-resume",
+          state: "partial",
+          correctionCount: 0,
+          obligations: [
+            {
+              obligationId: "source-resume",
+              status: "open",
+              verifiedTargetIds: [],
+              unresolvedTargetIds: ["item:32", "item:34"],
+              journalStepIds: [],
+              failureReasons: [],
+            },
+          ],
+          appliedReceiptKeys: [],
+          updatedAt: 1,
+        },
+      },
+    });
+
+    assert.deepEqual(executedInput._batchItemIds, [32]);
+  });
+
+  it("binds an empty target set when every applicable collection obligation is already closed", async function () {
+    installMode("yolo");
+    let executedInput: Record<string, unknown> = {};
+    const actionRegistry = new ActionRegistry();
+    actionRegistry.register({
+      name: "auto_tag",
+      description: "Tag papers",
+      inputSchema: { type: "object" },
+      execute: async (input: unknown) => {
+        executedInput = input as Record<string, unknown>;
+        return { ok: true, output: { tagged: 0, processed: 0 } };
+      },
+    } as never);
+    const tool = createLibraryBatchTool({
+      actionRegistry,
+      toolRegistry: {} as never,
+      zoteroGateway: {} as never,
+      now: () => 1000,
+      batchJobStore: makeJobStore(),
+    });
+    const validated = tool.validate({
+      job: "auto_tag",
+      jobArgs: { itemIds: [999] },
+    });
+    assert.isTrue(validated.ok);
+    if (!validated.ok) return;
+    await tool.execute(validated.value, {
+      ...context,
+      request: {
+        ...context.request,
+        actionContract: {
+          version: 2,
+          id: "contract-complete",
+          writeDisposition: "required",
+          interpretationSource: "classifier",
+          obligations: [
+            {
+              id: "source-complete",
+              capability: "zotero.tags",
+              operation: "apply_tags",
+              proofDomain: "zotero_state",
+              coverage: "all",
+              targetKind: "papers",
+              scopeRole: "source",
+              scope: {
+                kind: "collection",
+                includeDescendants: false,
+                libraryID: 1,
+                collectionId: 11,
+                collectionPath: "Collection 11",
+              },
+              targetBoundary: {
+                kind: "collection",
+                libraryID: 1,
+                frozenTargetIds: [41, 42],
+                scopeDigest: "scope:11",
+              },
+            },
+          ],
+        },
+        actionProgress: {
+          version: 1,
+          contractId: "contract-complete",
+          state: "satisfied",
+          correctionCount: 0,
+          obligations: [
+            {
+              obligationId: "source-complete",
+              status: "fulfilled",
+              verifiedTargetIds: ["item:41", "item:42"],
+              unresolvedTargetIds: [],
+              journalStepIds: ["done"],
+              failureReasons: [],
+            },
+          ],
+          appliedReceiptKeys: [],
+          updatedAt: 1,
+        },
+      },
+    });
+
+    assert.deepEqual(executedInput._batchItemIds, []);
+    assert.notProperty(executedInput, "itemIds");
   });
 
   it("lists interrupted jobs without requiring yolo or confirmation", async function () {

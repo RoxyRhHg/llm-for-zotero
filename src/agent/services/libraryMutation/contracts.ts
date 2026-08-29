@@ -2,12 +2,13 @@ import type {
   GeneratedChatImage,
   PaperContextRef,
 } from "../../../shared/types";
-import type { AgentToolEffect } from "../../types";
 import type {
   BatchTagAssignment,
   EditableArticleMetadataPatch,
   EditableArticleMetadataSnapshot,
-} from "../zoteroGateway";
+} from "./valueTypes";
+
+type LibraryMutationEffect = "applied" | "partial" | "none";
 
 export type NoteSaveTarget = "item" | "standalone";
 
@@ -339,7 +340,7 @@ export type LibraryMutationExecutionResult = {
 export type LibraryMutationExecution = {
   result: LibraryMutationExecutionResult;
   inverse?: LibraryMutationInverse | null;
-  effect: AgentToolEffect;
+  effect: LibraryMutationEffect;
   affectedCount: number;
 };
 
@@ -371,6 +372,7 @@ export type MutationItemState = {
   attachmentTitle?: string;
   childAttachmentIds?: number[];
   childNoteIds?: number[];
+  noteHtml?: string;
   noteHtmlChecksum?: string;
   annotation?: {
     type: string;

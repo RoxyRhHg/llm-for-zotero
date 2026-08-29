@@ -316,9 +316,7 @@ function buildAppendedNoteText(
 
 function getUniqueInScopePaperItemIds(context: AgentToolContext): number[] {
   const ids = [
-    ...(context.request.selectedPaperContexts || []),
-    ...(context.request.fullTextPaperContexts || []),
-    ...(context.request.pinnedPaperContexts || []),
+    ...context.request.turnPaperScope.papers.map((entry) => entry.paper),
   ]
     .map((entry) => normalizePositiveInt(entry?.itemId))
     .filter((entry): entry is number => Boolean(entry));
@@ -419,6 +417,36 @@ export function createEditCurrentNoteTool(
 ): AgentWriteToolDefinition<EditCurrentNoteInput, unknown> {
   const mutationService = new LibraryMutationService(zoteroGateway);
   return {
+    describeAction: (input) => [
+      {
+        id: `note_${input.mode}:${input.targetNoteId || input.noteId || input.targetItemId || "new"}`,
+        proofDomain: "zotero_state",
+        capability: "zotero.notes",
+        operation:
+          input.mode === "edit"
+            ? "note_edit"
+            : input.mode === "append"
+              ? "note_append"
+              : "note_create",
+        source: "zotero_native",
+        parameters: {
+          noteMode: input.mode,
+          targetItemId: input.targetItemId,
+          targetNoteId: input.targetNoteId || input.noteId,
+          expectedText: input.content
+            ? stripNoteHtml(renderRawNoteHtml(input.content))
+            : undefined,
+        },
+        requestedTargets: [
+          input.targetNoteId ||
+            input.noteId ||
+            (input.mode === "create" ? input.targetItemId : undefined),
+        ]
+          .filter((id): id is number => Boolean(id))
+          .map((id) => `item:${id}`),
+        destinationCollectionIds: input.collections || [],
+      },
+    ],
     spec: {
       name: "edit_current_note",
       description:
@@ -1019,6 +1047,9 @@ export function createEditCurrentNoteTool(
                 : undefined,
               noteId,
               title: String(note.getField?.("title") || ""),
+              ...(persisted.createdNoteReceipt
+                ? { createdNoteReceipt: persisted.createdNoteReceipt }
+                : {}),
               ...(persisted.warnings.length
                 ? { warnings: persisted.warnings }
                 : {}),

@@ -17,15 +17,11 @@ import { resolveRequestContentInputs } from "./messageBuilder";
 import {
   buildResponsesContinuationInput,
   buildResponsesInitialInput,
-  limitNormalizedResponsesStep,
   type ResponsesPayload,
   normalizeResponsesStepFromPayload,
   parseResponsesStepStream,
 } from "./responsesShared";
-import {
-  buildResponsesFunctionTools,
-  getToolContinuationMessages,
-} from "./shared";
+import { buildResponsesFunctionTools } from "./shared";
 import { CODEX_DIRECT_RESPONSES_URL } from "../../codexAuth/auth";
 import {
   assertCodexDirectModelAvailable,
@@ -42,7 +38,6 @@ function isCodexAuthRequest(request: AgentRuntimeRequest): boolean {
 }
 
 export {
-  limitNormalizedResponsesStep,
   normalizeResponsesStepFromPayload as normalizeStepFromPayload,
   parseResponsesStepStream,
 } from "./responsesShared";
@@ -89,7 +84,7 @@ export class CodexResponsesAgentAdapter implements AgentModelAdapter {
       "You are the agent runtime inside a Zotero plugin.";
     const followupInput = this.conversationItems
       ? await buildResponsesContinuationInput(
-          getToolContinuationMessages(params.messages),
+          params.continuationMessages || [],
           {
             resolveFilePart: async (part) => [
               {
@@ -163,18 +158,16 @@ export class CodexResponsesAgentAdapter implements AgentModelAdapter {
       },
       signal: params.signal,
     });
-    const normalized = limitNormalizedResponsesStep(
-      response.body
-        ? await parseResponsesStepStream(
-            response.body,
-            params.onTextDelta,
-            params.onReasoning,
-            params.onUsage,
-          )
-        : normalizeResponsesStepFromPayload(
-            (await response.json()) as ResponsesPayload,
-          ),
-    );
+    const normalized = response.body
+      ? await parseResponsesStepStream(
+          response.body,
+          params.onTextDelta,
+          params.onReasoning,
+          params.onUsage,
+        )
+      : normalizeResponsesStepFromPayload(
+          (await response.json()) as ResponsesPayload,
+        );
 
     this.conversationItems = [...inputItems, ...normalized.outputItems];
 

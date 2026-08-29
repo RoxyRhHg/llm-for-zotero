@@ -4,6 +4,7 @@ import {
   buildRetrievalQueryPlan,
   callLLMWithTimeout,
   generateRetrievalProbeReformulation,
+  classifyPaperReadIntent,
   detectExplicitFullReadIntent,
   RETRIEVAL_QUERY_PLAN_TIMEOUT_MS,
   RETRIEVAL_QUERY_VARIANT_DEFAULT_LIMIT,
@@ -86,7 +87,7 @@ describe("retrievalQueryPlan", function () {
   });
 
   it("recognizes explicit full-reading intent without treating ordinary summaries as full reads", function () {
-    assert.isTrue(
+    assert.isFalse(
       detectExplicitFullReadIntent("Read the full text before answering."),
     );
     assert.isTrue(
@@ -149,6 +150,11 @@ describe("retrievalQueryPlan", function () {
       assert.isTrue(detectExplicitFullReadIntent(query), query);
     }
     assert.isFalse(detectExplicitFullReadIntent("Summarize this paper."));
+    assert.isFalse(
+      detectExplicitFullReadIntent(
+        "Use the actual PDF/full text to explain the method.",
+      ),
+    );
     assert.isFalse(
       detectExplicitFullReadIntent(
         "Provide a complete explanation of Figure 2.",
@@ -287,6 +293,27 @@ describe("retrievalQueryPlan", function () {
       buildRetrievalQueryPlan({ query: "请阅读完整全文" }).readIntent,
       "full-once",
     );
+  });
+
+  it("classifies paper evidence source independently from read coverage", function () {
+    assert.deepEqual(
+      classifyPaperReadIntent(
+        "Use the actual PDF/full text to explain the method.",
+      ),
+      { source: "document_text", coverage: "targeted" },
+    );
+    assert.deepEqual(classifyPaperReadIntent("Summarize the actual PDF."), {
+      source: "document_text",
+      coverage: "overview",
+    });
+    assert.deepEqual(classifyPaperReadIntent("Read the entire actual PDF."), {
+      source: "document_text",
+      coverage: "exhaustive",
+    });
+    assert.deepEqual(classifyPaperReadIntent("Inspect the layout of page 5."), {
+      source: "rendered_pages",
+      coverage: "targeted",
+    });
   });
 
   it("does not let model planning promote a non-explicit request to a full read", function () {

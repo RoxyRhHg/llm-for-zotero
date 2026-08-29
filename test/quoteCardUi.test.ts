@@ -383,17 +383,48 @@ describe("quote card UI contract", function () {
     assert.isTrue(body.classList.contains("llm-rendered-markdown"));
   });
 
-  it("renders collapsed quote-card previews as lightweight plain text", function () {
+  it("renders collapsed quote-card previews through the math-only renderer", function () {
     const renderSource = source(
       "src/modules/contextPanel/assistantCitationLinks.ts",
+    );
+    const markdownSource = source(
+      "src/modules/contextPanel/renderedMarkdown.ts",
     );
 
     assert.include(renderSource, "buildQuoteCardPreviewText");
     assert.include(
       renderSource,
-      "preview.textContent =\n    buildQuoteCardPreviewText(params.quoteText)",
+      "renderRenderedMathPreviewInto(\n    preview,\n    buildQuoteCardPreviewText(params.quoteText)",
     );
-    assert.notInclude(renderSource, "renderQuoteCardPreviewMarkdown");
+    assert.notInclude(renderSource, "preview.textContent =");
+    assert.include(
+      markdownSource,
+      "export function renderRenderedMathPreviewInto",
+    );
+    const previewRendererStart = markdownSource.indexOf(
+      "export function renderRenderedMathPreviewInto",
+    );
+    const fullRendererStart = markdownSource.indexOf(
+      "export function renderRenderedMarkdownInto",
+      previewRendererStart,
+    );
+    const previewRenderer = markdownSource.slice(
+      previewRendererStart,
+      fullRendererStart,
+    );
+    assert.include(previewRenderer, "setRenderedMarkdownHtml");
+    assert.notInclude(previewRenderer, "attachRenderedCodeBlockControls");
+    assert.notInclude(previewRenderer, "attachRenderedCopyButtons");
+    assert.notInclude(previewRenderer, "renderMermaidBlocks");
+  });
+
+  it("keeps rendered preview math compact inside the two-line clamp", function () {
+    const css = source("addon/content/zoteroPane.css");
+
+    assert.include(css, ".llm-quote-card-preview .math-display-inline");
+    assert.include(css, ".llm-quote-card-preview .katex-display");
+    assert.include(css, "font-size: 1em");
+    assert.include(css, "margin: 0");
   });
 
   it("does not construct a hidden preview for rejected quote cards", function () {

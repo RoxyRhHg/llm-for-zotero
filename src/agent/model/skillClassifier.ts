@@ -23,6 +23,11 @@ import { resolveSkillRequestContext } from "../skills/contextEligibility";
 import { matchesSkill } from "../skills/skillLoader";
 import type { AgentSkill } from "../skills/skillLoader";
 import type { AgentRuntimeRequest, ClassifiedTurnIntent } from "../types";
+import {
+  inferActionIntentsFromRequest,
+  parseActionIntents,
+} from "./actionIntent";
+export { inferActionIntentsFromRequest } from "./actionIntent";
 
 /**
  * Pseudo-skill ID the classifier can return when none of the real skills
@@ -114,7 +119,31 @@ export async function detectTurnIntent(
   }
   const raw = result.text;
 
-  const classifiedIntent = parseClassifiedTurnIntent(raw);
+  const parsedIntent = parseClassifiedTurnIntent(raw);
+  const deterministicActions = inferActionIntentsFromRequest(request);
+  const classifierContradictsExplicitAction = Boolean(
+    parsedIntent &&
+    deterministicActions.length &&
+    JSON.stringify(
+      deterministicActions
+        .map((intent) => intent.operation)
+        .sort((left, right) => left.localeCompare(right)),
+    ) !==
+      JSON.stringify(
+        parsedIntent.actionIntents
+          .map((intent) => intent.operation)
+          .sort((left, right) => left.localeCompare(right)),
+      ),
+  );
+  const validParsedIntent = classifierContradictsExplicitAction
+    ? null
+    : parsedIntent;
+  const classifiedIntent = validParsedIntent
+    ? {
+        ...validParsedIntent,
+        actionInterpretationSource: "classifier" as const,
+      }
+    : null;
   const parsed = parseClassifierResponse(raw, skills);
   if (parsed === null) {
     (
@@ -127,6 +156,21 @@ export async function detectTurnIntent(
     return {
       skillIds: regexFallback(skills, request),
       classifiedIntent,
+      degraded: true,
+      failureReason: "unparseable",
+    };
+  }
+  if (!validParsedIntent) {
+    (
+      globalThis as typeof globalThis & {
+        Zotero?: { debug?: (message: string) => void };
+      }
+    ).Zotero?.debug?.(
+      `[llm-for-zotero] Skill classifier returned an invalid or contradictory action intent, falling back to deterministic action parsing. Raw: ${raw.slice(0, 200)}`,
+    );
+    return {
+      skillIds: parsed,
+      classifiedIntent: null,
       degraded: true,
       failureReason: "unparseable",
     };
@@ -191,18 +235,19 @@ function buildClassifierPrompt(
     context.push(`- Selected text snippets: ${request.selectedTexts.length}`);
   if (request.screenshots?.length)
     context.push(`- Screenshots attached: ${request.screenshots.length}`);
-  if (request.fullTextPaperContexts?.length)
+  const fullTextPaperCount = request.turnPaperScope.papers.filter((entry) =>
+    entry.roles.includes("full_text"),
+  ).length;
+  if (fullTextPaperCount)
+    context.push(`- Full-text papers marked: ${fullTextPaperCount}`);
+  if (request.turnPaperScope.collections.length) {
     context.push(
-      `- Full-text papers marked: ${request.fullTextPaperContexts.length}`,
-    );
-  if (request.selectedCollectionContexts?.length) {
-    context.push(
-      `- Selected collection scopes: ${request.selectedCollectionContexts.length}`,
+      `- Selected collection scopes: ${request.turnPaperScope.collections.length}`,
     );
   }
-  if (request.selectedTagContexts?.length) {
+  if (request.turnPaperScope.tags.length) {
     context.push(
-      `- Selected tag scopes: ${request.selectedTagContexts.length}`,
+      `- Selected tag scopes: ${request.turnPaperScope.tags.length}`,
     );
   }
 
@@ -214,8 +259,16 @@ function buildClassifierPrompt(
     '• When the user\'s message genuinely combines multiple distinct subtasks (e.g. "read this paper, analyze figure 1, and write a note"), return every skill ID that maps to a distinct subtask. Do NOT pad the list with tangentially related skills.',
     '• The user\'s message may be in any language (Chinese, Japanese, Korean, Spanish, French, German, Russian, Arabic, …). Match intent language-independently: a note request like "为这篇论文写阅读笔记" maps to the note-writing skill exactly as its English equivalent would.',
     '• retrievalIntent: how the question should read the library, in any language — "enumerate" for which/all/list/find-evidence questions, "verify" for exact presence/absence checks, "summarize" for themes/commonalities/comparisons/overviews across papers, "none" for pure operations (tagging, moving, editing) or single-paper reads.',
+    '• paperTargetIntent: which visible paper set the user references, in any language — "active" for this/current paper, "added" for selected/attached/added papers other than the active paper, "all_visible" for both/these/all papers visible in the turn, and "unspecified" only when no paper-set reference was found.',
+    '• externalSearchIntent: whether the answer needs live external evidence, in any language — "web" for general public web information, "literature" for scholarly discovery or external scholarly metadata, "both" when distinct parts need each source, and "none" when the available context or stable knowledge is sufficient. The tools are complementary, not mutually exclusive.',
     "• wantedSections: only the sections the user explicitly asks about (methods, results, limitations); otherwise an empty array.",
     '• queryLanguage: short language code of the user message, e.g. "en", "zh", "ja".',
+    '• writeDisposition: "required" only for a concrete requested mutation, "none" for questions, advice, negation, hypotheticals, or pure reads, and "uncertain" only when whether to write cannot be resolved.',
+    "• actionIntents: exact semantic obligations. Each entry must include operation, coverage, targetKind, optional parameters, exact collection scope, scopeRole, and constraints. Use the LibraryMutationOperationType verb whenever one exists: apply_tags and remove_tags are different; create_collection, update_collection, and delete_collection are different. External verbs are note_create, note_edit, note_append, annotation_write, settings_update, undo, revert, file_write, command_execute, zotero_script_execute, and read_full.",
+    '• Tag verbs are literal: "add/apply/assign" means apply_tags, "remove/delete the tag" means remove_tags, and only "replace/set the tags" means set_item_tags. The word "exactly" describes precision and never changes remove_tags into set_item_tags.',
+    '• Tool or workflow names never replace the requested semantic operation. For example, "use library_batch auto_tag" is apply_tags, not command_execute. Use command_execute only when the user requests an actual operating-system or shell command, and use zotero_script_execute only for an actual Zotero script invocation.',
+    "• Do not create a mutation action for questions, advice, hypothetical wording, negation, or ordinary reads. A successful command or script is execution only and never substitutes for a Zotero or file operation.",
+    "• Exact collection scope means direct members only. Set includeDescendants:true only when the user explicitly asks for subcollections or descendants.",
     "",
     "Available skills:",
     skillList,
@@ -228,7 +281,7 @@ function buildClassifierPrompt(
     request.userText,
     `"""`,
     "",
-    'Reply with ONLY a JSON object in this exact shape, no prose, no code fences: {"skillIds": ["id1", "id2"], "retrievalIntent": "enumerate|verify|summarize|none", "wantedSections": [], "queryLanguage": "en"}',
+    'Reply with ONLY a JSON object in this exact shape, no prose, no code fences: {"skillIds": ["id1", "id2"], "retrievalIntent": "enumerate|verify|summarize|none", "paperTargetIntent":"active|added|all_visible|unspecified", "externalSearchIntent": "none|web|literature|both", "wantedSections": [], "queryLanguage": "en", "writeDisposition":"none|required|uncertain", "actionIntents": [{"operation":"apply_tags","coverage":"all","targetKind":"papers","parameters":{"tags":["topic:drift"]},"scopeRole":"source","scope":{"kind":"collection","path":"Parent/Leaf","includeDescendants":false},"constraints":{"tagPrefix":"topic:"}}]}',
   ].join("\n");
 }
 
@@ -237,6 +290,18 @@ const VALID_RETRIEVAL_INTENTS = new Set([
   "verify",
   "summarize",
   "none",
+]);
+const VALID_PAPER_TARGET_INTENTS = new Set([
+  "active",
+  "added",
+  "all_visible",
+  "unspecified",
+]);
+const VALID_EXTERNAL_SEARCH_INTENTS = new Set([
+  "none",
+  "web",
+  "literature",
+  "both",
 ]);
 const VALID_WANTED_SECTIONS = new Set(["methods", "results", "limitations"]);
 
@@ -261,14 +326,32 @@ export function parseClassifiedTurnIntent(
   if (!parsed || typeof parsed !== "object") return null;
   const record = parsed as {
     retrievalIntent?: unknown;
+    paperTargetIntent?: unknown;
+    externalSearchIntent?: unknown;
     wantedSections?: unknown;
     queryLanguage?: unknown;
+    writeDisposition?: unknown;
+    actionIntents?: unknown;
   };
   const retrievalIntent =
     typeof record.retrievalIntent === "string"
       ? record.retrievalIntent.trim()
       : "";
   if (!VALID_RETRIEVAL_INTENTS.has(retrievalIntent)) return null;
+  const paperTargetIntent =
+    typeof record.paperTargetIntent === "string" &&
+    VALID_PAPER_TARGET_INTENTS.has(record.paperTargetIntent.trim())
+      ? (record.paperTargetIntent.trim() as NonNullable<
+          ClassifiedTurnIntent["paperTargetIntent"]
+        >)
+      : undefined;
+  const externalSearchIntent =
+    typeof record.externalSearchIntent === "string" &&
+    VALID_EXTERNAL_SEARCH_INTENTS.has(record.externalSearchIntent.trim())
+      ? (record.externalSearchIntent.trim() as NonNullable<
+          ClassifiedTurnIntent["externalSearchIntent"]
+        >)
+      : undefined;
   const wantedSections = Array.isArray(record.wantedSections)
     ? record.wantedSections
         .map((value) => (typeof value === "string" ? value.trim() : ""))
@@ -280,10 +363,25 @@ export function parseClassifiedTurnIntent(
     typeof record.queryLanguage === "string" && record.queryLanguage.trim()
       ? record.queryLanguage.trim().toLowerCase().slice(0, 12)
       : undefined;
+  const actionIntents = parseActionIntents(record.actionIntents);
+  const writeDisposition =
+    record.writeDisposition === "none" ||
+    record.writeDisposition === "required" ||
+    record.writeDisposition === "uncertain"
+      ? record.writeDisposition
+      : actionIntents.some((intent) => intent.operation !== "read_full")
+        ? "required"
+        : "none";
+  if (writeDisposition === "required" && !actionIntents.length) return null;
   return {
     retrievalIntent: retrievalIntent as ClassifiedTurnIntent["retrievalIntent"],
+    ...(paperTargetIntent ? { paperTargetIntent } : {}),
+    ...(externalSearchIntent ? { externalSearchIntent } : {}),
     wantedSections,
     queryLanguage,
+    writeDisposition,
+    actionInterpretationSource: "classifier",
+    actionIntents,
   };
 }
 

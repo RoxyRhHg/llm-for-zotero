@@ -21,6 +21,7 @@ import type {
   PdfChunkKind,
 } from "../../modules/contextPanel/types";
 import type { AgentRuntimeRequest } from "../types";
+import { getTurnPaperScopeFromRequest } from "../context/requestTurnPaperScope";
 import type {
   PaperContextRef,
   QuoteCitation,
@@ -578,10 +579,9 @@ function hasCollectionLikeScope(
   ) {
     return true;
   }
-  return Boolean(
-    request?.selectedCollectionContexts?.length ||
-    request?.selectedTagContexts?.length,
-  );
+  if (!request) return false;
+  const scope = getTurnPaperScopeFromRequest(request);
+  return Boolean(scope.collections.length || scope.tags.length);
 }
 
 function normalizeInput(
@@ -2046,12 +2046,13 @@ export class LibraryRetrieveService {
       explicitScope.tagNames?.length ||
       explicitScope.tagScopes?.length,
     );
+    const turnScope = request
+      ? getTurnPaperScopeFromRequest(request)
+      : undefined;
     const selectedCollections = !hasExplicitScope
-      ? request?.selectedCollectionContexts || []
+      ? turnScope?.collections || []
       : [];
-    const selectedTags = !hasExplicitScope
-      ? request?.selectedTagContexts || []
-      : [];
+    const selectedTags = !hasExplicitScope ? turnScope?.tags || [] : [];
     const collectionIds = dedupeNumbers(
       explicitScope.collectionIds ||
         selectedCollections.map((collection) => collection.collectionId),
@@ -2109,7 +2110,7 @@ export class LibraryRetrieveService {
         libraryID,
         itemIds: explicitItemIds,
         collectionIds,
-        tagContexts,
+        tagContexts: [...tagContexts],
       });
       const cappedIds = resolved.itemIds.slice(0, input.maxMetadataItems);
       // Materialize each unique target exactly once, after the complete union
@@ -2174,7 +2175,7 @@ export class LibraryRetrieveService {
         name: names.join(" + "),
         libraryID,
         collectionIds,
-        tagContexts,
+        tagContexts: [...tagContexts],
         tagItemIds: resolved.tagItemIds.filter((id) => included.has(id)),
         explicitItemIds: filteredExplicitIds,
         items,

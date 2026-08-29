@@ -3,6 +3,7 @@ import {
   appendAgentTranscriptMessages,
   loadAgentTranscriptSegment,
   clearAgentTranscriptStore,
+  replaceAgentTranscriptSegment,
 } from "../src/agent/store/transcriptStore";
 import type { AgentModelMessage } from "../src/agent/types";
 
@@ -125,5 +126,120 @@ describe("transcript orphan tool_calls", function () {
     };
     assert.equal(assistant?.content, "Let me file those.");
     assert.lengthOf(assistant?.tool_calls || [], 0);
+  });
+});
+
+describe("transcript replacement durability", function () {
+  it("keeps the previous segment when an atomic replacement fails", async function () {
+    const previousZotero = (
+      globalThis as typeof globalThis & { Zotero?: unknown }
+    ).Zotero;
+    const rows: Array<{
+      conversationKey: number;
+      compatibilityKey: string;
+      sequence: number;
+      messageJson: string;
+      compactedAt?: number;
+    }> = [];
+    let failAtSequence: number | undefined;
+    (
+      globalThis as typeof globalThis & {
+        Zotero?: unknown;
+      }
+    ).Zotero = {
+      DB: {
+        executeTransaction: async (task: () => Promise<unknown>) => {
+          const snapshot = rows.map((row) => ({ ...row }));
+          try {
+            return await task();
+          } catch (error) {
+            rows.splice(0, rows.length, ...snapshot);
+            throw error;
+          }
+        },
+        queryAsync: async (sql: string, params: unknown[] = []) => {
+          if (sql.includes("DELETE FROM llm_for_zotero_agent_transcript")) {
+            for (let index = rows.length - 1; index >= 0; index -= 1) {
+              if (
+                rows[index].conversationKey === Number(params[0]) &&
+                rows[index].compatibilityKey === params[1]
+              ) {
+                rows.splice(index, 1);
+              }
+            }
+            return [];
+          }
+          if (sql.includes("INSERT INTO llm_for_zotero_agent_transcript")) {
+            if (Number(params[2]) === failAtSequence) {
+              throw new Error("simulated transcript insert failure");
+            }
+            rows.push({
+              conversationKey: Number(params[0]),
+              compatibilityKey: String(params[1]),
+              sequence: Number(params[2]),
+              messageJson: String(params[3]),
+              compactedAt:
+                typeof params[4] === "number" ? Number(params[4]) : undefined,
+            });
+            return [];
+          }
+          if (sql.includes("FROM llm_for_zotero_agent_transcript")) {
+            return rows
+              .filter(
+                (row) =>
+                  row.conversationKey === Number(params[0]) &&
+                  row.compatibilityKey === params[1],
+              )
+              .sort((left, right) => left.sequence - right.sequence);
+          }
+          return [];
+        },
+      },
+    };
+
+    try {
+      clearAgentTranscriptStore();
+      const initialWrite = await replaceAgentTranscriptSegment({
+        conversationKey: 5150,
+        compatibilityKey: "atomic",
+        messages: [{ role: "user", content: "previous checkpoint" }],
+      });
+      assert.equal(initialWrite, "persisted");
+
+      failAtSequence = 1;
+      const failedWrite = await replaceAgentTranscriptSegment({
+        conversationKey: 5150,
+        compatibilityKey: "atomic",
+        messages: [
+          { role: "user", content: "replacement first row" },
+          { role: "user", content: "replacement second row" },
+        ],
+      });
+      assert.equal(failedWrite, "failed");
+
+      const cached = await loadAgentTranscriptSegment({
+        conversationKey: 5150,
+        compatibilityKey: "atomic",
+      });
+      assert.deepEqual(cached.messages, [
+        { role: "user", content: "previous checkpoint" },
+      ]);
+
+      clearAgentTranscriptStore();
+      const durable = await loadAgentTranscriptSegment({
+        conversationKey: 5150,
+        compatibilityKey: "atomic",
+      });
+      assert.deepEqual(durable.messages, [
+        { role: "user", content: "previous checkpoint" },
+      ]);
+    } finally {
+      clearAgentTranscriptStore();
+      (
+        globalThis as typeof globalThis & {
+          Zotero?: unknown;
+        }
+      ).Zotero = previousZotero;
+    }
   });
 });

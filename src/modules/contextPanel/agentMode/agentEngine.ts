@@ -12,7 +12,7 @@ import type {
   AgentPendingAction,
   AgentRunEventRecord,
   AgentRuntimeOutcome,
-  AgentRuntimeRequest,
+  AgentRuntimeRequestInput as AgentRuntimeRequest,
 } from "../../../agent/types";
 import { consumePendingRetentionEvents } from "../../../claudeCode/runtimeRetention";
 import {
@@ -953,6 +953,7 @@ type BuildAgentRuntimeRequestParamsShape = {
   conversationKey: number;
   conversationGeneration?: number;
   item: Zotero.Item;
+  activePaperContext?: PaperContextRef;
   userText: string;
   selectedTextContexts?: SelectedTextContext[];
   resolvedSelectedTextAnchors?: ResolvedSelectedTextAnchor[];
@@ -1155,6 +1156,7 @@ export type AgentEngineDeps = {
   ) => {
     paperContexts: PaperContextRef[];
     fullTextPaperContexts: PaperContextRef[];
+    activePaperContext?: PaperContextRef;
   };
   findLatestRetryPair: (history: Message[]) => LatestRetryPairShape | null;
   reconstructRetryPayload: (userMessage: Message) => ReconstructedRetryPayload;
@@ -1560,9 +1562,6 @@ export async function sendAgentTurn(
   );
   const normalizedPaperContexts = deps.normalizePaperContexts([
     ...(paperContexts || []),
-    ...selectedTextPaperContextsForMessage.filter(
-      (paper): paper is PaperContextRef => Boolean(paper),
-    ),
   ]);
   const normalizedFullTextPaperContexts = deps.normalizePaperContexts(
     fullTextPaperContexts,
@@ -1570,6 +1569,7 @@ export async function sendAgentTurn(
   const {
     paperContexts: paperContextsForMessage,
     fullTextPaperContexts: fullTextPaperContextsForMessage,
+    activePaperContext,
   } = deps.includeAutoLoadedPaperContext(
     item,
     normalizedPaperContexts,
@@ -1577,7 +1577,8 @@ export async function sendAgentTurn(
     pdfPaperContextsForMessage.length
       ? new Set(
           pdfPaperContextsForMessage.map(
-            (paper) => `${paper.itemId}:${paper.contextItemId}`,
+            (paper) =>
+              `${Math.floor(Number(paper.libraryID || item.libraryID))}:${paper.itemId}:${paper.contextItemId}`,
           ),
         )
       : undefined,
@@ -1624,6 +1625,7 @@ export async function sendAgentTurn(
     conversationKey,
     conversationGeneration: deps.conversationGeneration,
     item,
+    activePaperContext,
     userText: question,
     selectedTextContexts: selectedTextContextsForMessage,
     resolvedSelectedTextAnchors,
@@ -1853,6 +1855,7 @@ export async function retryAgentTurn(
   deps: AgentEngineDeps,
   requestId?: number,
   onProviderDispatch?: () => void,
+  activePaperContextOverride?: PaperContextRef,
 ): Promise<void> {
   const ui = deps.getPanelRequestUI(body);
   const initialConversationKey = deps.getConversationKey(item);
@@ -2083,12 +2086,26 @@ export async function retryAgentTurn(
   const {
     question,
     screenshotImages,
-    paperContexts,
     pdfPaperContexts,
-    fullTextPaperContexts,
     selectedCollectionContexts,
     selectedTagContexts,
   } = reconstructedRetryPayload;
+  let { paperContexts, fullTextPaperContexts } = reconstructedRetryPayload;
+  const retryPaperContext = deps.includeAutoLoadedPaperContext(
+    item,
+    paperContexts,
+    fullTextPaperContexts,
+    pdfPaperContexts.length
+      ? new Set(
+          pdfPaperContexts.map(
+            (paper) =>
+              `${Math.floor(Number(paper.libraryID || item.libraryID))}:${paper.itemId}:${paper.contextItemId}`,
+          ),
+        )
+      : undefined,
+  );
+  paperContexts = retryPaperContext.paperContexts;
+  fullTextPaperContexts = retryPaperContext.fullTextPaperContexts;
   retryPair.userMessage.paperContexts = paperContexts.length
     ? paperContexts
     : undefined;
@@ -2178,6 +2195,8 @@ export async function retryAgentTurn(
     conversationKey,
     conversationGeneration: deps.conversationGeneration,
     item,
+    activePaperContext:
+      activePaperContextOverride ?? retryPaperContext.activePaperContext,
     userText: question,
     selectedTextContexts: selectedTextContextsRaw,
     resolvedSelectedTextAnchors,

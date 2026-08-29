@@ -5,6 +5,7 @@ import type {
   PreparedToolExecution,
 } from "../types";
 import type { ActionExecutionContext } from "./types";
+import { resolveAgentRuntimeRequest } from "../context/resolvedAgentRequest";
 
 let _callCounter = 0;
 function nextCallId(): string {
@@ -24,7 +25,7 @@ function buildToolContext(
     : null;
   return {
     // Actions run outside an agent turn, so we build a synthetic request.
-    request: {
+    request: resolveAgentRuntimeRequest({
       // Carried from the caller. Hard-coding 0 filed every action-driven
       // change under a conversation nothing queries, so neither undo path
       // could find them.
@@ -38,7 +39,9 @@ function buildToolContext(
       selectedCollectionContexts:
         ctx.requestContext?.selectedCollectionContexts,
       selectedTagContexts: ctx.requestContext?.selectedTagContexts,
-    },
+      actionContract: ctx.requestContext?.actionContract,
+      actionProgress: ctx.requestContext?.actionProgress,
+    }),
     runId: ctx.runId,
     item: syntheticItem,
     currentAnswerText: "",

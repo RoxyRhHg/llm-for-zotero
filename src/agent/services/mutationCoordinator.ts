@@ -1,5 +1,6 @@
 import type {
   AgentJournalStepOutcome,
+  AgentActionEvidence,
   AgentToolContext,
   AgentToolEffect,
   AgentWriteToolOutput,
@@ -21,6 +22,7 @@ import type {
   LibraryMutationOperation,
   LibraryMutationService,
 } from "./libraryMutationService";
+import { mutationPostconditionIsSatisfied } from "./libraryMutation/handlerOperations";
 import {
   getActiveMutationActionId,
   withActiveMutationAction,
@@ -31,6 +33,7 @@ export type CoordinatedMutationResult = {
   effect: AgentToolEffect;
   affectedCount: number;
   results: LibraryMutationExecutionResult[];
+  actionEvidence: AgentActionEvidence[];
 };
 
 class MutationMayHaveAppliedError extends Error {
@@ -145,12 +148,19 @@ async function executeJournaledStep<T>(params: {
   plan: MutationStepPlan | (() => Promise<MutationStepPlan>);
   prepareAction?: (plan: MutationStepPlan) => JournalActionSeed;
   execute: (plan: MutationStepPlan) => Promise<MutationStepOutcome<T>>;
+  reconcileAfterError?: (
+    plan: MutationStepPlan,
+    error: unknown,
+  ) => Promise<MutationStepOutcome<T> | null>;
 }): Promise<{
   result: T;
   reversibility: JournalReversibility;
   effect: AgentToolEffect;
   status: AgentJournalStepOutcome["status"];
   affectedCount: number;
+  expectedPostcondition?: unknown;
+  precondition?: unknown;
+  journalStepId?: string;
 }> {
   const { context, actionId, sequence } = params;
   const parentScope = context.journalActionScope;
@@ -222,8 +232,7 @@ async function executeJournaledStep<T>(params: {
       }
     }
 
-    try {
-      const outcome = await params.execute(plan);
+    const recordOutcome = async (outcome: MutationStepOutcome<T>) => {
       const changed = outcome.effect !== "none";
       const finalInverse =
         outcome.inverse === undefined ? plan.inverse : outcome.inverse;
@@ -237,7 +246,7 @@ async function executeJournaledStep<T>(params: {
               : "full"
             : "none")
         : "full";
-      const status =
+      const status: AgentJournalStepOutcome["status"] =
         outcome.effect === "none"
           ? "no_effect"
           : outcome.effect === "partial"
@@ -275,8 +284,25 @@ async function executeJournaledStep<T>(params: {
         effect: outcome.effect,
         status,
         affectedCount: outcome.affectedCount,
+        expectedPostcondition: outcome.expectedPostcondition,
+        precondition: plan.precondition,
+        journalStepId: stepId || undefined,
       };
+    };
+
+    try {
+      return await recordOutcome(await params.execute(plan));
     } catch (error) {
+      const reconciled = await params
+        .reconcileAfterError?.(plan, error)
+        .catch(() => null);
+      if (reconciled) {
+        try {
+          return await recordOutcome(reconciled);
+        } catch {
+          // Fall through to the uncertain journal state below.
+        }
+      }
       const reason = error instanceof Error ? error.message : String(error);
       if (actionId && stepId) {
         await updateJournalStep({
@@ -342,6 +368,28 @@ async function executeOne(params: {
         reason: inverse?.irreversibleReason,
       };
     },
+    reconcileAfterError: async () => {
+      const postState = await service.captureOperationState(
+        operation,
+        context,
+        {
+          reconciliation: true,
+        },
+      );
+      if (!mutationPostconditionIsSatisfied(operation, postState)) return null;
+      return {
+        result: {
+          operation: operation.type,
+          operationId: operation.id,
+          result: { status: "reconciled_after_uncertain_execution" },
+        },
+        expectedPostcondition: postState,
+        affectedCount: 0,
+        effect: "none",
+        reason:
+          "The mutation call threw after starting, but authoritative Zotero state already satisfied its postcondition.",
+      };
+    },
   });
 }
 
@@ -357,7 +405,12 @@ export async function executeLibraryMutationAction(params: {
   const { service, operations, context, facadeToolName } = params;
   const journalToolName = context.journalToolName || facadeToolName;
   if (!operations.length) {
-    return { effect: "none", affectedCount: 0, results: [] };
+    return {
+      effect: "none",
+      affectedCount: 0,
+      results: [],
+      actionEvidence: [],
+    };
   }
 
   const parentScope = context.journalActionScope;
@@ -374,6 +427,7 @@ export async function executeLibraryMutationAction(params: {
 
   const results: LibraryMutationExecutionResult[] = [];
   const completedOutcomes: AgentJournalStepOutcome[] = [];
+  const actionEvidence: AgentActionEvidence[] = [];
   let affectedCount = 0;
   try {
     for (let index = 0; index < operations.length; index += 1) {
@@ -403,6 +457,23 @@ export async function executeLibraryMutationAction(params: {
             : undefined,
       });
       results.push(executed.result);
+      if (
+        executed.precondition &&
+        executed.expectedPostcondition &&
+        typeof executed.precondition === "object" &&
+        typeof executed.expectedPostcondition === "object"
+      ) {
+        actionEvidence.push({
+          version: 1,
+          proofDomain: "zotero_state",
+          operationValue: operations[index],
+          preState: executed.precondition as AgentActionEvidence["preState"],
+          postState:
+            executed.expectedPostcondition as AgentActionEvidence["postState"],
+          journalStepId: executed.journalStepId,
+          effect: executed.effect,
+        });
+      }
       completedOutcomes.push({
         effect: executed.effect,
         status: executed.status,
@@ -435,6 +506,7 @@ export async function executeLibraryMutationAction(params: {
       effect,
       affectedCount: summary.affectedCount,
       results,
+      actionEvidence,
     };
   } catch (error) {
     const changedOutcomes = completedOutcomes.filter(
@@ -530,8 +602,14 @@ export async function executeExternalMutation<T>(params: {
         affectedCount: executed.effect !== "none" ? executed.affectedCount : 0,
       });
     }
+    const content =
+      executed.result && typeof executed.result === "object"
+        ? Object.assign({}, executed.result, {
+            ...(actionId ? { actionId } : {}),
+          })
+        : executed.result;
     return {
-      content: executed.result,
+      content: content as T,
       effect: executed.effect,
     };
   } catch (error) {

@@ -573,7 +573,7 @@ export async function executeAndRecordUndo(
   operation: LibraryMutationOperation,
   context: AgentToolContext,
   facadeToolName: string,
-): Promise<AgentWriteToolOutput<{ result: unknown }>> {
+): Promise<AgentWriteToolOutput<{ actionId?: string; result: unknown }>> {
   const coordinated = await executeLibraryMutationAction({
     service: mutationService,
     operations: [operation],
@@ -581,8 +581,12 @@ export async function executeAndRecordUndo(
     facadeToolName,
   });
   return {
-    content: { result: coordinated.results[0] },
+    content: {
+      actionId: coordinated.actionId,
+      result: coordinated.results[0],
+    },
     effect: coordinated.effect,
+    actionEvidence: coordinated.actionEvidence,
   };
 }
 
@@ -596,7 +600,13 @@ export async function executeAndRecordUndoBatch(
   operations: LibraryMutationOperation[],
   context: AgentToolContext,
   facadeToolName: string,
-): Promise<AgentWriteToolOutput<{ appliedCount: number; results: unknown[] }>> {
+): Promise<
+  AgentWriteToolOutput<{
+    actionId?: string;
+    appliedCount: number;
+    results: unknown[];
+  }>
+> {
   const coordinated = await executeLibraryMutationAction({
     service: mutationService,
     operations,
@@ -605,10 +615,12 @@ export async function executeAndRecordUndoBatch(
   });
   return {
     content: {
+      actionId: coordinated.actionId,
       appliedCount: coordinated.affectedCount,
       results: coordinated.results,
     },
     effect: coordinated.effect,
+    actionEvidence: coordinated.actionEvidence,
   };
 }
 

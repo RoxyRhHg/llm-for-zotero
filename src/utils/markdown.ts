@@ -1025,6 +1025,141 @@ function createMathExtensions() {
   ];
 }
 
+function findClosingDisplayDollarMath(text: string, openIndex: number): number {
+  for (let index = openIndex + 2; index < text.length - 1; index++) {
+    if (text.slice(index, index + 2) !== "$$") continue;
+    if (!isEscapedDelimiter(text, index)) return index;
+  }
+  return -1;
+}
+
+function countBacktickRun(text: string, start: number): number {
+  let length = 0;
+  while (text[start + length] === "`") length++;
+  return length;
+}
+
+function findClosingBacktickRun(
+  text: string,
+  openIndex: number,
+  runLength: number,
+): number {
+  for (let index = openIndex + runLength; index < text.length; index++) {
+    if (text[index] !== "`") continue;
+    const candidateLength = countBacktickRun(text, index);
+    if (candidateLength === runLength) return index;
+    index += candidateLength - 1;
+  }
+  return -1;
+}
+
+function renderMathPreviewToken(math: string, display: boolean): string | null {
+  const trimmed = math.trim();
+  if (!trimmed) return null;
+  const rendered = display
+    ? renderDisplayLatex(trimmed)
+    : renderLatex(trimmed, false);
+  if (
+    rendered.includes('class="math-error"') ||
+    rendered.includes('class="katex-error"')
+  ) {
+    return null;
+  }
+  const className = display ? "math-display-inline" : "math-inline";
+  return `<span class="${className}">${rendered}</span>`;
+}
+
+/**
+ * Render only delimited LaTeX for a compact quote preview.
+ *
+ * Everything outside a valid math span stays literal and escaped. In
+ * particular, Markdown, HTML, and math-like text inside code spans or fences
+ * are not interpreted by the preview renderer.
+ */
+export function renderMathPreviewHtml(text: string): string {
+  if (!text) return "";
+
+  const rendered: string[] = [];
+  let cursor = 0;
+  while (cursor < text.length) {
+    if (text[cursor] === "`") {
+      const runLength = countBacktickRun(text, cursor);
+      const closeIndex = findClosingBacktickRun(text, cursor, runLength);
+      if (closeIndex < 0) {
+        rendered.push(escapeHtml(text.slice(cursor)));
+        break;
+      }
+      const end = closeIndex + runLength;
+      rendered.push(escapeHtml(text.slice(cursor, end)));
+      cursor = end;
+      continue;
+    }
+
+    let source = "";
+    let math = "";
+    let display = false;
+    let end = cursor;
+
+    if (text.startsWith("$$", cursor) && !isEscapedDelimiter(text, cursor)) {
+      const closeIndex = findClosingDisplayDollarMath(text, cursor);
+      if (closeIndex > cursor + 2) {
+        end = closeIndex + 2;
+        source = text.slice(cursor, end);
+        math = text.slice(cursor + 2, closeIndex);
+        display = true;
+      }
+    } else if (
+      text.startsWith("\\(", cursor) &&
+      !isEscapedDelimiter(text, cursor)
+    ) {
+      const closeIndex = findClosingEscapedMathDelimiter(text, cursor, "\\)");
+      if (closeIndex > cursor + 2) {
+        end = closeIndex + 2;
+        source = text.slice(cursor, end);
+        math = text.slice(cursor + 2, closeIndex);
+      }
+    } else if (
+      text.startsWith("\\[", cursor) &&
+      !isEscapedDelimiter(text, cursor)
+    ) {
+      const closeIndex = findClosingEscapedMathDelimiter(text, cursor, "\\]");
+      if (closeIndex > cursor + 2) {
+        end = closeIndex + 2;
+        source = text.slice(cursor, end);
+        math = text.slice(cursor + 2, closeIndex);
+        display = true;
+      }
+    } else if (canOpenInlineDollarMath(text, cursor)) {
+      const closeIndex = findClosingInlineDollarMath(text, cursor);
+      if (closeIndex > cursor + 1) {
+        end = closeIndex + 1;
+        source = text.slice(cursor, end);
+        math = text.slice(cursor + 1, closeIndex);
+      }
+    }
+
+    if (source) {
+      const mathHtml = renderMathPreviewToken(math, display);
+      rendered.push(mathHtml || escapeHtml(source));
+      cursor = end;
+      continue;
+    }
+
+    // Do not reinterpret the second dollar in an escaped, empty, or unmatched
+    // display opener as the beginning of inline math.
+    if (text.startsWith("$$", cursor)) {
+      rendered.push("$$");
+      cursor += 2;
+      continue;
+    }
+
+    rendered.push(escapeHtml(text[cursor]));
+    cursor++;
+  }
+
+  return rendered.join("");
+}
+
 // =============================================================================
 // Delimiter Validation
 // =============================================================================

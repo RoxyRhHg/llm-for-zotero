@@ -309,6 +309,91 @@ describe("agent adapters honour model profile overrides", function () {
     );
   });
 
+  it("keeps Ollama final thinking private while replaying it for a live correction", async function () {
+    const requestBodies: Record<string, unknown>[] = [];
+    let callCount = 0;
+    (
+      globalThis as typeof globalThis & {
+        ztoolkit: { getGlobal: (name: string) => unknown; log: () => void };
+      }
+    ).ztoolkit = {
+      getGlobal: (name: string) => {
+        if (name !== "fetch") return undefined;
+        return async (_url: string, init?: RequestInit) => {
+          callCount += 1;
+          requestBodies.push(
+            JSON.parse(String(init?.body || "{}")) as Record<string, unknown>,
+          );
+          const lines =
+            callCount === 1
+              ? [
+                  '{"message":{"role":"assistant","thinking":"Hidden Ollama plan. "},"done":false}\n',
+                  '{"message":{"role":"assistant","content":"Premature answer."},"done":true}\n',
+                ]
+              : [
+                  '{"message":{"role":"assistant","content":"Corrected answer."},"done":true}\n',
+                ];
+          return {
+            ok: true,
+            status: 200,
+            statusText: "OK",
+            headers: { get: () => "application/json" },
+            body: new ReadableStream<Uint8Array>({
+              start(controller) {
+                const encoder = new TextEncoder();
+                for (const line of lines)
+                  controller.enqueue(encoder.encode(line));
+                controller.close();
+              },
+            }),
+            json: async () => ({}),
+            text: async () => "",
+          };
+        };
+      },
+      log: () => undefined,
+    };
+
+    const adapter = new OllamaNativeAgentAdapter();
+    const request = makeRequest({
+      model: "qwen3:8b",
+      apiBase: "http://localhost:11434",
+      providerProtocol: "ollama_native",
+    });
+    const first = await adapter.runStep({
+      request,
+      messages: [{ role: "user", content: "Answer from the full paper" }],
+      tools,
+    });
+    assert.equal(first.kind, "final");
+    if (first.kind !== "final") return;
+    assert.notInclude(JSON.stringify(first.assistantMessage), "Hidden Ollama");
+
+    const correction = {
+      role: "user" as const,
+      content: "Correction for this turn: read the complete paper.",
+    };
+    await adapter.runStep({
+      request,
+      messages: [first.assistantMessage, correction],
+      continuationMessages: [correction],
+      tools,
+    });
+
+    const secondMessages = requestBodies[1]?.messages as Array<
+      Record<string, unknown>
+    >;
+    const nativeFinal = secondMessages.find(
+      (message) => message.role === "assistant",
+    );
+    assert.equal(nativeFinal?.thinking, "Hidden Ollama plan.");
+    assert.equal(nativeFinal?.content, "Premature answer.");
+    assert.equal(
+      secondMessages.at(-1)?.content,
+      "Correction for this turn: read the complete paper.",
+    );
+  });
+
   it("applies a user-defined reasoning level the plugin has no encoding for", async function () {
     // The point of the editor: adopt a provider's new effort value without
     // waiting for a release. Agent mode has to honour it too.

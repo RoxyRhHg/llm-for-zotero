@@ -19,10 +19,8 @@ import {
 import {
   buildPaperStateKey,
   getLastUsedUpstreamGlobalConversationKey,
-  getLastUsedPaperConversationKey,
   getLockedGlobalConversationKey,
   removeLastUsedUpstreamGlobalConversationKey,
-  removeLastUsedPaperConversationKey,
   setLockedGlobalConversationKey,
 } from "./prefHelpers";
 import {
@@ -54,9 +52,7 @@ import {
 } from "../../claudeCode/state";
 import {
   getLastUsedClaudeGlobalConversationKey,
-  getLastUsedClaudePaperConversationKey,
   removeLastUsedClaudeGlobalConversationKey,
-  removeLastUsedClaudePaperConversationKey,
 } from "../../claudeCode/prefs";
 import { getRegisteredConversationScope } from "../../shared/conversationRegistry";
 import {
@@ -77,10 +73,9 @@ import {
 } from "../../codexAppServer/state";
 import {
   getLastUsedCodexGlobalConversationKey,
-  getLastUsedCodexPaperConversationKey,
   removeLastUsedCodexGlobalConversationKey,
-  removeLastUsedCodexPaperConversationKey,
 } from "../../codexAppServer/prefs";
+import { invalidatePaperRestoreTargetCache } from "../../shared/paperConversationRestore";
 import {
   clearAgentConversationState,
   clearDeletedAgentConversationState,
@@ -570,15 +565,15 @@ async function clearRememberedSelection(
     ) {
       activeClaudePaperConversationByPaper.delete(stateKey);
     }
-    const persistedKey = Number(
-      getLastUsedClaudePaperConversationKey(target.libraryID, paperItemID) || 0,
+    invalidatePaperRestoreTargetCache(
+      {
+        system: "claude_code",
+        libraryID: target.libraryID,
+        paperItemID,
+      },
+      conversationKey,
+      target.instanceID,
     );
-    if (
-      Number.isFinite(persistedKey) &&
-      Math.floor(persistedKey) === conversationKey
-    ) {
-      removeLastUsedClaudePaperConversationKey(target.libraryID, paperItemID);
-    }
     return;
   }
   if (target.conversationSystem === "codex") {
@@ -590,15 +585,15 @@ async function clearRememberedSelection(
     ) {
       activeCodexPaperConversationByPaper.delete(stateKey);
     }
-    const persistedKey = Number(
-      getLastUsedCodexPaperConversationKey(target.libraryID, paperItemID) || 0,
+    invalidatePaperRestoreTargetCache(
+      {
+        system: "codex",
+        libraryID: target.libraryID,
+        paperItemID,
+      },
+      conversationKey,
+      target.instanceID,
     );
-    if (
-      Number.isFinite(persistedKey) &&
-      Math.floor(persistedKey) === conversationKey
-    ) {
-      removeLastUsedCodexPaperConversationKey(target.libraryID, paperItemID);
-    }
     return;
   }
   const stateKey = buildPaperStateKey(target.libraryID, paperItemID);
@@ -608,15 +603,15 @@ async function clearRememberedSelection(
   ) {
     activePaperConversationByPaper.delete(stateKey);
   }
-  const persistedKey = Number(
-    getLastUsedPaperConversationKey(target.libraryID, paperItemID) || 0,
+  invalidatePaperRestoreTargetCache(
+    {
+      system: "upstream",
+      libraryID: target.libraryID,
+      paperItemID,
+    },
+    conversationKey,
+    target.instanceID,
   );
-  if (
-    Number.isFinite(persistedKey) &&
-    Math.floor(persistedKey) === conversationKey
-  ) {
-    removeLastUsedPaperConversationKey(target.libraryID, paperItemID);
-  }
 }
 
 export async function finalizeConversationDeletion(

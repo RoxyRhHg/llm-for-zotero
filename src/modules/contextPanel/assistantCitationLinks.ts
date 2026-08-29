@@ -85,7 +85,10 @@ import {
   beginQuoteNavigationActivity,
   QUOTE_PROVENANCE_REVALIDATION_REQUEST_EVENT,
 } from "./quoteValidationActivity";
-import { renderRenderedMarkdownInto } from "./renderedMarkdown";
+import {
+  renderRenderedMarkdownInto,
+  renderRenderedMathPreviewInto,
+} from "./renderedMarkdown";
 import type { Message, PaperContextRef, QuoteCitation } from "./types";
 
 type CitationParagraphJumpNavigation = {
@@ -4497,9 +4500,12 @@ function createQuoteCardElement(params: {
 
   const preview = params.ownerDoc.createElement("span");
   preview.className = "llm-quote-card-preview";
-  preview.textContent =
+  renderRenderedMathPreviewInto(
+    preview,
     buildQuoteCardPreviewText(params.quoteText) ||
-    sanitizeText(params.quoteText || "").trim();
+      sanitizeText(params.quoteText || "").trim(),
+    params.ownerDoc,
+  );
   content.append(preview, body);
 
   const setExpanded = (expanded: boolean) => {

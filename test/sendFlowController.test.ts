@@ -74,6 +74,7 @@ describe("sendFlowController", function () {
   it("uses explicit Markdown source context before ambient reader context", function () {
     const currentItem = {
       id: 707,
+      libraryID: 1,
       isAttachment: () => false,
       isRegularItem: () => true,
     } as unknown as Zotero.Item;
@@ -113,6 +114,11 @@ describe("sendFlowController", function () {
       markdownContext.contextItemId,
     );
     assert.equal(result.paperContexts[0].contentSourceMode, "markdown");
+    assert.deepInclude(result.activePaperContext, {
+      libraryID: 1,
+      itemId: 707,
+      contextItemId: 808,
+    });
     assert.lengthOf(result.fullTextPaperContexts, 1);
     assert.equal(
       result.fullTextPaperContexts[0].contextItemId,
@@ -124,6 +130,7 @@ describe("sendFlowController", function () {
   it("keeps an auto-loaded raw PDF out of ordinary paper pipelines", function () {
     const currentItem = {
       id: 707,
+      libraryID: 1,
       isAttachment: () => false,
       isRegularItem: () => true,
     } as unknown as Zotero.Item;
@@ -138,7 +145,7 @@ describe("sendFlowController", function () {
       currentItem,
       [],
       [],
-      new Set(["707:808"]),
+      new Set(["1:707:808"]),
       {
         contextItem: null,
         paperContext: pdfContext,
@@ -148,6 +155,106 @@ describe("sendFlowController", function () {
 
     assert.deepEqual(result.paperContexts, []);
     assert.deepEqual(result.fullTextPaperContexts, []);
+    assert.deepInclude(result.activePaperContext, {
+      libraryID: 1,
+      itemId: 707,
+      contextItemId: 808,
+    });
+  });
+
+  it("does not invent an active paper for a standalone-note turn", function () {
+    const previousZotero = globalThis.Zotero;
+    globalThis.Zotero = {
+      Items: { get: () => null },
+      getMainWindow: () => null,
+      getActiveZoteroPane: () => null,
+    } as unknown as typeof Zotero;
+    try {
+      const standaloneNote = {
+        id: 700,
+        libraryID: 1,
+        parentID: false,
+        isNote: () => true,
+        getDisplayTitle: () => "Standalone note",
+      } as unknown as Zotero.Item;
+      const selectedPaper = {
+        libraryID: 1,
+        itemId: 42,
+        contextItemId: 101,
+        title: "Selected paper",
+      };
+
+      const result = includeAutoLoadedPaperContextForTests(
+        standaloneNote,
+        [selectedPaper],
+        [selectedPaper],
+      );
+
+      assert.isUndefined(result.activePaperContext);
+      assert.deepInclude(result.paperContexts[0], selectedPaper);
+    } finally {
+      globalThis.Zotero = previousZotero;
+    }
+  });
+
+  it("keeps the exact active PDF identity through request enrichment", async function () {
+    const firstPdf: PaperContextRef = {
+      libraryID: 1,
+      itemId: 42,
+      contextItemId: 100,
+      title: "Parent paper",
+    };
+    const activePdf: PaperContextRef = {
+      libraryID: 1,
+      itemId: 42,
+      contextItemId: 101,
+      title: "Parent paper",
+      contentSourceMode: "pdf",
+    };
+    const previousZotero = globalThis.Zotero;
+    globalThis.Zotero = {
+      Items: { get: () => null },
+      Prefs: { get: () => undefined },
+    } as unknown as typeof Zotero;
+    try {
+      const request = await buildAgentRuntimeRequestForTests({
+        conversationKey: 7001,
+        item: {
+          id: 9001,
+          libraryID: 1,
+          isAttachment: () => false,
+          isRegularItem: () => true,
+          isNote: () => false,
+        } as unknown as Zotero.Item,
+        userText: "Compare these papers.",
+        selectedTexts: [],
+        activePaperContext: activePdf,
+        paperContexts: [firstPdf],
+        pdfPaperContexts: [activePdf],
+        fullTextPaperContexts: [],
+        attachments: undefined,
+        screenshots: undefined,
+        effectiveRequestConfig: {
+          model: "gpt-5",
+          apiBase: "https://api.openai.com/v1",
+          apiKey: "test",
+          authMode: "api_key",
+          providerProtocol: "responses_api",
+          modelEntryId: "openai:gpt-5",
+          modelProviderLabel: "OpenAI",
+        },
+        history: [],
+      });
+
+      assert.deepInclude(request.activePaperContext, {
+        libraryID: 1,
+        itemId: 42,
+        contextItemId: 101,
+      });
+      assert.notDeepInclude(request.activePaperContext, firstPdf);
+    } finally {
+      globalThis.Zotero = previousZotero;
+    }
   });
 
   it("repairs legacy stored rows that duplicated a raw PDF into text routes", function () {

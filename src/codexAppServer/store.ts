@@ -73,6 +73,7 @@ import {
   type ConversationRegistryRow,
   type PaperContextJsonColumns,
 } from "../shared/conversationRegistry";
+import { stagePaperRestoreTargetForStartup } from "../shared/paperConversationRestore";
 import {
   repairRecoverableCatalogMessageConversationIDs,
   repairRecoverableMessageConversationIDs,
@@ -610,9 +611,8 @@ async function migrateLegacyCodexConversationKeys(): Promise<
     if (kind === "paper" && paperItemID) {
       const paperStateKey = `${libraryID}:${paperItemID}`;
       if (!latestPaperByState.has(paperStateKey)) {
-        setLastUsedCodexPaperConversationKey(
-          libraryID,
-          paperItemID,
+        stagePaperRestoreTargetForStartup(
+          { system: "codex", libraryID, paperItemID },
           targetConversationKey,
         );
         latestPaperByState.add(paperStateKey);
@@ -1274,11 +1274,6 @@ export async function repairCodexConversationIdentityRegistry(
           SET conversation_id = ?
            WHERE conversation_key = ?`,
           [repairedConversationID, summary.conversationKey],
-        );
-        setLastUsedCodexPaperConversationKey(
-          summary.libraryID,
-          inferredPaperItemID,
-          summary.conversationKey,
         );
         await repairRegisteredConversationScope(
           {

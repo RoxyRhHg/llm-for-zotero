@@ -33,6 +33,21 @@ export function createRevertChangesTool(
   zoteroGateway: ZoteroGateway,
 ): AgentWriteToolDefinition<RevertChangesInput, unknown> {
   return {
+    describeAction: (input) =>
+      input.dryRun
+        ? []
+        : [
+            {
+              id: `revert:${input.count}`,
+              proofDomain: "zotero_state",
+              capability: "zotero.undo",
+              operation: "revert",
+              source: "zotero_native",
+              parameters: { revertCount: input.count },
+              requestedTargets: [],
+              destinationCollectionIds: [],
+            },
+          ],
     spec: {
       name: "revert_changes",
       description:
@@ -225,6 +240,7 @@ export function createRevertChangesTool(
         content: {
           reverted: outcome.reverted,
           partiallyReverted: outcome.partiallyReverted,
+          actionIds: pending.map((action) => action.actionId),
           residuals: outcome.residuals,
           // Named explicitly so the agent reports what it could NOT put back
           // rather than implying a clean rollback.

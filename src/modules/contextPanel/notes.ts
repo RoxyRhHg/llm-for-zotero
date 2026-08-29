@@ -79,6 +79,7 @@ import {
 import {
   createFinalizedZoteroNote,
   persistVerifiedNoteHtml,
+  type CreatedZoteroNoteReceipt,
   type NotePersistenceSaveOptions,
 } from "./notePersistence";
 
@@ -481,6 +482,25 @@ function injectCitationLinksIntoNoteHtml(
 const NOTE_FOOTER_TEXT = "Written by LLM-for-Zotero.";
 const NOTE_FOOTER_HTML = `<hr/><p>${NOTE_FOOTER_TEXT}</p>`;
 
+function formatZoteroDateAddedForNote(value: string | undefined): string {
+  const normalized = (value || "").trim();
+  if (!normalized) return getCurrentLocalTimestamp();
+  const sqlUtc = normalized.match(/^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$/)
+    ? `${normalized.replace(" ", "T")}Z`
+    : normalized;
+  const parsed = new Date(sqlUtc);
+  if (Number.isNaN(parsed.getTime())) return normalized;
+  return new Intl.DateTimeFormat("en-US", {
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+    month: "2-digit",
+    day: "2-digit",
+    year: "numeric",
+    hour12: false,
+  }).format(parsed);
+}
+
 /**
  * Strips an already-present `Written by LLM-for-Zotero[ plugin][.]` footer
  * from the end of markdown text produced by the LLM. When the agent follows
@@ -551,6 +571,7 @@ async function buildAssistantNoteHtmlForSave(
     noteId?: number;
     figureRender?: NoteFigureRenderOptions;
     noteSaveOptions?: NotePersistenceSaveOptions;
+    timestamp?: string;
   } = {},
 ): Promise<string> {
   const query = buildQuoteExpandedMarkdown({
@@ -562,7 +583,7 @@ async function buildAssistantNoteHtmlForSave(
     quoteCitations,
   });
   const source = modelName.trim() || "unknown";
-  const timestamp = getCurrentLocalTimestamp();
+  const timestamp = options.timestamp || getCurrentLocalTimestamp();
   let queryHtml = query ? await renderRawNoteHtmlForSave(query, options) : "";
   let responseHtml = response
     ? await renderRawNoteHtmlForSave(response, options)
@@ -999,12 +1020,13 @@ async function buildChatHistoryNotePayloadForSave(
     generatedImageHtmlByMessageIndex?: Map<number, string>;
     figureRender?: NoteFigureRenderOptions;
     noteSaveOptions?: NotePersistenceSaveOptions;
+    timestamp?: string;
   },
 ): Promise<{
   noteHtml: string;
   noteText: string;
 }> {
-  const timestamp = getCurrentLocalTimestamp();
+  const timestamp = options.timestamp || getCurrentLocalTimestamp();
   const textLines: string[] = [];
   const htmlBlocks: string[] = [];
   let lastUserPaperContexts: PaperContextRef[] | undefined;
@@ -1173,6 +1195,7 @@ export type AssistantResponseNoteResult = {
   /** Collection ids the note was actually filed into. */
   collections?: number[];
   warnings?: string[];
+  createdNoteReceipt?: CreatedZoteroNoteReceipt;
 };
 
 export async function createAssistantResponseNote(params: {
@@ -1210,6 +1233,7 @@ export async function createAssistantResponseNote(params: {
     noteId?: number,
     noteSaveOptions?: NotePersistenceSaveOptions,
     warnings?: string[],
+    timestamp?: string,
   ): Promise<string> => {
     const generatedImagesHtml =
       noteId && generatedImages.length
@@ -1240,6 +1264,7 @@ export async function createAssistantResponseNote(params: {
         noteId,
         figureRender: params.figureRender,
         noteSaveOptions,
+        timestamp,
       },
     );
     if (
@@ -1277,20 +1302,20 @@ export async function createAssistantResponseNote(params: {
   const containsVisualFigures =
     containsVisualFigureFences(params.queryText || "") ||
     containsVisualFigureFences(params.contentText || "");
-  const needsNoteIdFinalization =
-    generatedImages.length > 0 ||
-    (Boolean(params.figureRender?.doc) && containsVisualFigures);
   const initialHtml = await buildHtml();
   const persisted = await createFinalizedZoteroNote({
     note,
     initialHtml,
-    finalize: needsNoteIdFinalization
-      ? async ({ noteId, saveOptions }) => {
-          const warnings: string[] = [];
-          const html = await buildHtml(noteId, saveOptions, warnings);
-          return { html, warnings };
-        }
-      : undefined,
+    finalize: async ({ noteId, saveOptions, createdNoteMetadata }) => {
+      const warnings: string[] = [];
+      const html = await buildHtml(
+        noteId,
+        saveOptions,
+        warnings,
+        formatZoteroDateAddedForNote(createdNoteMetadata?.system?.dateAdded),
+      );
+      return { html, warnings };
+    },
     log: (message, error) => ztoolkit.log(message, error),
   });
   const noteId = persisted.noteId;
@@ -1317,6 +1342,9 @@ export async function createAssistantResponseNote(params: {
     noteId: noteId && noteId > 0 ? noteId : undefined,
     collections: filedCollections.length ? filedCollections : undefined,
     warnings: persisted.warnings.length ? persisted.warnings : undefined,
+    ...(persisted.createdNoteReceipt
+      ? { createdNoteReceipt: persisted.createdNoteReceipt }
+      : {}),
   };
 }
 
@@ -1333,7 +1361,11 @@ export async function createNoteFromAssistantText(
     queryText?: string;
     figureRender?: NoteFigureRenderOptions;
   } = {},
-): Promise<{ status: "created" | "appended"; noteId?: number }> {
+): Promise<{
+  status: "created" | "appended";
+  noteId?: number;
+  createdNoteReceipt?: CreatedZoteroNoteReceipt;
+}> {
   const parentItem = resolveParentItemForNoteTarget(item);
   const parentId = parentItem?.id;
   if (!parentItem || !parentId) {
@@ -1415,7 +1447,13 @@ export async function createNoteFromAssistantText(
       rememberAssistantNoteForParent(parentId, result.noteId);
     }
   }
-  return { status: "created", noteId: result.noteId };
+  return {
+    status: "created",
+    noteId: result.noteId,
+    ...(result.createdNoteReceipt
+      ? { createdNoteReceipt: result.createdNoteReceipt }
+      : {}),
+  };
 }
 
 export async function createStandaloneNoteFromAssistantText(
@@ -1428,7 +1466,12 @@ export async function createStandaloneNoteFromAssistantText(
   queryText?: string,
   figureRender?: NoteFigureRenderOptions,
   collections?: number[],
-): Promise<{ status: "created"; noteId?: number; collections?: number[] }> {
+): Promise<{
+  status: "created";
+  noteId?: number;
+  collections?: number[];
+  createdNoteReceipt?: CreatedZoteroNoteReceipt;
+}> {
   const result = await createAssistantResponseNote({
     destination: { kind: "standalone", libraryID, collections },
     contentText,
@@ -1445,6 +1488,9 @@ export async function createStandaloneNoteFromAssistantText(
     status: "created",
     noteId: result.noteId,
     collections: result.collections,
+    ...(result.createdNoteReceipt
+      ? { createdNoteReceipt: result.createdNoteReceipt }
+      : {}),
   };
 }
 
@@ -1483,14 +1529,6 @@ function chatHistoryContainsVisualFigures(history: Message[]): boolean {
   });
 }
 
-function chatHistoryHasGeneratedImages(history: Message[]): boolean {
-  return history.some(
-    (message) =>
-      message.role === "assistant" &&
-      normalizeEmbeddableGeneratedImages(message.generatedImages).length > 0,
-  );
-}
-
 function countChatHistoryGeneratedImages(history: Message[]): number {
   return history.reduce(
     (count, message) =>
@@ -1505,6 +1543,7 @@ function countChatHistoryGeneratedImages(history: Message[]): number {
 export type ChatHistoryNoteResult = {
   noteId: number;
   warnings?: string[];
+  createdNoteReceipt?: CreatedZoteroNoteReceipt;
 };
 
 export async function createNoteFromChatHistory(
@@ -1524,8 +1563,6 @@ export async function createNoteFromChatHistory(
   const containsVisualFigures =
     Boolean(options.figureRender?.doc) &&
     chatHistoryContainsVisualFigures(normalizedHistory);
-  const needsNoteIdFinalization =
-    containsVisualFigures || chatHistoryHasGeneratedImages(normalizedHistory);
   const expectedGeneratedImageCount =
     countChatHistoryGeneratedImages(normalizedHistory);
   const initialPayload = buildChatHistoryNotePayload(normalizedHistory);
@@ -1540,48 +1577,48 @@ export async function createNoteFromChatHistory(
   const persisted = await createFinalizedZoteroNote({
     note,
     initialHtml: initialPayload.noteHtml,
-    finalize: needsNoteIdFinalization
-      ? async ({ noteId, saveOptions }) => {
-          const generatedImageHtmlByMessageIndex =
-            await buildGeneratedImageHtmlByMessageIndex(
-              normalizedHistory,
-              noteId,
-              saveOptions,
-            );
-          const payload = containsVisualFigures
-            ? await buildChatHistoryNotePayloadForSave(normalizedHistory, {
-                noteId,
-                generatedImageHtmlByMessageIndex,
-                figureRender: options.figureRender,
-                noteSaveOptions: saveOptions,
-              })
-            : buildChatHistoryNotePayload(normalizedHistory, {
-                generatedImageHtmlByMessageIndex,
-              });
-          const embeddedGeneratedImageCount = Array.from(
-            generatedImageHtmlByMessageIndex.values(),
-          ).reduce(
-            (count, html) =>
-              count + (html.match(/data-attachment-key=/g)?.length || 0),
-            0,
-          );
-          const warnings: string[] = [];
-          if (embeddedGeneratedImageCount < expectedGeneratedImageCount) {
-            warnings.push(
-              `${expectedGeneratedImageCount - embeddedGeneratedImageCount} generated image(s) could not be embedded`,
-            );
-          }
-          if (
-            containsVisualFigures &&
-            /(?:Mermaid diagram|SVG figure) could not be saved as an image/i.test(
-              payload.noteHtml,
-            )
-          ) {
-            warnings.push("One or more visual figures could not be embedded");
-          }
-          return { html: payload.noteHtml, warnings };
-        }
-      : undefined,
+    finalize: async ({ noteId, saveOptions, createdNoteMetadata }) => {
+      const generatedImageHtmlByMessageIndex =
+        await buildGeneratedImageHtmlByMessageIndex(
+          normalizedHistory,
+          noteId,
+          saveOptions,
+        );
+      const payload = await buildChatHistoryNotePayloadForSave(
+        normalizedHistory,
+        {
+          noteId,
+          generatedImageHtmlByMessageIndex,
+          figureRender: options.figureRender,
+          noteSaveOptions: saveOptions,
+          timestamp: formatZoteroDateAddedForNote(
+            createdNoteMetadata?.system?.dateAdded,
+          ),
+        },
+      );
+      const embeddedGeneratedImageCount = Array.from(
+        generatedImageHtmlByMessageIndex.values(),
+      ).reduce(
+        (count, html) =>
+          count + (html.match(/data-attachment-key=/g)?.length || 0),
+        0,
+      );
+      const warnings: string[] = [];
+      if (embeddedGeneratedImageCount < expectedGeneratedImageCount) {
+        warnings.push(
+          `${expectedGeneratedImageCount - embeddedGeneratedImageCount} generated image(s) could not be embedded`,
+        );
+      }
+      if (
+        containsVisualFigures &&
+        /(?:Mermaid diagram|SVG figure) could not be saved as an image/i.test(
+          payload.noteHtml,
+        )
+      ) {
+        warnings.push("One or more visual figures could not be embedded");
+      }
+      return { html: payload.noteHtml, warnings };
+    },
     log: (message, error) => ztoolkit.log(message, error),
   });
   const noteId = persisted.noteId;
@@ -1608,6 +1645,9 @@ export async function createNoteFromChatHistory(
   return {
     noteId,
     warnings: persisted.warnings.length ? persisted.warnings : undefined,
+    ...(persisted.createdNoteReceipt
+      ? { createdNoteReceipt: persisted.createdNoteReceipt }
+      : {}),
   };
 }
 
@@ -1629,8 +1669,6 @@ export async function createStandaloneNoteFromChatHistory(
   const containsVisualFigures =
     Boolean(options.figureRender?.doc) &&
     chatHistoryContainsVisualFigures(normalizedHistory);
-  const needsNoteIdFinalization =
-    containsVisualFigures || chatHistoryHasGeneratedImages(normalizedHistory);
   const expectedGeneratedImageCount =
     countChatHistoryGeneratedImages(normalizedHistory);
   const initialPayload = buildChatHistoryNotePayload(normalizedHistory);
@@ -1639,48 +1677,48 @@ export async function createStandaloneNoteFromChatHistory(
   const persisted = await createFinalizedZoteroNote({
     note,
     initialHtml: initialPayload.noteHtml,
-    finalize: needsNoteIdFinalization
-      ? async ({ noteId, saveOptions }) => {
-          const generatedImageHtmlByMessageIndex =
-            await buildGeneratedImageHtmlByMessageIndex(
-              normalizedHistory,
-              noteId,
-              saveOptions,
-            );
-          const payload = containsVisualFigures
-            ? await buildChatHistoryNotePayloadForSave(normalizedHistory, {
-                noteId,
-                generatedImageHtmlByMessageIndex,
-                figureRender: options.figureRender,
-                noteSaveOptions: saveOptions,
-              })
-            : buildChatHistoryNotePayload(normalizedHistory, {
-                generatedImageHtmlByMessageIndex,
-              });
-          const embeddedGeneratedImageCount = Array.from(
-            generatedImageHtmlByMessageIndex.values(),
-          ).reduce(
-            (count, html) =>
-              count + (html.match(/data-attachment-key=/g)?.length || 0),
-            0,
-          );
-          const warnings: string[] = [];
-          if (embeddedGeneratedImageCount < expectedGeneratedImageCount) {
-            warnings.push(
-              `${expectedGeneratedImageCount - embeddedGeneratedImageCount} generated image(s) could not be embedded`,
-            );
-          }
-          if (
-            containsVisualFigures &&
-            /(?:Mermaid diagram|SVG figure) could not be saved as an image/i.test(
-              payload.noteHtml,
-            )
-          ) {
-            warnings.push("One or more visual figures could not be embedded");
-          }
-          return { html: payload.noteHtml, warnings };
-        }
-      : undefined,
+    finalize: async ({ noteId, saveOptions, createdNoteMetadata }) => {
+      const generatedImageHtmlByMessageIndex =
+        await buildGeneratedImageHtmlByMessageIndex(
+          normalizedHistory,
+          noteId,
+          saveOptions,
+        );
+      const payload = await buildChatHistoryNotePayloadForSave(
+        normalizedHistory,
+        {
+          noteId,
+          generatedImageHtmlByMessageIndex,
+          figureRender: options.figureRender,
+          noteSaveOptions: saveOptions,
+          timestamp: formatZoteroDateAddedForNote(
+            createdNoteMetadata?.system?.dateAdded,
+          ),
+        },
+      );
+      const embeddedGeneratedImageCount = Array.from(
+        generatedImageHtmlByMessageIndex.values(),
+      ).reduce(
+        (count, html) =>
+          count + (html.match(/data-attachment-key=/g)?.length || 0),
+        0,
+      );
+      const warnings: string[] = [];
+      if (embeddedGeneratedImageCount < expectedGeneratedImageCount) {
+        warnings.push(
+          `${expectedGeneratedImageCount - embeddedGeneratedImageCount} generated image(s) could not be embedded`,
+        );
+      }
+      if (
+        containsVisualFigures &&
+        /(?:Mermaid diagram|SVG figure) could not be saved as an image/i.test(
+          payload.noteHtml,
+        )
+      ) {
+        warnings.push("One or more visual figures could not be embedded");
+      }
+      return { html: payload.noteHtml, warnings };
+    },
     log: (message, error) => ztoolkit.log(message, error),
   });
   const noteId = persisted.noteId;
@@ -1710,5 +1748,8 @@ export async function createStandaloneNoteFromChatHistory(
   return {
     noteId,
     warnings: persisted.warnings.length ? persisted.warnings : undefined,
+    ...(persisted.createdNoteReceipt
+      ? { createdNoteReceipt: persisted.createdNoteReceipt }
+      : {}),
   };
 }

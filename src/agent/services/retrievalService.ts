@@ -46,7 +46,7 @@ function dedupePaperContexts(
       !Number.isFinite(entry.contextItemId)
     )
       continue;
-    const key = `${entry.itemId}:${entry.contextItemId}`;
+    const key = `${entry.libraryID || 0}:${entry.itemId}:${entry.contextItemId}`;
     if (seen.has(key)) continue;
     seen.add(key);
     out.push(entry);

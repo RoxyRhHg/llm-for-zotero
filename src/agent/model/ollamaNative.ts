@@ -81,9 +81,6 @@ async function buildMessagesPayload(
           typeof message.content === "string"
             ? message.content
             : await flattenToText(message),
-        ...(message.reasoning_content
-          ? { thinking: message.reasoning_content }
-          : {}),
         tool_calls: message.tool_calls.map((call) => ({
           function: { name: call.name, arguments: call.arguments },
         })),
@@ -192,6 +189,8 @@ function resolveOllamaToolSupport(request: AgentRuntimeRequest): boolean {
 }
 
 export class OllamaNativeAgentAdapter implements AgentModelAdapter {
+  private conversationMessages: OllamaRequestMessage[] | null = null;
+
   getCapabilities(request: AgentRuntimeRequest): AgentModelCapabilities {
     return buildAgentModelCapabilities({
       streaming: true,
@@ -206,6 +205,10 @@ export class OllamaNativeAgentAdapter implements AgentModelAdapter {
     return this.getCapabilities(request).toolCalls;
   }
 
+  resetState(): void {
+    this.conversationMessages = null;
+  }
+
   async runStep(params: AgentStepParams): Promise<AgentModelStep> {
     const request = params.request;
     const auth = await resolveRequestAuthState({
@@ -218,7 +221,12 @@ export class OllamaNativeAgentAdapter implements AgentModelAdapter {
       apiBase: request.apiBase || "",
       authMode: request.authMode,
     });
-    const resolvedMessages = await buildMessagesPayload(params.messages);
+    const resolvedMessages = this.conversationMessages
+      ? [
+          ...this.conversationMessages,
+          ...(await buildMessagesPayload(params.continuationMessages || [])),
+        ]
+      : await buildMessagesPayload(params.messages);
     const tools = buildOpenAIFunctionTools(params.tools);
     // Same sizing as chat mode: allocate the context window the prompt was
     // trimmed against (Ollama's own default is far below the trained maximum
@@ -301,6 +309,27 @@ export class OllamaNativeAgentAdapter implements AgentModelAdapter {
       params.onUsage,
     );
 
+    this.conversationMessages = [
+      ...resolvedMessages,
+      {
+        role: "assistant",
+        content: result.text,
+        ...(result.reasoningText.trim()
+          ? { thinking: result.reasoningText.trim() }
+          : {}),
+        ...(result.toolCalls.length
+          ? {
+              tool_calls: result.toolCalls.map((call) => ({
+                function: {
+                  name: call.name,
+                  arguments: call.arguments,
+                },
+              })),
+            }
+          : {}),
+      },
+    ];
+
     if (result.toolCalls.length) {
       return {
         kind: "tool_calls",
@@ -308,9 +337,6 @@ export class OllamaNativeAgentAdapter implements AgentModelAdapter {
         assistantMessage: {
           role: "assistant",
           content: result.text,
-          ...(result.reasoningText.trim()
-            ? { reasoning_content: result.reasoningText.trim() }
-            : {}),
           tool_calls: result.toolCalls,
         },
       };

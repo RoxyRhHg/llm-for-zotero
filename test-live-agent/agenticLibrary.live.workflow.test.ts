@@ -1,4 +1,8 @@
 import { assert } from "chai";
+import {
+  resolveLiveAgentCredentials,
+  type LiveAgentCredentials,
+} from "./liveAgentCredentials";
 
 declare const Zotero: any;
 
@@ -29,25 +33,11 @@ describe("live agentic library operations", function () {
   };
   let credentialsReady = false;
   // Held only in memory for the duration of the run, and never logged.
-  let creds: { model: string; apiBase: string; apiKey: string } | null = null;
+  let creds: LiveAgentCredentials | null = null;
   const transcript: string[] = [];
 
   function libraryID(): number {
     return Zotero.Libraries.userLibraryID;
-  }
-
-  function configuredCredentialsProfilePath(): string {
-    try {
-      return String(
-        (
-          globalThis as unknown as {
-            Services?: { env?: { get?: (key: string) => string } };
-          }
-        ).Services?.env?.get?.("LLM_FOR_ZOTERO_LIVE_PROFILE_PATH") || "",
-      ).trim();
-    } catch {
-      return "";
-    }
   }
 
   /**
@@ -55,45 +45,8 @@ describe("live agentic library operations", function () {
    * profile prefs file. Returns only a boolean; nothing about the key is logged.
    */
   async function ensureCredentials(): Promise<boolean> {
-    const readPref = (key: string) =>
-      String(Zotero.Prefs.get(`${PREF_PREFIX}.${key}`, true) || "");
-    if (readPref("apiKey") && readPref("apiBase") && readPref("model")) {
-      creds = {
-        model: readPref("model"),
-        apiBase: readPref("apiBase"),
-        apiKey: readPref("apiKey"),
-      };
-      return true;
-    }
-    const configuredProfilePath = configuredCredentialsProfilePath();
-    const candidates = configuredProfilePath ? [configuredProfilePath] : [];
-    for (const path of candidates) {
-      try {
-        const contents = await Zotero.File.getContentsAsync(path);
-        if (typeof contents !== "string") continue;
-        const grab = (key: string) => {
-          const match = contents.match(
-            new RegExp(
-              `user_pref\\("${PREF_PREFIX.replace(/\./g, "\\.")}\\.${key}",\\s*"([^"]*)"\\)`,
-            ),
-          );
-          return match ? match[1] : "";
-        };
-        const apiKey = grab("apiKey");
-        const apiBase = grab("apiBase");
-        const model = grab("model");
-        if (apiKey && apiBase && model) {
-          Zotero.Prefs.set(`${PREF_PREFIX}.apiKey`, apiKey, true);
-          Zotero.Prefs.set(`${PREF_PREFIX}.apiBase`, apiBase, true);
-          Zotero.Prefs.set(`${PREF_PREFIX}.model`, model, true);
-          creds = { model, apiBase, apiKey };
-          return true;
-        }
-      } catch {
-        // Try the next candidate.
-      }
-    }
-    return false;
+    creds = await resolveLiveAgentCredentials();
+    return Boolean(creds);
   }
 
   /** Runs one real agent turn and returns what it did. */
@@ -105,6 +58,8 @@ describe("live agentic library operations", function () {
     assert.isOk(api, "agent API must be installed");
     const toolCalls: Array<{ name: string; args: unknown }> = [];
     const confirmations: string[] = [];
+    const contractStates: string[] = [];
+    const receipts: string[] = [];
     let finalText = "";
     const conversationKey = Math.floor(Math.random() * 1_000_000) + 900_000;
 
@@ -122,7 +77,15 @@ describe("live agentic library operations", function () {
         model: creds?.model,
         apiBase: creds?.apiBase,
         apiKey: creds?.apiKey,
-        providerProtocol: "openai_chat_compat",
+        providerProtocol: creds?.providerProtocol,
+        ...(creds?.reasoningLevel
+          ? {
+              reasoning: {
+                provider: "deepseek",
+                level: creds.reasoningLevel,
+              },
+            }
+          : {}),
         ...extra,
       },
       (event: any) => {
@@ -140,6 +103,15 @@ describe("live agentic library operations", function () {
           confirmations.push(event.action?.title || event.requestId);
           void api.resolveConfirmation(event.requestId, true);
         }
+        if (
+          event?.type === "provider_event" &&
+          event.providerType === "agent_action_contract"
+        ) {
+          contractStates.push(JSON.stringify(event.payload || {}));
+        }
+        if (event?.type === "tool_result" && event.receipt) {
+          receipts.push(JSON.stringify(event.receipt));
+        }
         if (event?.type === "message_delta" && typeof event.text === "string") {
           finalText += event.text;
         }
@@ -153,7 +125,7 @@ describe("live agentic library operations", function () {
     transcript.push(
       `PROMPT: ${userText}\n  TOOLS: ${names.join(" → ") || "(none)"}\n  CARDS: ${confirmations.join(" | ") || "(none)"}\n  OUTCOME: ${result?.kind}${
         result?.kind === "fallback" ? ` (${result.reason})` : ""
-      }`,
+      }\n  CONTRACT: ${contractStates.join(" → ") || "(none)"}\n  RECEIPTS: ${receipts.join(" → ") || "(none)"}\n  ANSWER: ${answer.slice(0, 1200) || "(empty)"}`,
     );
     // A fallback means the agent loop never really ran, so every downstream
     // assertion would be measuring the wrong thing.

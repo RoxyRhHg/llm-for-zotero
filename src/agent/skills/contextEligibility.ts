@@ -1,4 +1,4 @@
-import type { PaperContextRef, SelectedTextSource } from "../../shared/types";
+import type { SelectedTextSource } from "../../shared/types";
 import type { AgentRuntimeRequest } from "../types";
 import type { AgentSkill } from "./skillLoader";
 
@@ -8,12 +8,7 @@ export type SkillRoutingRequest = Pick<
   | "activeNoteContext"
   | "selectedTextSources"
   | "selectedTexts"
-  | "selectedTextPaperContexts"
-  | "selectedPaperContexts"
-  | "fullTextPaperContexts"
-  | "pinnedPaperContexts"
-  | "selectedCollectionContexts"
-  | "selectedTagContexts"
+  | "turnPaperScope"
   | "classifiedIntent"
 >;
 
@@ -42,9 +37,8 @@ const SINGLE_PAPER_TARGET_PATTERN =
 
 function addPaperKey(
   keys: Set<string>,
-  entry: PaperContextRef | undefined,
+  entry: { itemId: number; contextItemId: number },
 ): void {
-  if (!entry) return;
   const itemId = Math.floor(Number(entry.itemId));
   if (Number.isFinite(itemId) && itemId > 0) {
     keys.add(`item:${itemId}`);
@@ -68,14 +62,8 @@ export function resolveSkillRequestContext(
   request: SkillRoutingRequest,
 ): SkillRequestContext {
   const paperKeys = new Set<string>();
-  for (const entry of request.selectedPaperContexts || [])
-    addPaperKey(paperKeys, entry);
-  for (const entry of request.fullTextPaperContexts || [])
-    addPaperKey(paperKeys, entry);
-  for (const entry of request.pinnedPaperContexts || [])
-    addPaperKey(paperKeys, entry);
-  for (const entry of request.selectedTextPaperContexts || []) {
-    addPaperKey(paperKeys, entry);
+  for (const entry of request.turnPaperScope.papers) {
+    addPaperKey(paperKeys, entry.paper);
   }
 
   const userText = request.userText || "";
@@ -83,8 +71,8 @@ export function resolveSkillRequestContext(
   const corpusTargetedByText = CORPUS_TARGET_PATTERN.test(userText);
   const singlePaperTargetedByText = SINGLE_PAPER_TARGET_PATTERN.test(userText);
   const hasLibraryCorpus = Boolean(
-    request.selectedCollectionContexts?.length ||
-    request.selectedTagContexts?.length ||
+    request.turnPaperScope.collections.length ||
+    request.turnPaperScope.tags.length ||
     LIBRARY_CORPUS_INTENT_PATTERN.test(userText),
   );
   const hasNoteContext = Boolean(

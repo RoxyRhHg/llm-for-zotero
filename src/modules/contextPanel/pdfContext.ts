@@ -73,6 +73,12 @@ import {
   parseDocumentReferences,
   resolveDocumentReferenceMatches,
 } from "../../shared/documentReferences";
+import { createZoteroMetadataResolver } from "../../services/zoteroMetadata/resolver";
+import { projectPaperMetadata } from "../../services/zoteroMetadata/projections";
+import type {
+  ProjectedPaperMetadata,
+  ZoteroMetadataResolver,
+} from "../../services/zoteroMetadata/types";
 
 const prefKey = (key: string) => `${config.prefsPrefix}.${key}`;
 const getPref = (key: string) => Zotero.Prefs.get(prefKey(key), true);
@@ -1872,25 +1878,71 @@ export function buildPaperKey(ref: PaperContextRef): string {
   return `${Math.floor(ref.itemId)}:${Math.floor(ref.contextItemId)}`;
 }
 
-function formatPaperMetadataLines(ref: PaperContextRef): string[] {
-  const lines = [`Title: ${ref.title}`];
-  if (ref.citationKey) lines.push(`Citation key: ${ref.citationKey}`);
-  if (ref.firstCreator) lines.push(`Author: ${ref.firstCreator}`);
-  if (ref.year) lines.push(`Year: ${ref.year}`);
+function resolvePaperPromptMetadata(
+  ref: PaperContextRef,
+  resolver: ZoteroMetadataResolver = createZoteroMetadataResolver(),
+): ProjectedPaperMetadata {
+  return projectPaperMetadata(resolver.resolvePaperMetadata(ref), ref);
+}
+
+function formatBibliographicMetadataLines(
+  metadata: ProjectedPaperMetadata,
+): string[] {
+  const lines: string[] = [];
+  if (metadata.title) lines.push(`Title: ${metadata.title}`);
+  if (metadata.creatorDisplay) {
+    lines.push(`Authors: ${metadata.creatorDisplay}`);
+  }
+  if (metadata.publicationDate) {
+    lines.push(`Publication date: ${metadata.publicationDate}`);
+  }
+  if (metadata.year) lines.push(`Year: ${metadata.year}`);
+  if (metadata.citationKey) {
+    lines.push(`Citation key: ${metadata.citationKey}`);
+  }
+  if (metadata.doi) lines.push(`DOI: ${metadata.doi}`);
+  if (metadata.containerTitle) {
+    lines.push(
+      `Container title: ${metadata.containerTitle} (Zotero field: ${metadata.containerSourceField})`,
+    );
+  }
+  if (metadata.eventTitle) {
+    lines.push(
+      `Event title: ${metadata.eventTitle} (Zotero field: ${metadata.eventSourceField})`,
+    );
+  }
+  if (metadata.journalAbbreviation) {
+    lines.push(`Journal abbreviation: ${metadata.journalAbbreviation}`);
+  }
+  return lines;
+}
+
+function formatPaperMetadataLines(
+  ref: PaperContextRef,
+  metadata: ProjectedPaperMetadata,
+): string[] {
+  const lines = formatBibliographicMetadataLines(metadata);
   lines.push(`Source label: ${formatPaperSourceLabel(ref)}`);
   return lines;
 }
 
-function formatSelectedAttachmentMetadataLines(ref: PaperContextRef): string[] {
-  const lines = ["Parent Zotero Item:", `Title: ${ref.title}`];
-  if (ref.citationKey) lines.push(`Citation key: ${ref.citationKey}`);
-  if (ref.firstCreator) lines.push(`Author: ${ref.firstCreator}`);
-  if (ref.year) lines.push(`Year: ${ref.year}`);
+function formatSelectedAttachmentMetadataLines(
+  ref: PaperContextRef,
+  metadata: ProjectedPaperMetadata,
+): string[] {
+  const contentSource = metadata.contentSource;
+  const lines = [
+    "Parent Zotero Item:",
+    ...formatBibliographicMetadataLines(metadata),
+  ];
   lines.push(
     "",
     "Selected Source:",
-    `Type: ${formatAttachmentSourceType(ref.contentSourceMode)}`,
-    `Attachment title: ${formatPaperAttachmentTitle(ref)}`,
+    `Type: ${contentSource?.contentType || formatAttachmentSourceType(ref.contentSourceMode)}`,
+    `Attachment title: ${contentSource?.title || formatPaperAttachmentTitle(ref)}`,
+    ...(contentSource?.filename
+      ? [`Attachment filename: ${contentSource.filename}`]
+      : []),
     "Relationship: Child attachment under the parent item; it may be user OCR, a translated file, supplement, notes, or another related file.",
     `Source label: ${formatPaperSourceLabel(ref)}`,
   );
@@ -1914,13 +1966,18 @@ function formatPerPaperQuoteGuidanceLines(ref: PaperContextRef): string[] {
 export function buildFullPaperContext(
   paperContext: PaperContextRef,
   pdfContext: PdfContext | undefined,
+  metadataResolver: ZoteroMetadataResolver = createZoteroMetadataResolver(),
 ): string {
+  const resolvedMetadata = resolvePaperPromptMetadata(
+    paperContext,
+    metadataResolver,
+  );
   const isSelectedAttachment = isTextLikeAttachmentSourceMode(
     paperContext.contentSourceMode,
   );
   const metadata = isSelectedAttachment
-    ? formatSelectedAttachmentMetadataLines(paperContext)
-    : formatPaperMetadataLines(paperContext);
+    ? formatSelectedAttachmentMetadataLines(paperContext, resolvedMetadata)
+    : formatPaperMetadataLines(paperContext, resolvedMetadata);
   const guidance = isSelectedAttachment
     ? [
         ...formatSelectedAttachmentGuidanceLines(),
@@ -1952,19 +2009,26 @@ export function buildFullPaperContext(
 export function buildTruncatedFullPaperContext(
   paperContext: PaperContextRef,
   pdfContext: PdfContext | undefined,
-  options: { maxTokens: number },
+  options: {
+    maxTokens: number;
+    metadataResolver?: ZoteroMetadataResolver;
+  },
 ): {
   text: string;
   estimatedTokens: number;
   truncated: boolean;
   fullLength: number;
 } {
+  const resolvedMetadata = resolvePaperPromptMetadata(
+    paperContext,
+    options.metadataResolver,
+  );
   const isSelectedAttachment = isTextLikeAttachmentSourceMode(
     paperContext.contentSourceMode,
   );
   const metadata = isSelectedAttachment
-    ? formatSelectedAttachmentMetadataLines(paperContext)
-    : formatPaperMetadataLines(paperContext);
+    ? formatSelectedAttachmentMetadataLines(paperContext, resolvedMetadata)
+    : formatPaperMetadataLines(paperContext, resolvedMetadata);
   const guidance = isSelectedAttachment
     ? [
         ...formatSelectedAttachmentGuidanceLines(),
@@ -2634,6 +2698,7 @@ export function buildEvidencePack(params: {
   quoteAnchorDiagnostics: EvidenceQuoteAnchorDiagnostics;
 } {
   const { papers, candidates } = params;
+  const metadataResolver = createZoteroMetadataResolver();
   const quoteAnchorPolicy = params.quoteAnchorPolicy || "none";
   const quoteAnchorDiagnostics: EvidenceQuoteAnchorDiagnostics = {
     policy: quoteAnchorPolicy,
@@ -2751,7 +2816,12 @@ export function buildEvidencePack(params: {
     const paperCandidates = byPaper.get(paperKey) || [];
     paperCandidates.sort((a, b) => a.chunkIndex - b.chunkIndex);
     const lines: string[] = [`Paper ${paperIndex + 1}`];
-    lines.push(...formatPaperMetadataLines(paper));
+    lines.push(
+      ...formatPaperMetadataLines(
+        paper,
+        resolvePaperPromptMetadata(paper, metadataResolver),
+      ),
+    );
     if (paperCandidates.length) {
       lines.push("", "Evidence:");
       for (const [candidateIndex, candidate] of paperCandidates.entries()) {

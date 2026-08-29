@@ -58,10 +58,11 @@ describe("webchat last-used restore-pref guard", function () {
       "no restore pref may be written for isolated keys",
     );
 
-    // The same writers keep working for ordinary conversations — this guard
-    // is the shared chokepoint for switch, identity sync, and navigation
-    // priming, so a false positive here would break normal restore.
+    // Before startup initializes the registry-backed restore service, even an
+    // ordinary key remains unavailable and no legacy preference is recreated.
+    // The initialized positive path is covered by paperConversationRestore.
     setLastUsedPaperConversationKey(5, 300, 300);
-    assert.strictEqual(getLastUsedPaperConversationKey(5, 300), 300);
+    assert.isNull(getLastUsedPaperConversationKey(5, 300));
+    assert.strictEqual(prefs.size, 0);
   });
 });

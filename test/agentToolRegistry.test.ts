@@ -541,4 +541,49 @@ describe("AgentToolRegistry", function () {
       "outcome is unknown",
     );
   });
+
+  it("fails closed when Agent mode has no configured contract verifier", async function () {
+    const registry = new AgentToolRegistry();
+    let executed = false;
+    registry.register({
+      spec: {
+        name: "unverified_write",
+        description: "write",
+        inputSchema: { type: "object" },
+        mutability: "write",
+        requiresConfirmation: false,
+      },
+      validate: () => ({ ok: true, value: {} }),
+      execute: async () => {
+        executed = true;
+        return { content: { ok: true }, effect: "applied" as const };
+      },
+    });
+    const prepared = await registry.prepareExecution(
+      { id: "unverified", name: "unverified_write", arguments: {} },
+      {
+        ...baseContext,
+        request: {
+          ...baseContext.request,
+          actionContract: {
+            version: 2,
+            id: "contract:no-write",
+            writeDisposition: "none",
+            interpretationSource: "classifier",
+            obligations: [],
+          },
+        },
+      },
+      { callerKind: "model" },
+    );
+
+    assert.equal(prepared.kind, "result");
+    if (prepared.kind !== "result") return;
+    assert.isFalse(prepared.execution.result.ok);
+    assert.isFalse(executed);
+    assert.include(
+      JSON.stringify(prepared.execution.result.content),
+      "no configured Action Contract verifier",
+    );
+  });
 });

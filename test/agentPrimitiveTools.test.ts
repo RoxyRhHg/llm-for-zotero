@@ -1,5 +1,5 @@
 import { assert } from "chai";
-import { buildAgentInitialMessages } from "../src/agent/model/messageBuilder";
+import { buildAgentInitialMessages as buildAgentInitialMessagesResolved } from "../src/agent/model/messageBuilder";
 import { EDITABLE_ARTICLE_METADATA_FIELDS } from "../src/agent/services/zoteroGateway";
 import { AgentToolRegistry } from "../src/agent/tools/registry";
 import { PdfService } from "../src/agent/services/pdfService";
@@ -10,15 +10,37 @@ import { createReadPaperTool } from "../src/agent/tools/read/readPaper";
 import { createSearchPaperTool } from "../src/agent/tools/read/searchPaper";
 import { getPagedOperationId } from "../src/agent/actions/pagedWorkflow";
 import { createFileIOTool } from "../src/agent/tools/write/fileIO";
+import { createBuiltInToolRegistry } from "../src/agent/tools";
 import { createEditCurrentNoteTool } from "../src/agent/tools/write/editCurrentNote";
 import { createApplyTagsTool } from "../src/agent/tools/write/applyTags";
 import { createUpdateMetadataTool } from "../src/agent/tools/write/updateMetadata";
 import { createRunCommandTool } from "../src/agent/tools/write/runCommand";
 import { createZoteroScriptTool } from "../src/agent/tools/write/zoteroScript";
 import { getNotesDirectoryConfig } from "../src/utils/notesDirectoryConfig";
-import type { AgentModelMessage, AgentToolContext } from "../src/agent/types";
+import type {
+  AgentModelMessage,
+  AgentRuntimeRequest,
+  AgentRuntimeRequestInput,
+  AgentToolContext,
+} from "../src/agent/types";
 import type { PaperContextRef } from "../src/shared/types";
 import type { PdfContext } from "../src/modules/contextPanel/types";
+import { PAPER_CITATION_CONTRACT } from "../src/shared/instructionContracts";
+import { resolvedAgentRequest } from "./helpers/resolvedAgentRequest";
+
+async function buildAgentInitialMessages(
+  request: AgentRuntimeRequestInput | AgentRuntimeRequest,
+  tools: Parameters<typeof buildAgentInitialMessagesResolved>[1],
+  history: Parameters<typeof buildAgentInitialMessagesResolved>[2],
+) {
+  return buildAgentInitialMessagesResolved(
+    "turnPaperScope" in request
+      ? request
+      : resolvedAgentRequest({ libraryID: 1, ...request }),
+    tools,
+    history,
+  );
+}
 
 function makeMetadataSnapshot(itemId: number, title: string) {
   return {
@@ -172,13 +194,13 @@ const originalZotero = globalScope.Zotero;
 
 describe("primitive agent tools", function () {
   const baseContext: AgentToolContext = {
-    request: {
+    request: resolvedAgentRequest({
       conversationKey: 42,
       mode: "agent",
       userText: "organize the library",
       activeItemId: 9,
       libraryID: 1,
-    },
+    }),
     item: null,
     currentAnswerText: "",
     modelName: "gpt-5.4",
@@ -660,7 +682,7 @@ describe("primitive agent tools", function () {
     assert.isFalse(updateCalled);
   });
 
-  it("builds system instructions around semantic tool names", async function () {
+  it("keeps fixed instructions focused on cross-turn semantic invariants", async function () {
     const messages = await buildAgentInitialMessages(
       {
         conversationKey: 1,
@@ -680,9 +702,12 @@ describe("primitive agent tools", function () {
     assert.include(systemText, "library_retrieve");
     assert.include(systemText, "library_read");
     assert.include(systemText, "paper_read");
-    assert.include(systemText, "library_update");
-    assert.include(systemText, "use workflow:'answer' and answer in chat");
-    assert.notInclude(systemText, "web_search");
+    assert.include(systemText, "workflow:'answer'");
+    assert.include(systemText, "web_search");
+    assert.include(systemText, "web_read");
+    assert.include(systemText, "use the semantic tool");
+    assert.include(systemText, "current-turn verified receipt");
+    assert.notInclude(systemText, "library_update");
     assert.notInclude(systemText, "search_literature_online");
     assert.notInclude(systemText, "query_library");
     assert.notInclude(systemText, "search_related_papers_online");
@@ -807,10 +832,8 @@ describe("primitive agent tools", function () {
     assert.include(userText, "source_label=(Smith, 2021)");
     assert.include(resourceText, "citationLabel=Smith, 2021");
     assert.include(resourceText, "sourceLabel=(Lee, 2022)");
-    assert.include(
-      resourceText,
-      "for direct quotes and substantive paper-grounded claims",
-    );
+    assert.include(messageText(messages[0]), PAPER_CITATION_CONTRACT);
+    assert.notInclude(resourceText, "include short direct-source blockquotes");
   });
 
   it("file_io adds source metadata only for Codex app-server MinerU paper reads", async function () {
@@ -840,11 +863,11 @@ describe("primitive agent tools", function () {
 
       const codexResult = await tool.execute(validated.value, {
         ...baseContext,
-        request: {
+        request: resolvedAgentRequest({
           ...baseContext.request,
           authMode: "codex_app_server",
           fullTextPaperContexts: [paperContext],
-        },
+        }),
       });
       const codexContent = (codexResult as { content: Record<string, unknown> })
         .content;
@@ -861,11 +884,11 @@ describe("primitive agent tools", function () {
 
       const normalResult = await tool.execute(validated.value, {
         ...baseContext,
-        request: {
+        request: resolvedAgentRequest({
           ...baseContext.request,
           authMode: "api_key",
           fullTextPaperContexts: [paperContext],
-        },
+        }),
       });
       const normalContent = (
         normalResult as { content: Record<string, unknown> }
@@ -1016,6 +1039,7 @@ describe("primitive agent tools", function () {
     const tool = createFileIOTool();
     const createdDirs = new Set<string>();
     const writes: Array<{ path: string; text: string }> = [];
+    const writtenBytes = new Map<string, Uint8Array>();
     const originalIOUtils = (globalThis as { IOUtils?: unknown }).IOUtils;
     const originalOS = (globalThis as { OS?: unknown }).OS;
     (globalThis as { IOUtils?: unknown }).IOUtils = {
@@ -1032,7 +1056,9 @@ describe("primitive agent tools", function () {
           path,
           text: new TextDecoder().decode(bytes),
         });
+        writtenBytes.set(path, bytes);
       },
+      read: async (path: string) => writtenBytes.get(path) || new Uint8Array(),
     };
     (globalThis as { OS?: unknown }).OS = {
       File: {
@@ -1102,6 +1128,8 @@ describe("primitive agent tools", function () {
       write: async (path: string, bytes: Uint8Array) => {
         fileContent.set(path, new TextDecoder().decode(bytes));
       },
+      read: async (path: string) =>
+        new TextEncoder().encode(fileContent.get(path) || ""),
       makeDirectory: async () => undefined,
     };
     const context: AgentToolContext = {
@@ -1153,6 +1181,7 @@ describe("primitive agent tools", function () {
     const tool = createFileIOTool();
     const encoder = new TextEncoder();
     const writes: string[] = [];
+    const writtenBytes = new Map<string, Uint8Array>();
     const originalIOUtils = (globalThis as { IOUtils?: unknown }).IOUtils;
     const manifestPath = "/tmp/llm-for-zotero-mineru/77/manifest.json";
     const manifest = {
@@ -1186,11 +1215,13 @@ describe("primitive agent tools", function () {
     (globalThis as { IOUtils?: unknown }).IOUtils = {
       exists: async (path: string) => path === manifestPath,
       read: async (path: string) => {
+        if (writtenBytes.has(path)) return writtenBytes.get(path)!;
         if (path !== manifestPath) throw new Error(`Unexpected read: ${path}`);
         return encoder.encode(JSON.stringify(manifest));
       },
-      write: async (path: string) => {
+      write: async (path: string, bytes: Uint8Array) => {
         writes.push(path);
+        writtenBytes.set(path, bytes);
       },
       makeDirectory: async () => undefined,
     };
@@ -1271,6 +1302,7 @@ describe("primitive agent tools", function () {
       { type: "image", img_path: "images/b.jpg", page_idx: 1 },
       { type: "image", img_path: "images/c.jpg", page_idx: 1 },
     ];
+    const writtenBytes = new Map<string, Uint8Array>();
     (globalThis as { IOUtils?: unknown }).IOUtils = {
       exists: async (path: string) =>
         [
@@ -1282,6 +1314,7 @@ describe("primitive agent tools", function () {
           `${cacheDir}/images/c.jpg`,
         ].includes(path),
       read: async (path: string) => {
+        if (writtenBytes.has(path)) return writtenBytes.get(path)!;
         if (path === fullMdPath) return encoder.encode(fullMd);
         if (path === contentListPath) {
           return encoder.encode(JSON.stringify(contentList));
@@ -1290,8 +1323,9 @@ describe("primitive agent tools", function () {
       },
       getChildren: async (path: string) =>
         path === cacheDir ? [contentListPath] : [],
-      write: async (path: string) => {
+      write: async (path: string, bytes: Uint8Array) => {
         writes.push(path);
+        writtenBytes.set(path, bytes);
       },
       makeDirectory: async () => undefined,
     };
@@ -1373,6 +1407,9 @@ describe("primitive agent tools", function () {
           `${cacheDir}/images/c.jpg`,
         ].includes(path),
       read: async (path: string) => {
+        if (fileContent.has(path)) {
+          return encoder.encode(fileContent.get(path) || "");
+        }
         if (path === fullMdPath) return encoder.encode(fullMd);
         if (path === contentListPath) {
           return encoder.encode(JSON.stringify(contentList));
@@ -1390,12 +1427,12 @@ describe("primitive agent tools", function () {
     };
     const context: AgentToolContext = {
       ...baseContext,
-      request: {
+      request: resolvedAgentRequest({
         ...baseContext.request,
         conversationKey: 43_012,
         authMode: "codex_app_server",
         fullTextPaperContexts: [paperContext],
-      },
+      }),
     };
 
     try {
@@ -1446,11 +1483,11 @@ describe("primitive agent tools", function () {
     };
     const context: AgentToolContext = {
       ...baseContext,
-      request: {
+      request: resolvedAgentRequest({
         ...baseContext.request,
         selectedTextPaperContexts: [selectedTextContext],
         selectedPaperContexts: [selectedPaperContext],
-      },
+      }),
     };
 
     try {
@@ -1566,6 +1603,9 @@ describe("primitive agent tools", function () {
       exists: async (path: string) =>
         path === manifestPath || path === cropCachePath,
       read: async (path: string) => {
+        if (fileContent.has(path)) {
+          return encoder.encode(fileContent.get(path) || "");
+        }
         if (path === manifestPath)
           return encoder.encode(JSON.stringify(manifest));
         if (path === cropCachePath) {
@@ -1656,6 +1696,9 @@ describe("primitive agent tools", function () {
     (globalThis as { IOUtils?: unknown }).IOUtils = {
       exists: async (path: string) => path === manifestPath,
       read: async (path: string) => {
+        if (fileContent.has(path)) {
+          return encoder.encode(fileContent.get(path) || "");
+        }
         if (path !== manifestPath) throw new Error(`Unexpected read: ${path}`);
         return encoder.encode(JSON.stringify(manifest));
       },
@@ -2282,7 +2325,7 @@ describe("primitive agent tools", function () {
       new FakePdfService(
         makePdfContext(["Abstract text.", "Introduction text."]),
       ),
-      {} as never,
+      { resolvePaperContextTarget: () => paperContext } as never,
     );
     const validated = tool.validate({
       target: { paperContext },
@@ -2450,11 +2493,9 @@ describe("primitive agent tools", function () {
           },
         ] as never,
     );
-    const tool = createSearchPaperTool(
-      retrievalService,
-      pdfService,
-      {} as never,
-    );
+    const tool = createSearchPaperTool(retrievalService, pdfService, {
+      resolvePaperContextTarget: () => paperContext,
+    } as never);
     const validated = tool.validate({
       target: { paperContext },
       question: "evidence",
@@ -2470,20 +2511,25 @@ describe("primitive agent tools", function () {
   });
 
   it("adds direct-card guidance for write tool requests", async function () {
+    const registry = createBuiltInToolRegistry({
+      zoteroGateway: {} as never,
+      pdfService: {} as never,
+      pdfPageService: {} as never,
+      retrievalService: {} as never,
+    });
     const messages = await buildAgentInitialMessages(
       {
         conversationKey: 2,
         mode: "agent",
         userText: "can you help me tag these papers?",
       },
-      [],
+      registry.listToolDefinitions(),
       [],
     );
-    const systemText =
-      typeof messages[0]?.content === "string" ? messages[0].content : "";
-    assert.include(systemText, "library_update");
-    assert.include(systemText, "collection membership");
-    assert.include(systemText, "confirmation card is the deliverable");
+    const turnText = messageText(messages[messages.length - 1]);
+    assert.include(turnText, "library_update");
+    assert.include(turnText, "collection membership");
+    assert.include(turnText, "confirmation card is the deliverable");
   });
 
   it("edit_current_note confirms and updates the active note", async function () {

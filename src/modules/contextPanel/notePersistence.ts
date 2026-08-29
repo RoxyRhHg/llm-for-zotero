@@ -1,3 +1,6 @@
+import { createZoteroMetadataResolver } from "../../services/zoteroMetadata/resolver";
+import type { ResolvedNoteMetadata } from "../../services/zoteroMetadata/types";
+
 export type NotePersistenceSaveOptions = {
   notifierQueue?: unknown;
 };
@@ -5,6 +8,7 @@ export type NotePersistenceSaveOptions = {
 export type FinalizedNoteBuildContext = {
   noteId: number;
   saveOptions: NotePersistenceSaveOptions;
+  createdNoteMetadata?: ResolvedNoteMetadata;
 };
 
 export type FinalizedNoteBuildResult = {
@@ -16,7 +20,23 @@ export type FinalizedNotePersistenceResult = {
   noteId: number;
   html: string;
   warnings: string[];
+  createdNoteReceipt?: CreatedZoteroNoteReceipt;
 };
+
+export type CreatedZoteroNoteReceipt = Readonly<{
+  schemaVersion: 1;
+  operation: "created";
+  note: Readonly<{
+    itemId: number;
+    libraryID: number;
+    key?: string;
+    noteKind: "item" | "standalone";
+    parentItemId?: number;
+    dateAdded: string;
+    dateModified?: string;
+    version?: number;
+  }>;
+}>;
 
 type FinalizedNoteParams = {
   note: Zotero.Item;
@@ -163,6 +183,68 @@ function resolveCreatedNoteId(
   return id;
 }
 
+async function readCreatedNoteMetadata(
+  noteId: number,
+  originalNote: Zotero.Item,
+): Promise<ResolvedNoteMetadata | undefined> {
+  const items = (
+    Zotero as unknown as {
+      Items?: { get?: (itemId: number) => Zotero.Item | null | undefined };
+    }
+  ).Items;
+  const savedNote = items?.get?.(noteId) || originalNote;
+  const reload = (
+    savedNote as Zotero.Item & {
+      reload?: (
+        dataTypes?: string[],
+        reloadUnchanged?: boolean,
+      ) => Promise<void>;
+    }
+  ).reload;
+  if (typeof reload === "function") {
+    await reload.call(savedNote, ["primaryData", "note"], true);
+  }
+  const resolver = createZoteroMetadataResolver({
+    getItem: (itemId) => (itemId === noteId ? savedNote : items?.get?.(itemId)),
+  });
+  const resolution = resolver.resolveItemMetadata(noteId, {
+    detail: "summary",
+    includeSystemMetadata: true,
+  });
+  return resolution.status === "resolved" && resolution.value.kind === "note"
+    ? resolution.value
+    : undefined;
+}
+
+function buildCreatedNoteReceipt(params: {
+  initial?: ResolvedNoteMetadata;
+  final?: ResolvedNoteMetadata;
+}): CreatedZoteroNoteReceipt | undefined {
+  const identity = params.final?.identity || params.initial?.identity;
+  const dateAdded =
+    params.final?.system?.dateAdded || params.initial?.system?.dateAdded;
+  if (!identity || identity.libraryID <= 0 || !dateAdded) return undefined;
+  const finalSystem = params.final?.system;
+  const note = params.final || params.initial;
+  if (!note) return undefined;
+  return {
+    schemaVersion: 1,
+    operation: "created",
+    note: {
+      itemId: identity.itemId,
+      libraryID: identity.libraryID,
+      ...(identity.key ? { key: identity.key } : {}),
+      noteKind: note.noteKind,
+      ...(note.parentItemId ? { parentItemId: note.parentItemId } : {}),
+      dateAdded,
+      ...(finalSystem?.dateModified
+        ? { dateModified: finalSystem.dateModified }
+        : {}),
+      ...(finalSystem?.version ? { version: finalSystem.version } : {}),
+    },
+  };
+}
+
 /**
  * Create a Zotero note without exposing an intermediate placeholder to item
  * observers. The first persisted state is always useful content. When assets
@@ -178,17 +260,40 @@ export async function createFinalizedZoteroNote(
   let finalHtml = params.initialHtml;
   let primaryError: unknown;
   let result: FinalizedNotePersistenceResult | undefined;
+  let initialCreatedNoteMetadata: ResolvedNoteMetadata | undefined;
 
   try {
     params.note.setNote(params.initialHtml);
     const saveResult = await params.note.saveTx(queue.saveOptions as never);
     noteId = resolveCreatedNoteId(params.note, saveResult);
 
+    try {
+      initialCreatedNoteMetadata = await readCreatedNoteMetadata(
+        noteId,
+        params.note,
+      );
+      if (!initialCreatedNoteMetadata?.system?.dateAdded) {
+        warnings.push(
+          "Authoritative Zotero dateAdded was unavailable for the created note",
+        );
+      }
+    } catch (error) {
+      warnings.push(
+        "Authoritative Zotero creation metadata could not be read; the note was still saved",
+      );
+      logSafely(
+        params.log,
+        "LLM: Failed to read created-note metadata after initial save",
+        error,
+      );
+    }
+
     if (params.finalize) {
       try {
         const finalized = await params.finalize({
           noteId,
           saveOptions: queue.saveOptions,
+          createdNoteMetadata: initialCreatedNoteMetadata,
         });
         if (typeof finalized === "string") {
           finalHtml = finalized;
@@ -211,10 +316,31 @@ export async function createFinalizedZoteroNote(
       queue.saveOptions,
       !params.finalize || noteHtmlMatches(finalHtml, params.initialHtml),
     );
+    let finalCreatedNoteMetadata: ResolvedNoteMetadata | undefined;
+    try {
+      finalCreatedNoteMetadata = await readCreatedNoteMetadata(
+        noteId,
+        params.note,
+      );
+    } catch (error) {
+      warnings.push(
+        "Final Zotero note metadata could not be read; final note content was still verified",
+      );
+      logSafely(
+        params.log,
+        "LLM: Failed to read created-note metadata after final save",
+        error,
+      );
+    }
+    const createdNoteReceipt = buildCreatedNoteReceipt({
+      initial: initialCreatedNoteMetadata,
+      final: finalCreatedNoteMetadata,
+    });
     result = {
       noteId,
       html: finalHtml,
       warnings,
+      ...(createdNoteReceipt ? { createdNoteReceipt } : {}),
     };
   } catch (error) {
     primaryError = error;

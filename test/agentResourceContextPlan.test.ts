@@ -22,9 +22,11 @@ import { parseSkill, setUserSkills } from "../src/agent/skills";
 import type {
   AgentModelMessage,
   AgentRuntimeRequest,
+  AgentRuntimeRequestInput,
   AgentToolDefinition,
 } from "../src/agent/types";
 import type { PaperContextRef } from "../src/shared/types";
+import { resolvedAgentRequest } from "./helpers/resolvedAgentRequest";
 
 function paper(
   itemId: number,
@@ -42,9 +44,9 @@ function paper(
 }
 
 function request(
-  overrides: Partial<AgentRuntimeRequest> = {},
+  overrides: Partial<AgentRuntimeRequestInput> = {},
 ): AgentRuntimeRequest {
-  return {
+  return resolvedAgentRequest({
     conversationKey: 101,
     mode: "agent",
     userText: "What should I do next?",
@@ -52,7 +54,7 @@ function request(
     libraryID: 1,
     selectedPaperContexts: [paper(1, 10, "Baseline Paper")],
     ...overrides,
-  };
+  });
 }
 
 function messageText(message: AgentModelMessage): string {
@@ -398,7 +400,7 @@ describe("agent resource context plan", function () {
     assert.include(text, 'title="Baseline Paper"');
     assert.include(text, "Paper 2:");
     assert.include(text, 'title="Second Paper"');
-    assert.include(text, "the second paper");
+    assert.include(text, '"these papers" or "both papers"');
     assert.include(text, "User request:\nNow summarize the implication.");
   });
 
@@ -423,7 +425,7 @@ describe("agent resource context plan", function () {
   });
 
   it("renders contentful resources directly in the current turn", async function () {
-    const cases: Array<Partial<AgentRuntimeRequest>> = [
+    const cases: Array<Partial<AgentRuntimeRequestInput>> = [
       { selectedTexts: ["quoted text"] },
       {
         activeNoteContext: {

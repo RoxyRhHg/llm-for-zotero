@@ -28,6 +28,14 @@ import { createZToolkit } from "./utils/ztoolkit";
 import { clearAllState, initFontScale } from "./modules/contextPanel/state";
 import { clearQueuedFollowUpState } from "./modules/contextPanel/queuedFollowUps";
 import { closeAllAddonDialogs } from "./utils/dialogRegistry";
+import {
+  initializePaperRestoreSelections,
+  shutdownPaperRestoreSelections,
+} from "./shared/paperConversationRestore";
+import {
+  registerPaperConversationRestoreNotifications,
+  unregisterPaperConversationRestoreNotifications,
+} from "./services/paperConversationRestoreNotifications";
 
 type ConversationStoreReadiness = {
   chatStoreReady: boolean;
@@ -316,6 +324,11 @@ async function onStartup() {
   const conversationStoreReadiness =
     await initializeConversationStoresForStartup();
 
+  await measureStartupPhase("paper conversation restore selections", () =>
+    initializePaperRestoreSelections(conversationStoreReadiness),
+  );
+  registerPaperConversationRestoreNotifications();
+
   // A durable deletion intent that was not loaded is an active write fence,
   // but it must NOT abort startup. Throwing here skipped the preferences pane
   // and every window, leaving the user with no plugin at all and no way to
@@ -436,7 +449,9 @@ async function onMainWindowUnload(win: Window): Promise<void> {
   win.document.getElementById("llmforzotero-key-standalone")?.remove();
 }
 
-function onShutdown(): void {
+async function onShutdown(): Promise<void> {
+  unregisterPaperConversationRestoreNotifications();
+  await shutdownPaperRestoreSelections();
   ztoolkit.unregisterAll();
   unregisterReaderSelectionTracking();
   unregisterAllNoteEditingSelectionTracking();

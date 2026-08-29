@@ -28,7 +28,6 @@ import {
 } from "./messageBuilder";
 import {
   createFallbackToolCallId,
-  getToolContinuationMessages,
   groupToolContinuationMessages,
 } from "./shared";
 import { resolveContentParts } from "./adapterUtils";
@@ -119,10 +118,6 @@ function isToolUseBlock(block: AnthropicContentBlock): boolean {
   return block.type.toLowerCase() === "tool_use";
 }
 
-function isToolResultBlock(block: AnthropicContentBlock): boolean {
-  return block.type.toLowerCase() === "tool_result";
-}
-
 function isEmptyTextBlock(block: AnthropicContentBlock): boolean {
   return (
     block.type.toLowerCase() === "text" &&
@@ -204,72 +199,6 @@ function buildLooseToolResultSummaryMessage(
       },
     ],
   };
-}
-
-function collectToolResultIds(
-  messages: readonly AnthropicMessage[],
-): Set<string> {
-  const ids = new Set<string>();
-  for (const message of messages) {
-    for (const block of message.content) {
-      if (!isToolResultBlock(block)) continue;
-      const id = getBlockStringField(block, "tool_use_id");
-      if (id) ids.add(id);
-    }
-  }
-  return ids;
-}
-
-function cloneAnthropicMessage(message: AnthropicMessage): AnthropicMessage {
-  return {
-    role: message.role,
-    content: message.content.map((block) => cloneAnthropicContentBlock(block)),
-  };
-}
-
-function reconcileCachedConversationForContinuation(
-  cachedMessages: readonly AnthropicMessage[],
-  fallbackBaseMessages: readonly AnthropicMessage[],
-  continuationMessages: readonly AnthropicMessage[],
-): AnthropicMessage[] {
-  const expectedToolResultIds = collectToolResultIds(continuationMessages);
-  if (!expectedToolResultIds.size) {
-    return cachedMessages.map((message) => cloneAnthropicMessage(message));
-  }
-
-  for (let index = cachedMessages.length - 1; index >= 0; index -= 1) {
-    const message = cachedMessages[index];
-    if (message.role !== "assistant") continue;
-    const toolUseBlocks = message.content.filter(isToolUseBlock);
-    if (!toolUseBlocks.length) continue;
-
-    const filteredContent = message.content.filter((block) => {
-      if (!isToolUseBlock(block)) return true;
-      const id = getBlockStringField(block, "id");
-      return id ? expectedToolResultIds.has(id) : false;
-    });
-    const keptToolUseIds = toolUseIdsFromMessage({
-      role: "assistant",
-      content: filteredContent,
-    });
-    const keepsEveryExpectedResult = Array.from(expectedToolResultIds).every(
-      (id) => keptToolUseIds.has(id),
-    );
-    if (!keepsEveryExpectedResult) break;
-
-    return cachedMessages.map((entry, entryIndex) =>
-      entryIndex === index
-        ? {
-            role: "assistant",
-            content: filteredContent.map((block) =>
-              cloneAnthropicContentBlock(block),
-            ),
-          }
-        : cloneAnthropicMessage(entry),
-    );
-  }
-
-  return fallbackBaseMessages.map((message) => cloneAnthropicMessage(message));
 }
 
 async function buildAnthropicParts(
@@ -763,26 +692,13 @@ export class AnthropicMessagesAgentAdapter implements AgentModelAdapter {
       this.systemBlocks = initial.systemBlocks;
     }
     const continuationSource = cachedConversationMessages
-      ? getToolContinuationMessages(params.messages)
+      ? params.continuationMessages || []
       : [];
     const continuation = await buildAnthropicContinuationMessages(
       continuationSource,
       buildOptions,
     );
-    const fallbackBaseMessages = continuation.length
-      ? initial.messages.slice(
-          0,
-          Math.max(0, initial.messages.length - continuation.length),
-        )
-      : initial.messages;
-    const conversationBase =
-      continuation.length && cachedConversationMessages
-        ? reconcileCachedConversationForContinuation(
-            cachedConversationMessages,
-            fallbackBaseMessages,
-            continuation,
-          )
-        : cachedConversationMessages || initial.messages;
+    const conversationBase = cachedConversationMessages || initial.messages;
     const messages = continuation.length
       ? [...conversationBase, ...continuation]
       : conversationBase;

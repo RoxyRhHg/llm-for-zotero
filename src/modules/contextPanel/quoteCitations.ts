@@ -9,6 +9,7 @@ import {
   extractLocatorTokens,
   findQuoteTextAnchorMatches,
   normalizeLocatorText,
+  splitQuoteAtPairedInlineMath,
   splitQuoteAtEllipsisInOrder,
   stripBoundaryEllipsis,
   type QuoteTextAnchorMatch,
@@ -2657,6 +2658,7 @@ export type QuoteSecondaryEvidence =
         pageIndex: number;
         pageLabel?: string;
         sourceMatchText: string;
+        sourceMatchKind?: "exact" | "normalized-span";
         sourceMatchPageOccurrence: number;
       };
     }
@@ -2683,6 +2685,47 @@ type StrongPartialQuoteSource = {
   match: QuoteTextAnchorMatch;
   source: QuoteSourceIndexEntry;
 };
+
+type ExactUnpagedInlineMathQuoteSource = {
+  source: QuoteSourceIndexEntry;
+};
+
+function collectExactUnpagedInlineMathQuoteSources(params: {
+  quoteText: string;
+  sourceIndex: QuoteSourceIndex;
+}): ExactUnpagedInlineMathQuoteSource[] {
+  const displayed = normalizeDisplayedQuoteForExactBinding(params.quoteText);
+  if (!displayed || !splitQuoteAtPairedInlineMath(displayed.quoteText)) {
+    return [];
+  }
+
+  const displayedIndex = buildQuoteTextIndex(displayed.quoteText);
+  const byContextItemId = new Map<number, QuoteSourceIndexEntry>();
+  for (const source of params.sourceIndex.sources) {
+    const contextItemId = normalizePositiveInt(source.contextItemId);
+    if (
+      !contextItemId ||
+      source.sourceMatchSource !== "context-text" ||
+      !source.requiresPageHint ||
+      source.pageHintIndex !== undefined
+    ) {
+      continue;
+    }
+    const spans = findQuoteSourceSpansAllowingLayoutArtifactsFromIndex(
+      source.textIndex || buildQuoteTextIndex(source.sourceText),
+      displayedIndex,
+    );
+    if (!spans.length) continue;
+    const existing = byContextItemId.get(contextItemId);
+    if (
+      !existing ||
+      quoteSourceProvenanceScore(source) > quoteSourceProvenanceScore(existing)
+    ) {
+      byContextItemId.set(contextItemId, source);
+    }
+  }
+  return Array.from(byContextItemId.values(), (source) => ({ source }));
+}
 
 function isStrongPartialDisplayedQuoteMatch(
   match: QuoteTextAnchorMatch,
@@ -2734,20 +2777,20 @@ function collectStrongPartialDisplayedQuoteSources(params: {
 
 function buildPdfJsVerifiedQuoteCitation(params: {
   quoteText: string;
-  partial: StrongPartialQuoteSource;
+  source: QuoteSourceIndexEntry;
   evidence: Extract<QuoteSecondaryEvidence, { status: "matched" }>;
 }): QuoteCitation | undefined {
   const fingerprint = params.evidence.certificate.documentFingerprint;
   return buildQuoteCitation({
     quoteText: params.quoteText,
-    citationLabel: params.partial.source.citationLabel,
+    citationLabel: params.source.citationLabel,
     sourceMatchText: params.evidence.certificate.sourceMatchText,
-    sourceMatchKind: "exact",
+    sourceMatchKind: params.evidence.certificate.sourceMatchKind || "exact",
     sourceMatchSource: "pdf-page-text",
-    sourceSectionLabel: params.partial.source.sectionLabel,
-    sourceChunkKind: params.partial.source.chunkKind,
-    contextItemId: params.partial.source.contextItemId,
-    itemId: params.partial.source.itemId,
+    sourceSectionLabel: params.source.sectionLabel,
+    sourceChunkKind: params.source.chunkKind,
+    contextItemId: params.source.contextItemId,
+    itemId: params.source.itemId,
     sourceFingerprint: fingerprint.startsWith("pdfjs:")
       ? fingerprint
       : `pdfjs:${fingerprint}`,
@@ -2900,6 +2943,7 @@ function isHighConfidenceNonSourceQuote(params: {
 export function classifyDisplayedQuoteSource(params: {
   quoteText: string;
   sourceIndex: QuoteSourceIndex;
+  secondarySourceIndex?: QuoteSourceIndex;
   sourceEvidenceComplete: boolean;
   secondaryEvidence?: readonly QuoteSecondaryEvidence[];
 }): QuoteSourceResolution {
@@ -2913,6 +2957,53 @@ export function classifyDisplayedQuoteSource(params: {
   });
   if (quoteCitations.length) {
     return { kind: "matched", quoteCitations };
+  }
+  const exactUnpagedInlineMathSources =
+    collectExactUnpagedInlineMathQuoteSources({
+      quoteText,
+      sourceIndex: params.secondarySourceIndex || params.sourceIndex,
+    });
+  if (exactUnpagedInlineMathSources.length) {
+    const quoteKey = buildQuoteSecondaryEvidenceKey(quoteText);
+    const evidenceByContextItemId = new Map(
+      (params.secondaryEvidence || [])
+        .filter((entry) => entry.quoteKey === quoteKey)
+        .map((entry) => [entry.contextItemId, entry]),
+    );
+    const resolvedEvidence = exactUnpagedInlineMathSources.map(
+      ({ source }) => ({
+        source,
+        evidence: source.contextItemId
+          ? evidenceByContextItemId.get(source.contextItemId)
+          : undefined,
+      }),
+    );
+    if (
+      resolvedEvidence.some(
+        ({ evidence }) => !evidence || evidence.status === "defer",
+      )
+    ) {
+      return { kind: "defer" };
+    }
+    const matched = resolvedEvidence.filter(
+      (
+        entry,
+      ): entry is typeof entry & {
+        evidence: Extract<QuoteSecondaryEvidence, { status: "matched" }>;
+      } => entry.evidence?.status === "matched",
+    );
+    if (matched.length > 1) return { kind: "defer" };
+    if (matched.length === 1) {
+      const citation = buildPdfJsVerifiedQuoteCitation({
+        quoteText,
+        source: matched[0].source,
+        evidence: matched[0].evidence,
+      });
+      return citation
+        ? { kind: "matched", quoteCitations: [citation] }
+        : { kind: "defer" };
+    }
+    return { kind: "defer" };
   }
   const trailingPartialCitation = resolveTrailingPartialTokenQuoteCitation({
     quoteText,
@@ -2945,18 +3036,23 @@ export function classifyDisplayedQuoteSource(params: {
     ) {
       return { kind: "defer" };
     }
-    const matched = resolvedEvidence.filter(
-      (
-        entry,
-      ): entry is typeof entry & {
-        evidence: Extract<QuoteSecondaryEvidence, { status: "matched" }>;
-      } => entry.evidence?.status === "matched",
-    );
+    const matched = resolvedEvidence
+      .filter(
+        (
+          entry,
+        ): entry is typeof entry & {
+          evidence: Extract<QuoteSecondaryEvidence, { status: "matched" }>;
+        } => entry.evidence?.status === "matched",
+      )
+      .filter(
+        ({ evidence }) =>
+          evidence.certificate.sourceMatchKind !== "normalized-span",
+      );
     if (matched.length > 1) return { kind: "defer" };
     if (matched.length === 1) {
       const citation = buildPdfJsVerifiedQuoteCitation({
         quoteText,
-        partial: matched[0].partial,
+        source: matched[0].partial.source,
         evidence: matched[0].evidence,
       });
       return citation
@@ -3226,6 +3322,7 @@ function finalizeQuoteSourceCandidate(params: {
   quoteText: string;
   citationRemainder?: string;
   sourceIndex: QuoteSourceIndex;
+  secondarySourceIndex?: QuoteSourceIndex;
   sourceEvidenceComplete: boolean;
   secondaryEvidence?: readonly QuoteSecondaryEvidence[];
 }): {
@@ -3240,6 +3337,7 @@ function finalizeQuoteSourceCandidate(params: {
   const resolution = classifyDisplayedQuoteSource({
     quoteText,
     sourceIndex: params.sourceIndex,
+    secondarySourceIndex: params.secondarySourceIndex,
     sourceEvidenceComplete: params.sourceEvidenceComplete,
     secondaryEvidence: params.secondaryEvidence,
   });
@@ -3411,12 +3509,15 @@ export type DisplayedQuoteVerificationRequest = {
   quoteKey: string;
   quoteText: string;
   contextItemId: number;
+  verificationMode: "complete-quote" | "inline-math-locator";
 };
 
 /**
- * Collect quote/attachment pairs whose strong partial source support requires
- * an independent full-span check. Parsing mirrors the finalizer's blockquote
- * walk so fenced examples and structured quote anchors are treated identically.
+ * Collect quote/attachment pairs that require independent PDF.js evidence:
+ * either a full-span check for a strong partial or a unique page locator for
+ * inline math already verified exactly in context text. Parsing mirrors the
+ * finalizer's blockquote walk so fenced examples and structured quote anchors
+ * are treated identically.
  */
 export function collectDisplayedQuoteVerificationRequests(params: {
   markdown: string;
@@ -3472,8 +3573,10 @@ export function collectDisplayedQuoteVerificationRequests(params: {
     index -= 1;
   }
 
-  const out: DisplayedQuoteVerificationRequest[] = [];
-  const seen = new Set<string>();
+  const requestsByQuoteAndAttachment = new Map<
+    string,
+    DisplayedQuoteVerificationRequest
+  >();
   for (const quoteText of quoteTexts) {
     const quoteKey = buildQuoteSecondaryEvidenceKey(quoteText);
     if (!quoteKey) continue;
@@ -3484,12 +3587,31 @@ export function collectDisplayedQuoteVerificationRequests(params: {
       const contextItemId = normalizePositiveInt(partial.source.contextItemId);
       if (!contextItemId) continue;
       const key = `${quoteKey}\u241f${contextItemId}`;
-      if (seen.has(key)) continue;
-      seen.add(key);
-      out.push({ quoteKey, quoteText, contextItemId });
+      if (!requestsByQuoteAndAttachment.has(key)) {
+        requestsByQuoteAndAttachment.set(key, {
+          quoteKey,
+          quoteText,
+          contextItemId,
+          verificationMode: "complete-quote",
+        });
+      }
+    }
+    for (const exact of collectExactUnpagedInlineMathQuoteSources({
+      quoteText,
+      sourceIndex: params.sourceIndex,
+    })) {
+      const contextItemId = normalizePositiveInt(exact.source.contextItemId);
+      if (!contextItemId) continue;
+      const key = `${quoteKey}\u241f${contextItemId}`;
+      requestsByQuoteAndAttachment.set(key, {
+        quoteKey,
+        quoteText,
+        contextItemId,
+        verificationMode: "inline-math-locator",
+      });
     }
   }
-  return out;
+  return Array.from(requestsByQuoteAndAttachment.values());
 }
 
 export type AssistantQuoteCitationFinalizationResult = {
@@ -3702,6 +3824,7 @@ function* finalizeAssistantQuoteCitationSteps(
         const fullQuote = finalizeQuoteSourceCandidate({
           quoteText,
           sourceIndex: finalizedSourceIndex,
+          secondarySourceIndex: sourceIndex,
           sourceEvidenceComplete:
             params.quoteSourceReview.sourceEvidenceComplete,
           secondaryEvidence: params.secondaryEvidence,
@@ -3727,6 +3850,7 @@ function* finalizeAssistantQuoteCitationSteps(
           quoteText,
           citationRemainder: candidate.citationRemainder,
           sourceIndex: finalizedSourceIndex,
+          secondarySourceIndex: sourceIndex,
           sourceEvidenceComplete:
             params.quoteSourceReview.sourceEvidenceComplete,
           secondaryEvidence: params.secondaryEvidence,
@@ -3786,6 +3910,7 @@ function* finalizeAssistantQuoteCitationSteps(
       const finalized = finalizeQuoteSourceCandidate({
         quoteText,
         sourceIndex: finalizedSourceIndex,
+        secondarySourceIndex: sourceIndex,
         sourceEvidenceComplete: params.quoteSourceReview.sourceEvidenceComplete,
         secondaryEvidence: params.secondaryEvidence,
       });
