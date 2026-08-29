@@ -155,7 +155,9 @@ export class ActionContractRunSession {
       this.receipts,
       progress,
     );
-    if (progress) progress.state = evaluation.state;
+    if (progress && evaluation.state !== "failed") {
+      progress.state = evaluation.state;
+    }
     await this.emitSnapshot(evaluation.state);
 
     if (evaluation.state === "satisfied" || evaluation.state === "cancelled") {

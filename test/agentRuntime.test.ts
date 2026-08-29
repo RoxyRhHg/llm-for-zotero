@@ -62,6 +62,8 @@ type InstalledMockDb = (() => void) & {
   events: MockDbRow[];
   transcripts: MockDbRow[];
   journalDb: ChangeJournalTestDb;
+  setTranscriptWriteFailure: (enabled: boolean) => void;
+  transcriptWriteAttempts: () => number;
 };
 
 function createTestActionContractService(
@@ -75,6 +77,36 @@ function createTestActionContractService(
     getItem,
     getEditableArticleMetadata: () => null,
   });
+}
+
+function registerZeroEffectLibraryUpdate(registry: AgentToolRegistry): void {
+  registry.register({
+    spec: {
+      name: "library_update",
+      description: "update",
+      inputSchema: { type: "object" },
+      mutability: "write",
+      requiresConfirmation: false,
+    },
+    validate: (args) => ({ ok: true, value: args as never }),
+    planMutation: async () => ({
+      effect: "write",
+      reversibility: "full",
+    }),
+    async execute() {
+      return {
+        content: {
+          movedCount: 0,
+          selectedCount: 2,
+          items: [
+            { itemId: 1, status: "missing", reason: "wrong type" },
+            { itemId: 2, status: "missing", reason: "wrong type" },
+          ],
+        },
+        effect: "none",
+      };
+    },
+  } as never);
 }
 
 function commandActionDescriptor(id: string) {
@@ -97,6 +129,8 @@ function installMockDb(): InstalledMockDb {
   const transcripts: MockDbRow[] = [];
   const prefs = new Map<string, unknown>();
   const journalDb = new ChangeJournalTestDb();
+  let failTranscriptWrites = false;
+  let transcriptWriteAttempts = 0;
   const originalZotero = (
     globalThis as typeof globalThis & { Zotero?: unknown }
   ).Zotero;
@@ -104,6 +138,15 @@ function installMockDb(): InstalledMockDb {
     DB: {
       executeTransaction: async (fn: () => Promise<unknown>) => fn(),
       queryAsync: async (sql: string, params: unknown[] = []) => {
+        if (
+          sql.includes("llm_for_zotero_agent_transcript") &&
+          (sql.includes("DELETE FROM") || sql.includes("INSERT INTO"))
+        ) {
+          transcriptWriteAttempts += 1;
+          if (failTranscriptWrites) {
+            throw new Error("Injected transcript write failure");
+          }
+        }
         if (sql.includes("INSERT OR REPLACE INTO llm_for_zotero_agent_runs")) {
           runs.set(String(params[0]), {
             runId: params[0],
@@ -246,6 +289,10 @@ function installMockDb(): InstalledMockDb {
     events,
     transcripts,
     journalDb,
+    setTranscriptWriteFailure: (enabled: boolean) => {
+      failTranscriptWrites = enabled;
+    },
+    transcriptWriteAttempts: () => transcriptWriteAttempts,
   });
 }
 
@@ -1436,6 +1483,7 @@ describe("AgentRuntime", function () {
       let modelStep = 0;
       let resetCount = 0;
       let sawBoundedFollowup = false;
+      let initialMessages: AgentModelMessage[] = [];
       const overLimitCallCount = MAX_AGENT_TOOL_CALLS_PER_ROUND + 1;
       const runtime = new AgentRuntime({
         registry,
@@ -1452,6 +1500,7 @@ describe("AgentRuntime", function () {
           async runStep(params: AgentStepParams): Promise<AgentModelStep> {
             modelStep += 1;
             if (modelStep === 1) {
+              initialMessages = structuredClone(params.messages);
               const calls = Array.from(
                 { length: overLimitCallCount },
                 (_unused, index) => ({
@@ -1471,14 +1520,33 @@ describe("AgentRuntime", function () {
               };
             }
             if (modelStep === 2) {
+              const restartedMessages = structuredClone(params.messages);
               assert.isTrue(
-                params.messages.every(
+                restartedMessages.every(
                   (message) =>
                     message.role === "system" || message.role === "user",
                 ),
               );
+              assert.deepEqual(
+                restartedMessages.slice(0, -1),
+                initialMessages,
+                "the frozen system/current-turn envelope must be unchanged",
+              );
+              assert.equal(restartedMessages.at(-1)?.role, "user");
               assert.include(
-                params.messages
+                JSON.stringify(restartedMessages.at(-1)),
+                "Agent semantic continuation checkpoint",
+              );
+              assert.equal(
+                restartedMessages.filter((message) =>
+                  JSON.stringify(message).includes(
+                    "Agent semantic continuation checkpoint",
+                  ),
+                ).length,
+                1,
+              );
+              assert.include(
+                restartedMessages
                   .map((message) =>
                     typeof message.content === "string" ? message.content : "",
                   )
@@ -1523,6 +1591,8 @@ describe("AgentRuntime", function () {
           conversationKey: 1,
           mode: "agent",
           userText: "summarize the paper",
+          systemPrompt: "SYSTEM_RESTART_SENTINEL",
+          customInstructions: "CUSTOM_RESTART_SENTINEL",
           model: "gpt-4o-mini",
           apiBase: "https://api.openai.com/v1/chat/completions",
           apiKey: "test",
@@ -1537,6 +1607,89 @@ describe("AgentRuntime", function () {
       assert.equal(resetCount, 1);
     } finally {
       restoreDb();
+    }
+  });
+
+  it("does not install or reset a semantic restart when checkpoint storage fails", async function () {
+    const installed = installMockDb();
+    try {
+      const registry = new AgentToolRegistry();
+      let modelStep = 0;
+      let resetCount = 0;
+      let executionCount = 0;
+      registry.register({
+        spec: {
+          name: "read_context",
+          description: "read",
+          inputSchema: { type: "object" },
+          mutability: "read",
+          requiresConfirmation: false,
+        },
+        validate: () => ({ ok: true, value: {} }),
+        execute: async () => {
+          executionCount += 1;
+          return { ok: true };
+        },
+      });
+      const runtime = new AgentRuntime({
+        registry,
+        adapterFactory: () => ({
+          getCapabilities: () => ({
+            streaming: false,
+            toolCalls: true,
+            multimodal: false,
+          }),
+          supportsTools: () => true,
+          resetState: () => {
+            resetCount += 1;
+          },
+          async runStep(): Promise<AgentModelStep> {
+            modelStep += 1;
+            installed.setTranscriptWriteFailure(true);
+            const calls = Array.from(
+              { length: MAX_AGENT_TOOL_CALLS_PER_ROUND + 1 },
+              (_unused, index) => ({
+                id: `rejected-${index}`,
+                name: "read_context",
+                arguments: {},
+              }),
+            );
+            return {
+              kind: "tool_calls",
+              calls,
+              assistantMessage: {
+                role: "assistant",
+                content: "",
+                tool_calls: calls,
+              },
+            };
+          },
+        }),
+      });
+
+      let error: unknown;
+      try {
+        await runtime.runTurn({
+          request: {
+            conversationKey: 2,
+            mode: "agent",
+            userText: "Read safely",
+            model: "gpt-4o-mini",
+            apiBase: "https://api.openai.com/v1/chat/completions",
+            apiKey: "test",
+          },
+        });
+      } catch (caught) {
+        error = caught;
+      }
+
+      assert.match(String(error), /transcript checkpoint storage failed/i);
+      assert.equal(modelStep, 1);
+      assert.equal(executionCount, 0);
+      assert.equal(resetCount, 0);
+      assert.isAbove(installed.transcriptWriteAttempts(), 0);
+    } finally {
+      installed();
     }
   });
 
@@ -4981,6 +5134,7 @@ describe("AgentRuntime", function () {
     try {
       let resetCount = 0;
       let stepIndex = 0;
+      let initialMessages: AgentModelMessage[] = [];
       let inspectedMessages: AgentModelMessage[] = [];
       const registry = new AgentToolRegistry();
       registry.register({
@@ -5019,8 +5173,9 @@ describe("AgentRuntime", function () {
         },
         async runStep(params: AgentStepParams): Promise<AgentModelStep> {
           stepIndex += 1;
-          inspectedMessages = params.messages;
+          inspectedMessages = structuredClone(params.messages);
           if (stepIndex === 1) {
+            initialMessages = structuredClone(params.messages);
             const call = {
               id: "large-read-call",
               name: "query_library",
@@ -5055,6 +5210,8 @@ describe("AgentRuntime", function () {
           conversationKey: 12,
           mode: "agent",
           userText: "current request",
+          systemPrompt: "SYSTEM_PREFLIGHT_SENTINEL",
+          customInstructions: "CUSTOM_PREFLIGHT_SENTINEL",
           model: "claude-haiku-4-5",
           apiBase: "https://api.anthropic.com/v1/messages",
           apiKey: "test",
@@ -5063,9 +5220,19 @@ describe("AgentRuntime", function () {
       });
 
       assert.equal(outcome.kind, "completed");
-      assert.isAtLeast(resetCount, 1);
+      assert.equal(resetCount, 1);
+      assert.deepEqual(inspectedMessages.slice(0, -1), initialMessages);
+      assert.equal(inspectedMessages.at(-1)?.role, "user");
       assert.notInclude(JSON.stringify(inspectedMessages), "B".repeat(1000));
       assert.include(JSON.stringify(inspectedMessages), "current request");
+      assert.include(
+        JSON.stringify(inspectedMessages),
+        "SYSTEM_PREFLIGHT_SENTINEL",
+      );
+      assert.include(
+        JSON.stringify(inspectedMessages),
+        "CUSTOM_PREFLIGHT_SENTINEL",
+      );
       assert.include(
         JSON.stringify(inspectedMessages),
         "Agent semantic continuation checkpoint",
@@ -5094,6 +5261,7 @@ describe("AgentRuntime", function () {
 
       let stepIndex = 0;
       let resetCount = 0;
+      let initialStepMessages: AgentModelMessage[] = [];
       let secondStepMessages: AgentModelMessage[] = [];
       const events: AgentEvent[] = [];
       const runtime = new AgentRuntime({
@@ -5113,6 +5281,7 @@ describe("AgentRuntime", function () {
           async runStep(params: AgentStepParams): Promise<AgentModelStep> {
             stepIndex += 1;
             if (stepIndex === 1) {
+              initialStepMessages = structuredClone(params.messages);
               await params.onUsage?.({
                 promptTokens: 90_000,
                 completionTokens: 10_000,
@@ -5133,7 +5302,7 @@ describe("AgentRuntime", function () {
                 },
               };
             }
-            secondStepMessages = params.messages;
+            secondStepMessages = structuredClone(params.messages);
             return {
               kind: "final",
               text: "Done after checkpoint.",
@@ -5151,6 +5320,8 @@ describe("AgentRuntime", function () {
           conversationKey: 1212,
           mode: "agent",
           userText: "Use the small result.",
+          systemPrompt: "SYSTEM_REPLAY_SENTINEL",
+          customInstructions: "CUSTOM_REPLAY_SENTINEL",
           model: "deepseek-v4-pro",
           apiBase: "https://api.deepseek.com/anthropic",
           apiKey: "test",
@@ -5170,6 +5341,8 @@ describe("AgentRuntime", function () {
         JSON.stringify(secondStepMessages),
         "Agent semantic continuation checkpoint",
       );
+      assert.equal(secondStepMessages.at(-1)?.role, "user");
+      assert.deepEqual(secondStepMessages.slice(0, -1), initialStepMessages);
       assert.isTrue(
         events.some(
           (event) =>
@@ -5178,6 +5351,141 @@ describe("AgentRuntime", function () {
             event.payload?.action === "checkpoint_provider_replay_usage",
         ),
       );
+    } finally {
+      restoreDb();
+    }
+  });
+
+  it("keeps one frozen envelope and one latest checkpoint across consecutive semantic restarts", async function () {
+    const restoreDb = installMockDb();
+    try {
+      const registry = new AgentToolRegistry();
+      registry.register({
+        spec: {
+          name: "small_read",
+          description: "read",
+          inputSchema: { type: "object" },
+          mutability: "read",
+          requiresConfirmation: false,
+        },
+        validate: (args) => ({ ok: true, value: args as { index: number } }),
+        execute: async (args: { index: number }, context) => {
+          context.request.userText = `mutated request ${args.index}`;
+          context.request.customInstructions = `mutated instructions ${args.index}`;
+          context.request.metadata = {
+            ...(context.request.metadata || {}),
+            mutatedAfterPromptRender: args.index,
+          };
+          return {
+            index: args.index,
+            evidence: `evidence-${args.index}`,
+          };
+        },
+      });
+      registry.register(createToolResultReadTool());
+
+      let stepIndex = 0;
+      let resetCount = 0;
+      let initialMessages: AgentModelMessage[] = [];
+      let firstCheckpointHandle = "";
+      const runtime = new AgentRuntime({
+        registry,
+        adapterFactory: () => ({
+          getCapabilities: () => ({
+            streaming: false,
+            toolCalls: true,
+            multimodal: false,
+            fileInputs: false,
+            reasoning: true,
+          }),
+          supportsTools: () => true,
+          resetState: () => {
+            resetCount += 1;
+          },
+          async runStep(params: AgentStepParams): Promise<AgentModelStep> {
+            stepIndex += 1;
+            if (stepIndex === 1) {
+              initialMessages = structuredClone(params.messages);
+            } else {
+              const restarted = structuredClone(params.messages);
+              assert.deepEqual(restarted.slice(0, -1), initialMessages);
+              assert.equal(restarted.at(-1)?.role, "user");
+              assert.equal(
+                restarted.filter((message) =>
+                  JSON.stringify(message).includes(
+                    "Agent semantic continuation checkpoint",
+                  ),
+                ).length,
+                1,
+              );
+              assert.isFalse(
+                restarted.some(
+                  (message) =>
+                    message.role === "assistant" || message.role === "tool",
+                ),
+              );
+              const checkpointText = JSON.stringify(restarted.at(-1));
+              const handles = [
+                ...checkpointText.matchAll(/handle=(trh_[a-z0-9]+)/gi),
+              ].map((match) => match[1]);
+              if (stepIndex === 2) {
+                assert.lengthOf(handles, 1);
+                firstCheckpointHandle = handles[0];
+              } else {
+                assert.include(handles, firstCheckpointHandle);
+                assert.isAtLeast(new Set(handles).size, 2);
+              }
+            }
+
+            if (stepIndex <= 2) {
+              await params.onUsage?.({
+                promptTokens: 90_000,
+                completionTokens: 10_000,
+                totalTokens: 100_000,
+              });
+              const call = {
+                id: `small-read-${stepIndex}`,
+                name: "small_read",
+                arguments: { index: stepIndex },
+              };
+              return {
+                kind: "tool_calls",
+                calls: [call],
+                assistantMessage: {
+                  role: "assistant",
+                  content: "",
+                  tool_calls: [call],
+                },
+              };
+            }
+            return {
+              kind: "final",
+              text: "Done after two checkpoints.",
+              assistantMessage: {
+                role: "assistant",
+                content: "Done after two checkpoints.",
+              },
+            };
+          },
+        }),
+      });
+
+      const outcome = await runtime.runTurn({
+        request: {
+          conversationKey: 1213,
+          mode: "agent",
+          userText: "Use both small results.",
+          systemPrompt: "SYSTEM_DOUBLE_RESTART_SENTINEL",
+          model: "deepseek-v4-pro",
+          apiBase: "https://api.deepseek.com/anthropic",
+          apiKey: "test",
+          advanced: { inputTokenCap: 8_000 },
+        },
+      });
+
+      assert.equal(outcome.kind, "completed");
+      assert.equal(resetCount, 2);
+      assert.equal(stepIndex, 3);
     } finally {
       restoreDb();
     }
@@ -5737,93 +6045,81 @@ describe("shallow guard round-limit safety", function () {
           getEditableArticleMetadata: () => null,
         }),
       );
-      registry.register({
-        spec: {
-          name: "library_update",
-          description: "update",
-          inputSchema: { type: "object" },
-          mutability: "write",
-          requiresConfirmation: false,
-        },
-        validate: (args) => ({ ok: true, value: args as never }),
-        planMutation: async () => ({
-          effect: "write",
-          reversibility: "full",
-        }),
-        async execute() {
-          // The exact ledger shape the gateway returns when every row was
-          // rejected: the operation ran, and nothing moved.
-          return {
-            content: {
-              movedCount: 0,
-              selectedCount: 2,
-              items: [
-                { itemId: 1, status: "missing", reason: "wrong type" },
-                { itemId: 2, status: "missing", reason: "wrong type" },
-              ],
-            },
-            effect: "none",
-          };
-        },
-      } as never);
+      registerZeroEffectLibraryUpdate(registry);
 
       let stepIndex = 0;
+      let resolvedRequest: AgentRuntimeRequest | undefined;
       let correctionRequestMessages: AgentModelMessage[] = [];
       const runtime = new AgentRuntime({
         registry,
-        adapterFactory: () => ({
-          getCapabilities: () => ({
-            streaming: true,
-            toolCalls: true,
-            multimodal: false,
-          }),
-          supportsTools: () => true,
-          async runStep(params: AgentStepParams): Promise<AgentModelStep> {
-            stepIndex += 1;
-            if (stepIndex === 1) {
-              return {
-                kind: "tool_calls",
-                calls: [
-                  {
-                    id: "c1",
-                    name: "library_update",
-                    arguments: { kind: "collections" },
+        adapterFactory: (request) => {
+          resolvedRequest = request;
+          return {
+            getCapabilities: () => ({
+              streaming: true,
+              toolCalls: true,
+              multimodal: false,
+            }),
+            supportsTools: () => true,
+            async runStep(params: AgentStepParams): Promise<AgentModelStep> {
+              stepIndex += 1;
+              if (stepIndex === 1) {
+                return {
+                  kind: "tool_calls",
+                  calls: [
+                    {
+                      id: "c1",
+                      name: "library_update",
+                      arguments: { kind: "collections" },
+                    },
+                  ],
+                  assistantMessage: { role: "assistant", content: "" },
+                };
+              }
+              if (stepIndex === 2) {
+                resolvedRequest!.actionProgress!.updatedAt = 11;
+                await params.onTextDelta?.(
+                  "Filed both papers into Neuroscience.",
+                );
+                return {
+                  kind: "final",
+                  text: "Filed both papers into Neuroscience.",
+                  assistantMessage: {
+                    role: "assistant",
+                    content: "Filed both papers into Neuroscience.",
                   },
-                ],
-                assistantMessage: { role: "assistant", content: "" },
-              };
-            }
-            if (stepIndex === 2) {
+                };
+              }
+              assert.equal(resolvedRequest?.actionProgress?.correctionCount, 1);
+              assert.isAbove(
+                resolvedRequest?.actionProgress?.updatedAt || 0,
+                11,
+              );
+              resolvedRequest!.actionProgress!.updatedAt = 22;
+              correctionRequestMessages = structuredClone(params.messages);
               await params.onTextDelta?.(
-                "Filed both papers into Neuroscience.",
+                "Nothing changed — both items are the wrong type to file.",
               );
               return {
                 kind: "final",
-                text: "Filed both papers into Neuroscience.",
+                text: "Nothing changed — both items are the wrong type to file.",
                 assistantMessage: {
                   role: "assistant",
-                  content: "Filed both papers into Neuroscience.",
+                  content:
+                    "Nothing changed — both items are the wrong type to file.",
                 },
               };
-            }
-            correctionRequestMessages = params.messages.map((message) => ({
-              ...message,
-            }));
-            return {
-              kind: "final",
-              text: "Nothing changed — both items are the wrong type to file.",
-              assistantMessage: {
-                role: "assistant",
-                content:
-                  "Nothing changed — both items are the wrong type to file.",
-              },
-            };
-          },
-        }),
+            },
+          };
+        },
       });
 
       const events: AgentEvent[] = [];
-      let rollbackProgress: Record<string, unknown> | null = null;
+      const rollbackProgress: Array<{
+        correctionCount: number | undefined;
+        state: string | undefined;
+        updatedAt: number | undefined;
+      }> = [];
       const outcome = await runtime.runTurn({
         request: {
           conversationKey: 991,
@@ -5845,16 +6141,22 @@ describe("shallow guard round-limit safety", function () {
                 candidate.providerType === "agent_action_contract" &&
                 typeof candidate.payload?.state === "string",
             );
-          rollbackProgress =
-            terminalSnapshot?.type === "provider_event"
-              ? (terminalSnapshot.payload?.progress as Record<string, unknown>)
-              : null;
-          assert.equal(rollbackProgress?.correctionCount, 0);
+          const progress = resolvedRequest?.actionProgress;
+          rollbackProgress.push({
+            correctionCount: progress?.correctionCount,
+            state: progress?.state,
+            updatedAt: progress?.updatedAt,
+          });
           assert.equal(
-            rollbackProgress?.state,
             terminalSnapshot?.type === "provider_event"
               ? terminalSnapshot.payload?.state
               : undefined,
+            "failed",
+          );
+          assert.equal(
+            progress?.state,
+            "pending",
+            "failed evaluation must remain nonterminal until rollback succeeds",
           );
         },
       });
@@ -5867,7 +6169,12 @@ describe("shallow guard round-limit safety", function () {
         "the first, false claim must not be what the user is left with",
       );
       assert.include(outcome.text, "write was blocked");
-      assert.exists(rollbackProgress);
+      assert.deepEqual(rollbackProgress, [
+        { correctionCount: 0, state: "pending", updatedAt: 11 },
+        { correctionCount: 1, state: "pending", updatedAt: 22 },
+      ]);
+      assert.equal(resolvedRequest?.actionProgress?.state, "failed");
+      assert.isAbove(resolvedRequest?.actionProgress?.updatedAt || 0, 22);
 
       const falseFinalIndexes = correctionRequestMessages
         .map((message, index) =>
@@ -5917,6 +6224,193 @@ describe("shallow guard round-limit safety", function () {
       );
     } finally {
       restoreDb();
+    }
+  });
+
+  it("does not consume an action correction when streamed rollback fails", async function () {
+    const installed = installMockDb();
+    try {
+      await initAgentChangeJournal();
+      const registry = new AgentToolRegistry(createTestActionContractService());
+      registerZeroEffectLibraryUpdate(registry);
+
+      let resolvedRequest: AgentRuntimeRequest | undefined;
+      let modelStep = 0;
+      let transcriptAttemptsAtRollback = 0;
+      const runtime = new AgentRuntime({
+        registry,
+        adapterFactory: (request) => {
+          resolvedRequest = request;
+          return {
+            getCapabilities: () => ({
+              streaming: true,
+              toolCalls: true,
+              multimodal: false,
+            }),
+            supportsTools: () => true,
+            async runStep(params: AgentStepParams): Promise<AgentModelStep> {
+              modelStep += 1;
+              if (modelStep === 1) {
+                const call = {
+                  id: "rollback-c1",
+                  name: "library_update",
+                  arguments: { kind: "collections" },
+                };
+                return {
+                  kind: "tool_calls",
+                  calls: [call],
+                  assistantMessage: {
+                    role: "assistant",
+                    content: "",
+                    tool_calls: [call],
+                  },
+                };
+              }
+              resolvedRequest!.actionProgress!.updatedAt = 17;
+              await params.onTextDelta?.(
+                "Filed both papers into Neuroscience.",
+              );
+              return {
+                kind: "final",
+                text: "Filed both papers into Neuroscience.",
+                assistantMessage: {
+                  role: "assistant",
+                  content: "Filed both papers into Neuroscience.",
+                },
+              };
+            },
+          };
+        },
+      });
+
+      let error: unknown;
+      try {
+        await runtime.runTurn({
+          request: {
+            conversationKey: 993,
+            mode: "agent",
+            userText: "file these two papers into Neuroscience",
+            model: "gpt-4o-mini",
+            apiBase: "https://api.openai.com/v1/chat/completions",
+            apiKey: "test",
+            libraryID: 1,
+          },
+          onEvent: (event) => {
+            if (event.type !== "message_rollback") return;
+            transcriptAttemptsAtRollback = installed.transcriptWriteAttempts();
+            throw new Error("Injected rollback failure");
+          },
+        });
+      } catch (caught) {
+        error = caught;
+      }
+
+      assert.match(String(error), /injected rollback failure/i);
+      assert.equal(modelStep, 2);
+      assert.equal(resolvedRequest?.actionProgress?.correctionCount, 0);
+      assert.equal(resolvedRequest?.actionProgress?.state, "pending");
+      assert.equal(resolvedRequest?.actionProgress?.updatedAt, 17);
+      assert.equal(
+        installed.transcriptWriteAttempts(),
+        transcriptAttemptsAtRollback,
+        "no correction checkpoint may be attempted after rollback fails",
+      );
+    } finally {
+      installed();
+    }
+  });
+
+  it("does not consume an action correction when correction checkpoint storage fails", async function () {
+    const installed = installMockDb();
+    try {
+      await initAgentChangeJournal();
+      const registry = new AgentToolRegistry(createTestActionContractService());
+      registerZeroEffectLibraryUpdate(registry);
+
+      let resolvedRequest: AgentRuntimeRequest | undefined;
+      let modelStep = 0;
+      let rollbackObserved = false;
+      const runtime = new AgentRuntime({
+        registry,
+        adapterFactory: (request) => {
+          resolvedRequest = request;
+          return {
+            getCapabilities: () => ({
+              streaming: true,
+              toolCalls: true,
+              multimodal: false,
+            }),
+            supportsTools: () => true,
+            async runStep(params: AgentStepParams): Promise<AgentModelStep> {
+              modelStep += 1;
+              if (modelStep === 1) {
+                const call = {
+                  id: "storage-c1",
+                  name: "library_update",
+                  arguments: { kind: "collections" },
+                };
+                return {
+                  kind: "tool_calls",
+                  calls: [call],
+                  assistantMessage: {
+                    role: "assistant",
+                    content: "",
+                    tool_calls: [call],
+                  },
+                };
+              }
+              resolvedRequest!.actionProgress!.updatedAt = 19;
+              installed.setTranscriptWriteFailure(true);
+              await params.onTextDelta?.(
+                "Filed both papers into Neuroscience.",
+              );
+              return {
+                kind: "final",
+                text: "Filed both papers into Neuroscience.",
+                assistantMessage: {
+                  role: "assistant",
+                  content: "Filed both papers into Neuroscience.",
+                },
+              };
+            },
+          };
+        },
+      });
+
+      let error: unknown;
+      try {
+        await runtime.runTurn({
+          request: {
+            conversationKey: 994,
+            mode: "agent",
+            userText: "file these two papers into Neuroscience",
+            model: "gpt-4o-mini",
+            apiBase: "https://api.openai.com/v1/chat/completions",
+            apiKey: "test",
+            libraryID: 1,
+          },
+          onEvent: (event) => {
+            if (event.type !== "message_rollback") return;
+            rollbackObserved = true;
+            assert.equal(resolvedRequest?.actionProgress?.correctionCount, 0);
+          },
+        });
+      } catch (caught) {
+        error = caught;
+      }
+
+      assert.match(String(error), /transcript checkpoint storage failed/i);
+      assert.isTrue(rollbackObserved);
+      assert.equal(modelStep, 2);
+      assert.equal(resolvedRequest?.actionProgress?.correctionCount, 0);
+      assert.equal(resolvedRequest?.actionProgress?.state, "pending");
+      assert.equal(resolvedRequest?.actionProgress?.updatedAt, 19);
+      assert.notInclude(
+        JSON.stringify(installed.transcripts),
+        "Correction for this turn:",
+      );
+    } finally {
+      installed();
     }
   });
 

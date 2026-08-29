@@ -87,8 +87,8 @@ export class AgentRunContinuationSession {
     return appended;
   }
 
-  replaceWithCheckpoint(checkpoint: AgentUserMessage): void {
-    this.messages.splice(0, this.messages.length, checkpoint);
+  restartWithMessages(messages: readonly AgentModelMessage[]): void {
+    this.messages.splice(0, this.messages.length, ...messages);
     this.continuationMessages = [];
     this.toolStepOpen = false;
   }

@@ -53,27 +53,31 @@ describe("AgentRunContinuationSession", function () {
     assert.notInclude(JSON.stringify(continuation), "call-overview");
   });
 
-  it("restarts from one semantic checkpoint and clears live deltas", function () {
+  it("installs a complete restart input and clears live continuation state", function () {
     const messages: AgentModelMessage[] = [
       { role: "user", content: "Original request" },
     ];
     const session = new AgentRunContinuationSession(messages);
-    session.appendFinalCorrection({
-      assistantMessage: { role: "assistant", content: "Draft" },
-      correctionMessage: { role: "user", content: "Use more evidence" },
+    session.beginToolStep({
+      role: "assistant",
+      content: "",
+      tool_calls: [{ id: "stale-call", name: "read", arguments: {} }],
     });
 
-    session.replaceWithCheckpoint({
-      role: "user",
-      content: "Agent context checkpoint: evidence is incomplete.",
-    });
-
-    assert.deepEqual(messages, [
+    const restartMessages = [
+      { role: "system" as const, content: "Managed policy" },
+      { role: "user" as const, content: "Original request" },
       {
-        role: "user",
+        role: "user" as const,
         content: "Agent context checkpoint: evidence is incomplete.",
       },
-    ]);
+    ] satisfies readonly AgentModelMessage[];
+    const suppliedSnapshot = structuredClone(restartMessages);
+
+    session.restartWithMessages(restartMessages);
+
+    assert.deepEqual(messages, suppliedSnapshot);
+    assert.deepEqual(restartMessages, suppliedSnapshot);
     assert.deepEqual(session.inputForNextStep().continuationMessages, []);
   });
 

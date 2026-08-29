@@ -1,5 +1,8 @@
 import type { AgentModelMessage, AgentRuntimeRequest } from "../types";
-import type { ActionContractRunSession } from "../contracts/actionContractRunSession";
+import type {
+  ActionContractRunSession,
+  RejectedActionContractFinalDecision,
+} from "../contracts/actionContractRunSession";
 import {
   findLibraryRetrieveShallowSignal,
   isEvidenceSeekingTurn,
@@ -18,7 +21,7 @@ export type AgentFinalAnswerToolRecord = {
 
 export type AgentFinalActionSession = Pick<
   ActionContractRunSession,
-  "evaluateFinal" | "commitRejectedFinal"
+  "evaluateFinal"
 >;
 
 export type AgentFinalAnswerDecision =
@@ -30,10 +33,18 @@ export type AgentFinalAnswerDecision =
       kind: "correct";
       correction: string;
       assistantContent?: string;
+      actionContractRejection?: Extract<
+        RejectedActionContractFinalDecision,
+        { kind: "correct" }
+      >;
     }
   | {
       kind: "fail";
       userMessage: string;
+      actionContractRejection?: Extract<
+        RejectedActionContractFinalDecision,
+        { kind: "fail" }
+      >;
     };
 
 const LIBRARY_EVIDENCE_CORRECTION =
@@ -64,16 +75,17 @@ export class AgentFinalAnswerController {
       canCorrect: params.canCorrect,
     });
     if (actionDecision.kind !== "accept") {
-      this.actionContractSession.commitRejectedFinal(actionDecision);
       if (actionDecision.kind === "correct") {
         return {
           kind: "correct",
           correction: actionDecision.correction,
+          actionContractRejection: actionDecision,
         };
       }
       return {
         kind: "fail",
         userMessage: actionDecision.failure,
+        actionContractRejection: actionDecision,
       };
     }
 

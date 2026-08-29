@@ -439,4 +439,28 @@ describe("ActionContractRunSession state machine", function () {
     assert.equal(progress.correctionCount, 0);
     assert.isAbove(progress.updatedAt, 1);
   });
+
+  it("reports a failed evaluation without committing terminal progress", async function () {
+    const contract = createContract("uncertain-contract", {
+      writeDisposition: "uncertain",
+      obligations: [],
+    });
+    const harness = createHarness({ contract });
+    await harness.session.initialize({ checkpoint: null });
+    const progress = harness.request.actionProgress!;
+
+    const decision = await harness.session.evaluateFinal({ canCorrect: false });
+
+    assert.equal(decision.kind, "fail");
+    assert.equal(progress.state, "pending");
+    assert.equal(
+      harness.events.at(-1)?.type === "provider_event"
+        ? harness.events.at(-1)?.payload?.state
+        : undefined,
+      "failed",
+    );
+    if (decision.kind !== "fail") return;
+    harness.session.commitRejectedFinal(decision);
+    assert.equal(progress.state, "failed");
+  });
 });

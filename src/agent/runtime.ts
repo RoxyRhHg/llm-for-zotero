@@ -8,6 +8,7 @@ import {
   loadLatestAgentTranscriptSegment,
   loadAgentTranscriptSegment,
   replaceAgentTranscriptSegment,
+  type AgentTranscriptWriteResult,
 } from "./store/transcriptStore";
 import type {
   AgentInheritedApproval,
@@ -53,10 +54,11 @@ import {
 import { resolveAgentLimits } from "./model/limits";
 import { classifyRequest } from "./model/requestClassifier";
 import {
-  buildAgentInitialMessages,
+  buildAgentPromptInstructionInventory,
+  composeAgentModelInput,
   normalizeHistoryMessages,
+  renderAgentPromptEnvelope,
 } from "./model/messageBuilder";
-import type { InstructionInventory } from "./model/instructionInventory";
 import { classifyWriteNoteDestination } from "./writeNoteDestination";
 import { WRITE_NOTE_SKILL_ID } from "./skills/noteIntent";
 import {
@@ -1149,7 +1151,7 @@ export class AgentRuntime {
       //   2. getMatchedSkillIds — unions classifier output with explicit
       //      forcedSkillIds (slash menu) and runtime-context forces
       //      (e.g. notes-directory nickname mention).
-      //   3. matchedSkills is threaded into buildAgentInitialMessages so
+      //   3. matchedSkills is threaded into renderAgentPromptEnvelope so
       //      only those skills' instructions ship in current-turn guidance,
       //      and emitted as trace events for UI visibility.
       // The resulting prompt package is reused across every model inference
@@ -1290,25 +1292,21 @@ export class AgentRuntime {
       });
       const captureInstructionInventory =
         request.metadata?.instructionHarnessInventory === true;
-      const instructionInventoryHolder: { value?: InstructionInventory } = {};
-      const messages = (await buildAgentInitialMessages(
+      const renderedPrompt = await renderAgentPromptEnvelope(
         request,
         toolDefinitions,
         matchedSkills,
         resourceContextPlan,
         {
-          transcriptMessages: transcriptMessagesForPrompt,
           contentInputs: resolveCapabilitiesContentInputs(adapterCapabilities),
-          ...(captureInstructionInventory
-            ? {
-                onInstructionInventory: (inventory: InstructionInventory) => {
-                  instructionInventoryHolder.value = inventory;
-                },
-              }
-            : {}),
         },
-      )) as AgentModelMessage[];
-      const instructionInventory = instructionInventoryHolder.value;
+      );
+      const messages = composeAgentModelInput(renderedPrompt.envelope, {
+        transcriptMessages: transcriptMessagesForPrompt,
+      });
+      const instructionInventory = captureInstructionInventory
+        ? buildAgentPromptInstructionInventory(renderedPrompt, messages)
+        : undefined;
       if (captureInstructionInventory && instructionInventory) {
         await emit({
           type: "provider_event",
@@ -1374,17 +1372,9 @@ export class AgentRuntime {
           messages.splice(
             0,
             messages.length,
-            ...((await buildAgentInitialMessages(
-              request,
-              toolDefinitions,
-              matchedSkills,
-              resourceContextPlan,
-              {
-                transcriptMessages: transcriptMessagesForPrompt,
-                contentInputs:
-                  resolveCapabilitiesContentInputs(adapterCapabilities),
-              },
-            )) as AgentModelMessage[]),
+            ...composeAgentModelInput(renderedPrompt.envelope, {
+              transcriptMessages: transcriptMessagesForPrompt,
+            }),
           );
         }
       }
@@ -1394,8 +1384,11 @@ export class AgentRuntime {
         sourceMessages: AgentModelMessage[];
         preservedHandleRecords?: AgentToolResultHandleRecord[];
         retryInstruction?: string;
-        activateHandleReader?: boolean;
-      }): Promise<AgentUserMessage> => {
+      }): Promise<{
+        checkpoint: AgentUserMessage;
+        writeResult: AgentTranscriptWriteResult | undefined;
+        handleCount: number;
+      }> => {
         const semantic = buildAgentSemanticCheckpoint({
           messages: params.sourceMessages,
           summaryTokens: budgetState.summaryTokens,
@@ -1415,41 +1408,83 @@ export class AgentRuntime {
             .join("\n\n"),
         };
         await persistToolResultHandles(semantic.handleRecords);
-        if (params.activateHandleReader && semantic.handleRecords.length) {
-          toolResultReadAvailable = true;
-        }
         const nextSegment = {
           ...transcriptSegment,
           messages: [checkpoint],
           compactedAt: this.now(),
         };
-        await persistIfLive(() => replaceAgentTranscriptSegment(nextSegment));
-        if (writeAllowed()) transcriptSegment = nextSegment;
-        return checkpoint;
+        const writeResult = await persistIfLive(() =>
+          replaceAgentTranscriptSegment(nextSegment),
+        );
+        if (
+          writeAllowed() &&
+          (writeResult === "persisted" || writeResult === "memory_only")
+        ) {
+          transcriptSegment = nextSegment;
+        }
+        return {
+          checkpoint,
+          writeResult,
+          handleCount: semantic.handleRecords.length,
+        };
       };
-      const persistTranscriptCheckpoint = async (): Promise<void> => {
-        if (!newTranscriptMessages.length) return;
-        await commitSemanticCheckpoint({
+      const requireAcceptedCheckpointWrite = (
+        result: AgentTranscriptWriteResult | undefined,
+      ): void => {
+        if (result === "persisted" || result === "memory_only") return;
+        throw new Error(
+          result === "failed"
+            ? "Agent transcript checkpoint storage failed."
+            : "Agent transcript checkpoint was skipped because the conversation is no longer writable.",
+        );
+      };
+      const persistTranscriptCheckpoint = async (
+        options: {
+          requireAccepted?: boolean;
+        } = {},
+      ): Promise<AgentTranscriptWriteResult | undefined> => {
+        if (!newTranscriptMessages.length) return "skipped";
+        const committed = await commitSemanticCheckpoint({
           sourceMessages: [
             ...transcriptSegment.messages,
             ...newTranscriptMessages,
           ],
         });
-        if (!writeAllowed()) return;
+        if (options.requireAccepted) {
+          requireAcceptedCheckpointWrite(committed.writeResult);
+        }
+        if (
+          committed.writeResult !== "persisted" &&
+          committed.writeResult !== "memory_only"
+        ) {
+          return committed.writeResult;
+        }
         newTranscriptMessages.splice(0, newTranscriptMessages.length);
+        return committed.writeResult;
       };
       const restartFromSemanticCheckpoint = async (params: {
         sourceMessages: AgentModelMessage[];
         handleRecords?: AgentToolResultHandleRecord[];
         retryInstruction?: string;
       }): Promise<void> => {
-        const checkpoint = await commitSemanticCheckpoint({
+        const committed = await commitSemanticCheckpoint({
           sourceMessages: params.sourceMessages,
           preservedHandleRecords: params.handleRecords,
           retryInstruction: params.retryInstruction,
-          activateHandleReader: true,
         });
-        continuationSession.replaceWithCheckpoint(checkpoint);
+        requireAcceptedCheckpointWrite(committed.writeResult);
+        if (committed.handleCount) {
+          toolResultReadAvailable = true;
+          setToolResultReadAvailability(request, true);
+        }
+        const restartMessages = composeAgentModelInput(
+          renderedPrompt.envelope,
+          {
+            transcriptMessages: [],
+            postTurnMessages: [committed.checkpoint],
+          },
+        );
+        continuationSession.restartWithMessages(restartMessages);
         newTranscriptMessages.splice(0, newTranscriptMessages.length);
         latestProviderReplayTokens = 0;
         adapter.resetState?.();
@@ -2294,8 +2329,22 @@ export class AgentRuntime {
                     correctionMessage: userCorrectionMessage,
                   }),
                 );
-                await persistTranscriptCheckpoint();
+                await persistTranscriptCheckpoint({
+                  requireAccepted: Boolean(
+                    finalDecision.actionContractRejection,
+                  ),
+                });
+                if (finalDecision.actionContractRejection) {
+                  actionContractSession.commitRejectedFinal(
+                    finalDecision.actionContractRejection,
+                  );
+                }
                 continue;
+              }
+              if (finalDecision.actionContractRejection) {
+                actionContractSession.commitRejectedFinal(
+                  finalDecision.actionContractRejection,
+                );
               }
               return completeRun(finalDecision.userMessage, "failed");
             }

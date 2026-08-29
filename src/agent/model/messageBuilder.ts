@@ -3,9 +3,12 @@ import { renderLibraryOverviewSection } from "../context/libraryOverview";
 import type {
   AgentContentInputCapabilities,
   AgentActionObligation,
+  AgentModelContentPart,
   AgentModelMessage,
   AgentRuntimeRequest,
+  AgentSystemMessage,
   AgentToolDefinition,
+  AgentUserMessage,
 } from "../types";
 import { actionToolGuidanceForCapabilities } from "../contracts/actionEvaluation";
 import { AGENT_PERSONA_INSTRUCTIONS } from "./agentPersona";
@@ -150,7 +153,7 @@ function buildFullUserMessage(
     turnGuidanceBlock?: string;
     contentInputs?: AgentContentInputCapabilities;
   } = {},
-): AgentModelMessage {
+): AgentUserMessage {
   const contextLines: string[] = [];
   // Volatile by nature (collection ids and counts change as the agent works),
   // so it lives here rather than in the cached system prefix.
@@ -365,7 +368,7 @@ function buildUserMessage(
     turnGuidanceBlock?: string;
     contentInputs?: AgentContentInputCapabilities;
   } = {},
-): AgentModelMessage {
+): AgentUserMessage {
   return buildFullUserMessage(request, {
     priorReadBlock: resourceContextPlan?.priorReadBlock,
     coverageBlock: options.coverageBlock,
@@ -380,6 +383,79 @@ type PromptSection = {
   id: string;
   lines: string[];
 };
+
+export type AgentPromptEnvelope = Readonly<{
+  systemMessages: readonly Readonly<AgentSystemMessage>[];
+  turnMessage: Readonly<AgentUserMessage>;
+}>;
+
+type AgentPromptInventoryState = Readonly<{
+  fixedPrompt: string;
+  tools: readonly AgentToolDefinition<any, any>[];
+  matchedSkillInstructions: readonly string[];
+  dynamicGuidance: string;
+  stableResourceBlock: string;
+  turnResource: string;
+}>;
+
+export type RenderedAgentPromptEnvelope = Readonly<{
+  envelope: AgentPromptEnvelope;
+  inventory: AgentPromptInventoryState;
+}>;
+
+function cloneContentPart(part: AgentModelContentPart): AgentModelContentPart {
+  if (part.type === "text") {
+    return { type: "text", text: part.text };
+  }
+  if (part.type === "image_url") {
+    return {
+      type: "image_url",
+      image_url: {
+        url: part.image_url.url,
+        detail: part.image_url.detail,
+      },
+    };
+  }
+  return {
+    type: "file_ref",
+    file_ref: {
+      name: part.file_ref.name,
+      mimeType: part.file_ref.mimeType,
+      storedPath: part.file_ref.storedPath,
+      contentHash: part.file_ref.contentHash,
+    },
+  };
+}
+
+function cloneModelMessage(message: AgentModelMessage): AgentModelMessage {
+  const content =
+    typeof message.content === "string"
+      ? message.content
+      : message.content.map(cloneContentPart);
+  if (message.role === "assistant") {
+    return {
+      ...message,
+      content,
+      tool_calls: message.tool_calls?.map((call) => ({ ...call })),
+    };
+  }
+  return { ...message, content } as AgentModelMessage;
+}
+
+function freezeEnvelopeMessage<
+  TMessage extends AgentSystemMessage | AgentUserMessage,
+>(message: TMessage): Readonly<TMessage> {
+  const cloned = cloneModelMessage(message) as TMessage;
+  if (typeof cloned.content !== "string") {
+    for (const part of cloned.content) {
+      if (part.type === "image_url") Object.freeze(part.image_url);
+      if (part.type === "file_ref") Object.freeze(part.file_ref);
+      Object.freeze(part);
+    }
+    Object.freeze(cloned.content);
+  }
+  return Object.freeze(cloned);
+}
 
 function buildSystemPrompt(sections: PromptSection[]): string {
   return sections
@@ -629,17 +705,15 @@ function buildTextOnlyModelInstruction(
   );
 }
 
-export async function buildAgentInitialMessages(
+export async function renderAgentPromptEnvelope(
   request: AgentRuntimeRequest,
   tools: AgentToolDefinition<any, any>[],
   matchedSkillIds: ReadonlyArray<string>,
   resourceContextPlan?: AgentResourceContextPlan,
   options: {
-    transcriptMessages?: AgentModelMessage[];
     contentInputs?: AgentContentInputCapabilities;
-    onInstructionInventory?: (inventory: InstructionInventory) => void;
   } = {},
-): Promise<AgentModelMessage[]> {
+): Promise<RenderedAgentPromptEnvelope> {
   const memoryBlock = await buildAgentMemoryBlock(request.conversationKey);
   const autoReadInstruction = buildAutoReadInstruction(request);
   const workflowParityInstructions = [
@@ -711,39 +785,101 @@ export async function buildAgentInitialMessages(
     turnGuidanceBlock,
     contentInputs: options.contentInputs,
   });
-  const messages: AgentModelMessage[] = [
-    {
+  const systemMessages = [
+    freezeEnvelopeMessage<AgentSystemMessage>({
       role: "system",
       content: fixedPrompt,
-    },
+    }),
     ...(stableResourceBlock
       ? [
-          {
-            role: "system" as const,
+          freezeEnvelopeMessage<AgentSystemMessage>({
+            role: "system",
             content: stableResourceBlock,
-            cachePolicy: "stable-prefix" as const,
-          },
+            cachePolicy: "stable-prefix",
+          }),
         ]
       : []),
-    ...(options.transcriptMessages?.length
-      ? options.transcriptMessages
-      : normalizeHistoryMessages(request)),
-    turnMessage,
   ];
+  const frozenTurnMessage = freezeEnvelopeMessage(turnMessage);
+  const turnText = stringifyMessageContent(turnMessage.content);
+  return Object.freeze({
+    envelope: Object.freeze({
+      systemMessages: Object.freeze(systemMessages),
+      turnMessage: frozenTurnMessage,
+    }),
+    inventory: Object.freeze({
+      fixedPrompt,
+      tools: Object.freeze([...tools]),
+      matchedSkillInstructions: Object.freeze([...matchedSkillInstructions]),
+      dynamicGuidance: buildTurnGuidanceBlock(dynamicGuidanceInstructions),
+      stableResourceBlock,
+      turnResource: turnGuidanceBlock
+        ? turnText.replace(turnGuidanceBlock, "").trim()
+        : turnText,
+    }),
+  });
+}
+
+export function composeAgentModelInput(
+  envelope: AgentPromptEnvelope,
+  options: {
+    transcriptMessages?: readonly AgentModelMessage[];
+    postTurnMessages?: readonly AgentModelMessage[];
+  } = {},
+): AgentModelMessage[] {
+  return [
+    ...envelope.systemMessages.map((message) =>
+      cloneModelMessage(message as AgentSystemMessage),
+    ),
+    ...(options.transcriptMessages || []).map(cloneModelMessage),
+    cloneModelMessage(envelope.turnMessage as AgentUserMessage),
+    ...(options.postTurnMessages || []).map(cloneModelMessage),
+  ];
+}
+
+export function buildAgentPromptInstructionInventory(
+  rendered: RenderedAgentPromptEnvelope,
+  providerMessages: readonly AgentModelMessage[],
+): InstructionInventory {
+  return buildInstructionInventory({
+    fixed: rendered.inventory.fixedPrompt,
+    tools: rendered.inventory.tools,
+    matchedSkills: rendered.inventory.matchedSkillInstructions,
+    dynamicGuidance: rendered.inventory.dynamicGuidance,
+    stableResource: rendered.inventory.stableResourceBlock,
+    turnResource: rendered.inventory.turnResource,
+    providerMessages,
+  });
+}
+
+export async function buildAgentInitialMessages(
+  request: AgentRuntimeRequest,
+  tools: AgentToolDefinition<any, any>[],
+  matchedSkillIds: ReadonlyArray<string>,
+  resourceContextPlan?: AgentResourceContextPlan,
+  options: {
+    transcriptMessages?: AgentModelMessage[];
+    contentInputs?: AgentContentInputCapabilities;
+    onInstructionInventory?: (inventory: InstructionInventory) => void;
+  } = {},
+): Promise<AgentModelMessage[]> {
+  const rendered = await renderAgentPromptEnvelope(
+    request,
+    tools,
+    matchedSkillIds,
+    resourceContextPlan,
+    { contentInputs: options.contentInputs },
+  );
+  const transcriptMessages =
+    options.transcriptMessages === undefined
+      ? normalizeHistoryMessages(request)
+      : options.transcriptMessages;
+  const messages = composeAgentModelInput(rendered.envelope, {
+    transcriptMessages,
+  });
   if (options.onInstructionInventory) {
-    const turnText = stringifyMessageContent(turnMessage.content);
     options.onInstructionInventory(
-      buildInstructionInventory({
-        fixed: fixedPrompt,
-        tools,
-        matchedSkills: matchedSkillInstructions,
-        dynamicGuidance: buildTurnGuidanceBlock(dynamicGuidanceInstructions),
-        stableResource: stableResourceBlock,
-        turnResource: turnGuidanceBlock
-          ? turnText.replace(turnGuidanceBlock, "").trim()
-          : turnText,
-        providerMessages: messages,
-      }),
+      buildAgentPromptInstructionInventory(rendered, messages),
     );
   }
   return messages;

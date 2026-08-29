@@ -199,14 +199,15 @@ describe("transcript replacement durability", function () {
 
     try {
       clearAgentTranscriptStore();
-      await replaceAgentTranscriptSegment({
+      const initialWrite = await replaceAgentTranscriptSegment({
         conversationKey: 5150,
         compatibilityKey: "atomic",
         messages: [{ role: "user", content: "previous checkpoint" }],
       });
+      assert.equal(initialWrite, "persisted");
 
       failAtSequence = 1;
-      await replaceAgentTranscriptSegment({
+      const failedWrite = await replaceAgentTranscriptSegment({
         conversationKey: 5150,
         compatibilityKey: "atomic",
         messages: [
@@ -214,6 +215,7 @@ describe("transcript replacement durability", function () {
           { role: "user", content: "replacement second row" },
         ],
       });
+      assert.equal(failedWrite, "failed");
 
       const cached = await loadAgentTranscriptSegment({
         conversationKey: 5150,

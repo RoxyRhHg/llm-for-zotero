@@ -26,6 +26,12 @@ export type AgentTranscriptSegment = {
   compactedAt?: number;
 };
 
+export type AgentTranscriptWriteResult =
+  | "persisted"
+  | "memory_only"
+  | "failed"
+  | "skipped";
+
 export type AgentTranscriptCompatibilityInput = {
   request: AgentRuntimeRequest;
   resourceSignature: string;
@@ -444,20 +450,23 @@ async function persistTranscriptSegment(
 
 export async function replaceAgentTranscriptSegment(
   segment: AgentTranscriptSegment,
-): Promise<void> {
-  if (isConversationKeyRetiredInMemory(segment.conversationKey)) return;
+): Promise<AgentTranscriptWriteResult> {
+  if (isConversationKeyRetiredInMemory(segment.conversationKey)) {
+    return "skipped";
+  }
   const normalized: AgentTranscriptSegment = {
     ...segment,
     messages: normalizeMessages(segment.messages),
   };
   const persistence = await persistTranscriptSegment(normalized);
-  if (persistence === "failed") return;
+  if (persistence === "failed") return "failed";
   const key = segmentKey(
     normalized.conversationKey,
     normalized.compatibilityKey,
   );
   transcriptByKey.set(key, normalized);
   hydratedKeys.add(key);
+  return persistence === "persisted" ? "persisted" : "memory_only";
 }
 
 export async function appendAgentTranscriptMessages(params: {

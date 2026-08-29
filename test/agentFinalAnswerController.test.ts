@@ -26,13 +26,11 @@ function makeRequest(
 function acceptingActionSession(): AgentFinalActionSession {
   return {
     evaluateFinal: async () => ({ kind: "accept" as const }),
-    commitRejectedFinal: () => undefined,
   };
 }
 
 describe("AgentFinalAnswerController", function () {
-  it("returns the action-contract correction before other quality gates", async function () {
-    let committed = false;
+  it("returns an uncommitted action-contract correction before other quality gates", async function () {
     const controller = new AgentFinalAnswerController(
       makeRequest(),
       {
@@ -40,9 +38,6 @@ describe("AgentFinalAnswerController", function () {
           kind: "correct" as const,
           correction: "Complete the required action.",
         }),
-        commitRejectedFinal: () => {
-          committed = true;
-        },
       },
       [],
     );
@@ -56,8 +51,39 @@ describe("AgentFinalAnswerController", function () {
     assert.deepEqual(decision, {
       kind: "correct",
       correction: "Complete the required action.",
+      actionContractRejection: {
+        kind: "correct",
+        correction: "Complete the required action.",
+      },
     });
-    assert.isTrue(committed);
+  });
+
+  it("returns a kind-matched uncommitted action-contract failure", async function () {
+    const controller = new AgentFinalAnswerController(
+      makeRequest(),
+      {
+        evaluateFinal: async () => ({
+          kind: "fail" as const,
+          failure: "The action could not be verified.",
+        }),
+      },
+      [],
+    );
+
+    const decision = await controller.evaluate({
+      candidateText: "Draft",
+      canCorrect: false,
+      toolExecutionRecords: [],
+    });
+
+    assert.deepEqual(decision, {
+      kind: "fail",
+      userMessage: "The action could not be verified.",
+      actionContractRejection: {
+        kind: "fail",
+        failure: "The action could not be verified.",
+      },
+    });
   });
 
   it("allows one collection evidence correction then accepts the next final", async function () {
@@ -89,6 +115,9 @@ describe("AgentFinalAnswerController", function () {
       toolExecutionRecords: [],
     });
     assert.equal(first.kind, "correct");
+    if (first.kind === "correct") {
+      assert.notProperty(first, "actionContractRejection");
+    }
 
     const second = await controller.evaluate({
       candidateText: "Disclosed partial answer.",
@@ -115,6 +144,7 @@ describe("AgentFinalAnswerController", function () {
 
     assert.equal(decision.kind, "correct");
     if (decision.kind !== "correct") return;
+    assert.notProperty(decision, "actionContractRejection");
     assert.equal(decision.assistantContent, "An unsupported current claim.");
     assert.include(decision.correction, "Correct the web attribution");
   });
