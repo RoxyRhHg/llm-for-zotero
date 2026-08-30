@@ -1,5 +1,6 @@
 import type { WebSourceAnchor } from "../../webAccess/types";
 import { normalizePublicWebUrl } from "../../webAccess/tavilyClient";
+import { t } from "../../utils/i18n";
 import { createWebFaviconImage, normalizeWebFaviconUrl } from "./webFavicon";
 
 const ANCHOR_TOKEN_PREFIX = "LLMWEBSOURCEANCHOR";
@@ -169,7 +170,7 @@ function buildSourceIndicator(
   const chip = doc.createElement("button");
   chip.type = "button";
   chip.className = "llm-web-source-chip";
-  chip.setAttribute("aria-label", "View web sources");
+  chip.setAttribute("aria-label", t("View web sources"));
   chip.setAttribute("aria-haspopup", "dialog");
   chip.setAttribute("aria-expanded", "false");
 
@@ -181,7 +182,7 @@ function buildSourceIndicator(
   const popover = doc.createElement("span");
   popover.className = "llm-web-source-popover";
   popover.setAttribute("role", "dialog");
-  popover.setAttribute("aria-label", "Web sources");
+  popover.setAttribute("aria-label", t("Web sources"));
 
   const clearCloseTimer = () => {
     if (closeTimer === undefined) return;
@@ -271,7 +272,7 @@ function buildSourceIndicator(
     const row = doc.createElement("button");
     row.type = "button";
     row.className = "llm-web-source-row";
-    row.title = `Open ${source.title}`;
+    row.title = `${t("Open web source")}: ${source.title}`;
 
     const siteIcon = doc.createElement("span");
     siteIcon.className = "llm-web-source-site-icon";

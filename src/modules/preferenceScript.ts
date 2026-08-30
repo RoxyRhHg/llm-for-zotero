@@ -2895,8 +2895,9 @@ export async function registerPrefsScripts(_window: Window | undefined | null) {
           tavilyStatus.textContent = `${t("Connected")} · ${usage.plan}`;
         } catch (error) {
           tavilyStatus.style.color = "red";
-          tavilyStatus.textContent =
-            error instanceof Error ? error.message : String(error);
+          tavilyStatus.textContent = t(
+            error instanceof Error ? error.message : String(error),
+          );
         } finally {
           tavilyTestButton.disabled = false;
         }

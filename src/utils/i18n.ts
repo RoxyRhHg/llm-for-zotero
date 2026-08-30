@@ -350,6 +350,39 @@ const zhCN: Record<string, string> = {
   "Enable Agent Mode (Beta)": "启用 Agent 模式（测试版）",
   'Shows the "Agent (beta)" toggle in the context bar, enabling the agentic multi-step assistant. Off by default — enable only if you want to experiment with the beta feature.':
     '在上下文栏显示"Agent（测试版）"切换按钮，启用多步骤 Agent 助手。默认关闭 — 仅在你想体验测试版功能时启用。',
+  "Library Write Mode": "文献库写入模式",
+  safe: "安全",
+  yolo: "全自动",
+  "reviews every library change before it happens, and batch jobs pause on each page.":
+    "会在每次更改文献库之前进行审核，批处理任务会在每一页暂停。",
+  "lets the agent apply changes on its own judgement, including whole-library batch jobs — every run is still recorded and can be reverted from the agent history. This is separate from the Claude Code permission mode, which governs the bridge only.":
+    "允许 Agent 自主判断并应用更改，包括整个文献库的批处理任务——每次运行仍会被记录，并可从 Agent 历史记录中撤销。此模式与 Claude Code 权限模式相互独立；后者仅控制桥接服务。",
+  "Tavily Web Search": "Tavily 网页搜索",
+  "Adds current, general web search and focused page reading to the in-plugin Agent. The key stays in your local Zotero preferences.":
+    "为插件内的 Agent 提供最新的通用网页搜索和针对性网页读取功能。API 密钥仅保存在本机的 Zotero 偏好设置中。",
+  "API key": "API 密钥",
+  "Get a free API key": "获取免费 API 密钥",
+  "Basic search costs 1 Tavily credit; Advanced costs 2. Basic extraction costs 1 credit per 5 successful pages; Advanced costs 2 per 5. Tavily currently offers a free monthly credit allowance.":
+    "基础搜索消耗 1 个 Tavily 积分；高级搜索消耗 2 个。每成功提取 5 个网页，基础提取消耗 1 个积分；高级提取消耗 2 个。Tavily 目前每月提供免费积分额度。",
+  "Search queries and requested URLs are sent to Tavily and are handled under Tavily's privacy, retention, and search-index policies. When displayed, favicons are loaded from public URLs supplied by Tavily. Do not include credentials or sensitive private text in web queries.":
+    "搜索查询和所请求的 URL 会发送至 Tavily，并按照 Tavily 的隐私、数据保留和搜索索引政策进行处理。显示网站图标时，图标会从 Tavily 提供的公开 URL 加载。请勿在网页查询中包含登录凭据或敏感的私密文本。",
+  "Enter a Tavily API key first.": "请先输入 Tavily API 密钥。",
+  Connected: "已连接",
+  "Could not reach Tavily. Check the network connection.":
+    "无法连接 Tavily。请检查网络连接。",
+  "Tavily rejected the API key. Check it in Preferences → Agent.":
+    "Tavily 拒绝了该 API 密钥。请在偏好设置 → Agent 中检查。",
+  "Tavily rate-limited the request. Try again later.":
+    "Tavily 已对该请求限流。请稍后重试。",
+  "The Tavily plan credit limit has been reached.":
+    "已达到 Tavily 套餐的积分上限。",
+  "The Tavily pay-as-you-go limit has been reached.":
+    "已达到 Tavily 按量付费上限。",
+  "Tavily is temporarily unavailable. Try again later.":
+    "Tavily 暂时不可用。请稍后重试。",
+  "View web sources": "查看网页来源",
+  "Web sources": "网页来源",
+  "Open web source": "打开网页来源",
   "MinerU PDF Parsing": "MinerU PDF 解析",
   "Extract high-quality structured text from PDFs with preserved math formulas, tables, and figures. MinerU dramatically improves how the AI understands your papers.":
     "从 PDF 中提取高质量结构化文本，保留数学公式、表格和图片。MinerU 显著提升 AI 对论文的理解能力。",

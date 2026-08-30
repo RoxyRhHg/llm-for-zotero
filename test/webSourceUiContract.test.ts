@@ -3,6 +3,7 @@ import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { normalizeWebSourcePopoverRows } from "../src/modules/contextPanel/webSourceIndicators";
 import { createWebFaviconImage } from "../src/modules/contextPanel/webFavicon";
+import { initI18n, t } from "../src/utils/i18n";
 
 describe("web source UI contract", function () {
   const root = process.cwd();
@@ -41,6 +42,92 @@ describe("web source UI contract", function () {
     );
     assert.notInclude(preferenceScript, 't("API key usage")');
     assert.notInclude(preferenceScript, 't("Account usage")');
+  });
+
+  it("translates the complete Tavily preferences copy for Chinese users", function () {
+    const globalWithZotero = globalThis as typeof globalThis & {
+      Zotero?: {
+        Prefs?: { get: () => string };
+        locale?: string;
+      };
+    };
+    const previousZotero = globalWithZotero.Zotero;
+    globalWithZotero.Zotero = {
+      Prefs: { get: () => "zh-CN" },
+      locale: "zh-CN",
+    };
+    initI18n();
+
+    try {
+      assert.equal(t("Tavily Web Search"), "Tavily 网页搜索");
+      assert.equal(t("API key"), "API 密钥");
+      assert.equal(t("Get a free API key"), "获取免费 API 密钥");
+      assert.equal(
+        t("Enter a Tavily API key first."),
+        "请先输入 Tavily API 密钥。",
+      );
+      assert.equal(t("Connected"), "已连接");
+
+      for (const status of [
+        "Could not reach Tavily. Check the network connection.",
+        "Tavily rejected the API key. Check it in Preferences → Agent.",
+        "Tavily rate-limited the request. Try again later.",
+        "The Tavily plan credit limit has been reached.",
+        "The Tavily pay-as-you-go limit has been reached.",
+        "Tavily is temporarily unavailable. Try again later.",
+      ]) {
+        assert.notEqual(t(status), status, status);
+      }
+
+      assert.equal(t("View web sources"), "查看网页来源");
+      assert.equal(t("Web sources"), "网页来源");
+      assert.equal(t("Open web source"), "打开网页来源");
+
+      const preferences = readFileSync(
+        join(root, "addon/content/preferences.xhtml"),
+        "utf8",
+      );
+      const tavilyStart = preferences.indexOf('id="__addonRef__-tavily-card"');
+      const tavilyEnd = preferences.indexOf(
+        'id="__addonRef__-codex-app-server-card"',
+      );
+      const tavilyCopy = Array.from(
+        preferences.slice(tavilyStart, tavilyEnd).matchAll(/>([^<>]+)</g),
+        (match) => match[1].replace(/\s+/g, " ").trim(),
+      ).filter(Boolean);
+      assert.deepEqual(
+        tavilyCopy.filter((english) => t(english) === english),
+        [],
+        "every visible Tavily card string must have a Chinese translation",
+      );
+
+      const preferenceScript = readFileSync(
+        join(root, "src/modules/preferenceScript.ts"),
+        "utf8",
+      );
+      assert.match(
+        preferenceScript,
+        /t\(\s*error instanceof Error \? error\.message : String\(error\),\s*\)/,
+      );
+      const sourceIndicators = readFileSync(
+        join(root, "src/modules/contextPanel/webSourceIndicators.ts"),
+        "utf8",
+      );
+      for (const label of [
+        't("View web sources")',
+        't("Web sources")',
+        't("Open web source")',
+      ]) {
+        assert.include(sourceIndicators, label);
+      }
+    } finally {
+      if (previousZotero !== undefined) {
+        globalWithZotero.Zotero = previousZotero;
+      } else {
+        delete globalWithZotero.Zotero;
+      }
+      initI18n();
+    }
   });
 
   it("uses the existing paper-card surface and selectable-row primitives", function () {
