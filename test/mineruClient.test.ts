@@ -23,6 +23,10 @@ const LONG_PDF_PATH_B = `/tmp/${LONG_COMMON_PREFIX}second.pdf`;
 const LONG_UNICODE_PDF_PATH = `/tmp/${"论文😀".repeat(40)}.pdf`;
 const EXACT_LIMIT_PDF_FILE_NAME = `${"a".repeat(76)}.pdf`;
 const EXACT_LIMIT_PDF_PATH = `/tmp/${EXACT_LIMIT_PDF_FILE_NAME}`;
+const WINDOWS_LEGACY_MAX_PATH_CHARS = 260;
+const MINERU_WINDOWS_OUTPUT_ROOT =
+  "C:\\Users\\researcher\\Documents\\local-ai-services\\mineru-runtime\\outputs";
+const MINERU_TASK_ID = "19e9a6ce-d8ac-48c9-8a4f-8b9e24997d49";
 
 function bytes(value: string): Uint8Array {
   return encoder.encode(value);
@@ -115,6 +119,15 @@ async function readMultipartFileName(
   if (headerEnd < 0) return "";
   const header = text.slice(fieldIndex, headerEnd);
   return /filename="([^"]*)"/.exec(header)?.[1] || "";
+}
+
+function buildMineruWindowsOutputPath(
+  outputRoot: string,
+  taskId: string,
+  uploadFileName: string,
+): string {
+  const stem = uploadFileName.replace(/\.pdf$/i, "");
+  return `${outputRoot}\\${taskId}\\${stem}\\ocr\\${stem}.md`;
 }
 
 describe("mineruClient", function () {
@@ -477,9 +490,44 @@ describe("mineruClient", function () {
         "files",
       );
       assert.equal(firstName, secondName);
-      assert.isAtMost(encoder.encode(firstName).byteLength, 80);
-      assert.match(firstName, /_[a-f0-9]{12}\.pdf$/);
+      assert.equal(encoder.encode(firstName).byteLength, 16);
+      assert.match(firstName, /^[a-f0-9]{12}\.pdf$/);
       assert.notEqual(firstName, LONG_PDF_FILE_NAME);
+    });
+
+    it("keeps MinerU's repeated Windows output path below MAX_PATH", async function () {
+      let submittedBody: BodyInit | null | undefined;
+      globalThis.fetch = (async (_url, init) => {
+        submittedBody = init?.body;
+        return new Response(createMineruZip("# Parsed nested output path"), {
+          status: 200,
+        });
+      }) as typeof fetch;
+
+      await parsePdfWithMineruLocal(
+        LONG_PDF_PATH,
+        "http://127.0.0.1:58659",
+        "pipeline",
+      );
+
+      const previousCappedPath = buildMineruWindowsOutputPath(
+        MINERU_WINDOWS_OUTPUT_ROOT,
+        MINERU_TASK_ID,
+        EXACT_LIMIT_PDF_FILE_NAME,
+      );
+      const submittedName = await readMultipartFileName(submittedBody, "files");
+      const fixedPath = buildMineruWindowsOutputPath(
+        MINERU_WINDOWS_OUTPUT_ROOT,
+        MINERU_TASK_ID,
+        submittedName,
+      );
+
+      assert.isAtLeast(
+        previousCappedPath.length,
+        WINDOWS_LEGACY_MAX_PATH_CHARS,
+      );
+      assert.match(submittedName, /^[a-f0-9]{12}\.pdf$/);
+      assert.isBelow(fixedPath.length, WINDOWS_LEGACY_MAX_PATH_CHARS);
     });
 
     it("keeps distinct hashes for long names with a shared prefix", async function () {
@@ -511,11 +559,11 @@ describe("mineruClient", function () {
         "files",
       );
       assert.notEqual(firstName, secondName);
-      assert.isAtMost(encoder.encode(firstName).byteLength, 80);
-      assert.isAtMost(encoder.encode(secondName).byteLength, 80);
+      assert.match(firstName, /^[a-f0-9]{12}\.pdf$/);
+      assert.match(secondName, /^[a-f0-9]{12}\.pdf$/);
     });
 
-    it("sanitizes and bounds a long Unicode multipart filename", async function () {
+    it("uses a hash-only multipart filename for long Unicode names", async function () {
       let submittedBody: BodyInit | null | undefined;
       globalThis.fetch = (async (_url, init) => {
         submittedBody = init?.body;
@@ -531,9 +579,8 @@ describe("mineruClient", function () {
       );
 
       const fileName = await readMultipartFileName(submittedBody, "files");
-      assert.isAtMost(encoder.encode(fileName).byteLength, 80);
-      assert.match(fileName, /^[\x20-\x7E]+$/);
-      assert.match(fileName, /_[a-f0-9]{12}\.pdf$/);
+      assert.equal(encoder.encode(fileName).byteLength, 16);
+      assert.match(fileName, /^[a-f0-9]{12}\.pdf$/);
     });
 
     it("reports an unavailable SHA-256 implementation for long names", async function () {
