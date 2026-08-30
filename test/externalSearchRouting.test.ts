@@ -198,5 +198,7 @@ describe("external search guidance routing", function () {
     assert.include(persona, "Preserve the user's language");
     assert.include(persona, "If necessary web access is unavailable");
     assert.notInclude(persona, "Start with basic depth");
+    assert.notInclude(persona, "focused lookup");
+    assert.notInclude(persona, "exploratory or ambiguous discovery");
   });
 });

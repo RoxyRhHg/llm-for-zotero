@@ -57,10 +57,6 @@ export function matchesWebSearchGuidance(
   );
 }
 
-function normalizeDepth(value: unknown): WebAccessDepth {
-  return value === "advanced" ? "advanced" : "basic";
-}
-
 function normalizeTopic(value: unknown): WebSearchTopic {
   return value === "news" || value === "finance" ? value : "general";
 }
@@ -122,11 +118,7 @@ export function validateWebSearchInput(
   if (!query) return fail("query is required");
   if (query.length > 2_000)
     return fail("query must be 2,000 characters or less");
-  if (
-    args.depth !== undefined &&
-    args.depth !== "basic" &&
-    args.depth !== "advanced"
-  ) {
+  if (args.depth !== "basic" && args.depth !== "advanced") {
     return fail("depth must be one of: basic, advanced");
   }
   if (
@@ -170,7 +162,7 @@ export function validateWebSearchInput(
   }
   return ok({
     query,
-    depth: normalizeDepth(args.depth),
+    depth: args.depth,
     topic: normalizeTopic(args.topic),
     maxResults,
     timeRange,
@@ -219,7 +211,7 @@ export function createWebSearchTool(
         "Search the current public web with Tavily when the answer materially needs current facts or concrete general-web evidence. Use literature_search for scholarly discovery; a request may use both for distinct evidence needs.",
       inputSchema: {
         type: "object",
-        required: ["query"],
+        required: ["query", "depth"],
         additionalProperties: false,
         properties: {
           query: {
@@ -230,7 +222,7 @@ export function createWebSearchTool(
             type: "string",
             enum: ["basic", "advanced"],
             description:
-              "Search depth. basic costs 1 credit; advanced provides broader and deeper retrieval and costs 2 credits.",
+              "Required search depth for this call. Follow an explicit user depth request; an unscoped preference applies to both web_search and web_read, while a preference scoped to search or page reading applies only there. Treat an explicit request for deep search as advanced. Otherwise infer depth from the current retrieval need: use basic for a focused lookup with a clear target and limited evidence scope; use advanced for exploratory or ambiguous discovery, comparison or synthesis, multiple sources, entities, or subquestions, or deeper technical coverage. Do not choose advanced solely because the query is long, non-English, or scholarly. basic costs 1 credit; advanced costs 2 credits.",
           },
           topic: {
             type: "string",
@@ -263,7 +255,7 @@ export function createWebSearchTool(
     guidance: {
       matches: matchesWebSearchGuidance,
       instruction:
-        "Use web_search when the request needs current or general public evidence. A mixed request may also use literature_search for distinct scholarly evidence. Preserve the user's language by default, choose basic or advanced depth according to the retrieval need, and use web_read when search snippets are insufficient. Every final-answer paragraph that uses web results must end with the exact hidden source marker described in the tool result, using only returned sourceId values. Do not add a references footer.",
+        "Use web_search when the request needs current or general public evidence. A mixed request may also use literature_search for distinct scholarly evidence. Preserve the user's language by default, explicitly choose basic or advanced from the current retrieval need, and use web_read when search snippets are insufficient. Every final-answer paragraph that uses web results must end with the exact hidden source marker described in the tool result, using only returned sourceId values. Do not add a references footer.",
     },
     presentation: {
       label: "Search Web",

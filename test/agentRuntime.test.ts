@@ -5552,7 +5552,7 @@ describe("web attribution runtime guard", function () {
       {
         id: "web-call-1",
         name: "web_search",
-        arguments: { query: "current fact" },
+        arguments: { query: "current fact", depth: "basic" },
       },
     ],
     assistantMessage: {
@@ -5562,7 +5562,7 @@ describe("web attribution runtime guard", function () {
         {
           id: "web-call-1",
           name: "web_search",
-          arguments: { query: "current fact" },
+          arguments: { query: "current fact", depth: "basic" },
         },
       ],
     },
@@ -5579,6 +5579,119 @@ describe("web attribution runtime guard", function () {
     }
     throw new Error("Missing web source ID in mock model context");
   }
+
+  it("rejects missing depth without a request and executes a corrected call", async function () {
+    const restoreDb = installMockDb();
+    let searchCalls = 0;
+    const countingProvider: WebAccessProvider = {
+      ...provider,
+      search: async (request) => {
+        searchCalls += 1;
+        return provider.search(request);
+      },
+    };
+    try {
+      Zotero.Prefs.set(TAVILY_API_KEY_PREF, "tvly-test", true);
+      const registry = new AgentToolRegistry();
+      registry.register(createWebSearchTool(() => countingProvider));
+      let step = 0;
+      const runtime = new AgentRuntime({
+        registry,
+        adapterFactory: () => ({
+          getCapabilities: () => capabilities,
+          supportsTools: () => true,
+          async runStep(params: AgentStepParams): Promise<AgentModelStep> {
+            step += 1;
+            if (step === 1) {
+              return {
+                kind: "tool_calls",
+                calls: [
+                  {
+                    id: "web-call-missing-depth",
+                    name: "web_search",
+                    arguments: { query: "current fact" },
+                  },
+                ],
+                assistantMessage: {
+                  role: "assistant",
+                  content: "",
+                  tool_calls: [
+                    {
+                      id: "web-call-missing-depth",
+                      name: "web_search",
+                      arguments: { query: "current fact" },
+                    },
+                  ],
+                },
+              };
+            }
+            if (step === 2) {
+              assert.equal(searchCalls, 0);
+              assert.include(
+                JSON.stringify(params.messages),
+                "depth must be one of: basic, advanced",
+              );
+              return {
+                kind: "tool_calls",
+                calls: [
+                  {
+                    id: "web-call-corrected",
+                    name: "web_search",
+                    arguments: { query: "current fact", depth: "basic" },
+                  },
+                ],
+                assistantMessage: {
+                  role: "assistant",
+                  content: "",
+                  tool_calls: [
+                    {
+                      id: "web-call-corrected",
+                      name: "web_search",
+                      arguments: { query: "current fact", depth: "basic" },
+                    },
+                  ],
+                },
+              };
+            }
+            assert.equal(searchCalls, 1);
+            const sourceId = findSourceId(params.messages);
+            const text = `A supported current claim.<!--llm-web-source:${sourceId}-->`;
+            return {
+              kind: "final",
+              text,
+              assistantMessage: { role: "assistant", content: text },
+            };
+          },
+        }),
+      });
+      const events: AgentEvent[] = [];
+      const outcome = await runtime.runTurn({
+        request: {
+          conversationKey: 920,
+          mode: "agent",
+          userText: "What is current?",
+          model: "gpt-4o-mini",
+          apiBase: "https://api.openai.com/v1/chat/completions",
+          apiKey: "test",
+          authMode: "api_key",
+        },
+        onEvent: (event) => events.push(event),
+      });
+
+      assert.equal(outcome.kind, "completed");
+      assert.equal(searchCalls, 1);
+      const validationError = events.find(
+        (event): event is Extract<AgentEvent, { type: "tool_error" }> =>
+          event.type === "tool_error",
+      );
+      assert.include(
+        validationError?.error || "",
+        "depth must be one of: basic, advanced",
+      );
+    } finally {
+      restoreDb();
+    }
+  });
 
   it("allows one correction, persists clean Markdown, and stores terminal anchors", async function () {
     const restoreDb = installMockDb();

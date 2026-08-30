@@ -52,11 +52,7 @@ export function validateWebReadInput(
   if (!query) return fail("query is required");
   if (query.length > 2_000)
     return fail("query must be 2,000 characters or less");
-  if (
-    args.depth !== undefined &&
-    args.depth !== "basic" &&
-    args.depth !== "advanced"
-  ) {
+  if (args.depth !== "basic" && args.depth !== "advanced") {
     return fail("depth must be one of: basic, advanced");
   }
   const chunksRaw = args.chunksPerSource ?? 3;
@@ -71,7 +67,7 @@ export function validateWebReadInput(
   return ok({
     urls: uniqueUrls,
     query,
-    depth: args.depth === "advanced" ? "advanced" : "basic",
+    depth: args.depth,
     chunksPerSource,
   });
 }
@@ -90,11 +86,6 @@ function buildReadTraceDetails(
     details.push({
       label: "Query",
       value: input.value.query,
-    });
-    details.push({
-      label: "Depth",
-      value: `Depth: ${input.value.depth}`,
-      timeline: { icon: "brain" },
     });
     for (const url of input.value.urls) {
       const source = (result.pages || []).find((page) => page.url === url);
@@ -123,7 +114,7 @@ export function createWebReadTool(
         "Read query-relevant passages from one to five public web pages with Tavily. Use URLs returned by web_search when their snippets are not sufficient for the answer.",
       inputSchema: {
         type: "object",
-        required: ["urls", "query"],
+        required: ["urls", "query", "depth"],
         additionalProperties: false,
         properties: {
           urls: {
@@ -140,7 +131,7 @@ export function createWebReadTool(
             type: "string",
             enum: ["basic", "advanced"],
             description:
-              "Extraction depth. advanced provides deeper page retrieval.",
+              "Required extraction depth for this call. Follow an explicit user depth request; an unscoped preference applies to both web_search and web_read, while a preference scoped to search or page reading applies only there. Treat an explicit request for deep page reading as advanced. Otherwise infer depth from the current retrieval need: use basic for a few direct facts or passages with limited evidence scope; use advanced for long or technical pages, multiple sources or subquestions, comparison or synthesis, or deeper technical coverage. Do not choose advanced solely because the query is long, non-English, or scholarly.",
           },
           chunksPerSource: {
             type: "integer",
@@ -162,7 +153,7 @@ export function createWebReadTool(
         const input = validateWebReadInput(args);
         const result = content as Partial<WebReadToolResult> | undefined;
         if (!input.ok || !result) return null;
-        return `Read web pages · ${input.value.depth}`;
+        return `Read web pages · Depth: ${input.value.depth}`;
       },
       summaries: {
         onCall: ({ args }) => {

@@ -92,6 +92,51 @@ describe("web access agent tools", function () {
     };
   }
 
+  it("requires explicit depth and documents selection at the tool boundary", function () {
+    const search = createWebSearchTool(() => provider());
+    const read = createWebReadTool(() => provider());
+    const searchSchema = search.spec.inputSchema as {
+      required?: string[];
+      properties?: { depth?: { description?: string } };
+    };
+    const readSchema = read.spec.inputSchema as {
+      required?: string[];
+      properties?: { depth?: { description?: string } };
+    };
+
+    assert.includeMembers(searchSchema.required || [], ["query", "depth"]);
+    assert.includeMembers(readSchema.required || [], [
+      "urls",
+      "query",
+      "depth",
+    ]);
+    assert.include(
+      searchSchema.properties?.depth?.description || "",
+      "Follow an explicit user depth request",
+    );
+    assert.include(
+      searchSchema.properties?.depth?.description || "",
+      "use basic for a focused lookup",
+    );
+    assert.include(
+      searchSchema.properties?.depth?.description || "",
+      "use advanced for exploratory or ambiguous discovery",
+    );
+    assert.include(
+      readSchema.properties?.depth?.description || "",
+      "use basic for a few direct facts or passages",
+    );
+    assert.include(
+      readSchema.properties?.depth?.description || "",
+      "use advanced for long or technical pages",
+    );
+    assert.include(
+      search.guidance?.instruction || "",
+      "explicitly choose basic or advanced from the current retrieval need",
+    );
+    assert.notInclude(search.guidance?.instruction || "", "focused lookup");
+  });
+
   it("validates search depth, filters, limits, and dates", function () {
     const valid = validateWebSearchInput({
       query: "  current topic  ",
@@ -108,18 +153,37 @@ describe("web access agent tools", function () {
       assert.equal(valid.value.depth, "advanced");
       assert.deepEqual(valid.value.includeDomains, ["example.com"]);
     }
+    const missingDepth = validateWebSearchInput({ query: "x" });
+    assert.isFalse(missingDepth.ok);
+    if (!missingDepth.ok) {
+      assert.include(missingDepth.error, "depth must be one of");
+    }
     assert.isFalse(validateWebSearchInput({ query: "x", depth: "deep" }).ok);
-    assert.isFalse(validateWebSearchInput({ query: "x", topic: "social" }).ok);
     assert.isFalse(
       validateWebSearchInput({
         query: "x",
+        depth: "basic",
+        topic: "social",
+      }).ok,
+    );
+    assert.isFalse(
+      validateWebSearchInput({
+        query: "x",
+        depth: "basic",
         includeDomains: ["127.0.0.1"],
       }).ok,
     );
-    assert.isFalse(validateWebSearchInput({ query: "x", maxResults: 11 }).ok);
     assert.isFalse(
       validateWebSearchInput({
         query: "x",
+        depth: "basic",
+        maxResults: 11,
+      }).ok,
+    );
+    assert.isFalse(
+      validateWebSearchInput({
+        query: "x",
+        depth: "basic",
         timeRange: "week",
         startDate: "2026-01-01",
       }).ok,
@@ -127,6 +191,7 @@ describe("web access agent tools", function () {
     assert.isFalse(
       validateWebSearchInput({
         query: "x",
+        depth: "basic",
         startDate: "2026-09-01",
         endDate: "2026-01-01",
       }).ok,
@@ -138,12 +203,22 @@ describe("web access agent tools", function () {
       validateWebReadInput({
         urls: ["https://example.com/a"],
         query: "specific detail",
+        depth: "basic",
       }).ok,
     );
+    const missingDepth = validateWebReadInput({
+      urls: ["https://example.com/a"],
+      query: "specific detail",
+    });
+    assert.isFalse(missingDepth.ok);
+    if (!missingDepth.ok) {
+      assert.include(missingDepth.error, "depth must be one of");
+    }
     assert.isFalse(
       validateWebReadInput({
         urls: ["http://127.0.0.1/private"],
         query: "specific detail",
+        depth: "basic",
       }).ok,
     );
     assert.isFalse(
@@ -160,6 +235,7 @@ describe("web access agent tools", function () {
           (_, index) => `https://example.com/${index}`,
         ),
         query: "specific detail",
+        depth: "basic",
       }).ok,
     );
   });
@@ -340,17 +416,22 @@ describe("web access agent tools", function () {
     assert.equal(read.presentation?.traceIcon, "web");
     assert.equal(
       read.presentation?.buildTraceSummary?.({ args, content: result }),
-      "Read web pages · basic",
+      "Read web pages · Depth: basic",
+    );
+    const advancedArgs = { ...args, depth: "advanced" as const };
+    const advancedResult = await read.execute(advancedArgs, context());
+    assert.equal(advancedResult.depth, "advanced");
+    assert.equal(
+      read.presentation?.buildTraceSummary?.({
+        args: advancedArgs,
+        content: advancedResult,
+      }),
+      "Read web pages · Depth: advanced",
     );
     assert.deepEqual(
       read.presentation?.buildTraceDetails?.({ args, content: result }),
       [
         { label: "Query", value: "specific detail" },
-        {
-          label: "Depth",
-          value: "Depth: basic",
-          timeline: { icon: "brain" },
-        },
         {
           label: "URL",
           value: "https://example.com/report",
