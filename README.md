@@ -43,6 +43,7 @@ Documentation:
 - [File-Based Notes](#file-based-notes)
 - [Agent Mode](#agent-mode-beta)
 - [Skills](#skills)
+- [General Web Search](#general-web-search)
 - [WebChat Setup](#webchat-setup-chatgpt-web-sync)
 - [Codex Setup](#codex-setup-chatgpt-plus-subscribers)
 - [Claude Code Setup](#claude-code-setup-experimental)
@@ -62,6 +63,7 @@ Documentation:
   Markdown folders such as Obsidian and Logseq.
 - Enable Agent Mode for library-wide read, search, tagging, metadata, import,
   note-editing, and organization workflows.
+- Search the current public web and read relevant pages with Tavily, with source links attached to the answer.
 - Use your preferred backend: API keys, local models, ChatGPT WebChat, Codex App
   Server, or Claude Code.
 
@@ -78,6 +80,7 @@ Documentation:
   support native Zotero API operations.
 - **Skills** let you customize how Agent Mode handles research workflows. The
   plugin ships with 8 built-in skills and a portal for creating your own.
+- **General Web Search** lets the in-plugin Agent search the current public web with Tavily, read relevant pages, and attach source links to its answers.
 - **Standalone Window Mode** opens the assistant in a dedicated window with
   paper chat, library chat, and conversation history.
 - **File-Based Notes** save Markdown notes to local folders, including Obsidian,
@@ -271,6 +274,7 @@ again when the needed source or coverage layer is missing.
 | ------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------- |
 | Library and PDF reading  | Search items and collections, read metadata, read papers, search paper passages, render PDF pages, inspect attachments                            |
 | Scholarly discovery      | Search CrossRef and Semantic Scholar for metadata, recommendations, references, and citations                                                     |
+| General web research     | Search the current public web with Tavily, read relevant pages, and show source links with the answer                                             |
 | Library writes           | Apply tags, update metadata, move items, manage collections, manage attachments, merge duplicates, trash items, import identifiers or local files |
 | Notes                    | Edit the active Zotero note or create a new note in plain text, Markdown, or HTML                                                                 |
 | Filesystem and scripting | Read/write allowed local files, run analysis commands, or execute Zotero JavaScript with write confirmations                                      |
@@ -342,6 +346,30 @@ icon, choose **"+ New skill"**, edit the skill file, and save. Skills are stored
 as Markdown files in `{ZoteroDataDir}/llm-for-zotero/skills/`.
 
 </details>
+
+## General Web Search
+
+Agent Mode can search the current public web with [Tavily](https://www.tavily.com/) and read the most relevant returned pages when search-result snippets are not enough.
+Use it for current facts, official documentation, news, finance, product information, and other general-web evidence.
+Scholarly discovery remains separate: the agent uses CrossRef and Semantic Scholar for research literature, and it can combine both kinds of search when a question needs academic and general-web sources.
+
+To enable general web search:
+
+1. Get a Tavily API key from [app.tavily.com](https://app.tavily.com/).
+2. Open `Preferences` -> `llm-for-zotero` -> **Agent**.
+3. In **Tavily Web Search**, paste the API key and click **Test connection**.
+4. Enable Agent Mode and ask it to search or verify something online.
+
+There is no separate enable switch.
+The `web_search` and `web_read` tools become available to compatible in-plugin Agent conversations when a Tavily key is configured.
+They are not added to WebChat, Codex App Server, or Claude Code conversations, which use their own runtimes and tool sets.
+
+The agent chooses basic or advanced search and page-reading depth from the request, or follows an explicit request such as _"use advanced web search."_
+It can narrow searches by topic, date, or domain, and answers include clickable source indicators for the pages actually used.
+
+Basic search costs 1 Tavily credit and advanced search costs 2.
+Page extraction also consumes Tavily credits, and Tavily currently offers a free monthly allowance.
+The API key stays in local Zotero preferences, but search queries and requested URLs are sent to Tavily, so do not include credentials or sensitive private text in web queries.
 
 ## Codex Setup (ChatGPT Plus Subscribers)
 
@@ -695,6 +723,7 @@ and cloud MinerU involve their respective services or companion runtimes.
   configure.
 - In WebChat mode, requests are relayed through the browser extension to
   `chatgpt.com` or `chat.deepseek.com`.
+- When Tavily Web Search is configured, web queries and requested public URLs are sent to Tavily; the API key remains in local Zotero preferences.
 - In cloud MinerU mode, newly added PDFs are sent to MinerU for parsing when
   parsing is enabled.
 - In local MinerU mode, newly added PDFs are sent to the local or remote
@@ -734,6 +763,7 @@ and cloud MinerU involve their respective services or companion runtimes.
 | Use ChatGPT in the browser                                  | [WebChat](#webchat-setup-chatgpt-web-sync) with the Sync for Zotero extension | No                              |
 | Use Codex models with ChatGPT Plus                          | [Codex App Server](#codex-setup-chatgpt-plus-subscribers)                     | No separate API key             |
 | Use Claude Code inside Zotero                               | [Claude Code bridge](#claude-code-setup-experimental)                         | Claude Code auth                |
+| Search and read the current public web                      | [General Web Search](#general-web-search) with Tavily                          | Tavily API key                  |
 | Improve PDF extraction for tables, equations, and figures   | [MinerU PDF parsing](#mineru-pdf-parsing)                                     | Personal MinerU key recommended |
 
 > **Q: Is it free to use?**
