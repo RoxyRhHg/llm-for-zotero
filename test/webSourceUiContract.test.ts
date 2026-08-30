@@ -171,7 +171,7 @@ describe("web source UI contract", function () {
     assert.include(css, ".llm-web-source-favicon");
     assert.match(
       css,
-      /\.llm-agent-trace-timeline-favicon\s*\{[^}]*background:\s*var\(--material-sidepane,\s*var\(--material-background\)\)/s,
+      /\.llm-agent-trace-timeline-favicon\s*\{[^}]*background:\s*transparent/s,
     );
     assert.match(
       css,
@@ -202,5 +202,60 @@ describe("web source UI contract", function () {
     assert.include(libraryIcon, 'fill="currentColor"');
     assert.notInclude(libraryIcon, "490.667");
     assert.notInclude(libraryIcon, 'width="800px"');
+  });
+
+  it("aligns search activity icons with the first text line at every font scale", function () {
+    const css = readFileSync(
+      join(root, "addon/content/zoteroPane.css"),
+      "utf8",
+    );
+    const iconRule =
+      css.match(
+        /\.llm-at-icon-library,\s*\.llm-at-icon-web\s*\{[\s\S]*?\}/,
+      )?.[0] || "";
+
+    assert.include(iconRule, "flex: 0 0 var(--llm-fs-12)");
+    assert.include(iconRule, "width: var(--llm-fs-12)");
+    assert.include(iconRule, "height: var(--llm-fs-12)");
+    assert.include(
+      iconRule,
+      "margin-block-start: calc(1.7px * var(--llm-font-scale, 1))",
+    );
+
+    for (const fontScale of [0.8, 1.2, 1.8]) {
+      const textLineCenter = (11 * fontScale * 1.4) / 2;
+      const iconCenter = 1.7 * fontScale + (12 * fontScale) / 2;
+      assert.approximately(iconCenter, textLineCenter, 1e-9);
+    }
+  });
+
+  it("centers a fixed-ratio favicon inside its circular container", function () {
+    const css = readFileSync(
+      join(root, "addon/content/zoteroPane.css"),
+      "utf8",
+    );
+    const websiteIconRule =
+      css.match(
+        /\.llm-agent-trace-timeline-icon-website\s*\{[\s\S]*?\}/,
+      )?.[0] || "";
+    const faviconRule =
+      css.match(/\.llm-agent-trace-timeline-favicon\s*\{[\s\S]*?\}/)?.[0] || "";
+
+    assert.include(websiteIconRule, "display: grid");
+    assert.include(websiteIconRule, "place-items: center");
+    assert.include(websiteIconRule, "width: 20px");
+    assert.include(websiteIconRule, "height: 20px");
+    assert.include(websiteIconRule, "margin-left: -1px");
+    assert.include(websiteIconRule, "border-radius: 50%");
+    assert.include(websiteIconRule, "background: var(--material-background)");
+    assert.notInclude(websiteIconRule, "transform:");
+    assert.include(faviconRule, "position: static");
+    assert.include(faviconRule, "display: block");
+    assert.include(faviconRule, "width: 70%");
+    assert.include(faviconRule, "height: 70%");
+    assert.include(faviconRule, "border-radius: 0");
+    assert.include(faviconRule, "background: transparent");
+    assert.include(faviconRule, "object-fit: contain");
+    assert.notInclude(faviconRule, "transform:");
   });
 });

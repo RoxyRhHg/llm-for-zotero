@@ -4918,10 +4918,11 @@ label.llm-search-results-item:hover {
 
 .llm-at-icon-library,
 .llm-at-icon-web {
-  flex: 0 0 14px;
-  width: 14px;
-  height: 14px;
-  margin-top: 1px;
+  flex: 0 0 var(--llm-fs-12);
+  width: var(--llm-fs-12);
+  height: var(--llm-fs-12);
+  /* Center the mask in the first 15.4px text line at every font scale. */
+  margin-block-start: calc(1.7px * var(--llm-font-scale, 1));
   background-color: currentColor;
   font-size: 0;
   mask-position: center;
@@ -5091,7 +5092,19 @@ label.llm-search-results-item:hover {
   -webkit-mask-image: url("icons/action-paper.svg");
 }
 
+.llm-agent-trace-timeline-icon-website {
+  display: grid;
+  place-items: center;
+  width: 20px;
+  height: 20px;
+  margin-left: -1px;
+  border-radius: 50%;
+  background: var(--material-background);
+}
+
 .llm-agent-trace-timeline-icon-website::before {
+  z-index: 1;
+  inset: 2px;
   mask-image: url("icons/action-mode-global.svg");
   -webkit-mask-image: url("icons/action-mode-global.svg");
 }
@@ -5101,7 +5114,6 @@ label.llm-search-results-item:hover {
   display: none;
 }
 
-.llm-agent-trace-timeline-favicon,
 .llm-web-source-favicon {
   position: absolute;
   z-index: 1;
@@ -5114,7 +5126,14 @@ label.llm-search-results-item:hover {
 }
 
 .llm-agent-trace-timeline-favicon {
-  background: var(--material-sidepane, var(--material-background));
+  position: static;
+  z-index: 1;
+  display: block;
+  width: 70%;
+  height: 70%;
+  border-radius: 0;
+  background: transparent;
+  object-fit: contain;
 }
 
 .llm-web-source-favicon {

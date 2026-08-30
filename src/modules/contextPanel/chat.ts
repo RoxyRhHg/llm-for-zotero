@@ -1553,13 +1553,19 @@ function estimateHistoryContextUsageSnapshot(
   };
 }
 
-subscribeModelProviderGroups(() => {
+export function refreshAllActiveConversationPanels(): void {
   for (const [body, getItem] of activeContextPanels) {
-    if (!(body as Element).isConnected) continue;
+    if (!(body as Element).isConnected) {
+      activeContextPanels.delete(body);
+      activeContextPanelStateSync.delete(body);
+      continue;
+    }
     const item = getItem();
     if (item) refreshChat(body, item);
   }
-});
+}
+
+subscribeModelProviderGroups(refreshAllActiveConversationPanels);
 
 function accumulateSessionTokens(
   conversationKey: number,
