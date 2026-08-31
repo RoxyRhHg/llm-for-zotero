@@ -213,6 +213,54 @@ describe("mineruChunking", function () {
     );
   });
 
+  it("rewrites a relative Markdown image target exactly once", function () {
+    const merged = mergeMineruChunkResults([
+      {
+        range: { index: 0, startPage: 1, endPage: 1, total: 1 },
+        result: {
+          mdContent: "![figure](./images/figure.png)",
+          files: [
+            file("full.md", "ignored"),
+            file(
+              "content_list.json",
+              '[{"page_idx":0,"img_path":"images/figure.png"}]',
+            ),
+            file("images/figure.png", "image"),
+          ],
+        },
+      },
+    ]);
+
+    assert.equal(
+      merged.mdContent,
+      "<!-- MinerU pages 1-1 -->\n\n![figure](images/chunk-001/images/figure.png)",
+    );
+  });
+
+  it("rewrites a full job/auto Markdown image target exactly once", function () {
+    const merged = mergeMineruChunkResults([
+      {
+        range: { index: 0, startPage: 1, endPage: 1, total: 1 },
+        result: {
+          mdContent: "![figure](job-id/auto/images/figure.png)",
+          files: [
+            file("job-id/auto/full.md", "ignored"),
+            file(
+              "job-id/auto/content_list.json",
+              '[{"page_idx":0,"img_path":"images/figure.png"}]',
+            ),
+            file("job-id/auto/images/figure.png", "image"),
+          ],
+        },
+      },
+    ]);
+
+    assert.equal(
+      merged.mdContent,
+      "<!-- MinerU pages 1-1 -->\n\n![figure](images/chunk-001/images/figure.png)",
+    );
+  });
+
   it("rejects chunk ranges with gaps before merging", function () {
     assert.throws(
       () =>

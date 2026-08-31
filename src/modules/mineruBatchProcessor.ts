@@ -355,13 +355,14 @@ async function processNext(): Promise<void> {
     let lastProgressStage = "";
     const { value: result } = await runMineruTaskOnce(
       entry.attachmentId,
-      async (report) => {
+      async (report, sharedSignal) => {
         setItemProcessing(entry.attachmentId);
         const parsed = await parsePdfWithMineru(
           pdfPath as string,
           report,
-          abort?.signal,
+          sharedSignal,
         );
+        if (sharedSignal?.aborted) throw new MineruCancelledError();
         if (!parsed?.mdContent) return parsed;
 
         await writeMineruCacheFiles(
@@ -391,6 +392,7 @@ async function processNext(): Promise<void> {
         state.statusMessage = stage;
         notify();
       },
+      abort?.signal,
     );
     if (result?.mdContent) {
       state.processedCount++;

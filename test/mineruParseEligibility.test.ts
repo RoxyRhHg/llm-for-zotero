@@ -130,7 +130,7 @@ describe("mineruParseEligibility", function () {
     assert.equal(result.reasonLabel, "150 pages");
   });
 
-  it("keeps long PDFs eligible because the MinerU client splits them", async function () {
+  it("still skips long PDFs over the configured automatic page limit", async function () {
     setupZoteroPrefs({ maxAutoPages: 100 });
     setupIO({ "/tmp/106.pdf": pdfText(412) });
 
@@ -139,8 +139,8 @@ describe("mineruParseEligibility", function () {
       createPdf(106) as Zotero.Item,
     );
 
-    assert.isTrue(result.eligible);
-    assert.deepEqual(result.reasons, []);
+    assert.isFalse(result.eligible);
+    assert.deepEqual(result.reasons, ["page_count"]);
     assert.equal(result.pageCount, 412);
   });
 
@@ -202,17 +202,17 @@ describe("mineruParseEligibility", function () {
     assert.isNull(result.pageCount);
   });
 
-  it("uses the 200-page default when the saved value is zero", async function () {
+  it("uses the preserved 100-page default when the saved value is zero", async function () {
     setupZoteroPrefs({ maxAutoPages: 0 });
-    setupIO({ "/tmp/106.pdf": pdfText(150) });
+    setupIO({ "/tmp/109.pdf": pdfText(150) });
 
     const result = await getMineruParseEligibility(
       createParent() as Zotero.Item,
-      createPdf(106) as Zotero.Item,
+      createPdf(109) as Zotero.Item,
     );
 
-    assert.isTrue(result.eligible);
-    assert.deepEqual(result.reasons, []);
-    assert.equal(result.reasonLabel, "");
+    assert.isFalse(result.eligible);
+    assert.deepEqual(result.reasons, ["page_count"]);
+    assert.equal(result.pageCount, 150);
   });
 });

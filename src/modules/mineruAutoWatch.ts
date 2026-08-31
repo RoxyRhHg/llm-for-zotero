@@ -19,6 +19,7 @@ import {
   setItemCached,
   setItemFailed,
   clearItemStatus,
+  cancelMineruTask,
   getItemStatus,
   runMineruTaskOnce,
 } from "./mineruProcessingStatus";
@@ -67,6 +68,7 @@ let currentItemTitle = "";
 let currentStatusMessage = "";
 let currentAttachmentId: number | null = null;
 const staleAbortAttachmentIds = new Set<number>();
+const stoppedAbortAttachmentIds = new Set<number>();
 const progressListeners = new Set<ProgressListener>();
 const readinessRetryTimers = new Map<
   number,
@@ -291,6 +293,7 @@ function removeDeletedAttachmentsFromQueue(ids: number[]): void {
 
   if (currentAttachmentId !== null && deletedIds.has(currentAttachmentId)) {
     staleAbortAttachmentIds.add(currentAttachmentId);
+    cancelMineruTask(currentAttachmentId);
     if (currentAbort) {
       currentAbort.abort();
       currentAbort = null;
@@ -420,13 +423,14 @@ async function processQueue(): Promise<void> {
       let lastProgressStage = "";
       const { value: result } = await runMineruTaskOnce(
         entry.attachmentId,
-        async (report) => {
+        async (report, sharedSignal) => {
           setItemProcessing(entry.attachmentId);
           const parsed = await parsePdfWithMineru(
             pdfPath as string,
             report,
-            abort?.signal,
+            sharedSignal,
           );
+          if (sharedSignal?.aborted) throw new MineruCancelledError();
           if (!parsed?.mdContent) return parsed;
 
           if (!getValidatedQueueItem(entry)) {
@@ -462,6 +466,7 @@ async function processQueue(): Promise<void> {
           currentStatusMessage = `${stage} — ${entry.title}`;
           notifyProgress();
         },
+        abort?.signal,
       );
 
       if (result?.mdContent) {
@@ -490,6 +495,12 @@ async function processQueue(): Promise<void> {
           staleAbortAttachmentIds.delete(entry.attachmentId);
           discardStaleEntry(entry, "attachment deleted while parsing");
           continue;
+        }
+        if (stoppedAbortAttachmentIds.has(entry.attachmentId)) {
+          stoppedAbortAttachmentIds.delete(entry.attachmentId);
+          clearItemStatus(entry.attachmentId);
+          ztoolkit.log(`MinerU auto-parse: stopped ${entry.title}`);
+          break;
         }
         errorCount++;
         ztoolkit.log(`MinerU auto-parse: cancelled ${entry.title}`);
@@ -523,6 +534,7 @@ async function processQueue(): Promise<void> {
         currentAbort = null;
       }
       staleAbortAttachmentIds.delete(entry.attachmentId);
+      stoppedAbortAttachmentIds.delete(entry.attachmentId);
     }
   }
 
@@ -688,6 +700,8 @@ async function handleItemNotification(
 export function startAutoWatch(): void {
   if (notifierId) return;
 
+  stoppedAbortAttachmentIds.clear();
+
   try {
     const notifier = (
       Zotero as unknown as {
@@ -761,6 +775,9 @@ export function resumeAutoWatch(): void {
 }
 
 export function stopAutoWatch(): void {
+  if (currentAttachmentId !== null) {
+    stoppedAbortAttachmentIds.add(currentAttachmentId);
+  }
   if (currentAbort) {
     currentAbort.abort();
     currentAbort = null;
@@ -854,6 +871,9 @@ export function isAutoWatchQueueEntryCurrentForTests(
 }
 
 export function resetAutoWatchForTests(): void {
+  if (currentAttachmentId !== null) {
+    stoppedAbortAttachmentIds.add(currentAttachmentId);
+  }
   if (currentAbort) {
     currentAbort.abort();
     currentAbort = null;

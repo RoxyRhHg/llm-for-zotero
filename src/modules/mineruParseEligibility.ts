@@ -3,7 +3,6 @@ import {
   getMineruMaxAutoPages,
   type MineruFilenameMatcher,
 } from "../utils/mineruConfig";
-import { MINERU_PAGE_CHUNK_SIZE } from "../utils/mineruChunking";
 
 type IOUtilsLike = {
   read?: (path: string) => Promise<Uint8Array | ArrayBuffer>;
@@ -174,11 +173,7 @@ export async function getMineruParseEligibility(
     options.inspectPageCount !== false
   ) {
     pageCount = await getMineruPdfPageCount(pdfAtt);
-    if (
-      pageCount !== null &&
-      pageCount > maxPages &&
-      pageCount <= MINERU_PAGE_CHUNK_SIZE
-    ) {
+    if (pageCount !== null && pageCount > maxPages) {
       reasons.push("page_count");
     }
   }

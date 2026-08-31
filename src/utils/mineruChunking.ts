@@ -137,13 +137,33 @@ function buildAssetPathMap(
   return pathMap;
 }
 
-function rewriteTextPaths(text: string, pathMap: Map<string, string>): string {
-  return [...pathMap.entries()]
-    .sort(([left], [right]) => right.length - left.length)
-    .reduce(
-      (current, [sourcePath, targetPath]) =>
-        current.split(sourcePath).join(targetPath),
-      text,
+function rewriteMarkdownPathRefs(
+  text: string,
+  pathMap: Map<string, string>,
+): string {
+  const rewriteTarget = (target: string): string => {
+    const trimmed = target.trim();
+    const unwrapped =
+      trimmed.startsWith("<") && trimmed.endsWith(">")
+        ? trimmed.slice(1, -1)
+        : trimmed;
+    const mapped = pathMap.get(normalizePath(unwrapped));
+    if (!mapped) return target;
+    return trimmed.startsWith("<") && trimmed.endsWith(">")
+      ? `<${mapped}>`
+      : mapped;
+  };
+
+  return text
+    .replace(
+      /(!?\[[^\]]*]\()([^)]+)(\))/g,
+      (_match, prefix, target, suffix) =>
+        `${prefix}${rewriteTarget(String(target))}${suffix}`,
+    )
+    .replace(
+      /(<img\b[^>]*\bsrc=["'])([^"']+)(["'][^>]*>)/gi,
+      (_match, prefix, target, suffix) =>
+        `${prefix}${rewriteTarget(String(target))}${suffix}`,
     );
 }
 
@@ -347,7 +367,7 @@ export function mergeMineruChunkResults(
     );
 
     markdownParts.push(
-      `<!-- MinerU pages ${chunk.range.startPage}-${chunk.range.endPage} -->\n\n${rewriteTextPaths(chunk.result.mdContent.trim(), pathMap)}`,
+      `<!-- MinerU pages ${chunk.range.startPage}-${chunk.range.endPage} -->\n\n${rewriteMarkdownPathRefs(chunk.result.mdContent.trim(), pathMap)}`,
     );
 
     for (const file of chunk.result.files) {

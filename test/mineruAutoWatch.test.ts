@@ -9,12 +9,14 @@ import {
   isAutoWatchQueueEntryCurrentForTests,
   processAutoWatchQueueForTests,
   resetAutoWatchForTests,
+  stopAutoWatch,
 } from "../src/modules/mineruAutoWatch";
 import {
   clearAllStatuses,
   getAllFailedIds,
   getAllProcessingIds,
   getItemStatus,
+  runMineruTaskOnce,
   setItemProcessing,
 } from "../src/modules/mineruProcessingStatus";
 import {
@@ -24,6 +26,7 @@ import {
 } from "../src/modules/contextPanel/mineruCache";
 import { pdfTextCache } from "../src/modules/contextPanel/state";
 import { clearMineruEligibilityCacheForTests } from "../src/modules/mineruParseEligibility";
+import { MineruCancelledError } from "../src/utils/mineruClient";
 
 const encoder = new TextEncoder();
 
@@ -189,6 +192,14 @@ function createMineruZip(markdown: string): Uint8Array {
     "full.md": bytes(markdown),
     "content_list.json": bytes("[]"),
   });
+}
+
+async function waitForAutoWatchStatus(message: string): Promise<void> {
+  for (let attempt = 0; attempt < 50; attempt++) {
+    if (getAutoWatchStatus().statusMessage.includes(message)) return;
+    await new Promise<void>((resolve) => setTimeout(resolve, 0));
+  }
+  assert.fail(`Timed out waiting for auto-watch status: ${message}`);
 }
 
 describe("mineruAutoWatch", function () {
@@ -416,6 +427,84 @@ describe("mineruAutoWatch", function () {
     } finally {
       globalThis.fetch = originalFetch;
     }
+  });
+
+  it("stops waiting immediately when auto-watch joins a batch-owned task", async function () {
+    const parent = createParent();
+    const pdf = createPdf();
+    const items = new Map<number, MockItem>([
+      [parent.id, parent],
+      [pdf.id, pdf],
+    ]);
+    setupZotero(items);
+
+    let releaseOwner: (() => void) | null = null;
+    let sharedSignal: AbortSignal | undefined;
+    const owner = runMineruTaskOnce(pdf.id, async (report, signal) => {
+      sharedSignal = signal;
+      report("Batch owner running");
+      await new Promise<void>((resolve) => {
+        releaseOwner = resolve;
+      });
+      return { mdContent: "# batch owner", files: [] };
+    });
+
+    await handleAutoWatchNotificationForTests("add", "item", [pdf.id]);
+    const auto = processAutoWatchQueueForTests();
+    await waitForAutoWatchStatus("Batch owner running");
+
+    stopAutoWatch();
+    await auto;
+
+    assert.isFalse(sharedSignal?.aborted ?? false);
+    assert.lengthOf(getAutoWatchQueueSnapshotForTests(), 0);
+    assert.isFalse(getAutoWatchStatus().isProcessing);
+
+    assert.exists(releaseOwner);
+    releaseOwner?.();
+    await owner;
+  });
+
+  it("deletion cancels a batch-owned task even when auto-watch only joined it", async function () {
+    const parent = createParent();
+    const pdf = createPdf();
+    const items = new Map<number, MockItem>([
+      [parent.id, parent],
+      [pdf.id, pdf],
+    ]);
+    setupZotero(items);
+
+    let sharedSignal: AbortSignal | undefined;
+    const owner = runMineruTaskOnce(pdf.id, async (report, signal) => {
+      sharedSignal = signal;
+      report("Batch owner running");
+      await new Promise<void>((_resolve, reject) => {
+        signal?.addEventListener(
+          "abort",
+          () => reject(new MineruCancelledError()),
+          { once: true },
+        );
+      });
+      return { mdContent: "# unreachable", files: [] };
+    });
+    const ownerOutcome = owner.then(
+      () => null,
+      (error) => error,
+    );
+
+    await handleAutoWatchNotificationForTests("add", "item", [pdf.id]);
+    const auto = processAutoWatchQueueForTests();
+    await waitForAutoWatchStatus("Batch owner running");
+
+    items.delete(pdf.id);
+    await handleAutoWatchNotificationForTests("delete", "item", [pdf.id]);
+    await auto;
+
+    const ownerError = await ownerOutcome;
+    assert.isTrue(sharedSignal?.aborted ?? false);
+    assert.instanceOf(ownerError, MineruCancelledError);
+    assert.lengthOf(getAutoWatchQueueSnapshotForTests(), 0);
+    assert.isUndefined(getItemStatus(pdf.id));
   });
 
   it("retries a newly added PDF when Zotero has not resolved its file path yet", async function () {
