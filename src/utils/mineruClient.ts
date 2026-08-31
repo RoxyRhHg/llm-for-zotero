@@ -44,9 +44,8 @@ const REQUEST_TIMEOUT_MS = 60000;
 const LOCAL_PARSE_TIMEOUT_MS = 0;
 const LOCAL_PROGRESS_INTERVAL_MS = 3000;
 const LOCAL_BUSY_RETRY_DELAYS_MS = [5000, 15000, 30000, 60000, 120000] as const;
-// MinerU repeats the uploaded filename stem in nested output paths. Long names
-// therefore use a compact hash-only filename instead of a truncated prefix.
-const MAX_MINERU_UPLOAD_FILENAME_BYTES = 80;
+// MinerU repeats the uploaded filename stem in nested output paths. Use a
+// compact hash-only filename for every local upload to keep those paths short.
 const MINERU_FILENAME_HASH_HEX_LENGTH = 12;
 
 export type MinerUExtractedFile = MinerUZipFile;
@@ -668,15 +667,6 @@ async function downloadAndExtractZip(
   };
 }
 
-function getSafePdfFileName(pdfPath: string): string {
-  const rawName = pdfPath.split(/[\\/]/).pop() || "paper.pdf";
-  return rawName.replace(/[^\x20-\x7E]/g, "_") || "paper.pdf";
-}
-
-function utf8ByteLength(value: string): number {
-  return new TextEncoder().encode(value).byteLength;
-}
-
 async function getShortFileNameHash(value: string): Promise<string> {
   const cryptoObject = (globalThis as { crypto?: Crypto }).crypto;
   if (!cryptoObject?.subtle) {
@@ -692,11 +682,6 @@ async function getShortFileNameHash(value: string): Promise<string> {
 
 async function getSafeMineruUploadFileName(pdfPath: string): Promise<string> {
   const rawName = pdfPath.split(/[\\/]/).pop() || "paper.pdf";
-  const safeName = getSafePdfFileName(pdfPath);
-  if (utf8ByteLength(safeName) <= MAX_MINERU_UPLOAD_FILENAME_BYTES) {
-    return safeName;
-  }
-
   const hash = await getShortFileNameHash(rawName);
   return `${hash}.pdf`;
 }

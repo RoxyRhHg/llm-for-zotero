@@ -419,7 +419,7 @@ describe("mineruClient", function () {
       );
     });
 
-    it("keeps a short ASCII multipart filename unchanged", async function () {
+    it("uses a hash-only multipart filename for a short ASCII name", async function () {
       let submittedBody: BodyInit | null | undefined;
       globalThis.fetch = (async (_url, init) => {
         submittedBody = init?.body;
@@ -435,13 +435,13 @@ describe("mineruClient", function () {
       );
 
       assert.equal(result?.mdContent, "# Parsed short filename");
-      assert.equal(
-        await readMultipartFileName(submittedBody, "files"),
-        "paper.pdf",
-      );
+      const fileName = await readMultipartFileName(submittedBody, "files");
+      assert.equal(encoder.encode(fileName).byteLength, 16);
+      assert.match(fileName, /^[a-f0-9]{12}\.pdf$/);
+      assert.notEqual(fileName, "paper.pdf");
     });
 
-    it("keeps a filename at the byte limit unchanged", async function () {
+    it("hashes a filename at the previous byte limit", async function () {
       let submittedBody: BodyInit | null | undefined;
       globalThis.fetch = (async (_url, init) => {
         submittedBody = init?.body;
@@ -457,8 +457,9 @@ describe("mineruClient", function () {
       );
 
       const fileName = await readMultipartFileName(submittedBody, "files");
-      assert.equal(encoder.encode(fileName).byteLength, 80);
-      assert.equal(fileName, EXACT_LIMIT_PDF_FILE_NAME);
+      assert.equal(encoder.encode(fileName).byteLength, 16);
+      assert.match(fileName, /^[a-f0-9]{12}\.pdf$/);
+      assert.notEqual(fileName, EXACT_LIMIT_PDF_FILE_NAME);
     });
 
     it("shortens long multipart filenames deterministically", async function () {
@@ -495,7 +496,7 @@ describe("mineruClient", function () {
       assert.notEqual(firstName, LONG_PDF_FILE_NAME);
     });
 
-    it("keeps MinerU's repeated Windows output path below MAX_PATH", async function () {
+    it("hashes the unsafe boundary before building MinerU output paths", async function () {
       let submittedBody: BodyInit | null | undefined;
       globalThis.fetch = (async (_url, init) => {
         submittedBody = init?.body;
@@ -505,12 +506,12 @@ describe("mineruClient", function () {
       }) as typeof fetch;
 
       await parsePdfWithMineruLocal(
-        LONG_PDF_PATH,
+        EXACT_LIMIT_PDF_PATH,
         "http://127.0.0.1:58659",
         "pipeline",
       );
 
-      const previousCappedPath = buildMineruWindowsOutputPath(
+      const unsafeBoundaryPath = buildMineruWindowsOutputPath(
         MINERU_WINDOWS_OUTPUT_ROOT,
         MINERU_TASK_ID,
         EXACT_LIMIT_PDF_FILE_NAME,
@@ -523,10 +524,11 @@ describe("mineruClient", function () {
       );
 
       assert.isAtLeast(
-        previousCappedPath.length,
+        unsafeBoundaryPath.length,
         WINDOWS_LEGACY_MAX_PATH_CHARS,
       );
       assert.match(submittedName, /^[a-f0-9]{12}\.pdf$/);
+      assert.notEqual(submittedName, EXACT_LIMIT_PDF_FILE_NAME);
       assert.isBelow(fixedPath.length, WINDOWS_LEGACY_MAX_PATH_CHARS);
     });
 
