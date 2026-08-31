@@ -507,6 +507,44 @@ describe("mineruAutoWatch", function () {
     assert.isUndefined(getItemStatus(pdf.id));
   });
 
+  it("deletion cancels a batch-owned task even when auto-watch never joined it", async function () {
+    const parent = createParent();
+    const pdf = createPdf();
+    const items = new Map<number, MockItem>([
+      [parent.id, parent],
+      [pdf.id, pdf],
+    ]);
+    setupZotero(items);
+
+    let sharedSignal: AbortSignal | undefined;
+    const owner = runMineruTaskOnce(pdf.id, async (_report, signal) => {
+      sharedSignal = signal;
+      await new Promise<void>((_resolve, reject) => {
+        signal?.addEventListener(
+          "abort",
+          () => reject(new MineruCancelledError()),
+          { once: true },
+        );
+      });
+      return { mdContent: "# unreachable", files: [] };
+    });
+    const ownerOutcome = owner.then(
+      () => null,
+      (error) => error,
+    );
+    await Promise.resolve();
+    assert.exists(sharedSignal);
+
+    items.delete(pdf.id);
+    await handleAutoWatchNotificationForTests("delete", "item", [pdf.id]);
+
+    const ownerError = await ownerOutcome;
+    assert.isTrue(sharedSignal?.aborted ?? false);
+    assert.instanceOf(ownerError, MineruCancelledError);
+    assert.lengthOf(getAutoWatchQueueSnapshotForTests(), 0);
+    assert.isUndefined(getItemStatus(pdf.id));
+  });
+
   it("retries a newly added PDF when Zotero has not resolved its file path yet", async function () {
     const originalFetch = globalThis.fetch;
     globalThis.fetch = (async () =>

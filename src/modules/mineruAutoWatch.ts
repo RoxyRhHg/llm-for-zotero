@@ -281,6 +281,9 @@ function removeDeletedAttachmentsFromQueue(ids: number[]): void {
   for (const id of deletedIds) {
     clearReadinessRetryTimer(id);
     clearItemStatus(id);
+    if (cancelMineruTask(id)) {
+      ztoolkit.log(`MinerU auto-parse: cancelled deleted PDF ${id}`);
+    }
   }
 
   if (previousLength !== processingQueue.length) {
@@ -293,14 +296,10 @@ function removeDeletedAttachmentsFromQueue(ids: number[]): void {
 
   if (currentAttachmentId !== null && deletedIds.has(currentAttachmentId)) {
     staleAbortAttachmentIds.add(currentAttachmentId);
-    cancelMineruTask(currentAttachmentId);
     if (currentAbort) {
       currentAbort.abort();
       currentAbort = null;
     }
-    ztoolkit.log(
-      `MinerU auto-parse: cancelled deleted PDF ${currentAttachmentId}`,
-    );
   }
 
   if (
