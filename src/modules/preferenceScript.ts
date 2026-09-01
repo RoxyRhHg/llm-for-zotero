@@ -191,6 +191,7 @@ import {
   MINERU_PARSE_FILTERS_CHANGED_EVENT,
   registerMineruManagerScript,
 } from "./mineruManagerScript";
+import { hasPendingMineruManagerSelection } from "./mineruManagerNavigation";
 import {
   cleanSyncedMineruPackages,
   repairMineruSyncPackages,
@@ -1027,8 +1028,9 @@ export async function registerPrefsScripts(_window: Window | undefined | null) {
         switchTab(btn.getAttribute("data-pref-tab") || "models");
       });
     }
-    // Activate first tab
-    switchTab("models");
+    // A Zotero item-tree MinerU action can open preferences with a pending
+    // attachment selection. Show MinerU immediately instead of flashing Models.
+    switchTab(hasPendingMineruManagerSelection() ? "mineru" : "models");
   }
 
   const modelSections = doc.querySelector(

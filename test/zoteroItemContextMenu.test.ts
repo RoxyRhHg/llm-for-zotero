@@ -7,6 +7,10 @@ import {
   registerContextSurfaceActionTarget,
   registerZoteroItemContextMenu,
 } from "../src/modules/contextPanel/zoteroItemContextMenu";
+import {
+  clearMineruManagerNavigationForTests,
+  registerMineruManagerSelectionTarget,
+} from "../src/modules/mineruManagerNavigation";
 
 function makeItem(id: number): Zotero.Item {
   return {
@@ -21,6 +25,8 @@ function makeItem(id: number): Zotero.Item {
 describe("Zotero item context menu dispatch", function () {
   afterEach(function () {
     clearContextSurfaceActionTargetsForTests();
+    clearMineruManagerNavigationForTests();
+    delete (globalThis as unknown as { Zotero?: unknown }).Zotero;
   });
 
   it("registers the Zotero item-tree command between separators", function () {
@@ -54,6 +60,83 @@ describe("Zotero item context menu dispatch", function () {
       "Add Items as Context to LLM-for-Zotero",
     );
     assert.equal(registrations[2].options.tag, "menuseparator");
+  });
+
+  it("opens MinerU manager and preselects every PDF below the selected item", function () {
+    const parent = {
+      id: 10,
+      libraryID: 1,
+      isRegularItem: () => true,
+      isAttachment: () => false,
+      getAttachments: () => [11, 12, 13],
+      getField: () => "Parent",
+    } as unknown as Zotero.Item;
+    const pdfA = {
+      id: 11,
+      isRegularItem: () => false,
+      isAttachment: () => true,
+      attachmentContentType: "application/pdf",
+    } as unknown as Zotero.Item;
+    const pdfB = {
+      id: 12,
+      isRegularItem: () => false,
+      isAttachment: () => true,
+      attachmentContentType: "application/pdf",
+    } as unknown as Zotero.Item;
+    const noteAttachment = {
+      id: 13,
+      isRegularItem: () => false,
+      isAttachment: () => true,
+      attachmentContentType: "text/html",
+    } as unknown as Zotero.Item;
+    const items = new Map<number, Zotero.Item>([
+      [11, pdfA],
+      [12, pdfB],
+      [13, noteAttachment],
+    ]);
+    (globalThis as unknown as { Zotero: unknown }).Zotero = {
+      Items: { get: (id: number) => items.get(id) || null },
+    };
+
+    let requestedIds: readonly number[] = [];
+    registerMineruManagerSelectionTarget((attachmentIds) => {
+      requestedIds = [...attachmentIds];
+      return true;
+    });
+
+    const registrations: Array<{
+      options: {
+        id?: string;
+        label?: string;
+        commandListener?: () => void;
+      };
+    }> = [];
+    let openCount = 0;
+    registerZoteroItemContextMenu({
+      ztoolkit: {
+        Menu: {
+          register: (_menu: string, options: any) => {
+            registrations.push({ options });
+          },
+        },
+      } as any,
+      getSelectedItems: () => [parent],
+      openStandaloneChat: () => undefined,
+      openMineruManager: () => {
+        openCount += 1;
+      },
+    });
+
+    const mineruCommand = registrations.find(
+      ({ options }) => options.id === "llmforzotero-recognize-pdfs-with-mineru",
+    )?.options;
+    assert.equal(mineruCommand?.label, "Recognize PDFs with MinerU");
+    assert.isFunction(mineruCommand?.commandListener);
+
+    mineruCommand?.commandListener?.();
+
+    assert.deepEqual(requestedIds, [11, 12]);
+    assert.equal(openCount, 1);
   });
 
   it("opens standalone instead of dispatching to a mounted embedded chat surface", async function () {

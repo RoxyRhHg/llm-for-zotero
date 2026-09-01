@@ -1,4 +1,8 @@
 import { t } from "../../utils/i18n";
+import {
+  collectMineruPdfAttachmentIds,
+  requestMineruManagerSelection,
+} from "../mineruManagerNavigation";
 import type { ContextSelectionActionResult } from "./contextSelectionActions";
 import type { ZoteroToolkit } from "zotero-plugin-toolkit";
 
@@ -31,6 +35,7 @@ type RegisterMenuDeps = {
   ztoolkit: Pick<ZoteroToolkit, "Menu">;
   getSelectedItems: () => Zotero.Item[];
   openStandaloneChat: OpenStandaloneChat;
+  openMineruManager?: () => void;
 };
 
 type DispatchDeps = {
@@ -38,6 +43,7 @@ type DispatchDeps = {
 };
 
 const MENU_ID = "llmforzotero-add-items-as-context";
+const MINERU_MENU_ID = "llmforzotero-recognize-pdfs-with-mineru";
 const MENU_SEPARATOR_BEFORE_ID = "llmforzotero-add-items-as-context-before";
 const MENU_SEPARATOR_AFTER_ID = "llmforzotero-add-items-as-context-after";
 const activeContextSurfaceTargets = new Map<
@@ -120,6 +126,20 @@ export function registerZoteroItemContextMenu(deps: RegisterMenuDeps): void {
       });
     },
   });
+  if (deps.openMineruManager) {
+    deps.ztoolkit.Menu?.register?.("item", {
+      tag: "menuitem",
+      id: MINERU_MENU_ID,
+      label: t("Recognize PDFs with MinerU"),
+      commandListener: () => {
+        const attachmentIds = collectMineruPdfAttachmentIds(
+          deps.getSelectedItems(),
+        );
+        if (!requestMineruManagerSelection(attachmentIds)) return;
+        deps.openMineruManager?.();
+      },
+    });
+  }
   deps.ztoolkit.Menu?.register?.("item", {
     tag: "menuseparator",
     id: MENU_SEPARATOR_AFTER_ID,

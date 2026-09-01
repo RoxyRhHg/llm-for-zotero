@@ -53,6 +53,7 @@ import {
   buildMineruFilenameMatcher,
   type MineruFilenameMatcher,
 } from "../utils/mineruConfig";
+import { registerMineruManagerSelectionTarget } from "./mineruManagerNavigation";
 
 /** Show a confirm dialog with a custom title using ztoolkit.Dialog. */
 async function confirmDialog(message: string): Promise<boolean> {
@@ -362,6 +363,64 @@ export async function registerMineruManagerScript(
 
   function getManagerVisibleSourceItems(): MineruItemEntry[] {
     return allItems.filter(shouldShowMineruManagerItem);
+  }
+
+  function applyExternalAttachmentSelection(
+    attachmentIds: readonly number[],
+  ): void {
+    const requestedIds = new Set(attachmentIds);
+    const availableItems = getManagerVisibleSourceItems();
+
+    // A direct item-tree action should always reveal the requested PDFs, even
+    // if the manager was previously narrowed to another folder/tag/search.
+    activeCollectionId = "all";
+    tagScope = "all";
+    selectedTags.clear();
+    itemSearchQuery = "";
+    if (itemSearchInput) itemSearchInput.value = "";
+
+    selectedIds.clear();
+    for (const item of availableItems) {
+      if (requestedIds.has(item.attachmentId)) {
+        selectedIds.add(item.attachmentId);
+      }
+    }
+    lastClickedId = selectedIds.values().next().value ?? null;
+
+    // Make every selected PDF row visible, including single-PDF parent groups
+    // that are collapsed by default.
+    for (const group of groupByParent(availableItems)) {
+      if (group.children.some((child) => selectedIds.has(child.attachmentId))) {
+        collapsedParents.delete(group.parentItemId);
+      }
+    }
+
+    renderSidebar();
+    renderItemsList();
+
+    const mineruTab = doc.querySelector(
+      '[data-pref-tab="mineru"]',
+    ) as HTMLElement | null;
+    mineruTab?.click();
+
+    const firstSelectedId = selectedIds.values().next().value;
+    const firstEntry =
+      firstSelectedId === undefined
+        ? undefined
+        : availableItems.find((item) => item.attachmentId === firstSelectedId);
+    const selectedRow =
+      firstSelectedId === undefined
+        ? null
+        : (doc.querySelector(
+            `[data-attachment-id="${firstSelectedId}"]`,
+          ) as HTMLElement | null);
+    const parentRow = firstEntry
+      ? (doc.querySelector(
+          `[data-parent-id="${firstEntry.parentItemId}"]`,
+        ) as HTMLElement | null)
+      : null;
+    selectedRow?.scrollIntoView?.({ block: "nearest" });
+    if (!selectedRow) parentRow?.scrollIntoView?.({ block: "nearest" });
   }
 
   function pruneSelectedIdsToVisibleItems(): void {
@@ -2785,4 +2844,14 @@ export async function registerMineruManagerScript(
   renderItemSearchBar();
   renderItemsList();
   syncUIFromState(getMineruBatchState());
+
+  const unregisterManagerSelectionTarget = registerMineruManagerSelectionTarget(
+    (attachmentIds) => {
+      applyExternalAttachmentSelection(attachmentIds);
+      return true;
+    },
+  );
+  win.addEventListener("unload", unregisterManagerSelectionTarget, {
+    once: true,
+  });
 }
