@@ -73,18 +73,21 @@ describe("Zotero item context menu dispatch", function () {
     } as unknown as Zotero.Item;
     const pdfA = {
       id: 11,
+      libraryID: 1,
       isRegularItem: () => false,
       isAttachment: () => true,
       attachmentContentType: "application/pdf",
     } as unknown as Zotero.Item;
     const pdfB = {
       id: 12,
+      libraryID: 1,
       isRegularItem: () => false,
       isAttachment: () => true,
       attachmentContentType: "application/pdf",
     } as unknown as Zotero.Item;
     const noteAttachment = {
       id: 13,
+      libraryID: 1,
       isRegularItem: () => false,
       isAttachment: () => true,
       attachmentContentType: "text/html",
@@ -95,6 +98,7 @@ describe("Zotero item context menu dispatch", function () {
       [13, noteAttachment],
     ]);
     (globalThis as unknown as { Zotero: unknown }).Zotero = {
+      Libraries: { userLibraryID: 1 },
       Items: { get: (id: number) => items.get(id) || null },
     };
 
@@ -130,12 +134,58 @@ describe("Zotero item context menu dispatch", function () {
     const mineruCommand = registrations.find(
       ({ options }) => options.id === "llmforzotero-recognize-pdfs-with-mineru",
     )?.options;
-    assert.equal(mineruCommand?.label, "Recognize PDFs with MinerU");
+    assert.equal(mineruCommand?.label, "Open MinerU Manager");
     assert.isFunction(mineruCommand?.commandListener);
 
     mineruCommand?.commandListener?.();
 
     assert.deepEqual(requestedIds, [11, 12]);
+    assert.equal(openCount, 1);
+  });
+
+  it("opens MinerU manager even when the selected item has no PDF", function () {
+    const parentWithoutPdf = {
+      id: 20,
+      libraryID: 1,
+      isRegularItem: () => true,
+      isAttachment: () => false,
+      getAttachments: () => [],
+      getField: () => "No PDF",
+    } as unknown as Zotero.Item;
+    (globalThis as unknown as { Zotero: unknown }).Zotero = {
+      Libraries: { userLibraryID: 1 },
+      Items: { get: () => null },
+    };
+
+    const registrations: Array<{
+      options: {
+        id?: string;
+        commandListener?: () => void;
+      };
+    }> = [];
+    let openCount = 0;
+    registerZoteroItemContextMenu({
+      ztoolkit: {
+        Menu: {
+          register: (_menu: string, options: any) => {
+            registrations.push({ options });
+          },
+        },
+      } as any,
+      getSelectedItems: () => [parentWithoutPdf],
+      openStandaloneChat: () => undefined,
+      openMineruManager: () => {
+        openCount += 1;
+      },
+    });
+
+    registrations
+      .find(
+        ({ options }) =>
+          options.id === "llmforzotero-recognize-pdfs-with-mineru",
+      )
+      ?.options.commandListener?.();
+
     assert.equal(openCount, 1);
   });
 

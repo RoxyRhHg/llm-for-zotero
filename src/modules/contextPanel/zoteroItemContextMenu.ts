@@ -1,6 +1,7 @@
 import { t } from "../../utils/i18n";
 import {
   collectMineruPdfAttachmentIds,
+  requestMineruManagerOpen,
   requestMineruManagerSelection,
 } from "../mineruManagerNavigation";
 import type { ContextSelectionActionResult } from "./contextSelectionActions";
@@ -130,12 +131,15 @@ export function registerZoteroItemContextMenu(deps: RegisterMenuDeps): void {
     deps.ztoolkit.Menu?.register?.("item", {
       tag: "menuitem",
       id: MINERU_MENU_ID,
-      label: t("Recognize PDFs with MinerU"),
+      label: t("Open MinerU Manager"),
       commandListener: () => {
         const attachmentIds = collectMineruPdfAttachmentIds(
           deps.getSelectedItems(),
         );
-        if (!requestMineruManagerSelection(attachmentIds)) return;
+        requestMineruManagerOpen();
+        if (attachmentIds.length) {
+          requestMineruManagerSelection(attachmentIds);
+        }
         deps.openMineruManager?.();
       },
     });
