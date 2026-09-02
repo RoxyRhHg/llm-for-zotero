@@ -108,6 +108,8 @@ export async function runMineruTaskOnce<T>(
   onProgress?: (stage: string) => void,
   subscriberSignal?: AbortSignal,
 ): Promise<{ joined: boolean; value: T }> {
+  if (subscriberSignal?.aborted) throw new MineruCancelledError();
+
   const existing = activeTasks.get(attachmentId);
   if (existing) {
     if (onProgress) {
@@ -143,7 +145,12 @@ export async function runMineruTaskOnce<T>(
     }
   };
   active.promise = Promise.resolve()
-    .then(() => task(report, active.controller?.signal))
+    .then(() => {
+      if (active.controller?.signal.aborted || subscriberSignal?.aborted) {
+        throw new MineruCancelledError();
+      }
+      return task(report, active.controller?.signal);
+    })
     .finally(() => {
       if (activeTasks.get(attachmentId) === active) {
         activeTasks.delete(attachmentId);

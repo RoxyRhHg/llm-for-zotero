@@ -196,6 +196,42 @@ describe("mineruProcessingStatus", function () {
     assert.deepEqual(secondProgress, ["server processing"]);
   });
 
+  it("does not start a task for an already cancelled subscriber", async function () {
+    const controller = new AbortController();
+    controller.abort();
+    let executions = 0;
+    await assertCancelled(
+      mineruProcessingStatus.runMineruTaskOnce(
+        104,
+        async () => {
+          executions++;
+          return "unexpected";
+        },
+        undefined,
+        controller.signal,
+      ),
+    );
+    assert.equal(executions, 0);
+    assert.isFalse(mineruProcessingStatus.cancelMineruTask(104));
+  });
+
+  it("does not start a task cancelled before its callback runs", async function () {
+    const controller = new AbortController();
+    let executions = 0;
+    const task = mineruProcessingStatus.runMineruTaskOnce(
+      105,
+      async () => {
+        executions++;
+        return "unexpected";
+      },
+      undefined,
+      controller.signal,
+    );
+    controller.abort();
+    await assertCancelled(task);
+    assert.equal(executions, 0);
+  });
+
   it("lets a joined batch subscriber pause without cancelling an auto-owned task", async function () {
     const runOnce = mineruProcessingStatus.runMineruTaskOnce;
     const ownerController = new AbortController();
